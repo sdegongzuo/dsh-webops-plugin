@@ -49,27 +49,34 @@ src/tool-browser/       工具消费者 —— 把能力暴露成 browser_* 工�
 往官方仓库 `packages/` 里加代码，只会沉淀成一份永远无法提交的本地工作区——而
 `packages/bundle/*/cordis.patch.yml` 与 preset 恰恰是上游每次 release 都会改动的文件，下轮拉取必冲突。
 
-### 开发期（推荐）
+### 开发期
 
-官方 `docs/user/develop/basic/publish.md` 推荐的做法：**让插件目录出现在 dsh 源码 checkout 的根目录**，
-命令统一用 `pnpm dsh ...` 跑，这样 Node 会向上解析到 dsh 自己的 `node_modules`（本地 workspace 链接、
-版本 0.1.5-rc.2），而不是去 npm 拉旧版。
+两个方向要通，方向不同、手段不同。
 
-本仓位于 `D:\dev\cli\dsh-browser-plugin`，用一个**目录联接（junction）**把它挂进 checkout 即可，
-不需要管理员权限、也不移动代码：
+**① 插件仓 → 依赖 dsh 的包**（已配好，`pnpm install` 即可）。
 
-```cmd
-mklink /J D:\dev\cli\deepseek-harness\dsh-browser-plugin D:\dev\cli\dsh-browser-plugin
+`package.json` 用 pnpm 的 `link:` 协议直接指向本地 checkout，不查 registry：
+
+```json
+"@deepseek-ai/cordis": "link:../deepseek-harness/vendor/cordis",
+"@deepseek-ai/dsh-tools": "link:../deepseek-harness/packages/core/tools",
+"@deepseek-ai/dsh-subprocess": "link:../deepseek-harness/packages/subprocess/subprocess",
+"@deepseek-ai/schemastery": "link:../deepseek-harness/vendor/schemastery"
 ```
 
-再把它排除出 dsh 的 git status（`.git/info/exclude` 是本地文件，**不要动仓库的 `.gitignore`**）：
+这既是绕开 npm 旧版的唯一可行手段（见下节），也让 `pnpm typecheck` 开箱可用。
+`link:` 写死了本地相对路径，**发布前要换回 peerDependencies + npm 版本号**。
 
-```gitignore
-# .git/info/exclude
-/dsh-browser-plugin
-```
+**② dsh → 加载本插件**（待 P0 实测）。
 
-然后从 dsh 根目录验证层序：
+patch 里的 `name: 'dsh-browser-plugin/browser'` 需要 dsh 侧的 Node 解析能找到这个包。
+让插件目录出现在 dsh checkout 里**还不够**——包名解析找的是 `node_modules/dsh-browser-plugin`，
+不是仓库根下的同名目录。候选方案：
+
+- 把本仓路径加进 dsh 的 `pnpm-workspace.yaml` 的 `packages`（改的是 dsh 仓库文件，仅本地生效、不提交）；
+- 或在 dsh 的 `node_modules/` 下建一个 junction 指向本仓（注意 `pnpm install` 会清掉非管理的条目）。
+
+两者都验证到位后再补进本节。验证命令：
 
 ```bash
 cd /d/dev/cli/deepseek-harness
@@ -86,17 +93,22 @@ dsh plugin --profile <name> add github:sdegongzuo/dsh-browser-plugin#<sha>  # gi
 > git 安装需要本仓提供 self-contained 的 `prepare` 脚本，且用户要在 profile 的 `pnpm-workspace.yaml`
 > 里 `allowBuilds: { dsh-browser-plugin: true }`。详见官方 `publish.md`。**待 P0 期间实测**。
 
-## 依赖版本约束（重要）
+## 依赖版本约束（重要，实测）
 
 | 包 | npm 上 | 本地 checkout |
 |---|---|---|
-| `@deepseek-ai/cordis` | 4.0.2 ✓ | 4.0.2 |
+| `@deepseek-ai/cordis` | 4.0.2 | 4.0.2 |
+| `@deepseek-ai/schemastery` | 3.18.2 | 3.18.2 |
 | `@deepseek-ai/dsh-tools` | **0.0.1-rc.1** | 0.1.5-rc.2 |
 | `@deepseek-ai/dsh-subprocess` | **0.0.1-rc.1** | 0.1.5-rc.2 |
 
-除了 cordis，**dsh 自己的包在 npm 上落后 5 个 minor，类型与接口都对不上**。
-所以 `package.json` 把 dsh 包写成 `peerDependencies: "*"`，并用 `.npmrc` 关掉 `auto-install-peers`，
-强制走本地 link。**不要**把它们改成 npm 版本号。
+**dsh 自己的包不要从 registry 装。** 两条实测证据：
+
+1. 版本落后 5 个 minor（`0.0.1-rc.1` vs `0.1.5-rc.2`），类型与接口都对不上。
+2. npm 上的 dsh 生态**不完整**：直接 `pnpm install` 会因 `@deepseek-ai/dsh-type-meta` 404 而失败——
+   这个包根本没发布。`.npmrc` 里的 `auto-install-peers=false` 挡不住这条链路。
+
+所以 dsh 相关的四个包一律走 `link:` 指向本地 checkout。**不要**把它们改成 npm 版本号。
 
 ## 接线：全部落在 host 平面
 
@@ -153,9 +165,9 @@ P0 的 provider 走「用户自己开着的 Chrome + 对接调试端口」这一
 ## 开发
 
 ```bash
-pnpm install       # 只装工具链（typescript / vitest）；dsh 包靠 link
-pnpm typecheck     # 需要先完成上面的 junction 步骤，否则找不到 dsh 类型
-pnpm test
+pnpm install       # 工具链 + link 本地 dsh 包；不查 registry
+pnpm typecheck     # 已验证通过
+pnpm test          # 尚无测试；P0 填实现时同步补
 ```
 
 ## License
