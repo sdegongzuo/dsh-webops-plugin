@@ -17,8 +17,13 @@
 **P0（只读）已实现并通过验收。** 模型现在能「看」页面：开标签页、跳转、读可访问性大纲（带 ref）、截图。
 四个工具已在真实 profile 上确认进入 agent 的工具视图，不只是配置上插上了（见「接线」一节的实跑验证）。
 
-**桌面端已接入并跑通。** 在**开发态桌面端**（Electron）里实跑通过：host 半边三个面全部加载、客户端半边加载并执行、
+**桌面端已接入并跑通。** 在**开发态桌面端**（Electron）里实跑通过：host 半边四个面全部加载、客户端半边加载并执行、
 观察面板渲染在输入框上方（输入框上方那行「浏览器 · 已就绪」）。见「桌面端接入」一节。
+
+**桌面端里的浏览器窗口是桌面端自己的 Electron 窗口。** 第二个 provider `browser-electron` 让 host 进程
+spawn 一个窗口宿主，开真正的 `BrowserWindow`，用它的 `webContents.debugger` 走同一套 CDP 命令。
+实测：在**正在运行的桌面端 host 进程里**开出了窗口、跳转、27 个 ref 的大纲、207 KB 截图
+（`pnpm run window:desktop`）。见「桌面端：开 Electron 窗口」一节。
 
 ![桌面端里的浏览器面板](docs/desktop-dock.png)
 
@@ -26,6 +31,7 @@
 |---|---|
 | **P0 只读** ← 已完成 | `ctx.browser` + `browser-cdp` 的 connect / open / navigate / snapshot / screenshot + 4 个只读工具 + ref 纪元 |
 | **UI 观察面板** ← 已完成 | `conversation.input.dock` 常驻状态条（含无活动时的「已就绪」态）+ `tool.call.toolview` 四个专属卡片（地址 / 大纲 / 截图） |
+| **Electron 窗口 provider** ← 已完成 | `browser-electron`：spawn 窗口宿主 → 真 `BrowserWindow` → `webContents.debugger` 驱动；桌面端默认用它 |
 | P1 操作 | click / fill / press / scroll / wait + 能力分级 + `stale_ref` 恢复 |
 | P2 调试 | console / network 采集 + 受限 `browser_execute` + 进度策略 |
 | P3 协作 | 人工接管 / 回收 + `browser_find` / `browser_locate` |
@@ -55,15 +61,15 @@ pnpm dsh --profile browserp0
 ## 结构
 
 ```
-cordis.patch.yml        bundle 的配置层：把四行插进 profile（见下）
+cordis.patch.yml        bundle 的配置层：把五行插进 profile（见下）
 package.json            声明 dsh.bundle.patch、dsh.client（客户端双面）、多入口导出
-tsdown.config.ts        两条独立产物：host 三面 + 包根（ESM）/ 客户端 bundle（CJS，外裹 __ModuleLoader__）
+tsdown.config.ts        两条独立产物：host 四面 + 包根（ESM）/ 客户端 bundle（CJS，外裹 __ModuleLoader__）
 src/index.ts            包根的 host 半边：**故意是空的**，只为让客户端半边被发现（见「桌面端接入」的坑）
 src/debug.ts            加载诊断（写 stdout，桌面端才看得见）
 src/browser/            Service Definition —— ctx.browser 服务、provider 选择语义、错误类型
-  index.ts                BrowserRuntime（Service）
+  index.ts                BrowserRuntime（Service）+ DSH_BROWSER_PROVIDER 兜底
   types.ts                会话 / 观察请求 / 错误码
-src/browser-cdp/        provider —— 通过 CDP 驱动浏览器
+src/browser-cdp/        provider —— 通过 CDP 驱动**外部 Chrome**
   index.ts                插件入口：注册 provider + 卸载时释放资源
   provider.ts             CdpBrowserProvider：会话生命周期、四条操作、截图裁剪
   protocol.ts             CDP 传输层：/json/* HTTP 端点 + WebSocket 命令通道
@@ -71,6 +77,14 @@ src/browser-cdp/        provider —— 通过 CDP 驱动浏览器
   snapshot.ts             可访问性树 → 紧凑大纲 + ref 候选（纯函数）
   url-policy.ts           地址策略：只许 HTTP(S)、禁内嵌凭据、端点是回环
   live.test.ts            对着真实 Chrome 跑的验收测试（没有调试端口时自动跳过）
+src/browser-electron/   provider —— 开**桌面端自己的 Electron 窗口**
+  index.ts                插件入口：注册 provider（`electron`）+ 启用闸
+  provider.ts             ElectronBrowserProvider：复用 CdpBrowserProvider，只换传输层
+  bridge.ts               spawn Electron 宿主 + TCP JSON Lines 通道（可注入，单测替换）
+  socket.ts               把「桥上的一个窗口」包成 CdpSocket，喂给现成的 CdpConnection
+  transport.ts            桥 ↔ CdpTransport 的翻译；句柄 scheme `electron-window://`
+  host.cjs                **被 spawn 的 Electron 应用入口**：BrowserWindow + webContents.debugger
+  index.test.ts           假通道下的单测（真机行为归 smoke:window）
 src/tool-browser/       工具消费者 —— 把能力暴露成 browser_* 工具给模型
   index.ts                browser_open / navigate / snapshot / screenshot + 系统提示分段
 src/client/             浏览器半边（dsh.client）
@@ -136,7 +150,7 @@ dsh: initialized profile browserp0 at C:\Users\yemaf\.dsh\profiles\browserp0
 + dsh-browser-plugin link:D:/dev/cli/dsh-browser-plugin
 ```
 
-验证层序（应出现 `# == dsh-browser-plugin` 层与四行）：
+验证层序（应出现 `# == dsh-browser-plugin` 层与五行）：
 
 ```bash
 pnpm dsh --profile browserp0 --dump-config | grep -A4 "== dsh-browser-plugin"
@@ -181,6 +195,7 @@ pnpm run build          # 产出 lib/（桌面端只吃构建产物，src/ 不�
 pnpm run dev:desktop    # 装配进开发态 profile 并拉起 Electron（含 --build 可先跑 dsh 的构建）
 pnpm run check:desktop  # 从外部用 CDP 断言「host 认了 / 客户端跑了 / 面板渲染了 / 卡片注册了」
 pnpm run shot:desktop   # 截一张真实桌面端的 PNG（docs/desktop-dock.png）
+pnpm run window:desktop # 让桌面端 host 进程自己开一个 Electron 窗口（端到端证据）
 ```
 
 开发态**装插件是被硬禁的**（`apps/desktop/src/main.ts` 里 `plugin package changes require a packaged
@@ -209,10 +224,79 @@ Electron 的 stdout。所以 `src/debug.ts` 的加载诊断**必须写 stdout**�
 
 ```
 [dsh-browser-plugin] root: client row registered
-[dsh-browser-plugin] browser-cdp: endpoint=http://127.0.0.1:9222
+[dsh-browser-plugin] browser-cdp: endpoint=http://127.0.0.1:9333
+[dsh-browser-plugin] browser-electron: enabled=true electron=…/electron/dist/electron.exe
 [dsh-browser-plugin] tool-browser: registered open, navigate, snapshot, screenshot
 ```
 
+---
+
+## 桌面端：开 Electron 窗口（`browser-electron`）
+
+![桌面端 host 进程开出的 Electron 窗口](docs/window-electron.png)
+
+### 为什么还需要第二个 provider
+
+`browser-cdp` 连的是**外部** Chrome 的调试端口。桌面端里这条路是死的：
+
+- 桌面端自己的 `--remote-debugging-port`（开发态 9222）就是**它自己的渲染进程**；
+- 内置 Chromium 不实现 `PUT /json/new`，实测回一句 `Could not create new page`；
+- 桌面端 host 又跑在**纯 Node** 子进程里（`node.exe … dsh-desktop-host/lib/index.js`，不是 Electron），
+  所以插件连 `BrowserWindow` 都拿不到，没法自己开窗口。
+
+于是换一条路：host 进程 **spawn 一个 Electron 窗口宿主**（`src/browser-electron/host.cjs`），
+窗口由它创建，插件继续用同一套 CDP 命令驱动 —— `Page.navigate` / `Runtime.evaluate` /
+`Accessibility.getFullAXTree` / `Page.captureScreenshot` 一个都不用改。
+`CdpBrowserProvider` 原样复用，只换传输层（`ElectronWindowTransport`）。
+
+两个 provider 并列注册，用 `DSH_BROWSER_PROVIDER` 选（`dev:desktop` 默认 `electron`）：
+
+| provider | id | 开的是什么 | 谁用 |
+|---|---|---|---|
+| `browser-cdp` | `cdp` | 外部 Chrome 的标签页 | CLI / 想接自己日常浏览器时 |
+| `browser-electron` | `electron` | 真正的 `BrowserWindow` | 桌面端（默认） |
+
+`browser-electron` **默认不参与 provider 选择**（`available()` 有一道启用闸）：不这样做，
+`cdp`（端点活着）与 `electron`（二进制找得到）会同时「可用」，`browser` 服务就会
+`BROWSER_PROVIDER_AMBIGUOUS`。
+
+### 验证
+
+```bash
+pnpm run smoke:window    # 纯 Node 侧：直接驱动 provider 开窗口 → 大纲 → 截图
+pnpm run window:desktop  # 端到端：让**正在运行的桌面端 host 进程**自己开窗口
+```
+
+`window:desktop` 的实测输出（host 进程就在桌面端里）：
+
+```json
+{
+  "providerId": "electron",
+  "enabled": true,
+  "session": { "id": "w1", "url": "https://www.baidu.com/", "title": "百度一下，你就知道" },
+  "snapshot": { "epoch": 1, "refs": 27, "chars": 3891 },
+  "screenshotBytes": 207285
+}
+```
+
+它靠桌面端 host 的 inspector（开发态 9230）注入：`Runtime.evaluate` 走
+`process.getBuiltinModule('module').createRequire(...)` 把插件产物 require 进来
+（inspector 里的 `import()` 会报 *A dynamic import callback was not specified*，
+而 Node 22 的 `require()` 认 ESM）。
+
+### 三个必须踩准的时机（全是实测，且都表现为「命令发出去永远不回」）
+
+1. **通道用 TCP，不要用 stdio。** Electron（Windows）主进程的 `process.stdin` 会**立刻 EOF**，
+   `on('end')` 一收尾就把 app 关了 —— 症状是「窗口刚建好就自己没了」。
+   stdout 是通的，所以反向：宿主监听 `127.0.0.1:0`，把端口从 stdout 宣布。
+2. **`debugger.attach()` 要等 `dom-ready`。** 窗口刚 `new` 出来就 attach，`Page.enable` 直接挂住。
+3. **建窗口后必须显式 `loadURL()`。** 哪怕加载 `about:blank`：不加载就没有导航，
+   `dom-ready` 永远不来，第 2 步就永远等不到。
+
+另外 `CdpSocket` 的 `open` 事件必须是「下一个微任务」派发：`CdpConnection` 的构造是同步的，
+`openSocket()` 要先把监听器挂上，派发早了它就错过了。
+
+---
 ## 依赖版本约束（重要，实测）
 
 | 包 | npm 上 | 本地 checkout | 用途 |
@@ -238,12 +322,13 @@ Chrome，从不启动进程，所以「进程树回收」这一条在 P0 里没�
 
 ## 接线：全部落在 host 平面
 
-`cordis.patch.yml` 的 `insert` 里有四行（前三条 host 行 + 一条裸包名客户端行），都在 host 平面：
+`cordis.patch.yml` 的 `insert` 里有五行（前四条 host 行 + 一条裸包名客户端行），都在 host 平面：
 
 | 行 | 说明 |
 |---|---|
 | `browser` | `ctx.browser` 能力服务，跨会话共享，不能按 preset 分叉 |
-| `browser-cdp` | provider，注册进 `ctx.browser` |
+| `browser-cdp` | provider（外部 Chrome），注册进 `ctx.browser` |
+| `browser-electron` | provider（桌面端自己的 Electron 窗口），默认不参与选择 |
 | `tool-browser` | 模型可见的工具 |
 | `dsh-browser-plugin`（裸包名） | host 半边是空实现，只为让浏览器那半边被客户端模块表发现；见「桌面端接入」里的坑 |
 
@@ -319,7 +404,7 @@ host 平面那份就会与 preset 那份一起进入 agent 的工具视图。
 
 | # | 验收项 | 状态 | 怎么验 |
 |---|---|---|---|
-| 1 | `--dump-config` 四行在、层序对 | ✅ | `pnpm dsh --profile browserp0 --dump-config \| grep -A4 "== dsh-browser-plugin"` |
+| 1 | `--dump-config` 五行在、层序对 | ✅ | `pnpm dsh --profile browserp0 --dump-config \| grep -A5 "== dsh-browser-plugin"` |
 | 2 | 真 Chrome 上跑通 open → snapshot → screenshot | ✅ | live 测试（下） |
 | 3 | 截图以 attachment 引用出现 | ⚠️ 见下 | live 测试用真实 `LocalAttachmentStore` 存盘；工具层的「图片块」由单测覆盖 |
 | 4 | 导航后用旧 ref 拿到 `stale_ref` | ✅ | live 测试 + `provider.test.ts`（并断言**没有**发出截图命令） |
@@ -363,8 +448,8 @@ pnpm dsh --profile browserp0
 ```bash
 pnpm install       # 工具链 + link 本地 dsh 包；不查 registry
 pnpm typecheck     # tsc --noEmit
-pnpm test          # vitest；115 个用例通过（另有 3 个 live，端点不是真 Chrome 时整组跳过）
-pnpm build         # tsdown；产出 lib/（host 三面 + 包根 + 客户端 bundle）
+pnpm test          # vitest；143 个用例通过（另有 3 个 live，端点不是真 Chrome 时整组跳过）
+pnpm build         # tsdown 加 copy-assets；产出 lib/（host 四面 + 包根 + 客户端 bundle + host.cjs）
 ```
 
 测试全部就近放在 `src/**/*.test.ts`（`vitest.config.ts` 的 include 就是这一条）。覆盖：

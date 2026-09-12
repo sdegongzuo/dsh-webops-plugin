@@ -24,6 +24,12 @@
     - id: browser-cdp
       name: 'dsh-browser-plugin/browser-cdp'
 
+    # 桌面端用的 provider：开一个真的 Electron 窗口，用 webContents.debugger 驱动。
+    # 它**默认不参与 provider 选择**（`available()` 要求显式启用），所以插在这儿
+    # 不会影响 CLI 场景 —— 那边只有 browser-cdp 可用，仍然自动选中它。
+    - id: browser-electron
+      name: 'dsh-browser-plugin/browser-electron'
+
     - id: tool-browser
       name: 'dsh-browser-plugin/tool-browser'
 

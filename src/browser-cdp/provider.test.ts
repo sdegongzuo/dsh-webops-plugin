@@ -28,6 +28,8 @@ class FakeChrome {
   navigateErrorText: string | undefined
   axeNodes: AxNode[] = []
   page = { url: 'https://example.com/', title: 'Example' }
+  /** 当前文档的地址；`Page.navigate` 一被调用就变（模拟导航提交）。 */
+  href = 'about:blank'
   png = pngBytes(640, 480)
   readyStateComplete = true
   boxModel: readonly number[] | undefined = [10, 20, 110, 20, 110, 60, 10, 60]
@@ -40,6 +42,14 @@ class FakeChrome {
         return {}
       case 'Runtime.evaluate': {
         const expression = String(params['expression'])
+        // 导航判据里带 `ready:`；`readPageMeta` 也读 location.href，但没有这个键。
+        if (expression.includes('ready:')) {
+          return {
+            result: {
+              value: JSON.stringify({ ready: this.readyStateComplete, href: this.href }),
+            },
+          }
+        }
         return expression.includes('readyState')
           ? { result: { value: this.readyStateComplete } }
           : { result: { value: { url: this.page.url, title: this.page.title } } }
@@ -47,6 +57,7 @@ class FakeChrome {
       case 'Accessibility.getFullAXTree':
         return { nodes: this.axeNodes }
       case 'Page.navigate':
+        this.href = String(params['url'])
         return this.navigateErrorText === undefined ? {} : { errorText: this.navigateErrorText }
       case 'Page.captureScreenshot':
         return { data: Buffer.from(this.png).toString('base64') }

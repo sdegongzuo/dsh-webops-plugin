@@ -139,7 +139,9 @@ interface ScreenshotClip {
  * 连接与标签页的所有权边界很明确 —— **只关自己开的标签页**。
  */
 export class CdpBrowserProvider implements BrowserProvider {
-  readonly id = CDP_PROVIDER_ID
+  // 类型放宽成 `string`：这个 provider 也是「Electron 窗口」provider 的基类，
+  // 子类会用另一个 id 注册（见 `browser-electron/provider.ts`）。
+  readonly id: string = CDP_PROVIDER_ID
 
   private readonly config: ResolvedConfig
   private readonly transport: CdpTransport
@@ -188,7 +190,14 @@ export class CdpBrowserProvider implements BrowserProvider {
   /** @inheritdoc */
   async open(request: BrowserOpenRequest, signal?: AbortSignal): Promise<BrowserSession> {
     const url = request.url === undefined ? 'about:blank' : validateTargetUrl(request.url)
-    const target = await this.createTarget(url, signal)
+    // 先建一个空白页，再显式 `Page.navigate` 到目标地址。
+    //
+    // 为什么不直接把 url 交给 `/json/new`：那样标签页建好后导航是**异步**开始的，
+    // 此刻 `document.readyState` 已经是 `complete`（空白页本来就 complete），
+    // 「等加载完成」会立刻返回，于是 url / title / 大纲全在空白页上读了一遍 ——
+    // 实测表现是 `open` 成功、返回的 url 却是 `about:blank`、snapshot 零字符。
+    // 显式 navigate 之后，「等加载」等到的才是目标文档。
+    const target = await this.createTarget('about:blank', signal)
     this.probe = { at: Date.now(), ok: true }
 
     let connection: CdpConnection
@@ -211,7 +220,7 @@ export class CdpBrowserProvider implements BrowserProvider {
       await connection.send('Page.enable', {}, { signal, timeoutMs: this.config.commandTimeoutMs })
       // 等加载完成。超时**不**抛错：此时标签页已经建好，抛错会让调用方拿不到 session id，
       // 反而留下一个谁也管不着的孤儿标签。加载慢的页面交给模型自己再 snapshot。
-      await this.waitForDocument(connection, signal, this.config.navigationTimeoutMs)
+      await this.navigateTo(connection, url, session.url, signal)
       const meta = await this.readPageMeta(connection, signal)
       if (meta !== undefined) {
         session.url = meta.url
@@ -261,15 +270,10 @@ export class CdpBrowserProvider implements BrowserProvider {
   async navigate(request: BrowserNavigateRequest, signal?: AbortSignal): Promise<BrowserSession> {
     const session = this.require(request.sessionId)
     const url = validateTargetUrl(request.url)
-    const result = await session.connection.send<NavigateResult>(
-      'Page.navigate',
-      { url },
-      { signal, timeoutMs: this.config.commandTimeoutMs },
-    )
-    if (result.errorText !== undefined && result.errorText.length > 0) {
-      throw new BrowserError(`navigation to ${url} failed: ${result.errorText}`, 'BROWSER_NAVIGATION_FAILED')
-    }
-    const loaded = await this.waitForDocument(session.connection, signal, this.config.navigationTimeoutMs)
+    // 记住导航前的地址：新文档提交之前，`readyState` 仍是**旧**文档的 complete，
+    // 只有「地址真的变了」才说明新页面已经顶上来。
+    const previousUrl = session.url
+    const loaded = await this.navigateTo(session.connection, url, previousUrl, signal)
     // 导航无论成功与否都作废既有 ref —— 页面已经变了，旧 ref 指向的东西不再可信。
     session.refs.invalidate()
     const meta = await this.readPageMeta(session.connection, signal)
@@ -491,6 +495,88 @@ export class CdpBrowserProvider implements BrowserProvider {
   }
 
   /**
+   * 跳到目标地址并等**新文档**顶上来。
+   *
+   * `about:blank` 是「不需要导航」的特例：它本来就是空白页，等 `readyState` 就够。
+   *
+   * @param connection - 目标页面的连接。
+   * @param url - 目标地址（已过地址策略）。
+   * @param previousUrl - 导航前的地址；用来判断新文档是否已提交。
+   * @param signal - 取消信号。
+   * @returns 是否在超时前完成加载（超时不抛错，交给调用方决定）。
+   */
+  private async navigateTo(
+    connection: CdpConnection,
+    url: string,
+    previousUrl: string,
+    signal?: AbortSignal,
+  ): Promise<boolean> {
+    if (url !== 'about:blank') {
+      const result = await connection.send<NavigateResult>(
+        'Page.navigate',
+        { url },
+        { signal, timeoutMs: this.config.commandTimeoutMs },
+      )
+      if (result.errorText !== undefined && result.errorText.length > 0) {
+        throw new BrowserError(`navigation to ${url} failed: ${result.errorText}`, 'BROWSER_NAVIGATION_FAILED')
+      }
+      return this.waitForNavigation(connection, previousUrl, signal, this.config.navigationTimeoutMs)
+    }
+    return this.waitForDocument(connection, signal, this.config.navigationTimeoutMs)
+  }
+
+  /**
+   * 轮询到「地址已经变了，且新文档加载完成」。
+   *
+   * 判据必须是**地址变化**而不是 `readyState`：新标签页在导航提交前就是一个
+   * `readyState === 'complete'` 的空白页，只看 readyState 会立刻判定加载完成，
+   * 随后读到的 url / title / 大纲全是空白页的。
+   *
+   * @param connection - 目标页面的连接。
+   * @param previousUrl - 导航前的地址。
+   * @param signal - 取消信号。
+   * @param timeoutMs - 超时上限。
+   * @returns 是否在超时前完成。
+   */
+  private async waitForNavigation(
+    connection: CdpConnection,
+    previousUrl: string,
+    signal: AbortSignal | undefined,
+    timeoutMs: number,
+  ): Promise<boolean> {
+    const deadline = Date.now() + timeoutMs
+    for (;;) {
+      if (await this.navigationSettled(connection, previousUrl, signal)) return true
+      if (Date.now() >= deadline) return false
+      await delay(Math.min(100, Math.max(1, deadline - Date.now())), signal)
+    }
+  }
+
+  /** 问一次「地址变了吗 + 加载完了吗」；任何读取失败都当作「还没完成」。 */
+  private async navigationSettled(
+    connection: CdpConnection,
+    previousUrl: string,
+    signal?: AbortSignal,
+  ): Promise<boolean> {
+    try {
+      const evaluated = await connection.send<EvaluateResult>(
+        'Runtime.evaluate',
+        {
+          expression: 'JSON.stringify({ ready: document.readyState === "complete", href: String(location.href) })',
+          returnByValue: true,
+        },
+        { signal, timeoutMs: Math.min(this.config.commandTimeoutMs, 5_000) },
+      )
+      const state = readNavigationState(evaluated.result?.value)
+      if (state === undefined || !state.ready) return false
+      // 从空白页出发时只要求「不再是空白页」；否则要求「不再是刚才那个地址」。
+      return previousUrl === 'about:blank' ? state.href !== 'about:blank' : state.href !== previousUrl
+    } catch {
+      return false
+    }
+  }
+
+  /**
    * 轮询 `document.readyState === 'complete'`。
    *
    * 用轮询而不是 `Page.loadEventFired`，是因为后者有两个坑：事件可能在 `Page.enable` 之前
@@ -523,6 +609,22 @@ export class CdpBrowserProvider implements BrowserProvider {
       return false
     }
   }
+}
+
+/** 把 `navigationSettled` 的探测结果从 `unknown` 收窄成结构化状态。 */
+function readNavigationState(value: unknown): { ready: boolean; href: string } | undefined {
+  if (typeof value !== 'string') return undefined
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(value)
+  } catch {
+    return undefined
+  }
+  if (typeof parsed !== 'object' || parsed === null) return undefined
+  const record: Record<string, unknown> = { ...parsed }
+  const ready = record['ready']
+  const href = record['href']
+  return typeof ready === 'boolean' && typeof href === 'string' ? { ready, href } : undefined
 }
 
 /** 可取消的 sleep。 */

@@ -160,9 +160,19 @@ async function main() {
   environment.ELECTRON_ENABLE_LOGGING ??= '1'
   // 打开本插件的加载诊断，便于确认 host 半边是否真的挂上。
   environment.DSH_BROWSER_PLUGIN_DEBUG ??= '1'
+  // 桌面端的浏览器 provider 用 `electron`：它开的是**桌面端自己的 BrowserWindow**。
+  // 不用 `cdp` 是因为桌面端那个调试端口（9222）就是它自己的渲染进程，嵌入式 Chromium
+  // 不实现 `PUT /json/new` —— 连它做 browser_open 只会得到「Could not create new page」。
+  environment.DSH_BROWSER_PROVIDER ??= 'electron'
+  // 窗口宿主需要真的 Electron 二进制；这里就用跑桌面端的这一个。
+  environment.DSH_BROWSER_ELECTRON_PATH ??= electron
+  // 万一有人把 provider 切回 `cdp`，端点也别指向桌面端自己。
+  environment.DSH_BROWSER_CDP_ENDPOINT ??= 'http://127.0.0.1:9333'
 
   console.log(`dev-desktop: DSH_HOME=${environment.DSH_HOME}`)
   console.log(`dev-desktop: 调试端口 main=${PORTS.main} renderer=${PORTS.renderer} host=${PORTS.host}`)
+  console.log(`dev-desktop: 浏览器 provider=${environment.DSH_BROWSER_PROVIDER}`
+    + `（electron = 桌面端自己的窗口；换 cdp 需另起真 Chrome）`)
   console.log('dev-desktop: 校验用 → pnpm run check:desktop')
 
   await new Promise((resolvePromise, reject) => {

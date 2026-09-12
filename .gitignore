@@ -8,3 +8,5 @@ coverage/
 .env.*
 !.env.example
 .desktop-shot.png
+.smoke-*.png
+.probe-*

@@ -48,6 +48,15 @@ export interface BrowserRuntimeConfig {
   readonly provider?: string
 }
 
+/**
+ * 让 `provider` 可以走环境变量的变量名。
+ *
+ * 为什么需要：桌面端的 profile 目录由应用独占并每次重建，往里写 `config.provider` 活不过一次重启；
+ * 而桌面端里 `cdp`（连 9222，也就是桌面端自己）与 `electron`（开真窗口）都可能「可用」，
+ * 不指定就会撞上 `BROWSER_PROVIDER_AMBIGUOUS`。env 是唯一稳定的旋钮。
+ */
+export const BROWSER_PROVIDER_ENV = 'DSH_BROWSER_PROVIDER'
+
 export class BrowserRuntime extends Service {
   static Config: z<BrowserRuntimeConfig> = z.object({
     provider: z.string(),
@@ -58,7 +67,8 @@ export class BrowserRuntime extends Service {
 
   constructor(ctx: Context, config: BrowserRuntimeConfig = {}) {
     super(ctx, 'browser')
-    this.providerId = config.provider
+    const fromEnv = process.env[BROWSER_PROVIDER_ENV]
+    this.providerId = config.provider ?? (fromEnv !== undefined && fromEnv.length > 0 ? fromEnv : undefined)
   }
 
   /**

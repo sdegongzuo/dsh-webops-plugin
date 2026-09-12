@@ -70,11 +70,30 @@ export const Config: z<Config> = z.object({
   }),
 })
 
+/**
+ * 端点覆盖用的环境变量名。
+ *
+ * 为什么需要它：桌面端里 profile 目录由应用**独占并每次重建**，往里写 `config.endpoint`
+ * 是一次性改动 —— 下次启动就没了。而桌面端自己的调试端口（9222）就是它自己的渲染进程，
+ * 嵌入式 Chromium 不实现 `PUT /json/new`，连它必然开不出标签页。要让桌面端里的浏览器工具
+ * 真的能用，必须把端点指到**外接的真 Chrome**，env 是唯一稳定的旋钮。
+ *
+ * 优先级高于 `config.endpoint`：它表达的是「部署时说了算」，不是「插件默认值」。
+ */
+export const CDP_ENDPOINT_ENV = 'DSH_BROWSER_CDP_ENDPOINT'
+
+/** 读一次端点覆盖；空串按「没设」处理。 */
+function readEndpointOverride(): string | undefined {
+  const value = process.env[CDP_ENDPOINT_ENV]
+  return value !== undefined && value.length > 0 ? value : undefined
+}
+
 /** 把插件配置折算成 provider 配置；每一格都留着 `??` 兜底。 */
 function toProviderConfig(config: Config): CdpProviderConfig {
   const limits = config.snapshotLimits
+  const endpoint = readEndpointOverride() ?? config.endpoint
   return {
-    ...config.endpoint !== undefined ? { endpoint: config.endpoint } : {},
+    ...endpoint !== undefined ? { endpoint } : {},
     ...config.commandTimeoutMs !== undefined ? { commandTimeoutMs: config.commandTimeoutMs } : {},
     ...config.requestTimeoutMs !== undefined ? { requestTimeoutMs: config.requestTimeoutMs } : {},
     ...config.navigationTimeoutMs !== undefined ? { navigationTimeoutMs: config.navigationTimeoutMs } : {},

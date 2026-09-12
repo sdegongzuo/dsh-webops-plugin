@@ -16,6 +16,9 @@
     "./browser-cdp": {
       "default": "./lib/browser-cdp/index.js"
     },
+    "./browser-electron": {
+      "default": "./lib/browser-electron/index.js"
+    },
     "./tool-browser": {
       "default": "./lib/tool-browser/index.js"
     },
@@ -46,13 +49,16 @@
     }
   },
   "scripts": {
-    "build": "tsdown",
+    "build": "tsdown && node scripts/copy-assets.mjs",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
     "dev:desktop": "tsx scripts/dev-desktop.mjs",
     "check:desktop": "node scripts/check-desktop.mjs",
-    "shot:desktop": "node scripts/shot-desktop.mjs"
+    "shot:desktop": "node scripts/shot-desktop.mjs",
+    "smoke:dispatch": "tsx scripts/smoke-dispatch.ts",
+    "smoke:window": "tsx scripts/smoke-window.ts",
+    "window:desktop": "node scripts/window-in-host.mjs"
   },
   "peerDependencies": {
     "@deepseek-ai/cordis": "^4.0.2",
