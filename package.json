@@ -5,8 +5,11 @@
   "description": "为 DeepSeek Harness 提供浏览器调试与操作能力：ctx.browser 能力服务 + CDP provider + browser_* 工具 + 客户端观察面板。",
   "type": "module",
   "license": "MIT",
-  "main": "./lib/browser/index.js",
+  "main": "./lib/index.js",
   "exports": {
+    ".": {
+      "default": "./lib/index.js"
+    },
     "./browser": {
       "default": "./lib/browser/index.js"
     },
@@ -48,7 +51,8 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "dev:desktop": "tsx scripts/dev-desktop.mjs",
-    "check:desktop": "node scripts/check-desktop.mjs"
+    "check:desktop": "node scripts/check-desktop.mjs",
+    "shot:desktop": "node scripts/shot-desktop.mjs"
   },
   "peerDependencies": {
     "@deepseek-ai/cordis": "^4.0.2",

@@ -1,6 +1,10 @@
 /**
- * 浏览器观察面板：挂在 `conversation.input.dock` 上，只要有会话就参与渲染，
- * 有浏览器活动时显示「状态 · 地址 · 快照/截图计数」，没有活动时完全不占位。
+ * 浏览器观察面板：挂在 `conversation.input.dock` 上，**常驻显示**。
+ *
+ * 为什么无活动也要占位：这个插件要「装完在界面里看得见」。只在模型真的调用过
+ * `browser_*` 之后才出现的话，用户装完插件打开会话什么也看不到，等于没有证据表明
+ * 客户端半边活了。所以无活动时显示一行「浏览器 · 已就绪 / 等待 agent 操作浏览器」。
+ * 这一行同时也是 `scripts/check-desktop.mjs` 的第四项硬证据。
  *
  * 数据全部派生自对话快照（`ui-chat` 的 `ChatSnapshot`），**不新增任何 RPC**：
  * 浏览器调用本来就以工具调用节点的形式流经客户端，客户端收得到，面板跟着它走即可。
@@ -47,13 +51,9 @@ export function BrowserDock(props: BrowserDockProps) {
   const { useChat, t } = props
   const calls = useBrowserCalls(useChat)
   const observation = observeBrowser(calls)
-  const latest = observation.latest
-
-  // 没有浏览器活动时不占位：dock 参与渲染，但渲染出空。
-  if (latest === undefined) return null
-
   const state = observation.running ? 'running' : observation.failures > 0 ? 'error' : 'idle'
   const stateText = state === 'running' ? t('active') : state === 'error' ? t('failed') : t('idle')
+  const idle = observation.calls === 0
 
   return (
     <div
@@ -67,18 +67,25 @@ export function BrowserDock(props: BrowserDockProps) {
     >
       <span style={{ fontWeight: 600 }}>{t('title')}</span>
       <span style={{ opacity: 0.75 }}>{stateText}</span>
-      {observation.url === undefined ? null : (
-        <code data-dsh-browser-url style={{ wordBreak: 'break-all', opacity: 0.9 }}>
-          {observation.url}
-        </code>
-      )}
-      <span style={{ opacity: 0.6 }}>
-        {`${t('snapshot')} ${String(observation.snapshots)} · ${t('screenshot')} ${String(observation.screenshots)}`}
-      </span>
-      {observation.failures === 0 ? null : (
-        <span data-dsh-browser-failures style={{ opacity: 0.75 }}>
-          {`${t('failure')} ${String(observation.failures)}`}
-        </span>
+      {/* 无活动时给一句说明，否则这行就只剩「浏览器 · 已就绪」，看不出在等什么。 */}
+      {idle ? (
+        <span data-dsh-browser-hint style={{ opacity: 0.6 }}>{t('idleHint')}</span>
+      ) : (
+        <>
+          {observation.url === undefined ? null : (
+            <code data-dsh-browser-url style={{ wordBreak: 'break-all', opacity: 0.9 }}>
+              {observation.url}
+            </code>
+          )}
+          <span style={{ opacity: 0.6 }}>
+            {`${t('snapshot')} ${String(observation.snapshots)} · ${t('screenshot')} ${String(observation.screenshots)}`}
+          </span>
+          {observation.failures === 0 ? null : (
+            <span data-dsh-browser-failures style={{ opacity: 0.75 }}>
+              {`${t('failure')} ${String(observation.failures)}`}
+            </span>
+          )}
+        </>
       )}
     </div>
   )

@@ -10,6 +10,13 @@
 # 注意：patch 命中某一行时是**整块替换 config**（不是深合并），将来若要覆盖其中一行的 config，
 # 必须把这行拥有的所有键重述一遍。
 
+# 第四行是**裸包名**，host 侧是空实现，唯一作用是让浏览器那半边被发现：
+# `packages/client/modules/src/index.ts` 的 `locatePkgJson()` 用
+# `exactPackageSpecifier()` 取包名，它对「非 scoped 且带 `/`」的 specifier 直接返回
+# undefined —— 也就是说下面三条 host 行永远不会被当成客户端包，只有裸包名行才会去解析
+# `dsh.client` 与 `exports["./client"]`。dsh 自己的纯客户端包
+# （如 `dsh-client-ui-brand-official`）也是这个「空 host 行 + ./client」形态。
+
 - insert:
     - id: browser
       name: 'dsh-browser-plugin/browser'
@@ -19,3 +26,6 @@
 
     - id: tool-browser
       name: 'dsh-browser-plugin/tool-browser'
+
+    - id: browser-plugin
+      name: 'dsh-browser-plugin'

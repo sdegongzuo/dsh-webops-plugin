@@ -46,7 +46,7 @@ const clientDefines = {
 export default defineConfig([
   {
     name: PLUGIN_ID,
-    entry: ['src/browser/index.ts', 'src/browser-cdp/index.ts', 'src/tool-browser/index.ts'],
+    entry: ['src/index.ts', 'src/browser/index.ts', 'src/browser-cdp/index.ts', 'src/tool-browser/index.ts'],
     outDir: 'lib',
     format: ['esm'],
     platform: 'node',

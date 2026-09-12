@@ -17,12 +17,18 @@
 **P0（只读）已实现并通过验收。** 模型现在能「看」页面：开标签页、跳转、读可访问性大纲（带 ref）、截图。
 四个工具已在真实 profile 上确认进入 agent 的工具视图，不只是配置上插上了（见「接线」一节的实跑验证）。
 
+**桌面端已接入并跑通。** 在**开发态桌面端**（Electron）里实跑通过：host 半边三个面全部加载、客户端半边加载并执行、
+观察面板渲染在输入框上方（输入框上方那行「浏览器 · 已就绪」）。见「桌面端接入」一节。
+
+![桌面端里的浏览器面板](docs/desktop-dock.png)
+
 | 阶段 | 内容 |
 |---|---|
 | **P0 只读** ← 已完成 | `ctx.browser` + `browser-cdp` 的 connect / open / navigate / snapshot / screenshot + 4 个只读工具 + ref 纪元 |
+| **UI 观察面板** ← 已完成 | `conversation.input.dock` 常驻状态条（含无活动时的「已就绪」态）+ `tool.call.toolview` 四个专属卡片（地址 / 大纲 / 截图） |
 | P1 操作 | click / fill / press / scroll / wait + 能力分级 + `stale_ref` 恢复 |
 | P2 调试 | console / network 采集 + 受限 `browser_execute` + 进度策略 |
-| P3 协作 | 人工接管 / 回收 + `browser_find` / `browser_locate` + UI 渲染 |
+| P3 协作 | 人工接管 / 回收 + `browser_find` / `browser_locate` |
 
 ### 用法（三步）
 
@@ -49,8 +55,11 @@ pnpm dsh --profile browserp0
 ## 结构
 
 ```
-cordis.patch.yml        bundle 的配置层：把三行插进 profile（见下）
-package.json            声明 dsh.bundle.patch；多入口导出
+cordis.patch.yml        bundle 的配置层：把四行插进 profile（见下）
+package.json            声明 dsh.bundle.patch、dsh.client（客户端双面）、多入口导出
+tsdown.config.ts        两条独立产物：host 三面 + 包根（ESM）/ 客户端 bundle（CJS，外裹 __ModuleLoader__）
+src/index.ts            包根的 host 半边：**故意是空的**，只为让客户端半边被发现（见「桌面端接入」的坑）
+src/debug.ts            加载诊断（写 stdout，桌面端才看得见）
 src/browser/            Service Definition —— ctx.browser 服务、provider 选择语义、错误类型
   index.ts                BrowserRuntime（Service）
   types.ts                会话 / 观察请求 / 错误码
@@ -64,6 +73,15 @@ src/browser-cdp/        provider —— 通过 CDP 驱动浏览器
   live.test.ts            对着真实 Chrome 跑的验收测试（没有调试端口时自动跳过）
 src/tool-browser/       工具消费者 —— 把能力暴露成 browser_* 工具给模型
   index.ts                browser_open / navigate / snapshot / screenshot + 系统提示分段
+src/client/             浏览器半边（dsh.client）
+  index.ts                注册两个 slot 面：conversation.input.dock 与 tool.call.toolview
+  BrowserDock.tsx         常驻状态条（无活动时显示「已就绪」）
+  BrowserToolRow.tsx      四个工具的专属卡片（地址 / 大纲 / 截图）
+  observation.ts          从对话快照派生面板状态（纯函数，不 import dsh 客户端类型）
+  locales.ts              中英文案
+scripts/dev-desktop.mjs   开发态装配进桌面端 profile 并拉起 Electron
+scripts/check-desktop.mjs 用 CDP 断言桌面端接入的五项事实
+scripts/shot-desktop.mjs  截一张真实桌面端的 PNG
 ```
 
 为什么不分三个包：官方把能力拆成 `<capability>` / provider / `tool-<cap>` 三包，是为「能力可组合」
@@ -118,7 +136,7 @@ dsh: initialized profile browserp0 at C:\Users\yemaf\.dsh\profiles\browserp0
 + dsh-browser-plugin link:D:/dev/cli/dsh-browser-plugin
 ```
 
-验证层序（应出现 `# == dsh-browser-plugin` 层与三行）：
+验证层序（应出现 `# == dsh-browser-plugin` 层与四行）：
 
 ```bash
 pnpm dsh --profile browserp0 --dump-config | grep -A4 "== dsh-browser-plugin"
@@ -152,10 +170,48 @@ profile 里的插件做四类断言，**每一条都与开发期的 `link:` 路�
 | `must declare <host 包> as a peer dependency` | dsh 的共享包只能出现在 `peerDependencies`，出现在 `dependencies` 直接报错 | 本仓现在把 dsh 包放在 `devDependencies` + `link:` → 桌面端会拒 |
 | `requires <name>@<range>, found <version>` | peer 版本必须满足范围 | 要跟桌面端 runtime 里的版本对齐 |
 
-结论：**P0 不要碰桌面端。** 先在 CLI（探针 profile，symlink 路线）把能力跑通；桌面端接入是独立一步，
-届时要出一份 vendor 形态（真实文件副本 + `peerDependencies` 声明），并对着 `linkDesktopHostPackages`
-的 shared packages 清单核对版本。桌面端开发态的 `$DSH_HOME` 是
-`apps/desktop/.desktop-build/development/home`，profile 名是 `desktop`。
+结论：桌面端要的是**另一套形态**（真实文件副本 + `peerDependencies` 声明 + 版本对齐）。本仓已经出好这一套，
+接入方式见下面的「桌面端接入」小节。桌面端开发态的 `$DSH_HOME` 是
+`apps/desktop/.desktop-build/development/home`，profile 是 `apps/desktop/.desktop-build/development/project`。
+
+### 桌面端接入（已打通，三条命令）
+
+```bash
+pnpm run build          # 产出 lib/（桌面端只吃构建产物，src/ 不进去）
+pnpm run dev:desktop    # 装配进开发态 profile 并拉起 Electron（含 --build 可先跑 dsh 的构建）
+pnpm run check:desktop  # 从外部用 CDP 断言「host 认了 / 客户端跑了 / 面板渲染了 / 卡片注册了」
+pnpm run shot:desktop   # 截一张真实桌面端的 PNG（docs/desktop-dock.png）
+```
+
+开发态**装插件是被硬禁的**（`apps/desktop/src/main.ts` 里 `plugin package changes require a packaged
+application`，且 `plugin-add` 只收 npm registry 形态的 spec），而且 `apps/desktop/scripts/dev.ts` 每次启动都会用
+`prepareDevelopmentProject` **整目录重建** `project/`。所以 `scripts/dev-desktop.mjs` 复刻了 dev.ts 的启动序列，
+只在中间插一步装配（真实目录复制，不是链接），并且从 dsh 源码直接 import 它的
+`prepareDevelopmentProject` / `DESKTOP_HOST_PROTOCOL_VERSION`，**不改动 deepseek-harness 里任何文件**。
+
+#### 这里踩到的坑：客户端行必须是**裸包名**
+
+四个 patch 行里，前三个（`dsh-browser-plugin/browser` 等）负责能力，第四个是**裸包名** `dsh-browser-plugin`，
+它的 host 半边是空实现（`src/index.ts`）。原因在 dsh 的
+`packages/client/modules/src/index.ts#locatePkgJson()`：它先调 `exactPackageSpecifier(name)` 取包名，而该函数对
+**非 scoped 且带 `/`** 的 specifier 直接返回 `undefined`，于是整行被判为「永久不是客户端行」，永远不会去读
+`dsh.client` 与 `exports["./client"]`。
+
+也就是说：**带子路径的 host 行不可能带上客户端半边**，客户端两面必须挂在一个裸包名行上。
+dsh 自己的纯客户端包（如 `dsh-client-ui-brand-official`）就是这个形态——注释里写得很直白：
+「The empty apply gives Loader a host-side row while the browser half ships through exports["./client"]」。
+
+#### 另一个坑：桌面端把 host 的 stderr 吞了
+
+`apps/desktop/src/host-process.ts` 把子进程 stderr 攒在内存里，只在失败时随错误抛出；stdout 才 `pipe` 到
+Electron 的 stdout。所以 `src/debug.ts` 的加载诊断**必须写 stdout**——写 stderr 等于什么都没写。
+`DSH_BROWSER_PLUGIN_DEBUG=1`（`dev-desktop.mjs` 默认打开）时能看到：
+
+```
+[dsh-browser-plugin] root: client row registered
+[dsh-browser-plugin] browser-cdp: endpoint=http://127.0.0.1:9222
+[dsh-browser-plugin] tool-browser: registered open, navigate, snapshot, screenshot
+```
 
 ## 依赖版本约束（重要，实测）
 
@@ -182,13 +238,14 @@ Chrome，从不启动进程，所以「进程树回收」这一条在 P0 里没�
 
 ## 接线：全部落在 host 平面
 
-`cordis.patch.yml` 的 `insert` 里有三行，都在 host 平面：
+`cordis.patch.yml` 的 `insert` 里有四行（前三条 host 行 + 一条裸包名客户端行），都在 host 平面：
 
 | 行 | 说明 |
 |---|---|
 | `browser` | `ctx.browser` 能力服务，跨会话共享，不能按 preset 分叉 |
 | `browser-cdp` | provider，注册进 `ctx.browser` |
 | `tool-browser` | 模型可见的工具 |
+| `dsh-browser-plugin`（裸包名） | host 半边是空实现，只为让浏览器那半边被客户端模块表发现；见「桌面端接入」里的坑 |
 
 依据：host 平面的行在**所有** surface（TUI / headless / web / 桌面端）都会生效，除非该 surface 的 overlay
 显式 `disabled: true`——这正是 `dsh-web-app` 必须写下 `disabled: true` 才能压掉 `tool-web` 的原因。
@@ -262,7 +319,7 @@ host 平面那份就会与 preset 那份一起进入 agent 的工具视图。
 
 | # | 验收项 | 状态 | 怎么验 |
 |---|---|---|---|
-| 1 | `--dump-config` 三行在、层序对 | ✅ | `pnpm dsh --profile browserp0 --dump-config \| grep -A4 "== dsh-browser-plugin"` |
+| 1 | `--dump-config` 四行在、层序对 | ✅ | `pnpm dsh --profile browserp0 --dump-config \| grep -A4 "== dsh-browser-plugin"` |
 | 2 | 真 Chrome 上跑通 open → snapshot → screenshot | ✅ | live 测试（下） |
 | 3 | 截图以 attachment 引用出现 | ⚠️ 见下 | live 测试用真实 `LocalAttachmentStore` 存盘；工具层的「图片块」由单测覆盖 |
 | 4 | 导航后用旧 ref 拿到 `stale_ref` | ✅ | live 测试 + `provider.test.ts`（并断言**没有**发出截图命令） |
@@ -306,7 +363,8 @@ pnpm dsh --profile browserp0
 ```bash
 pnpm install       # 工具链 + link 本地 dsh 包；不查 registry
 pnpm typecheck     # tsc --noEmit
-pnpm test          # vitest；101 个用例（其中 3 个是 live，无浏览器时自动跳过）
+pnpm test          # vitest；115 个用例通过（另有 3 个 live，端点不是真 Chrome 时整组跳过）
+pnpm build         # tsdown；产出 lib/（host 三面 + 包根 + 客户端 bundle）
 ```
 
 测试全部就近放在 `src/**/*.test.ts`（`vitest.config.ts` 的 include 就是这一条）。覆盖：

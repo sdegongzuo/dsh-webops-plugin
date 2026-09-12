@@ -41,6 +41,21 @@ function markLoaded(): void {
 }
 
 /**
+ * 记录某个 slot 面上**真正注册成功**的条目数。
+ *
+ * 为什么不能只看 `markLoaded`：`ctx.slots.inject(name, cb)` 的 cb 要等 `name` 被声明才跑，
+ * 声明没来就什么都不发生——「bundle 执行过」和「卡片注册上了」是两件事。把注册结果也写成
+ * dataset 键，验证脚本才能分开断言这两件事（否则卡片静默缺席时无从察觉）。
+ * @param face - dataset 键后缀（`Dock` / `ToolViews`）。
+ * @param count - 该面上已注册的条目数。
+ */
+function markRegistered(face: string, count: number): void {
+  const root = globalThis.document?.documentElement
+  if (root === undefined) return
+  root.dataset[`dshBrowserPlugin${face}`] = String(count)
+}
+
+/**
  * 浏览器半边入口。
  * @param ctx - 客户端根上下文。
  */
@@ -48,15 +63,25 @@ export function apply(ctx: ClientContext): void {
   markLoaded()
   ctx.effect(() => ctx.locale.register(BROWSER_NS, { zh, en }), 'browser-plugin: dictionaries')
 
-  ctx.slots.inject('conversation.input.dock', () => ctx.slots.register(
-    { name: 'conversation.input.dock', id: 'browser', order: 10, locale: BROWSER_NS },
-    BrowserDock,
-  ))
+  ctx.slots.inject('conversation.input.dock', () => {
+    const dispose = ctx.slots.register(
+      { name: 'conversation.input.dock', id: 'browser', order: 10, locale: BROWSER_NS },
+      BrowserDock,
+    )
+    markRegistered('Dock', 1)
+    return dispose
+  })
 
+  let toolViews = 0
   for (const key of BROWSER_TOOLS) {
-    ctx.slots.inject('tool.call.toolview', () => ctx.slots.register(
-      { name: 'tool.call.toolview', key, locale: BROWSER_NS },
-      BrowserToolRow,
-    ))
+    ctx.slots.inject('tool.call.toolview', () => {
+      const dispose = ctx.slots.register(
+        { name: 'tool.call.toolview', key, locale: BROWSER_NS },
+        BrowserToolRow,
+      )
+      toolViews += 1
+      markRegistered('ToolViews', toolViews)
+      return dispose
+    })
   }
 }
