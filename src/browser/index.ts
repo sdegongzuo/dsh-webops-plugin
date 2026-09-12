@@ -1,0 +1,153 @@
+/**
+ * ctx.browser —— 浏览器能力的能力缝隙（Service Definition）。
+ *
+ * 形状与 provider 选择语义照 dsh 的 `packages/web/web/src/index.ts` 对齐：
+ * 选择在**调用时**解析，绝不依赖注册顺序。
+ *
+ * 状态：P0 骨架。缝隙本身已可用（注册 / 选择 / 转发），页面能力在 provider 侧。
+ *
+ * @module dsh-browser-plugin/browser
+ */
+
+import { Service } from '@deepseek-ai/cordis'
+import type { Context } from '@deepseek-ai/cordis'
+import z from '@deepseek-ai/schemastery'
+import { BrowserError } from './types.ts'
+import type {
+  BrowserObservation,
+  BrowserObserveRequest,
+  BrowserOpenRequest,
+  BrowserProvider,
+  BrowserSession,
+} from './types.ts'
+
+export { BrowserError } from './types.ts'
+export type {
+  BrowserErrorCode,
+  BrowserObservation,
+  BrowserObserveRequest,
+  BrowserOpenRequest,
+  BrowserProvider,
+  BrowserRef,
+  BrowserScreenshot,
+  BrowserSession,
+  BrowserSnapshot,
+} from './types.ts'
+
+declare module '@deepseek-ai/cordis' {
+  interface Context {
+    browser: BrowserRuntime
+  }
+}
+
+/** 能力缝隙的配置：只用来钉住 provider。 */
+export interface BrowserRuntimeConfig {
+  /** 显式指定 provider id。省略 = 恰好一个可用时自动选。 */
+  readonly provider?: string
+}
+
+export class BrowserRuntime extends Service {
+  static Config: z<BrowserRuntimeConfig> = z.object({
+    provider: z.string(),
+  })
+
+  private readonly providers = new Map<string, BrowserProvider>()
+  private readonly providerId: string | undefined
+
+  constructor(ctx: Context, config: BrowserRuntimeConfig = {}) {
+    super(ctx, 'browser')
+    this.providerId = config.provider
+  }
+
+  /**
+   * 注册一个 provider。id 重复时抛 `BROWSER_DUPLICATE_PROVIDER`。
+   * @param provider - provider 本身；它的 `id` 就是注册键。
+   * @returns 注销该 provider 的 disposer，随调用方 fiber 一并销毁。
+   */
+  registerProvider(provider: BrowserProvider): () => void {
+    const store = this.providers
+    if (store.has(provider.id)) {
+      throw new BrowserError(
+        `a browser provider with id "${provider.id}" is already registered`,
+        'BROWSER_DUPLICATE_PROVIDER',
+      )
+    }
+    // 注册即 effect：贡献随 fiber 生命周期存在，disposer 由 ctx.effect 管理。
+    const dispose = this.ctx.effect(function* () {
+      store.set(provider.id, provider)
+      yield () => store.delete(provider.id)
+    }, 'browser.registerProvider()')
+    // ctx.effect 的 disposer 返回 Promise<void>；对外暴露同步的 fire-and-forget。
+    return () => void dispose()
+  }
+
+  /**
+   * 开一个受控会话。
+   * @param request - 目标 URL（省略 = 空白页）。
+   * @param signal - 可选取消信号，转发给 provider。
+   */
+  async open(request: BrowserOpenRequest, signal?: AbortSignal): Promise<BrowserSession> {
+    return this.resolve().open(request, signal)
+  }
+
+  /**
+   * 观察会话（snapshot / screenshot）。
+   * @param request - 观察类型与目标会话。
+   * @param signal - 可选取消信号，转发给 provider。
+   */
+  async observe(request: BrowserObserveRequest, signal?: AbortSignal): Promise<BrowserObservation> {
+    return this.resolve().observe(request, signal)
+  }
+
+  /**
+   * 关闭会话并释放其 target。
+   * @param sessionId - `open()` 返回的会话 id。
+   */
+  async close(sessionId: string): Promise<void> {
+    return this.resolve().close(sessionId)
+  }
+
+  /**
+   * 调用时解析 provider：
+   * - 配了 id、已注册且可用 → 用它
+   * - 配了 id 但没注册 → `BROWSER_PROVIDER_CONFIGURED_MISSING`
+   * - 配了 id 但不可用 → `BROWSER_PROVIDER_CONFIGURED_UNAVAILABLE`
+   * - 没配、恰好一个可用 → 自动选
+   * - 没配、多个可用 → `BROWSER_PROVIDER_AMBIGUOUS`
+   * - 没配、没有可用 → `BROWSER_PROVIDER_UNAVAILABLE`
+   */
+  private resolve(): BrowserProvider {
+    const { providerId } = this
+    if (providerId !== undefined) {
+      const provider = this.providers.get(providerId)
+      if (!provider) {
+        throw new BrowserError(
+          `configured browser provider "${providerId}" is not registered`,
+          'BROWSER_PROVIDER_CONFIGURED_MISSING',
+        )
+      }
+      if (!provider.available()) {
+        throw new BrowserError(
+          `configured browser provider "${providerId}" is registered but unavailable`,
+          'BROWSER_PROVIDER_CONFIGURED_UNAVAILABLE',
+        )
+      }
+      return provider
+    }
+    const usable = [...this.providers.values()].filter(provider => provider.available())
+    const [single] = usable
+    if (single === undefined) {
+      throw new BrowserError('no usable browser provider is registered', 'BROWSER_PROVIDER_UNAVAILABLE')
+    }
+    if (usable.length > 1) {
+      const ids = usable.map(provider => provider.id).join(', ')
+      throw new BrowserError(
+        `multiple usable browser providers are registered (${ids}); configure one explicitly`,
+        'BROWSER_PROVIDER_AMBIGUOUS',
+      )
+    }
+    return single
+  }
+}
+
+export default BrowserRuntime

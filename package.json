@@ -1,0 +1,42 @@
+{
+  "name": "dsh-browser-plugin",
+  "version": "0.0.1",
+  "private": true,
+  "description": "为 DeepSeek Harness 提供浏览器调试与操作能力：ctx.browser 能力服务 + CDP provider + browser_* 工具。",
+  "type": "module",
+  "license": "MIT",
+  "exports": {
+    "./browser": "./src/browser/index.ts",
+    "./browser-cdp": "./src/browser-cdp/index.ts",
+    "./tool-browser": "./src/tool-browser/index.ts",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "src",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.2",
+    "@deepseek-ai/dsh-tools": "*",
+    "@deepseek-ai/dsh-subprocess": "*",
+    "@deepseek-ai/schemastery": "*"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.0",
+    "typescript": "^5.9.3",
+    "vitest": "^3.2.4"
+  }
+}

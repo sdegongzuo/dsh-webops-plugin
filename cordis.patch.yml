@@ -1,0 +1,21 @@
+# dsh-browser-plugin 的 bundle patch。
+#
+# 三行全部落在 HOST 平面：能力服务、它的 CDP provider、以及模型可见的工具。
+#
+# 为什么工具也放 host 平面：host 平面的行在**所有** surface（TUI / headless / web / 桌面端）
+# 都会生效，除非某个 surface 的 overlay 显式把它 disabled —— 这正是 `dsh-web-app` 必须写下
+# `disabled: true` 才能压掉 `tool-web` 的原因。因此把工具行放在这里，用户侧**不需要改 preset**。
+# （官方 bundle 把工具搬进 preset，只是为了按 preset 区分工具集；通用插件不需要这份弹性。）
+#
+# 注意：patch 命中某一行时是**整块替换 config**（不是深合并），将来若要覆盖其中一行的 config，
+# 必须把这行拥有的所有键重述一遍。
+
+- insert:
+    - id: browser
+      name: 'dsh-browser-plugin/browser'
+
+    - id: browser-cdp
+      name: 'dsh-browser-plugin/browser-cdp'
+
+    - id: tool-browser
+      name: 'dsh-browser-plugin/tool-browser'
