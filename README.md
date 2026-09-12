@@ -67,21 +67,34 @@ src/tool-browser/       工具消费者 —— 把能力暴露成 browser_* 工�
 这既是绕开 npm 旧版的唯一可行手段（见下节），也让 `pnpm typecheck` 开箱可用。
 `link:` 写死了本地相对路径，**发布前要换回 peerDependencies + npm 版本号**。
 
-**② dsh → 加载本插件**（待 P0 实测）。
+**② dsh → 加载本插件**（已实测通过）。
 
-patch 里的 `name: 'dsh-browser-plugin/browser'` 需要 dsh 侧的 Node 解析能找到这个包。
-让插件目录出现在 dsh checkout 里**还不够**——包名解析找的是 `node_modules/dsh-browser-plugin`，
-不是仓库根下的同名目录。候选方案：
-
-- 把本仓路径加进 dsh 的 `pnpm-workspace.yaml` 的 `packages`（改的是 dsh 仓库文件，仅本地生效、不提交）；
-- 或在 dsh 的 `node_modules/` 下建一个 junction 指向本仓（注意 `pnpm install` 会清掉非管理的条目）。
-
-两者都验证到位后再补进本节。验证命令：
+一行命令，用官方的 `dsh plugin` 把 checkout link 进 profile：
 
 ```bash
 cd /d/dev/cli/deepseek-harness
-pnpm dsh --profile web --dump-config | grep -A2 -E "browser|tool-browser"
+pnpm dsh plugin --profile browserp0 add D:/dev/cli/dsh-browser-plugin
 ```
+
+它初始化 profile（不存在时）、pnpm link 本目录、并把 `dsh-browser-plugin` 追加进 profile 的
+`dsh.profile.bundles`。实测 5 秒完成：
+
+```
+dsh: initialized profile browserp0 at C:\Users\yemaf\.dsh\profiles\browserp0
++ dsh-browser-plugin link:D:/dev/cli/dsh-browser-plugin
+```
+
+验证层序（应出现 `# == dsh-browser-plugin` 层与三行）：
+
+```bash
+pnpm dsh --profile browserp0 --dump-config | grep -A4 "== dsh-browser-plugin"
+```
+
+**不需要 junction，也不需要改 dsh 的 `pnpm-workspace.yaml`**——`dsh plugin add` 自己完成了包名解析
+所需的那一步。本仓的 `link:` 依赖只负责反方向（插件仓 import 得到 dsh 的包）。
+
+> 已实测：三个入口都能被 dsh 的 tsx 模式加载（`browser` / `browser-cdp` / `tool-browser`），
+> 所以 `exports` 指向 `src/*.ts` 源码是可行的。
 
 ### 生产期
 
@@ -92,6 +105,23 @@ dsh plugin --profile <name> add github:sdegongzuo/dsh-browser-plugin#<sha>  # gi
 
 > git 安装需要本仓提供 self-contained 的 `prepare` 脚本，且用户要在 profile 的 `pnpm-workspace.yaml`
 > 里 `allowBuilds: { dsh-browser-plugin: true }`。详见官方 `publish.md`。**待 P0 期间实测**。
+
+### 桌面端另有硬约束（重要，别把两件事混在一起做）
+
+桌面端启动前会跑 `apps/desktop/src/profile-packages.ts` 的 `validateDesktopPluginGraph`，它对
+profile 里的插件做四类断言，**每一条都与开发期的 `link:` 路线冲突**：
+
+| 断言（源码位置） | 含义 | 对本仓的影响 |
+|---|---|---|
+| `linked private package` | profile 的 `node_modules` 下出现 symlink 即拒 | `dsh plugin add` 产生的正是 symlink → **桌面端不吃这条路** |
+| `package resolves outside profile` | 依赖闭包必须物理位于 profile 目录内 | 本仓在 `D:\dev\cli\dsh-browser-plugin` → 必须 vendor 一份副本进去 |
+| `must declare <host 包> as a peer dependency` | dsh 的共享包只能出现在 `peerDependencies`，出现在 `dependencies` 直接报错 | 本仓现在把 dsh 包放在 `devDependencies` + `link:` → 桌面端会拒 |
+| `requires <name>@<range>, found <version>` | peer 版本必须满足范围 | 要跟桌面端 runtime 里的版本对齐 |
+
+结论：**P0 不要碰桌面端。** 先在 CLI（探针 profile，symlink 路线）把能力跑通；桌面端接入是独立一步，
+届时要出一份 vendor 形态（真实文件副本 + `peerDependencies` 声明），并对着 `linkDesktopHostPackages`
+的 shared packages 清单核对版本。桌面端开发态的 `$DSH_HOME` 是
+`apps/desktop/.desktop-build/development/home`，profile 名是 `desktop`。
 
 ## 依赖版本约束（重要，实测）
 
@@ -123,10 +153,22 @@ dsh plugin --profile <name> add github:sdegongzuo/dsh-browser-plugin#<sha>  # gi
 依据：host 平面的行在**所有** surface（TUI / headless / web / 桌面端）都会生效，除非该 surface 的 overlay
 显式 `disabled: true`——这正是 `dsh-web-app` 必须写下 `disabled: true` 才能压掉 `tool-web` 的原因。
 
-> **待 P0 实测**：host 平面 insert 的 `tool-browser` 在 `--profile web` / 桌面端下是否真对 agent 可见。
-> 上面的推断来自 `dsh-web-app` 的注释（「a row absent from a surface overlay would silently reappear」），
-> 是强线索但不是保证。若不生效，退路是把该行搬进 `$DSH_HOME/.agent-presets/<preset>/agent.cordis.yml`
->（preset 是用户资产，可写）。
+**已在源码层核实（不再是推断）**：agent 的 `tools` 视图按 scope 链解析——未加入 preset 的 agent
+解析到「空的 global 层」而拿不到任何工具，已加入 preset 的 agent 则同时看到 global 层与 preset 层
+（见 `.agents/notes/implemented/architecture/2026-08-10-host-plane-ownership-after-presets.md`）。
+这正是 `dsh-web-app` 必须把 base 里**全部 16 个**工具行逐个 `disabled: true` 的原因：不压掉，
+host 平面那份就会与 preset 那份一起进入 agent 的工具视图。
+
+所以 host 平面 insert 对四种 surface 都成立：
+
+| surface | base 的工具行 | 本插件的三行 |
+|---|---|---|
+| headless | 全部 enabled（该 bundle 不禁任何工具行） | enabled → agent 可见 |
+| web / 桌面 | 被 `dsh-web-app` 逐个禁用，工具改由 preset 提供 | **不在禁用名单里** → enabled → agent 可见 |
+| acp / sdk | 各自的 overlay 只禁 1 行，不涉及工具 | enabled → agent 可见 |
+
+> 若将来上游把工具行整体搬进 preset 并同时禁用 host 平面的一切 `tool-*`，本节结论失效——
+> 届时的退路是把该行搬进 `$DSH_HOME/.agent-presets/<preset>/agent.cordis.yml`（preset 是用户资产，可写）。
 
 **patch 语义**：命中某一行时是**整块替换 config**（非深合并），所以覆盖时要重述该行的所有 config 键。
 
@@ -167,8 +209,21 @@ P0 的 provider 走「用户自己开着的 Chrome + 对接调试端口」这一
 ```bash
 pnpm install       # 工具链 + link 本地 dsh 包；不查 registry
 pnpm typecheck     # 已验证通过
-pnpm test          # 尚无测试；P0 填实现时同步补
+pnpm test          # 尚无测试；P0 填实现时同步补（vitest include: src/**/*.test.ts）
 ```
+
+`pnpm-workspace.yaml` 里的 `allowBuilds: { esbuild: true }` 是必需的：pnpm 默认挂起依赖的构建脚本，
+vitest 启动前的 deps-status 检查会因此直接失败（`ERR_PNPM_IGNORED_BUILDS`）。
+
+端到端验证（三行接线是否真的进配置）：
+
+```bash
+cd /d/dev/cli/deepseek-harness
+pnpm dsh plugin --profile browserp0 add D:/dev/cli/dsh-browser-plugin   # 仅首次
+pnpm dsh --profile browserp0 --dump-config | grep -A4 "== dsh-browser-plugin"
+```
+
+profile 里装的是 **symlink**，所以改完源码不必重新 `add`，直接重跑 `dsh --profile browserp0` 即可。
 
 ## License
 
