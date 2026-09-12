@@ -14,6 +14,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import { BrowserError } from './types.ts'
 import type {
+  BrowserNavigateRequest,
   BrowserObservation,
   BrowserObserveRequest,
   BrowserOpenRequest,
@@ -21,9 +22,10 @@ import type {
   BrowserSession,
 } from './types.ts'
 
-export { BrowserError } from './types.ts'
+export { BrowserError, isBrowserError } from './types.ts'
 export type {
   BrowserErrorCode,
+  BrowserNavigateRequest,
   BrowserObservation,
   BrowserObserveRequest,
   BrowserOpenRequest,
@@ -91,6 +93,15 @@ export class BrowserRuntime extends Service {
   }
 
   /**
+   * 让一个已存在的会话跳转。**这会作废该会话的全部既有 ref。**
+   * @param request - 会话 id 与目标 URL（走地址策略）。
+   * @param signal - 可选取消信号，转发给 provider。
+   */
+  async navigate(request: BrowserNavigateRequest, signal?: AbortSignal): Promise<BrowserSession> {
+    return this.resolve().navigate(request, signal)
+  }
+
+  /**
    * 观察会话（snapshot / screenshot）。
    * @param request - 观察类型与目标会话。
    * @param signal - 可选取消信号，转发给 provider。
@@ -105,6 +116,30 @@ export class BrowserRuntime extends Service {
    */
   async close(sessionId: string): Promise<void> {
     return this.resolve().close(sessionId)
+  }
+
+  /**
+   * 释放**全部** provider 持有的资源（连接、标签页）。
+   * 由插件的 `ctx.effect` 在卸载时调用；逐个 provider 的失败不会阻断其余清理。
+   */
+  async dispose(): Promise<void> {
+    const providers = [...this.providers.values()]
+    const failures: unknown[] = []
+    for (const provider of providers) {
+      if (provider.dispose === undefined) continue
+      try {
+        await provider.dispose()
+      } catch (error: unknown) {
+        failures.push(error)
+      }
+    }
+    if (failures.length > 0) {
+      throw new BrowserError(
+        `${failures.length} browser provider(s) failed to dispose`,
+        'BROWSER_DISPOSE_FAILED',
+        { cause: failures[0] },
+      )
+    }
   }
 
   /**

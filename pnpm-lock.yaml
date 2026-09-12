@@ -11,9 +11,18 @@ importers:
       '@deepseek-ai/cordis':
         specifier: link:../deepseek-harness/vendor/cordis
         version: link:../deepseek-harness/vendor/cordis
+      '@deepseek-ai/dsh-attachment':
+        specifier: link:../deepseek-harness/packages/attachment/attachment
+        version: link:../deepseek-harness/packages/attachment/attachment
+      '@deepseek-ai/dsh-attachment-local':
+        specifier: link:../deepseek-harness/packages/attachment/attachment-local
+        version: link:../deepseek-harness/packages/attachment/attachment-local
       '@deepseek-ai/dsh-subprocess':
         specifier: link:../deepseek-harness/packages/subprocess/subprocess
         version: link:../deepseek-harness/packages/subprocess/subprocess
+      '@deepseek-ai/dsh-system-prompt':
+        specifier: link:../deepseek-harness/packages/core/system-prompt
+        version: link:../deepseek-harness/packages/core/system-prompt
       '@deepseek-ai/dsh-tools':
         specifier: link:../deepseek-harness/packages/core/tools
         version: link:../deepseek-harness/packages/core/tools

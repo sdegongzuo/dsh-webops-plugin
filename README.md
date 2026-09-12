@@ -14,14 +14,37 @@
 
 ## 状态
 
-**P0（只读）进行中。** 目标：模型能「看」页面。
+**P0（只读）已实现并通过验收。** 模型现在能「看」页面：开标签页、跳转、读可访问性大纲（带 ref）、截图。
+四个工具已在真实 profile 上确认进入 agent 的工具视图，不只是配置上插上了（见「接线」一节的实跑验证）。
 
 | 阶段 | 内容 |
 |---|---|
-| **P0 只读** ← 当前 | `ctx.browser` + `browser-cdp` 的 connect / open / snapshot / screenshot + 4 个只读工具 |
-| P1 操作 | click / fill / press / scroll / wait + ref 纪元 + `stale_ref` 恢复 |
+| **P0 只读** ← 已完成 | `ctx.browser` + `browser-cdp` 的 connect / open / navigate / snapshot / screenshot + 4 个只读工具 + ref 纪元 |
+| P1 操作 | click / fill / press / scroll / wait + 能力分级 + `stale_ref` 恢复 |
 | P2 调试 | console / network 采集 + 受限 `browser_execute` + 进度策略 |
 | P3 协作 | 人工接管 / 回收 + `browser_find` / `browser_locate` + UI 渲染 |
+
+### 用法（三步）
+
+```bash
+# 1) 起一个带调试端口的 Chrome。必须用**独立的 user-data-dir**，
+#    否则会复用你日常那个 Chrome 实例，而它不会开调试端口。
+"C:\Program Files\Google\Chrome\Application\chrome.exe" \
+  --remote-debugging-port=9333 --user-data-dir="%TEMP%\dsh-cdp-profile"
+
+# 2) 启动 dsh（探针 profile 里已经 link 了本仓，改完源码不必重新 add）
+cd /d/dev/cli/deepseek-harness
+pnpm dsh --profile browserp0
+
+# 3) 让模型做事，例如：
+#    browser_open { "url": "https://example.com" }  → 返回 session_id
+#    browser_snapshot { "session_id": "…" }         → 大纲 + ref
+#    browser_screenshot { "session_id": "…" }       → 存成 attachment
+```
+
+> **端口别用 9222。** 本机 9222 被 dsh 桌面端开发态的 Electron renderer 调试端口占着
+> （见「踩过的坑」第 3 条），此时插件会连上那个 Electron 而不是 Chrome，`/json/new` 直接 500。
+> 换一个端口（上例用 9333）即可。
 
 ## 结构
 
@@ -29,12 +52,23 @@
 cordis.patch.yml        bundle 的配置层：把三行插进 profile（见下）
 package.json            声明 dsh.bundle.patch；多入口导出
 src/browser/            Service Definition —— ctx.browser 服务、provider 选择语义、错误类型
+  index.ts                BrowserRuntime（Service）
+  types.ts                会话 / 观察请求 / 错误码
 src/browser-cdp/        provider —— 通过 CDP 驱动浏览器
+  index.ts                插件入口：注册 provider + 卸载时释放资源
+  provider.ts             CdpBrowserProvider：会话生命周期、四条操作、截图裁剪
+  protocol.ts             CDP 传输层：/json/* HTTP 端点 + WebSocket 命令通道
+  refs.ts                 ref 纪元状态机（P0 的核心语义）
+  snapshot.ts             可访问性树 → 紧凑大纲 + ref 候选（纯函数）
+  url-policy.ts           地址策略：只许 HTTP(S)、禁内嵌凭据、端点是回环
+  live.test.ts            对着真实 Chrome 跑的验收测试（没有调试端口时自动跳过）
 src/tool-browser/       工具消费者 —— 把能力暴露成 browser_* 工具给模型
+  index.ts                browser_open / navigate / snapshot / screenshot + 系统提示分段
 ```
 
 为什么不分三个包：官方把能力拆成 `<capability>` / provider / `tool-<cap>` 三包，是为「能力可组合」
 （换 provider 不用换工具层）。个人插件不需要这份弹性，单包多入口即可。
+
 
 ## 接进 dsh
 
@@ -125,12 +159,18 @@ profile 里的插件做四类断言，**每一条都与开发期的 `link:` 路�
 
 ## 依赖版本约束（重要，实测）
 
-| 包 | npm 上 | 本地 checkout |
-|---|---|---|
-| `@deepseek-ai/cordis` | 4.0.2 | 4.0.2 |
-| `@deepseek-ai/schemastery` | 3.18.2 | 3.18.2 |
-| `@deepseek-ai/dsh-tools` | **0.0.1-rc.1** | 0.1.5-rc.2 |
-| `@deepseek-ai/dsh-subprocess` | **0.0.1-rc.1** | 0.1.5-rc.2 |
+| 包 | npm 上 | 本地 checkout | 用途 |
+|---|---|---|---|
+| `@deepseek-ai/cordis` | 4.0.2 | 4.0.2 | Service / 插件机制 |
+| `@deepseek-ai/schemastery` | 3.18.2 | 3.18.2 | `Config` 校验 |
+| `@deepseek-ai/dsh-tools` | **0.0.1-rc.1** | 0.1.5-rc.2 | `defineTool`、类型化参数/输出 |
+| `@deepseek-ai/dsh-system-prompt` | **0.0.1-rc.1** | 0.1.5-rc.2 | 系统提示分段 |
+| `@deepseek-ai/dsh-attachment` | **0.0.1-rc.1** | 0.1.5-rc.2 | 截图落盘（`ImageAttachmentRef`） |
+| `@deepseek-ai/dsh-attachment-local` | **0.0.1-rc.1** | 0.1.5-rc.2 | 只在 live 测试里用真实存储 |
+| `@deepseek-ai/dsh-subprocess` | **0.0.1-rc.1** | 0.1.5-rc.2 | **P0 未使用**，P1 起用来自动拉起浏览器 |
+
+`@deepseek-ai/dsh-subprocess` 在 P0 里是**刻意留着不用的**：P0 的 provider 只连接用户自己开着的
+Chrome，从不启动进程，所以「进程树回收」这一条在 P0 里没有对象可回收（见「验收」第 5 条）。
 
 **dsh 自己的包不要从 registry 装。** 两条实测证据：
 
@@ -138,7 +178,7 @@ profile 里的插件做四类断言，**每一条都与开发期的 `link:` 路�
 2. npm 上的 dsh 生态**不完整**：直接 `pnpm install` 会因 `@deepseek-ai/dsh-type-meta` 404 而失败——
    这个包根本没发布。`.npmrc` 里的 `auto-install-peers=false` 挡不住这条链路。
 
-所以 dsh 相关的四个包一律走 `link:` 指向本地 checkout。**不要**把它们改成 npm 版本号。
+所以 dsh 相关的包一律走 `link:` 指向本地 checkout。**不要**把它们改成 npm 版本号。
 
 ## 接线：全部落在 host 平面
 
@@ -170,60 +210,163 @@ host 平面那份就会与 preset 那份一起进入 agent 的工具视图。
 > 若将来上游把工具行整体搬进 preset 并同时禁用 host 平面的一切 `tool-*`，本节结论失效——
 > 届时的退路是把该行搬进 `$DSH_HOME/.agent-presets/<preset>/agent.cordis.yml`（preset 是用户资产，可写）。
 
+**已实跑验证（2026-09-12）**：`pnpm dsh --profile browserp0` 真起一次会话后，从会话日志
+（`~/.dsh/sessions/<cwd 编码>/<session-id>/session.v3.jsonl.zstd`）里读出来的事实：
+
+- `request/header.tools` 共 **29** 项，其中前四项就是 `browser_navigate` / `browser_open` /
+  `browser_screenshot` / `browser_snapshot` —— 工具确实进了发给模型的请求体。
+- `request/header.tools[].description` 里，四个工具各自都带着 ref 语义与失效条件
+  （`BROWSER_STALE_REF`）以及 untrusted 声明。
+- `system/message` 里本插件那个分段文本完整在列（含 `[ref=e12]`、纪元失效、attachment 与
+  untrusted 三段）。
+
+即：**host 平面 insert 对 agent 可见这件事，在真实 profile 上已闭环**，上面那张表不再是推断。
+会话日志的 `zstd` 需要 `zstd -d -c` 解开；`last` 一条是 `turn/end`。
+
 **patch 语义**：命中某一行时是**整块替换 config**（非深合并），所以覆盖时要重述该行的所有 config 键。
 
-## 实现指引（P0）
+## 实现说明（P0）
 
-参照 dsh 仓库里的这些文件，别从零设计：
+### ref 纪元：唯一一件不做就会出错的状态机
 
-| 要做的事 | 照抄哪个 |
-|---|---|
-| Service Definition | `packages/web/web/src/index.ts` |
-| provider 注册与选择语义 | `packages/web/web-fetch-http/src/` |
-| 工具注册写法 | `packages/web/tool-web/src/search.ts` |
-| 工具定义 API | `defineTool`，见 `packages/core/tools/src/schema.ts` |
-| 截图落盘 | `ctx.attachments.saveImage({ data, mediaType })` |
-| 起浏览器进程 | `ctx.subprocess`（`super(ctx, 'subprocess')`），**不要裸用 `child_process`** |
-| 地址策略（只允许公网 HTTP(S)） | `packages/web/web-fetch-http/src/policy.ts` + `network.ts` |
-| 系统提示分段 | `packages/core/system-prompt/src/index.ts` 的 `SECTION_ORDERS` |
+一次 snapshot 给页面上每个可操作元素编号。若下一次 snapshot 从 1 重新编号，模型拿着上一次的 `e3`
+很可能**命中一个完全不同的元素** —— 这是静默的、最难排查的事故。`src/browser-cdp/refs.ts` 用两条规则
+把这个可能性从根上删掉：
 
-两条硬约束：
+1. **序号在会话内单调递增，绝不重置。** 新 snapshot 从上一个纪元的最大值之后继续编号，
+   所以「同号不同元素」不可能出现。
+2. **解析前先比纪元。** 持有 ref 表的永远只是「当前纪元」那一份；导航与下一次 snapshot 都把整张表换掉。
+
+于是旧 ref 只会落到「表里没有」，报 `BROWSER_STALE_REF`（观察过页面）或 `BROWSER_SNAPSHOT_REQUIRED`
+（从未观察过）。两者都是模型该用「重新观察」恢复的错误。P0 里唯一消费 ref 的工具是
+`browser_screenshot`（可选的 `ref` 参数，截单个元素）—— 它是只读的，因此**没有**越过 P0 的边界，
+却让「旧 ref 必须失败」这条语义有了真实的调用路径，而不是只活在单元测试里。
+
+### 为什么是自己写 CDP 而不是上 Playwright
+
+`src/browser-cdp/protocol.ts` 只做两件事：DevTools 的 `/json/{version,list,new,close}` HTTP 端点，
+以及 WebSocket 上的 `{ id, method, params }` 命令通道（约 400 行，含超时、取消、断线结算）。
+换来的是零浏览器下载、零 `allowBuilds` 授权、零 Chromium 体积，以及**用户自己的登录态**。
+`snapshot.ts` 走可访问性树而不是视觉树 —— 浏览器已经算好了角色与名称，比从布局反推少一个数量级
+的代码，对模型也更友好。
+
+### 一次性环境约束
 
 - **`SECTION_ORDERS` 是中央封闭注册表**，外部插件加不了键，只能给 `section({ order: <number> })`
-  传显式数字。建议 `2050`（紧挨 `TOOL_WEB_SEARCH: 2000` / `TOOL_WEB_FETCH: 2100`）。
+  传显式数字。本插件用 `2050`（紧挨 `TOOL_WEB_SEARCH: 2000` / `TOOL_WEB_FETCH: 2100`）。
 - **注册即 effect**：所有贡献走 `ctx.effect()` / `ctx.on()`，`register()` 返回 disposer。
+- **插件入口模块不能有 `export default`**（见「踩过的坑」第 1 条）。
+- 页面上的一切按**不可信数据**处理，这条同时写进四个工具描述与系统提示分段 —— 只写一处等于没写。
 
-P0 的 provider 走「用户自己开着的 Chrome + 对接调试端口」这一形态：最贴近「调试」语义，
-且完全绕开 Playwright 自带 Chromium 的下载与 `allowBuilds` 授权问题。
+## 验收（P0）
 
-## 验证（P0 验收）
+| # | 验收项 | 状态 | 怎么验 |
+|---|---|---|---|
+| 1 | `--dump-config` 三行在、层序对 | ✅ | `pnpm dsh --profile browserp0 --dump-config \| grep -A4 "== dsh-browser-plugin"` |
+| 2 | 真 Chrome 上跑通 open → snapshot → screenshot | ✅ | live 测试（下） |
+| 3 | 截图以 attachment 引用出现 | ⚠️ 见下 | live 测试用真实 `LocalAttachmentStore` 存盘；工具层的「图片块」由单测覆盖 |
+| 4 | 导航后用旧 ref 拿到 `stale_ref` | ✅ | live 测试 + `provider.test.ts`（并断言**没有**发出截图命令） |
+| 5 | 会话关闭后连接释放、无残留 | ✅ | live 测试断言 `close()` 后 `/json/list` 里不再有那个 target |
 
-1. `pnpm dsh --profile web --dump-config` 能看到三行，层序正确。
-2. 起一个带调试端口的 Chrome，跑通 open → snapshot → screenshot。
-3. `browser_screenshot` 的图片在会话里以 attachment 引用出现。
-4. 导航后使用旧 ref 必须拿到 `stale_ref`，而不是静默点错元素。
-5. 关会话后浏览器进程树确实回收，无残留。
+**第 3 条的边界要说清楚**：`browser_screenshot` 的图确实会以 `ImageAttachmentRef` 形式作为
+`{ type: 'image' }` 内容块进入工具结果（单测断言了内容块形状与「base64 不进消息」），
+CDP 产出的 PNG 也确实能被真实的 `LocalAttachmentStore` 接受并原样读回（live 测试断言了字节相等）。
+**没有**验到的是「在一个真实会话的 UI 里看到这张图」——那需要 `DEEPSEEK_API_KEY` 跑一次真实模型回合，
+本机未配置。
+
+**第 5 条的边界**：P0 从不启动浏览器进程（只连接用户已开的 Chrome），所以没有进程树可回收；
+「无残留」在这里的准确含义是：WebSocket 全部关闭、由本插件创建的标签页全部关闭。
+自动拉起浏览器是 P1 的事，届时才需要 `ctx.subprocess` 的进程树回收语义。
+
+### 手工验收（复制粘贴即可）
+
+```bash
+# 0) 起 Chrome（换一个没被占用的端口，本机 9222 被桌面端占着）
+"C:\Program Files\Google\Chrome\Application\chrome.exe" \
+  --remote-debugging-port=9333 --user-data-dir="%TEMP%\dsh-cdp-profile"
+
+# 1) 对着这个 Chrome 跑全套测试
+#    这组只在端点是「真 Chrome」时才跑：9222 上那个 Electron 会被认出来并带原因跳过
+cd D:/dev/cli/dsh-browser-plugin
+DSH_CDP_ENDPOINT=http://127.0.0.1:9333 pnpm test
+
+# 2) 层序
+cd /d/dev/cli/deepseek-harness
+pnpm dsh --profile browserp0 --dump-config | grep -A4 "== dsh-browser-plugin"
+
+# 3) 真实会话（需要一个 API key；见下）
+#    在容器根建 .env 写入 DEEPSEEK_API_KEY=...（绝不提交），然后：
+pnpm dsh --profile browserp0
+#    让模型依次调用 browser_open / browser_snapshot / browser_screenshot，
+#    即可看到大纲、ref、以及会话里的图片附件。
+```
 
 ## 开发
 
 ```bash
 pnpm install       # 工具链 + link 本地 dsh 包；不查 registry
-pnpm typecheck     # 已验证通过
-pnpm test          # 尚无测试；P0 填实现时同步补（vitest include: src/**/*.test.ts）
+pnpm typecheck     # tsc --noEmit
+pnpm test          # vitest；101 个用例（其中 3 个是 live，无浏览器时自动跳过）
 ```
+
+测试全部就近放在 `src/**/*.test.ts`（`vitest.config.ts` 的 include 就是这一条）。覆盖：
+
+| 文件 | 覆盖什么 |
+|---|---|
+| `browser/index.test.ts` | provider 选择语义（7 个错误码）、navigate 转发、dispose 聚合 |
+| `browser-cdp/protocol.test.ts` | 命令相关性、CDP 错误映射、断线结算、超时/取消、真 HTTP 端点 |
+| `browser-cdp/refs.test.ts` | 纪元推进、序号单调、`stale_ref` / `snapshot_required` |
+| `browser-cdp/snapshot.test.ts` | 大纲裁剪、透明层、ref 只给可操作角色、截断、环状树 |
+| `browser-cdp/provider.test.ts` | 全链路（含「旧 ref 不发截图命令」与「拒绝新建标签页时不劫持用户页面」） |
+| `browser-cdp/url-policy.test.ts` | 地址策略与端点回环约束 |
+| `tool-browser/index.test.ts` | 四个工具的 schema 编译、参数校验、输出过 schema、图片块 |
+| `browser-cdp/live.test.ts` | 真实 Chrome 上的 open → snapshot → screenshot → navigate → stale_ref → close + 真实 attachment 存储（端点非真 Chrome 时整组带原因跳过） |
 
 `pnpm-workspace.yaml` 里的 `allowBuilds: { esbuild: true }` 是必需的：pnpm 默认挂起依赖的构建脚本，
 vitest 启动前的 deps-status 检查会因此直接失败（`ERR_PNPM_IGNORED_BUILDS`）。
 
-端到端验证（三行接线是否真的进配置）：
-
-```bash
-cd /d/dev/cli/deepseek-harness
-pnpm dsh plugin --profile browserp0 add D:/dev/cli/dsh-browser-plugin   # 仅首次
-pnpm dsh --profile browserp0 --dump-config | grep -A4 "== dsh-browser-plugin"
-```
-
 profile 里装的是 **symlink**，所以改完源码不必重新 `add`，直接重跑 `dsh --profile browserp0` 即可。
+
+## 踩过的坑（都是实测）
+
+### 1. 插件入口模块加 `export default` 会静默丢掉 `name` / `inject` / `Config`
+
+`vendor/loader/src/index.ts:194` 是 `exports = exports.default ?? exports`。只要有默认导出，
+加载器就用默认导出**替换整个模块命名空间**，于是 `inject` 消失，症状是启动时报
+`cannot get property "systemPrompt" without inject` —— 和配置八竿子打不着，很难从错误信息反推。
+
+**规则：插件入口（有 `apply` 的那个模块）不要写 `export default`。**
+`src/browser/index.ts` 是例外，它的默认导出就是 `BrowserRuntime` 服务类本身，本来就该是默认导出。
+（`pnpm typecheck` 与 `pnpm test` 都发现不了这个问题 —— 只有真的 `dsh --profile` 启动一次才会暴露。）
+
+### 2. patch 行不带 `config:` 时，`apply` 收到的是 `undefined`，不是 schemastery 的默认值
+
+上游 `web-fetch-http` 直接 `config as ResolvedConfig`，是因为它的 patch 行里写了 `config:`。
+本插件的行不写 config，所以 `apply` 必须自己 `config: Config = {}` 且每一格都用 `??` 兜底。
+
+### 3. `PUT /json/new` 不是所有 Chromium 都实现
+
+Electron 系的 DevTools 端点（**包括 dsh 桌面端自己**）对 `/json/new` 直接回
+`500 Could not create new page`。所以：
+
+- `browser_open` 明确定位为**新建**标签页，不实现「接管既有标签页」的降级 ——
+  `/json/list` 里的页面可能是用户的邮箱或 IDE，悄悄接管并导航它比「open 失败」糟得多。
+  端点拒绝新建时抛一条带诊断的错误（含当前 page target 数量），指向「换一个真正的 Chrome」。
+- **本机 9222 不是空的**：它被 dsh 桌面端开发态的 Electron renderer 调试端口占着
+  （`netstat` 显示属主是 `electron.exe`）。此时插件连上的是那个 Electron，`/json/new` 必然失败。
+  手工验证请换端口（如 9333）。这也是一个真实的教训：**先确认端口属于谁**，
+  别假定 `127.0.0.1:9222` 就是 Chrome。
+
+  这个坑还咬了测试本身：`live.test.ts` 最初只判断 `/json/version` 是否 200，于是 9222 上的
+  Electron 让整组「以为」有 Chrome，带着假前提跑完，以两条与实现无关的失败收场。
+  现在判定改成读 `User-Agent`：**含 `Electron/` 即视为嵌入式并跳过**——它内部包着的 Chrome
+  版本号看不出区别，只认 `Chrome/` 是不够的；跳过时会打印原因（`[live] skipping …`），
+  日志里不会只剩一个沉默的 skip。
+
+### 4. 用 `--user-data-dir` 起 Chrome 必须用**新目录**，否则复用已有实例
+
+Chrome 发现同名 user-data-dir 已在运行时，会把 `--remote-debugging-port` 丢掉、直接附着到那个实例。
+表现是「端口起不来但不报错」。
 
 ## License
 
