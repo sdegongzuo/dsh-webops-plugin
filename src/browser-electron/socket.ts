@@ -9,15 +9,15 @@
  */
 
 import type { CdpSocket } from '../browser-cdp/protocol.ts'
-import type { WindowHostChannel } from './bridge.ts'
+import type { TabHostChannel } from './bridge.ts'
 
 /** 支持的事件名。 */
 type SocketEvent = 'open' | 'message' | 'close' | 'error'
 
 /**
- * 一条通往受控窗口的 CDP 通道。
+ * 一条通往受控标签页的 CDP 通道。
  *
- * 断开来源有两个，都归到 `close` 上：桥本身断了，或宿主报告该窗口被关掉。
+ * 断开来源有两个，都归到 `close` 上：桥本身断了，或宿主报告该标签页被关掉。
  */
 export class WindowCdpSocket implements CdpSocket {
   private readonly listeners = new Map<SocketEvent, Set<(event: unknown) => void>>()
@@ -27,13 +27,13 @@ export class WindowCdpSocket implements CdpSocket {
 
   /**
    * @param bridge - 活着的窗口宿主通道。
-   * @param windowId - 这个 socket 负责的窗口。
+   * @param tabId - 这个 socket 负责的标签页。
    */
   constructor(
-    private readonly bridge: WindowHostChannel,
-    private readonly windowId: string,
+    private readonly bridge: TabHostChannel,
+    private readonly tabId: string,
   ) {
-    this.detachEvents = bridge.onEvent(windowId, (method, params) => {
+    this.detachEvents = bridge.onEvent(tabId, (method, params) => {
       this.emit('message', { data: JSON.stringify({ method, params }) })
     })
     this.detachClose = bridge.onClose(() => { this.shutdown() })
@@ -57,7 +57,7 @@ export class WindowCdpSocket implements CdpSocket {
     const params = message.params === undefined || message.params === null
       ? {}
       : message.params as Record<string, unknown>
-    void this.bridge.command(this.windowId, method, params).then(
+    void this.bridge.command(this.tabId, method, params).then(
       (result) => {
         this.emit('message', { data: JSON.stringify({ id, result: result ?? {} }) })
       },

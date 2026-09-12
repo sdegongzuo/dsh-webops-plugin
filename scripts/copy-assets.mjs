@@ -17,6 +17,8 @@ const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 /** 需要原样搬运的资产：源路径 → 产物路径（都相对仓库根）。 */
 const ASSETS = [
   ['src/browser-electron/host.cjs', 'lib/browser-electron/host.cjs'],
+  ['src/browser-electron/tabbar.html', 'lib/browser-electron/tabbar.html'],
+  ['src/browser-electron/tabbar-preload.cjs', 'lib/browser-electron/tabbar-preload.cjs'],
 ]
 
 for (const [from, to] of ASSETS) {

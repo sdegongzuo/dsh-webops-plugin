@@ -448,7 +448,7 @@ pnpm dsh --profile browserp0
 ```bash
 pnpm install       # 工具链 + link 本地 dsh 包；不查 registry
 pnpm typecheck     # tsc --noEmit
-pnpm test          # vitest；143 个用例通过（另有 3 个 live，端点不是真 Chrome 时整组跳过）
+pnpm test          # vitest；147 个用例通过（另有 3 个 live，端点不是真 Chrome 时整组跳过）
 pnpm build         # tsdown 加 copy-assets；产出 lib/（host 四面 + 包根 + 客户端 bundle + host.cjs）
 ```
 

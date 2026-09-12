@@ -8,17 +8,18 @@
 
 import { describe, expect, it, vi } from 'vitest'
 import { CdpConnection } from '../browser-cdp/protocol.ts'
-import type { BridgeWindow, EventListener, WindowHostChannel } from './bridge.ts'
+import type { BridgeTab, BridgeTabBar, EventListener, TabHostChannel } from './bridge.ts'
 import { ElectronBrowserProvider } from './provider.ts'
 import { WindowCdpSocket } from './socket.ts'
-import { ElectronWindowTransport, windowHandle, windowIdFromHandle } from './transport.ts'
+import { ElectronWindowTransport, tabHandle, tabIdFromHandle } from './transport.ts'
 import { resolveConfig } from './index.ts'
 
-/** 一个可编程的假窗口宿主。 */
-class FakeHost implements WindowHostChannel {
-  readonly commands: { windowId: string; method: string; params: Record<string, unknown> }[] = []
-  readonly closedWindows: string[] = []
+/** 一个可编程的假窗口宿主（一个壳窗口、多个标签页）。 */
+class FakeHost implements TabHostChannel {
+  readonly commands: { tabId: string; method: string; params: Record<string, unknown> }[] = []
+  readonly closedTabs: string[] = []
   readonly opened: string[] = []
+  readonly activated: string[] = []
   disposed = false
   isClosed = false
   /** 命令的固定结果；设成 Error 表示这条命令失败。 */
@@ -26,26 +27,48 @@ class FakeHost implements WindowHostChannel {
   private readonly eventListeners = new Map<string, Set<EventListener>>()
   private readonly closeListeners = new Set<() => void>()
 
-  open(url: string): Promise<BridgeWindow> {
-    const id = `w${String(this.opened.length + 1)}`
+  open(url: string): Promise<BridgeTab> {
+    const id = `t${String(this.opened.length + 1)}`
     this.opened.push(url)
-    return Promise.resolve({ id, url, title: '' })
+    return Promise.resolve({ id, url, title: '', active: true })
   }
 
-  list(): Promise<readonly BridgeWindow[]> {
-    return Promise.resolve(this.opened.map((url, index) => ({ id: `w${String(index + 1)}`, url, title: '' })))
+  list(): Promise<readonly BridgeTab[]> {
+    const last = this.opened.length
+    return Promise.resolve(this.opened.map((url, index) => ({
+      id: `t${String(index + 1)}`,
+      url,
+      title: '',
+      active: index + 1 === last,
+    })))
   }
 
-  command(windowId: string, method: string, params: Record<string, unknown>): Promise<unknown> {
-    this.commands.push({ windowId, method, params })
+  command(tabId: string, method: string, params: Record<string, unknown>): Promise<unknown> {
+    this.commands.push({ tabId, method, params })
     const result = this.respond(method)
     return result instanceof Error ? Promise.reject(result) : Promise.resolve(result)
   }
 
-  closeWindow(windowId: string): Promise<void> {
-    this.closedWindows.push(windowId)
-    // 宿主关窗会上报 closed；桥把它翻成一次「断连」事件。
-    this.emit(windowId, 'Inspector.detached', { reason: 'window closed' })
+  /** 标签条渲染出来的 `.tab` 节点数；`-1` 表示「没有标签条」。 */
+  barRendered = -1
+
+  bar(): Promise<BridgeTabBar> {
+    return Promise.resolve({
+      tabs: this.opened.length,
+      rendered: this.barRendered < 0 ? this.opened.length : this.barRendered,
+      active: this.opened.length === 0 ? undefined : `t${String(this.opened.length)}`,
+    })
+  }
+
+  activate(tabId: string): Promise<void> {
+    this.activated.push(tabId)
+    return Promise.resolve()
+  }
+
+  closeTab(tabId: string): Promise<void> {
+    this.closedTabs.push(tabId)
+    // 宿主关标签会上报 closed；桥把它翻成一次「断连」事件。
+    this.emit(tabId, 'Inspector.detached', { reason: 'tab closed' })
     return Promise.resolve()
   }
 
@@ -54,10 +77,10 @@ class FakeHost implements WindowHostChannel {
     return Promise.resolve()
   }
 
-  onEvent(windowId: string, listener: EventListener): () => void {
-    const set = this.eventListeners.get(windowId) ?? new Set<EventListener>()
+  onEvent(tabId: string, listener: EventListener): () => void {
+    const set = this.eventListeners.get(tabId) ?? new Set<EventListener>()
     set.add(listener)
-    this.eventListeners.set(windowId, set)
+    this.eventListeners.set(tabId, set)
     return () => { set.delete(listener) }
   }
 
@@ -67,8 +90,8 @@ class FakeHost implements WindowHostChannel {
   }
 
   /** 推一条 CDP 事件给某个窗口的订阅者。 */
-  emit(windowId: string, method: string, params: unknown): void {
-    for (const listener of [...this.eventListeners.get(windowId) ?? []]) listener(method, params)
+  emit(tabId: string, method: string, params: unknown): void {
+    for (const listener of [...this.eventListeners.get(tabId) ?? []]) listener(method, params)
   }
 
   /** 模拟整条通道断开。 */
@@ -88,28 +111,28 @@ function transportFor(host: FakeHost): ElectronWindowTransport {
 
 describe('窗口句柄', () => {
   it('往返一致，并且带上 scheme 前缀', () => {
-    expect(windowHandle('w7')).toBe('electron-window://w7')
-    expect(windowIdFromHandle('electron-window://w7')).toBe('w7')
+    expect(tabHandle('t7')).toBe('electron-tab://t7')
+    expect(tabIdFromHandle('electron-tab://t7')).toBe('t7')
   })
 
   it('对不是本 scheme 或空的句柄返回 undefined', () => {
-    expect(windowIdFromHandle('ws://127.0.0.1:9222/devtools/page/x')).toBeUndefined()
-    expect(windowIdFromHandle('electron-window://')).toBeUndefined()
+    expect(tabIdFromHandle('ws://127.0.0.1:9222/devtools/page/x')).toBeUndefined()
+    expect(tabIdFromHandle('electron-tab://')).toBeUndefined()
   })
 })
 
 describe('ElectronWindowTransport', () => {
-  it('newTab 让宿主开窗口，并把句柄写成 electron-window:// 形式', async () => {
+  it('newTab 让宿主开窗口，并把句柄写成 electron-tab:// 形式', async () => {
     const host = new FakeHost()
     const target = await transportFor(host).newTab('https://example.com/')
 
     expect(host.opened).toEqual(['https://example.com/'])
     expect(target).toEqual({
-      id: 'w1',
+      id: 't1',
       type: 'page',
       url: 'https://example.com/',
       title: '',
-      webSocketDebuggerUrl: 'electron-window://w1',
+      webSocketDebuggerUrl: 'electron-tab://t1',
     })
   })
 
@@ -119,8 +142,8 @@ describe('ElectronWindowTransport', () => {
     await transport.newTab('https://example.com/a')
     const targets = await transport.list()
 
-    expect(targets.map(target => target.id)).toEqual(['w1'])
-    expect(targets[0]?.webSocketDebuggerUrl).toBe('electron-window://w1')
+    expect(targets.map(target => target.id)).toEqual(['t1'])
+    expect(targets[0]?.webSocketDebuggerUrl).toBe('electron-tab://t1')
   })
 
   it('version 报告 Electron 版本，用来证明宿主起得来', async () => {
@@ -130,17 +153,59 @@ describe('ElectronWindowTransport', () => {
     expect(version.browser).toMatch(/^Electron\//u)
   })
 
-  it('closeTarget 透传到宿主的关窗', async () => {
+  it('closeTarget 透传到宿主的关标签', async () => {
     const host = new FakeHost()
-    await transportFor(host).closeTarget('w3')
+    await transportFor(host).closeTarget('t3')
 
-    expect(host.closedWindows).toEqual(['w3'])
+    expect(host.closedTabs).toEqual(['t3'])
+  })
+
+  it('activateTarget 透传到宿主的切前台（多标签页的关键动作）', async () => {
+    const host = new FakeHost()
+    const transport = transportFor(host)
+    await transport.newTab('https://example.com/a')
+    await transport.newTab('https://example.com/b')
+    await transport.activateTarget('t1')
+
+    expect(host.activated).toEqual(['t1'])
+  })
+
+  it('barState 透传宿主的标签条状态：持有数、渲染数、前台 id', async () => {
+    const host = new FakeHost()
+    const transport = transportFor(host)
+    await transport.newTab('https://example.com/a')
+    await transport.newTab('https://example.com/b')
+    const bar = await transport.barState()
+
+    expect(bar).toEqual({ tabs: 2, rendered: 2, active: 't2' })
+  })
+
+  it('barState 能暴露「标签条没画出来」（rendered 与持有数脱钩）', async () => {
+    const host = new FakeHost()
+    host.barRendered = 0
+    const transport = transportFor(host)
+    await transport.newTab('https://example.com/a')
+    const bar = await transport.barState()
+
+    expect(bar).toEqual({ tabs: 1, rendered: 0, active: 't1' })
+  })
+
+  it('连续 newTab 开的是同一个宿主的多个标签，句柄各不相同', async () => {
+    const host = new FakeHost()
+    const transport = transportFor(host)
+    const first = await transport.newTab('https://example.com/a')
+    const second = await transport.newTab('https://example.com/b')
+    const targets = await transport.list()
+
+    expect([first.id, second.id]).toEqual(['t1', 't2'])
+    expect(second.webSocketDebuggerUrl).toBe('electron-tab://t2')
+    expect(targets.map(target => target.id)).toEqual(['t1', 't2'])
   })
 
   it('connect 拒绝不是本 scheme 的句柄', async () => {
     const host = new FakeHost()
     await expect(transportFor(host).connect('ws://127.0.0.1:9222/devtools/page/x'))
-      .rejects.toThrow(expect.objectContaining({ message: expect.stringContaining('not an Electron window handle') as unknown as string }))
+      .rejects.toThrow(expect.objectContaining({ message: expect.stringContaining('not an Electron tab handle') as unknown as string }))
   })
 
   it('桥起不来时不缓存失败，下一次会重试', async () => {
@@ -155,7 +220,7 @@ describe('ElectronWindowTransport', () => {
     )
 
     await expect(transport.version()).rejects.toThrow('boom')
-    await expect(transport.version()).resolves.toMatchObject({ webSocketDebuggerUrl: 'electron-window://host' })
+    await expect(transport.version()).resolves.toMatchObject({ webSocketDebuggerUrl: 'electron-tab://host' })
     expect(attempts).toBe(2)
   })
 
@@ -179,21 +244,21 @@ describe('WindowCdpSocket', () => {
   it('把 CDP 命令经桥发出去，并把结果拼成 message 事件', async () => {
     const host = new FakeHost()
     host.respond = method => ({ echo: method })
-    const socket = new WindowCdpSocket(host, 'w1')
+    const socket = new WindowCdpSocket(host, 't1')
     const messages: string[] = []
     socket.addEventListener('message', event => { messages.push((event as { data: string }).data) })
 
     socket.send(JSON.stringify({ id: 1, method: 'Page.enable', params: { a: 1 } }))
     await vi.waitFor(() => { expect(messages).toHaveLength(1) })
 
-    expect(host.commands).toEqual([{ windowId: 'w1', method: 'Page.enable', params: { a: 1 } }])
+    expect(host.commands).toEqual([{ tabId: 't1', method: 'Page.enable', params: { a: 1 } }])
     expect(JSON.parse(messages[0] ?? '{}')).toEqual({ id: 1, result: { echo: 'Page.enable' } })
   })
 
   it('命令失败时回一条带 error 的响应，而不是把异常抛到别处', async () => {
     const host = new FakeHost()
     host.respond = () => new Error('no such node')
-    const socket = new WindowCdpSocket(host, 'w1')
+    const socket = new WindowCdpSocket(host, 't1')
     const messages: string[] = []
     socket.addEventListener('message', event => { messages.push((event as { data: string }).data) })
 
@@ -205,11 +270,11 @@ describe('WindowCdpSocket', () => {
 
   it('把宿主的 CDP 事件原样搬成 message 事件', () => {
     const host = new FakeHost()
-    const socket = new WindowCdpSocket(host, 'w1')
+    const socket = new WindowCdpSocket(host, 't1')
     const messages: string[] = []
     socket.addEventListener('message', event => { messages.push((event as { data: string }).data) })
 
-    host.emit('w1', 'Page.loadEventFired', { timestamp: 1 })
+    host.emit('t1', 'Page.loadEventFired', { timestamp: 1 })
 
     expect(JSON.parse(messages[0] ?? '{}')).toEqual({
       method: 'Page.loadEventFired',
@@ -219,7 +284,7 @@ describe('WindowCdpSocket', () => {
 
   it('忽略解析不了或不成形的消息（不能因此炸掉整条连接）', async () => {
     const host = new FakeHost()
-    const socket = new WindowCdpSocket(host, 'w1')
+    const socket = new WindowCdpSocket(host, 't1')
 
     socket.send('{not json')
     socket.send(JSON.stringify({ method: 'Page.enable' }))
@@ -230,7 +295,7 @@ describe('WindowCdpSocket', () => {
 
   it('构造后异步派发 open，保证监听方先注册再收到', async () => {
     const host = new FakeHost()
-    const socket = new WindowCdpSocket(host, 'w1')
+    const socket = new WindowCdpSocket(host, 't1')
     const seen: string[] = []
     socket.addEventListener('open', () => { seen.push('open') })
 
@@ -239,7 +304,7 @@ describe('WindowCdpSocket', () => {
 
   it('桥断开时派发 close，并且之后不再发命令', async () => {
     const host = new FakeHost()
-    const socket = new WindowCdpSocket(host, 'w1')
+    const socket = new WindowCdpSocket(host, 't1')
     const seen: string[] = []
     socket.addEventListener('close', () => { seen.push('close') })
 
@@ -252,7 +317,7 @@ describe('WindowCdpSocket', () => {
 
   it('close() 之后再派发一次是幂等的', () => {
     const host = new FakeHost()
-    const socket = new WindowCdpSocket(host, 'w1')
+    const socket = new WindowCdpSocket(host, 't1')
     const seen: string[] = []
     socket.addEventListener('close', () => { seen.push('close') })
 
@@ -265,7 +330,7 @@ describe('WindowCdpSocket', () => {
   it('能被 CdpConnection 直接使用（这才是它存在的理由）', async () => {
     const host = new FakeHost()
     host.respond = method => (method === 'Browser.getVersion' ? { product: 'Electron/44' } : {})
-    const connection = new CdpConnection(new WindowCdpSocket(host, 'w1'), 5_000)
+    const connection = new CdpConnection(new WindowCdpSocket(host, 't1'), 5_000)
 
     await expect(connection.send('Browser.getVersion')).resolves.toEqual({ product: 'Electron/44' })
     expect(connection.isClosed).toBe(false)

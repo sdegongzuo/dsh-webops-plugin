@@ -39,8 +39,8 @@ import { noteLoaded } from '../debug.ts'
 
 export { ELECTRON_PROVIDER_ID, ElectronBrowserProvider } from './provider.ts'
 export { BridgeError, ElectronWindowBridge } from './bridge.ts'
-export type { BridgeOptions, BridgeWindow } from './bridge.ts'
-export { ELECTRON_WINDOW_SCHEME, ElectronWindowTransport, windowHandle, windowIdFromHandle } from './transport.ts'
+export type { BridgeOptions, BridgeTab, BridgeTabBar, TabHostChannel } from './bridge.ts'
+export { ELECTRON_TAB_SCHEME, ElectronWindowTransport, tabHandle, tabIdFromHandle } from './transport.ts'
 export { WindowCdpSocket } from './socket.ts'
 
 /** Cordis 插件名。 */

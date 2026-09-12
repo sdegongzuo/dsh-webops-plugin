@@ -5,6 +5,9 @@
  * [`host.cjs`](./host.cjs) 的模块注释里。CDP 语义由 {@link ElectronWindowTransport}
  * 翻译成 `CdpTransport`，于是整个 `CdpBrowserProvider` 可以原样复用。
  *
+ * 宿主是**一个窗口、多个标签页**：`open` 开的是标签（复用同一个壳窗口），
+ * `activate` 决定哪个标签在前台，用户点标签条上的叉会自己关（`closed` 事件没有 `id`）。
+ *
  * @module dsh-browser-plugin/browser-electron/bridge
  */
 
@@ -12,11 +15,13 @@ import { spawn, type ChildProcess } from 'node:child_process'
 import { existsSync } from 'node:fs'
 import { connect, type Socket } from 'node:net'
 
-/** 一个受控窗口的摘要。 */
-export interface BridgeWindow {
+/** 一个标签页的摘要。 */
+export interface BridgeTab {
   readonly id: string
   readonly url: string
   readonly title: string
+  /** 是否在前台。 */
+  readonly active: boolean
 }
 
 /** 宿主启动参数。 */
@@ -25,15 +30,20 @@ export interface BridgeOptions {
   readonly electronPath: string
   /** 窗口宿主脚本（`host.cjs`）的绝对路径。 */
   readonly hostScript: string
-  /** 新建窗口的尺寸。 */
+  /** 首次开窗的尺寸。 */
   readonly windowSize?: { readonly width: number; readonly height: number }
   /** 单条命令的超时（毫秒）。默认 30000。 */
   readonly commandTimeoutMs?: number
   /** 等宿主宣布端口的上限（毫秒）。默认 20000。 */
   readonly handshakeTimeoutMs?: number
+  /**
+   * 父进程断连后是否仍把窗口留在屏幕上（默认 `false`）。
+   *
+   * 演示与人工接管时用：宿主不再「一断连就自杀」，而是等用户关窗口才退出。
+   */
+  readonly keepAlive?: boolean
 }
 
-/** 宿主给的失败。 */
 /** 宿主给的失败。 */
 export class BridgeError extends Error {
   readonly code: string
@@ -55,8 +65,6 @@ export const DEFAULT_BRIDGE_COMMAND_TIMEOUT_MS = 30_000
 /** 默认握手超时。 */
 export const DEFAULT_BRIDGE_HANDSHAKE_TIMEOUT_MS = 20_000
 
-const NEWLINE = 0x0a
-
 /** 一条在途命令。 */
 interface Pending {
   readonly resolve: (value: unknown) => void
@@ -64,7 +72,20 @@ interface Pending {
   readonly timer: ReturnType<typeof setTimeout>
 }
 
-/** 宿主事件监听器集合，按窗口 id 归拢。 */
+/** 宿主报告的「标签条状态」：可观测性用，见 {@link TabHostChannel.bar}。 */
+export interface BridgeTabBar {
+  /** 宿主当前持有的标签数。 */
+  readonly tabs: number
+  /**
+   * 标签条里实际渲染出来的 `.tab` 节点数。
+   * `-1` 表示壳窗口不在（或脚本执行失败）—— 也就是「没有标签条」。
+   */
+  readonly rendered: number
+  /** 当前前台标签 id。 */
+  readonly active: string | undefined
+}
+
+/** 宿主事件监听器集合，按标签 id 归拢。 */
 export type EventListener = (method: string, params: unknown) => void
 
 /**
@@ -73,21 +94,31 @@ export type EventListener = (method: string, params: unknown) => void
  * 抽出这个接口是为了让上层（socket / transport）**不依赖一个活着的 Electron 进程**：
  * 单测喂一个假通道就够，不必真的 spawn 一个窗口 —— 真机行为由 `smoke:window` 负责。
  */
-export interface WindowHostChannel {
+export interface TabHostChannel {
   /** 通道是否已断开。 */
   readonly isClosed: boolean
-  /** 让宿主开一个窗口。 */
-  open: (url: string) => Promise<BridgeWindow>
-  /** 列出现有窗口。 */
-  list: () => Promise<readonly BridgeWindow[]>
+  /** 让宿主开一个标签页。 */
+  open: (url: string, options?: { readonly keepAlive?: boolean }) => Promise<BridgeTab>
+  /** 列出现有标签页。 */
+  list: () => Promise<readonly BridgeTab[]>
+  /**
+   * 报告标签条状态。
+   *
+   * 宿主是自己画的标签条（Electron 没有原生标签页），而它跑在没有 stdout 之外的
+   * 旁观者的进程里。这一条让「标签条真的渲染了 N 个标签」变成可断言的事实，
+   * 不必靠人眼看屏幕。
+   */
+  bar: () => Promise<BridgeTabBar>
   /** 发一条 CDP 命令。 */
-  command: (windowId: string, method: string, params: Record<string, unknown>) => Promise<unknown>
-  /** 关掉一个窗口。 */
-  closeWindow: (windowId: string) => Promise<void>
+  command: (tabId: string, method: string, params: Record<string, unknown>) => Promise<unknown>
+  /** 把某个标签页切到前台。 */
+  activate: (tabId: string) => Promise<void>
+  /** 关掉一个标签页。 */
+  closeTab: (tabId: string) => Promise<void>
   /** 关掉宿主与它开的所有窗口。 */
   dispose: () => Promise<void>
-  /** 订阅某个窗口的 CDP 事件。 */
-  onEvent: (windowId: string, listener: EventListener) => () => void
+  /** 订阅某个标签页的 CDP 事件。 */
+  onEvent: (tabId: string, listener: EventListener) => () => void
   /** 订阅通道断开。 */
   onClose: (listener: () => void) => () => void
 }
@@ -96,10 +127,10 @@ export interface WindowHostChannel {
  * 一个活着的窗口宿主。
  *
  * 生命周期：{@link ElectronWindowBridge.start} 启动并握手 → 若干 `open` / `command`
- * → {@link ElectronWindowBridge.dispose} 收摊。宿主进程随父进程退出而退出
- * （它监听的那条 TCP 连接一断就自杀）。
+ * → {@link ElectronWindowBridge.dispose} 收摊。宿主进程默认随父进程退出而退出
+ * （它监听的那条 TCP 连接一断就自杀）；`keepAlive` 时窗口留给用户。
  */
-export class ElectronWindowBridge implements WindowHostChannel {
+export class ElectronWindowBridge implements TabHostChannel {
   private readonly child: ChildProcess
   private readonly socket: Socket
   private readonly commandTimeoutMs: number
@@ -107,6 +138,7 @@ export class ElectronWindowBridge implements WindowHostChannel {
   private readonly listeners = new Map<string, Set<EventListener>>()
   private readonly closeListeners = new Set<() => void>()
   private readonly windowSize: { readonly width: number; readonly height: number } | undefined
+  private readonly keepAlive: boolean
   private nextId = 1
   private closed = false
 
@@ -124,6 +156,7 @@ export class ElectronWindowBridge implements WindowHostChannel {
     this.socket = socket
     this.commandTimeoutMs = options.commandTimeoutMs ?? DEFAULT_BRIDGE_COMMAND_TIMEOUT_MS
     this.windowSize = options.windowSize
+    this.keepAlive = options.keepAlive === true
     this.wire()
   }
 
@@ -191,18 +224,18 @@ export class ElectronWindowBridge implements WindowHostChannel {
   }
 
   /**
-   * 订阅某个窗口的 CDP 事件。
-   * @param windowId - 受控窗口 id。
+   * 订阅某个标签页的 CDP 事件。
+   * @param tabId - 标签 id。
    * @param listener - 每收到一条事件调用一次。
    * @returns 退订函数。
    */
-  onEvent(windowId: string, listener: EventListener): () => void {
-    const set = this.listeners.get(windowId) ?? new Set<EventListener>()
+  onEvent(tabId: string, listener: EventListener): () => void {
+    const set = this.listeners.get(tabId) ?? new Set<EventListener>()
     set.add(listener)
-    this.listeners.set(windowId, set)
+    this.listeners.set(tabId, set)
     return () => {
       set.delete(listener)
-      if (set.size === 0) this.listeners.delete(windowId)
+      if (set.size === 0) this.listeners.delete(tabId)
     }
   }
 
@@ -221,58 +254,88 @@ export class ElectronWindowBridge implements WindowHostChannel {
   }
 
   /**
-   * 让宿主开一个窗口。
+   * 让宿主开一个标签页（同一个壳窗口里）。
+   *
    * @param url - 初始地址。
-   * @returns 新窗口摘要。
+   * @param options - `keepAlive`：父进程断连后窗口仍然留在屏幕上。
+   * @returns 新标签摘要。
    */
-  async open(url: string): Promise<BridgeWindow> {
-    const response = await this.request({ op: 'open', url, ...this.windowSize === undefined ? {} : { size: this.windowSize } })
+  async open(url: string, options: { readonly keepAlive?: boolean } = {}): Promise<BridgeTab> {
+    const response = await this.request({
+      op: 'open',
+      url,
+      ...this.windowSize === undefined ? {} : { size: this.windowSize },
+      ...this.keepAlive || options.keepAlive === true ? { keepAlive: true } : {},
+    })
     return {
-      id: String(response['windowId']),
+      id: String(response['tabId']),
       url: typeof response['url'] === 'string' ? response['url'] : url,
       title: typeof response['title'] === 'string' ? response['title'] : '',
+      active: true,
     }
   }
 
   /**
-   * 列出现有窗口。
-   * @returns 窗口摘要列表。
+   * 列出现有标签页。
+   * @returns 标签摘要列表。
    */
-  async list(): Promise<readonly BridgeWindow[]> {
+  async list(): Promise<readonly BridgeTab[]> {
     const response = await this.request({ op: 'list' })
-    const windows = response['windows']
-    if (!Array.isArray(windows)) return []
-    return windows.map((entry) => {
+    const entries = response['tabs']
+    if (!Array.isArray(entries)) return []
+    return entries.map((entry) => {
       const record = entry as Record<string, unknown>
       return {
         id: String(record['id']),
         url: typeof record['url'] === 'string' ? record['url'] : '',
         title: typeof record['title'] === 'string' ? record['title'] : '',
+        active: record['active'] === true,
       }
     })
   }
 
   /**
-   * 发一条 CDP 命令给某个窗口。
-   * @param windowId - 受控窗口 id。
+   * 报告标签条状态：宿主持有几个标签、标签条画出了几个、谁在前台。
+   * @returns 标签条状态。
+   */
+  async bar(): Promise<BridgeTabBar> {
+    const response = await this.request({ op: 'bar' })
+    return {
+      tabs: typeof response['tabs'] === 'number' ? response['tabs'] : 0,
+      rendered: typeof response['rendered'] === 'number' ? response['rendered'] : -1,
+      active: typeof response['active'] === 'string' ? response['active'] : undefined,
+    }
+  }
+
+  /**
+   * 发一条 CDP 命令给某个标签页。
+   * @param tabId - 标签 id。
    * @param method - CDP 方法名。
    * @param params - 方法参数。
    * @returns 该方法的 `result`。
    */
-  async command(windowId: string, method: string, params: Record<string, unknown>): Promise<unknown> {
-    const response = await this.request({ op: 'cdp', windowId, method, params })
+  async command(tabId: string, method: string, params: Record<string, unknown>): Promise<unknown> {
+    const response = await this.request({ op: 'cdp', tabId, method, params })
     return response['result']
   }
 
   /**
-   * 关掉一个窗口。
-   * @param windowId - 受控窗口 id。
+   * 把某个标签页切到前台。
+   * @param tabId - 标签 id。
    */
-  async closeWindow(windowId: string): Promise<void> {
+  async activate(tabId: string): Promise<void> {
+    await this.request({ op: 'activate', tabId })
+  }
+
+  /**
+   * 关掉一个标签页。
+   * @param tabId - 标签 id。
+   */
+  async closeTab(tabId: string): Promise<void> {
     try {
-      await this.request({ op: 'close', windowId })
+      await this.request({ op: 'close', tabId })
     } catch {
-      // 窗口早就没了 —— 那正是我们想要的。
+      // 标签早就没了 —— 那正是我们想要的。
     }
   }
 
@@ -333,17 +396,17 @@ export class ElectronWindowBridge implements WindowHostChannel {
     const id = message['id']
 
     if (type === 'event') {
-      const windowId = String(message['windowId'])
+      const tabId = String(message['tabId'])
       const method = String(message['method'])
-      for (const listener of [...this.listeners.get(windowId) ?? []]) listener(method, message['params'])
+      for (const listener of [...this.listeners.get(tabId) ?? []]) listener(method, message['params'])
       return
     }
 
     if (type === 'closed' && typeof id !== 'number') {
-      // 用户自己把窗口关了：当成一条 CDP 断连事件，让上层摘掉会话。
-      const windowId = String(message['windowId'])
-      for (const listener of [...this.listeners.get(windowId) ?? []]) {
-        listener('Inspector.detached', { reason: 'window closed by the user' })
+      // 用户自己在标签条上点了叉：当成一条 CDP 断连事件，让上层摘掉会话。
+      const tabId = String(message['tabId'])
+      for (const listener of [...this.listeners.get(tabId) ?? []]) {
+        listener('Inspector.detached', { reason: 'tab closed by the user' })
       }
       return
     }
