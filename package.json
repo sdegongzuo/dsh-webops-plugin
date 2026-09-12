@@ -2,18 +2,28 @@
   "name": "dsh-browser-plugin",
   "version": "0.0.1",
   "private": true,
-  "description": "为 DeepSeek Harness 提供浏览器调试与操作能力：ctx.browser 能力服务 + CDP provider + browser_* 工具。",
+  "description": "为 DeepSeek Harness 提供浏览器调试与操作能力：ctx.browser 能力服务 + CDP provider + browser_* 工具 + 客户端观察面板。",
   "type": "module",
   "license": "MIT",
+  "main": "./lib/browser/index.js",
   "exports": {
-    "./browser": "./src/browser/index.ts",
-    "./browser-cdp": "./src/browser-cdp/index.ts",
-    "./tool-browser": "./src/tool-browser/index.ts",
+    "./browser": {
+      "default": "./lib/browser/index.js"
+    },
+    "./browser-cdp": {
+      "default": "./lib/browser-cdp/index.js"
+    },
+    "./tool-browser": {
+      "default": "./lib/tool-browser/index.js"
+    },
+    "./client": {
+      "default": "./lib/client.js"
+    },
     "./cordis.patch.yml": "./cordis.patch.yml",
     "./package.json": "./package.json"
   },
   "files": [
-    "src",
+    "lib",
     "cordis.patch.yml",
     "README.md",
     "LICENSE"
@@ -21,22 +31,50 @@
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-conversation",
+        "@deepseek-ai/dsh-client-ui-renderer",
+        "@deepseek-ai/dsh-client-ui-tool"
+      ]
     }
   },
   "scripts": {
+    "build": "tsdown",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "dev:desktop": "tsx scripts/dev-desktop.mjs",
+    "check:desktop": "node scripts/check-desktop.mjs"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.2",
+    "@deepseek-ai/dsh-attachment": "^0.1.5-rc.2",
+    "@deepseek-ai/dsh-system-prompt": "^0.1.5-rc.2",
+    "@deepseek-ai/dsh-tools": "^0.1.5-rc.2",
+    "@deepseek-ai/schemastery": "^3.18.2"
   },
   "devDependencies": {
     "@deepseek-ai/cordis": "link:../deepseek-harness/vendor/cordis",
     "@deepseek-ai/dsh-attachment": "link:../deepseek-harness/packages/attachment/attachment",
     "@deepseek-ai/dsh-attachment-local": "link:../deepseek-harness/packages/attachment/attachment-local",
-    "@deepseek-ai/dsh-subprocess": "link:../deepseek-harness/packages/subprocess/subprocess",
+    "@deepseek-ai/dsh-client-locale": "link:../deepseek-harness/packages/client/locale",
+    "@deepseek-ai/dsh-client-ui-chat": "link:../deepseek-harness/packages/client/ui-chat",
+    "@deepseek-ai/dsh-client-ui-conversation": "link:../deepseek-harness/packages/client/ui-conversation",
+    "@deepseek-ai/dsh-client-ui-renderer": "link:../deepseek-harness/packages/client/ui-renderer",
+    "@deepseek-ai/dsh-client-ui-slots": "link:../deepseek-harness/packages/client/ui-slots",
+    "@deepseek-ai/dsh-client-ui-tool": "link:../deepseek-harness/packages/client/ui-tool",
     "@deepseek-ai/dsh-system-prompt": "link:../deepseek-harness/packages/core/system-prompt",
     "@deepseek-ai/dsh-tools": "link:../deepseek-harness/packages/core/tools",
     "@deepseek-ai/schemastery": "link:../deepseek-harness/vendor/schemastery",
     "@types/node": "^22.15.0",
+    "@types/react": "~18.3.1",
+    "react": "^18.2.0",
+    "tsdown": "0.22.2",
+    "tsx": "^4.20.6",
     "typescript": "^5.9.3",
     "vitest": "^3.2.4"
   }

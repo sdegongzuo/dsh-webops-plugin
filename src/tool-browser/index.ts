@@ -34,6 +34,7 @@ import type { ImageAttachmentRef } from '@deepseek-ai/dsh-attachment'
 import type {} from '@deepseek-ai/dsh-system-prompt'
 import type {} from '../browser/index.ts'
 import type { BrowserSession } from '../browser/index.ts'
+import { noteLoaded } from '../debug.ts'
 
 /** Cordis 插件名，用于加载器诊断。 */
 export const name = 'tool-browser'
@@ -417,6 +418,11 @@ export function apply(ctx: Context, config: Config = {}): void {
   if (enabled.navigate) registerNavigate(ctx)
   if (enabled.snapshot) registerSnapshot(ctx)
   if (enabled.screenshot) registerScreenshot(ctx)
+
+  // 四个工具全部注册完再报，这样这一行同时证明了 browser 能力与 systemPrompt / attachments
+  // 都已就绪 —— 任一个 inject 没解析成功，本函数根本不会被执行。
+  const registered = Object.entries(enabled).filter(([, on]) => on).map(([key]) => key)
+  noteLoaded('tool-browser', `registered ${registered.join(', ')}`)
 }
 
 /** 保留给 P1：`presentResult` 需要按会话回放图片附件时才启用。 */

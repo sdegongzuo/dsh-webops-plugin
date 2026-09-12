@@ -12,6 +12,7 @@ import type {} from '../browser/index.ts'
 import { CdpBrowserProvider, DEFAULT_CDP_ENDPOINT } from './provider.ts'
 import type { CdpProviderConfig } from './provider.ts'
 import { DEFAULT_SNAPSHOT_LIMITS } from './snapshot.ts'
+import { noteLoaded } from '../debug.ts'
 
 export {
   CdpBrowserProvider,
@@ -105,7 +106,8 @@ function toProviderConfig(config: Config): CdpProviderConfig {
  * @param config - 插件配置；缺省即全部使用默认值。
  */
 export function apply(ctx: Context, config: Config = {}): void {
-  const provider = new CdpBrowserProvider(toProviderConfig(config))
+  const settings = toProviderConfig(config)
+  const provider = new CdpBrowserProvider(settings)
   ctx.browser.registerProvider(provider)
   // 卸载时释放连接与标签页；不注册这一步，进程退出前会留下一堆没关的 WebSocket 和标签页。
   ctx.effect(function* () {
@@ -113,4 +115,5 @@ export function apply(ctx: Context, config: Config = {}): void {
       void provider.dispose().catch(() => undefined)
     }
   }, 'browser-cdp.dispose()')
+  noteLoaded('browser-cdp', `endpoint=${settings.endpoint ?? DEFAULT_CDP_ENDPOINT}`)
 }
