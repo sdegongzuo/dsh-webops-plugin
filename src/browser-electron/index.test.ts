@@ -7,12 +7,38 @@
  */
 
 import { describe, expect, it, vi } from 'vitest'
+import Module from 'node:module'
+import { createRequire } from 'node:module'
 import { CdpConnection } from '../browser-cdp/protocol.ts'
 import type { BridgeDevTools, BridgeTab, BridgeTabBar, EventListener, TabHostChannel, TakeoverListener } from './bridge.ts'
 import { ElectronBrowserProvider } from './provider.ts'
 import { WindowCdpSocket } from './socket.ts'
 import { ElectronWindowTransport, tabHandle, tabIdFromHandle } from './transport.ts'
 import { resolveConfig } from './index.ts'
+
+// host.cjs 是纯 CommonJS（在 tsc / vite 转换范围之外）且顶层依赖 electron 运行时；
+// electron 包未安装也不能在纯 Node 里跑，所以用 Module._load 钩子顶掉 require('electron')，
+// 只测它可独立运行的部分（地址规范化、导航指令的空态忽略）。
+const fakeElectron = {
+  app: { on: () => {}, whenReady: () => ({ then: () => {} }) },
+  BaseWindow: class {},
+  WebContentsView: class {},
+  ipcMain: { on: () => {} },
+  Menu: { setApplicationMenu: () => {}, buildFromTemplate: () => ({}) },
+}
+const nodeRequire = createRequire(import.meta.url)
+const moduleWithLoad = Module as unknown as {
+  _load: (request: string, parent?: unknown, isMain?: boolean) => unknown
+}
+const nativeLoad = moduleWithLoad._load
+moduleWithLoad._load = (request, parent, isMain) =>
+  request === 'electron' ? fakeElectron : nativeLoad(request, parent, isMain)
+const hostModule = nodeRequire('./host.cjs') as {
+  normalizeAddress: (input: unknown) => string
+  handleNav: (action: string, url?: string) => void
+}
+moduleWithLoad._load = nativeLoad
+const { normalizeAddress, handleNav } = hostModule
 
 /** 一个可编程的假窗口宿主（一个壳窗口、多个标签页）。 */
 class FakeHost implements TabHostChannel {
@@ -526,5 +552,22 @@ describe('resolveConfig', () => {
 
   it('窗口尺寸有默认值', () => {
     expect(resolveConfig({}).windowSize).toEqual({ width: 1100, height: 820 })
+  })
+})
+
+describe('地址栏（host.cjs 内联逻辑）', () => {
+  it('navigate 规范化：trim 后不含 :// 就补 https:// 前缀，空串原样返回', () => {
+    expect(normalizeAddress(' example.com ')).toBe('https://example.com')
+    expect(normalizeAddress('localhost:3000/x')).toBe('https://localhost:3000/x')
+    expect(normalizeAddress('https://a.b/c')).toBe('https://a.b/c')
+    expect(normalizeAddress('   ')).toBe('')
+  })
+
+  it('没有活动标签时忽略导航指令', () => {
+    expect(() => handleNav('navigate', 'example.com')).not.toThrow()
+    expect(() => handleNav('back')).not.toThrow()
+    expect(() => handleNav('forward')).not.toThrow()
+    expect(() => handleNav('reload')).not.toThrow()
+    expect(() => handleNav('unknown')).not.toThrow()
   })
 })
