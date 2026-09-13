@@ -22,6 +22,9 @@
     "./tool-browser": {
       "default": "./lib/tool-browser/index.js"
     },
+    "./fake-llm": {
+      "default": "./lib/fake-llm/index.js"
+    },
     "./client": {
       "default": "./lib/client.js"
     },
@@ -55,6 +58,7 @@
     "test:watch": "vitest",
     "dev:desktop": "tsx scripts/dev-desktop.mjs",
     "check:desktop": "node scripts/check-desktop.mjs",
+    "verify:card": "node scripts/verify-card.mjs",
     "shot:desktop": "node scripts/shot-desktop.mjs",
     "smoke:dispatch": "tsx scripts/smoke-dispatch.ts",
     "smoke:window": "tsx scripts/smoke-window.ts",
@@ -70,6 +74,7 @@
   "devDependencies": {
     "@deepseek-ai/cordis": "link:../deepseek-harness/vendor/cordis",
     "@deepseek-ai/dsh-attachment": "link:../deepseek-harness/packages/attachment/attachment",
+    "@deepseek-ai/dsh-llm": "link:../deepseek-harness/packages/llm/llm",
     "@deepseek-ai/dsh-attachment-local": "link:../deepseek-harness/packages/attachment/attachment-local",
     "@deepseek-ai/dsh-client-locale": "link:../deepseek-harness/packages/client/locale",
     "@deepseek-ai/dsh-client-ui-chat": "link:../deepseek-harness/packages/client/ui-chat",

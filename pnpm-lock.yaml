@@ -35,6 +35,9 @@ importers:
       '@deepseek-ai/dsh-client-ui-tool':
         specifier: link:../deepseek-harness/packages/client/ui-tool
         version: link:../deepseek-harness/packages/client/ui-tool
+      '@deepseek-ai/dsh-llm':
+        specifier: link:../deepseek-harness/packages/llm/llm
+        version: link:../deepseek-harness/packages/llm/llm
       '@deepseek-ai/dsh-system-prompt':
         specifier: link:../deepseek-harness/packages/core/system-prompt
         version: link:../deepseek-harness/packages/core/system-prompt

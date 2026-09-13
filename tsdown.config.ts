@@ -52,6 +52,8 @@ export default defineConfig([
       'src/browser-cdp/index.ts',
       'src/browser-electron/index.ts',
       'src/tool-browser/index.ts',
+      'src/fake-llm/index.ts',
+      'src/fake-llm/index.ts',
     ],
     outDir: 'lib',
     format: ['esm'],
