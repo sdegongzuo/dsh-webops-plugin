@@ -1,0 +1,202 @@
+name: release-desktop
+
+# 发版「包含 dsh-webops-plugin 的整个 dsh 桌面端」Windows x64 便携版。
+#
+# 为什么必须放 CI 跑：本机流程走到 `prepare:dsh` 会失败，缺的不是磁盘也不是网络，
+# 而是一个**必须就地编译的原生模块 fs-ext** —— 它没有任何预编译二进制
+# （require 时报 `Cannot find module './build/Release/fs_ext.node'`），必须 node-gyp 现场编译，
+# 因此需要 Visual C++ 构建工具。**GitHub 的 windows-latest runner 自带 Visual Studio + MSVC**，
+# 正好缺什么有什么，不用在主机上装几个 G 的 VS。
+#
+# 另一道门槛：harness 的 `pnpm-workspace.yaml` 的 `allowBuilds` 白名单**不含 fs-ext**
+# （策略是「未列出 = hard install error」，默认拒绝）。而 `prepare-dsh.ts:83` 会清洗所有
+# `npm_*` / `pnpm_*` 环境变量、并用空 npmrc，所以环境变量与全局 npmrc 都注入不进去。
+# 唯一可行的注入点是**改那份 yaml** —— 在 CI 里 clone 之后改，不污染本地 checkout。
+#
+# 触发：
+#   推 `desktop-v*` tag（与插件便携版的 `v*` tag 区分开），或 Actions 手动补发。
+
+on:
+  push:
+    tags: ['desktop-v*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 版本号（不含 v 前缀，例如 0.1.0）
+        required: true
+        type: string
+      harness_ref:
+        description: deepseek-harness 的 ref（tag / branch / sha）
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  # 默认 pin 到与本机 checkout 一致的提交，避免上游 main 漂移把构建搞挂。
+  HARNESS_REF: ${{ inputs.harness_ref || 'c291e7961a515f6d7af9304e7fd1d257929aef26' }}
+  TAG: ${{ github.event_name == 'workflow_dispatch' && format('desktop-v{0}', inputs.version) || github.ref_name }}
+  # electron-builder 需要一个 reverse-DNS 应用标识（`desktop-release-environment.mjs:42` 只校验格式）。
+  DSH_DESKTOP_APP_ID: com.sdegongzuo.dshwebops
+
+jobs:
+  portable-win-x64:
+    runs-on: windows-latest
+    timeout-minutes: 180
+
+    steps:
+      - name: 签出插件仓
+        uses: actions/checkout@v4
+
+      - name: 装 pnpm + Node
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11.12.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: 取 deepseek-harness 源码
+        shell: pwsh
+        run: |
+          $dest = Join-Path (Split-Path $PWD) 'deepseek-harness'
+          Write-Host "harness ref: $env:HARNESS_REF -> $dest"
+          New-Item -ItemType Directory -Path $dest -Force | Out-Null
+          Set-Location $dest
+          git init --quiet
+          git remote add origin https://github.com/deepseek-ai/deepseek-harness.git
+          git fetch --depth 1 origin $env:HARNESS_REF
+          git checkout --quiet FETCH_HEAD
+
+      - name: 补 fs-ext 进 allowBuilds 白名单
+        # 只改 CI 里这份临时 checkout。fs-ext 是 dsh 生产依赖树里唯一「无预编译、
+        # 必须 node-gyp 就地编译」的包；不批准它的 build script，prepare:dsh 的
+        # native payload smoke 会以 `Cannot find module 'fs-ext'` 失败。
+        shell: pwsh
+        run: |
+          Set-Location (Join-Path (Split-Path $PWD) 'deepseek-harness')
+          $path = 'pnpm-workspace.yaml'
+          $text = Get-Content $path -Raw
+          if ($text -match '(?m)^\s+fs-ext:') {
+            Write-Host 'fs-ext 已在白名单里，跳过'
+          } else {
+            $patched = [regex]::Replace($text, '(?m)^allowBuilds:[ \t]*$', "allowBuilds:`n  fs-ext: true", 1)
+            if ($patched -eq $text) { throw 'allowBuilds 块没找到，白名单 patch 失败' }
+            Set-Content -Path $path -Value $patched -NoNewline
+            Write-Host '已插入 fs-ext: true'
+          }
+          Get-Content $path | Select-String -Pattern 'allowBuilds' -Context 0,2
+
+      - name: 装 harness 依赖
+        shell: pwsh
+        timeout-minutes: 30
+        run: |
+          Set-Location (Join-Path (Split-Path $PWD) 'deepseek-harness')
+          pnpm install --no-frozen-lockfile
+
+      - name: 判断 tar 是否需要 --force-local
+        # Git Bash 的 GNU tar 会把 Windows 盘符路径当成远程主机（`Cannot connect to D:`），
+        # 本机就是栽在这。但 Windows 自带的 bsdtar 不认识 --force-local，所以只认 GNU 再设。
+        shell: pwsh
+        run: |
+          $tar = (Get-Command tar).Source
+          $banner = (& tar --version 2>&1 | Out-String)
+          if ($banner -match 'GNU tar') {
+            Add-Content -Path $env:GITHUB_ENV -Value 'TAR_OPTIONS=--force-local'
+            Write-Host "GNU tar ($tar) -> TAR_OPTIONS=--force-local"
+          } else {
+            Write-Host "tar=$tar 非 GNU，不设 TAR_OPTIONS"
+          }
+
+      - name: 构建桌面端应用目录
+        # `package:win:x64:dir` = electron-builder --dir，产出可直接运行的 win-unpacked 目录。
+        # 必须带 --unsigned：本机/CI 都没有 SafeNet USB 签名令牌，而
+        # `electron-builder.config.mjs:108` 是 forceCodeSigning: !unsigned。
+        # 注意别写成 `pnpm run x -- --unsigned`：pnpm 会把 `--` 也传给脚本，
+        # package-target.ts 会报 "expected at most one target"。
+        shell: pwsh
+        timeout-minutes: 120
+        env:
+          PYTHON: python
+        run: |
+          Set-Location (Join-Path (Split-Path $PWD) 'deepseek-harness\apps\desktop')
+          pnpm run package:win:x64:dir --unsigned
+
+      - name: 定位 win-unpacked
+        id: locate
+        shell: pwsh
+        run: |
+          $base = Join-Path (Split-Path $PWD) 'deepseek-harness\apps\desktop\.desktop-build\targets\win-x64'
+          $app = Get-ChildItem -Path $base -Recurse -Directory -Filter 'win-unpacked' -ErrorAction SilentlyContinue |
+                 Select-Object -First 1
+          if ($null -eq $app) { throw "没找到 win-unpacked（搜过 $base）" }
+          Write-Host "win-unpacked: $($app.FullName)"
+          Add-Content -Path $env:GITHUB_ENV -Value "WIN_UNPACKED=$($app.FullName)"
+
+      - name: 物化插件 profile 并打便携版 zip
+        # 把插件按官方模板写进 profile，随 zip 分发；启动器用 DSH_HOME 把配置锁在包内。
+        shell: pwsh
+        run: |
+          $version = $env:TAG -replace '^desktop-v', ''
+          Write-Host "version: $version"
+          node scripts/package-desktop-portable.mjs --app "$env:WIN_UNPACKED" --version $version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $zip = Get-ChildItem dist/*.zip | Select-Object -First 1
+          Add-Content -Path $env:GITHUB_ENV -Value "ZIP_NAME=$($zip.Name)"
+          Add-Content -Path $env:GITHUB_ENV -Value "ZIP_SHA256=$((Get-FileHash $zip.FullName -Algorithm SHA256).Hash.ToLower())"
+          Add-Content -Path $env:GITHUB_ENV -Value "ZIP_MB=$([math]::Round($zip.Length / 1MB, 1))"
+
+      - name: 写 release 说明
+        shell: pwsh
+        run: |
+          $notes = @'
+          ## dsh 桌面端便携版 __TAG__
+
+          内置 [dsh-webops-plugin](https://github.com/sdegongzuo/dsh-webops-plugin) 的
+          DeepSeek Harness 桌面端。**解压即用**：不需要 Node、pnpm、Git，也不需要联网装插件。
+
+          ### 用法
+
+          1. 解压到**不含中文和空格**的路径
+          2. 双击 **启动.cmd**（不要直接点 app 目录里的 exe —— 那样 `$DSH_HOME` 会落回用户目录，配置不再随包走）
+          3. 首次运行会被 SmartScreen 拦，点「更多信息」→「仍要运行」
+
+          ### 这一版装在里面的是什么
+
+          - dsh 桌面端本体（Electron + 内置 Node 运行时 + 内置 pnpm + dsh 生产依赖树）
+          - 插件 `dsh-webops-plugin`，已按桌面端要求物化进 `home\profiles\desktop\`
+            （真实文件副本，不是链接；`dsh.profile.bundles` 里已登记）
+
+          ### 验证插件生效
+
+          启动后输入框上方应能看到「网页操作」状态条，让 agent 调用 `browser_open` 能开出页面。
+
+          ### 数据在哪
+
+          `home\` 是 dsh 的全部用户数据（会话 / 设置 / 凭据 / 已装插件）。整个目录拷到 U 盘就能带走，删掉即恢复出厂。
+
+          ### 产物
+
+          | 文件 | 大小 | SHA-256 |
+          | --- | --- | --- |
+          | __ZIP__ | __MB__ MB | __SHA__ |
+
+          **未签名构建**：CLI 这条链路的产物不做代码签名，SmartScreen 会有提示。
+          '@
+          $notes = $notes -replace '__TAG__', $env:TAG `
+                           -replace '__ZIP__', $env:ZIP_NAME `
+                           -replace '__MB__', $env:ZIP_MB `
+                           -replace '__SHA__', $env:ZIP_SHA256
+          $notes | Out-File -FilePath dist/notes.md -Encoding utf8
+
+      - name: 发布 Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "$env:TAG" `
+            --title "$env:TAG · dsh 桌面端便携版（含网页操作插件）" `
+            --notes-file dist/notes.md `
+            (Get-ChildItem dist/*.zip).FullName
