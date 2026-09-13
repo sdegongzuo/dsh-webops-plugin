@@ -65,7 +65,7 @@
  * @module dsh-webops-plugin/browser-electron/host
  */
 
-const { app, BaseWindow, WebContentsView, ipcMain } = require('electron')
+const { app, BaseWindow, WebContentsView, ipcMain, Menu } = require('electron')
 const net = require('node:net')
 const path = require('node:path')
 
@@ -177,28 +177,26 @@ function openTab(url, size) {
   })
   window.contentView.addChildView(view)
 
-  const entry = { id, view, debugger: undefined, ready: undefined }
+  const entry = { id, view, debugger: view.webContents.debugger, ready: undefined, debuggerAttached: false }
+  // 调试器的监听只注册一次（对象与 view 同生命周期），attach/detach 可反复。
+  entry.debugger.on('message', (_event, method, params) => {
+    send({ type: 'event', tabId: id, method, params })
+  })
+  entry.debugger.on('detach', (_event, reason) => {
+    entry.debuggerAttached = false
+    send({ type: 'event', tabId: id, method: 'Inspector.detached', params: { reason } })
+  })
   entry.ready = new Promise((resolveReady) => {
     view.webContents.once('dom-ready', () => {
-      const debugger_ = view.webContents.debugger
-      try {
-        debugger_.attach('1.3')
-      } catch (error) {
-        send({ type: 'error', tabId: id, message: `debugger.attach failed: ${String(error?.message ?? error)}` })
-      }
-      debugger_.on('message', (_event, method, params) => {
-        send({ type: 'event', tabId: id, method, params })
-      })
-      debugger_.on('detach', (_event, reason) => {
-        send({ type: 'event', tabId: id, method: 'Inspector.detached', params: { reason } })
-      })
-      entry.debugger = debugger_
+      attachDebugger(entry)
       resolveReady()
     })
     view.webContents.once('render-process-gone', (_event, details) => {
       send({ type: 'error', tabId: id, message: `renderer gone: ${JSON.stringify(details)}` })
     })
   })
+  // DevTools 关掉后把插件的调试器接回来，agent 工具自动恢复。
+  view.webContents.on('devtools-closed', () => { attachDebugger(entry) })
 
   // 标题与地址随时会变，标签条要跟着变。
   view.webContents.on('page-title-updated', () => { sendTabBar() })
@@ -249,6 +247,47 @@ function closeTab(id) {
   layout()
   sendTabBar()
   send({ type: 'closed', tabId: id })
+}
+
+/**
+ * 给标签接上 CDP 调试器（幂等）。
+ *
+ * 消息/分离监听在 `openTab` 里注册一次 —— `debugger` 对象与 view 同生命周期，
+ * detach 后再 attach 不需要重复注册。Chrome 一个 target 只允许一个调试客户端，
+ * DevTools 打开期间这里必须让位（见 `toggleDevTools`）。
+ */
+function attachDebugger(entry) {
+  if (entry.debuggerAttached) return
+  try {
+    entry.debugger.attach('1.3')
+    entry.debuggerAttached = true
+  } catch (error) {
+    send({ type: 'error', tabId: entry.id, message: `debugger.attach failed: ${String(error?.message ?? error)}` })
+  }
+}
+
+/**
+ * 切换活动标签的开发者工具。
+ *
+ * 实测（Electron 44）：插件 debugger 已 attach 时 `openDevTools` 会静默失败 ——
+ * 一个 target 只允许一个调试客户端。所以打开前先把插件的调试器 detach 让位
+ * （父进程会收到 `Inspector.detached`，CDP 命令此期间会失败），关闭 DevTools
+ * 后自动重新 attach，agent 工具恢复。
+ */
+function toggleDevTools() {
+  const entry = activeTabId !== undefined ? tabs.get(activeTabId) : undefined
+  if (entry === undefined) return
+  const wc = entry.view.webContents
+  if (wc.isDevToolsOpened()) {
+    wc.closeDevTools()
+    return
+  }
+  if (entry.debuggerAttached) {
+    entry.debuggerAttached = false
+    try { entry.debugger.detach() } catch { /* 已分离就算了 */ }
+    send({ type: 'event', tabId: entry.id, method: 'Inspector.detached', params: { reason: 'devtools-opened' } })
+  }
+  wc.openDevTools({ mode: 'undocked' })
 }
 
 /** 处理一条来自父进程的命令。 */
@@ -344,6 +383,25 @@ app.whenReady().then(() => {
   ipcMain.on('dsh-tab-select', (_event, id) => { activateTab(id) })
   ipcMain.on('dsh-tab-close', (_event, id) => { closeTab(id) })
   ipcMain.on('dsh-tab-create', () => { void openTab('about:blank') })
+
+  // BaseWindow 没有 webContents，默认菜单的「切换开发者工具」打在空处。
+  // 这里显式接管：指向活动标签的 webContents，并处理与插件 CDP 调试器的互斥。
+  Menu.setApplicationMenu(Menu.buildFromTemplate([
+    { role: 'fileMenu' },
+    { role: 'editMenu' },
+    {
+      label: 'View',
+      submenu: [
+        { role: 'forceReload' },
+        { label: '切换开发者工具', accelerator: 'Ctrl+Shift+I', click: () => { toggleDevTools() } },
+        { type: 'separator' },
+        { role: 'resetZoom' },
+        { role: 'zoomIn' },
+        { role: 'zoomOut' },
+      ],
+    },
+    { role: 'windowMenu' },
+  ]))
 
   const server = net.createServer((socket) => {
     connection = socket
