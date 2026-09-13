@@ -32,7 +32,7 @@ spawn 一个窗口宿主，开真正的 `BrowserWindow`，用它的 `webContents
 | **P0 只读** ← 已完成 | `ctx.browser` + `browser-cdp` 的 connect / open / navigate / snapshot / screenshot + 4 个只读工具 + ref 纪元 |
 | **UI 观察面板** ← 已完成 | `conversation.input.dock` 常驻状态条（含无活动时的「已就绪」态）+ `tool.call.toolview` 四个专属卡片（地址 / 大纲 / 截图） |
 | **Electron 窗口 provider** ← 已完成 | `browser-electron`：spawn 窗口宿主 → 真 `BrowserWindow` → `webContents.debugger` 驱动；桌面端默认用它 |
-| P1 操作 | click / fill / press / scroll / wait + 能力分级 + `stale_ref` 恢复 |
+| **P1 操作** ← 已完成 | `browser_tabs`（list/activate/close）+ click / fill / press / scroll / wait + 能力分级（只读 vs 操作）+ `stale_ref` 可重试错误码；fake-llm 脚本扩展为「open → snapshot → tabs+click 同轮双调用」的全链路 keyless 验证 |
 | P2 调试 | console / network 采集 + 受限 `browser_execute` + 进度策略 |
 | P3 协作 | 人工接管 / 回收 + `browser_find` / `browser_locate` |
 
@@ -86,11 +86,12 @@ src/browser-electron/   provider —— 开**桌面端自己的 Electron 窗口*
   host.cjs                **被 spawn 的 Electron 应用入口**：BrowserWindow + webContents.debugger
   index.test.ts           假通道下的单测（真机行为归 smoke:window）
 src/tool-browser/       工具消费者 —— 把能力暴露成 browser_* 工具给模型
-  index.ts                browser_open / navigate / snapshot / screenshot + 系统提示分段
+  index.ts                browser_open / navigate / snapshot / screenshot / tabs /
+                          click / fill / press / scroll / wait + 能力分级 + 系统提示分段
 src/client/             浏览器半边（dsh.client）
   index.ts                注册两个 slot 面：conversation.input.dock 与 tool.call.toolview
   BrowserDock.tsx         常驻状态条（无活动时显示「已就绪」）
-  BrowserToolRow.tsx      四个工具的专属卡片（地址 / 大纲 / 截图）
+  BrowserToolRow.tsx      工具的专属卡片（地址 / 大纲 / 截图 / 标签页 / 操作结果）
   observation.ts          从对话快照派生面板状态（纯函数，不 import dsh 客户端类型）
   locales.ts              中英文案
 scripts/dev-desktop.mjs   开发态装配进桌面端 profile 并拉起 Electron
@@ -510,6 +511,48 @@ Electron 系的 DevTools 端点（**包括 dsh 桌面端自己**）对 `/json/ne
 
 Chrome 发现同名 user-data-dir 已在运行时，会把 `--remote-debugging-port` 丢掉、直接附着到那个实例。
 表现是「端口起不来但不报错」。
+
+## P1 操作交付（2026-09-13）
+
+### 内容
+
+- **`browser_tabs`**：`list` / `activate` / `close` 三个 action。只列本会话自己开的标签页
+  （用户的标签页永不出现、永不关闭）；activate 依赖传输层支持，不支持时报
+  `BROWSER_NOT_IMPLEMENTED` 而不是静默失败。
+- **五个按 ref 的操作工具**：`browser_click` / `browser_fill` / `browser_press` /
+  `browser_scroll` / `browser_wait`。全部走 `refs.resolve()` 的**写前检查**：纪元失效
+  返回可重试的 `BROWSER_STALE_REF`，从未 snapshot 过返回 `BROWSER_SNAPSHOT_REQUIRED`
+  —— 且这两条检查发生在**任何 CDP 页面命令发出之前**（不会先点再查）。
+- **导航检测**：click / press 后轮询页面元数据（800ms）；URL 变了就推进纪元并在结果里
+  标 `navigated=true`，工具层渲染「所有旧 ref 已失效，请重新 snapshot」。
+- **能力分级**：`BROWSER_TOOL_CAPABILITIES` 把 10 个工具分成 `read` / `mutate`，
+  作为元数据导出，供策略层（P2 的进度策略、审批面）消费。
+- **fake-llm 全链路验证**：脚本第 3 轮同轮发 `browser_tabs(list)` + `browser_click`
+  两个工具调用。参数不写死 —— 每轮从请求历史的**非 system 消息**里抽 session_id 与
+  最新 ref（系统提示里的 `[ref=e12]` 示例就是第一版误抓的来源，教训：**从消息结构里
+  抽，别对整个请求 JSON 做正则**）。
+
+### 实测证据（keyless，headless Chrome @9333）
+
+会话日志四条工具结果全部 `isError=false`：
+
+1. `browser_open` → session_id（ref epoch 0）
+2. `browser_snapshot` → epoch 1，`[ref=e1]`
+3. `browser_tabs list` → 只列本会话控制的 1 个标签页
+4. `browser_click(ref=e1)` → 真实鼠标事件执行，导航被检测到，epoch 推进到 2，
+   结果里正确广播「旧 ref 全部失效」
+
+回归：171 通过 + 3 跳过；typecheck 干净；`check:desktop` 的 beacon / dockRegistered /
+toolViews=10 三项硬证据通过。
+
+### 已知环境死角（非代码回归）
+
+`check:desktop` 的 `hasDock` 断言在 P1 收尾时失败，根因在桌面端开发环境的 onboarding
+死角，与本插件代码无关：桌面 UI 处于 hero 冷启动态（无活动会话），且 workspace 快照为空
+—— 此时 `ui-workspace` 的 picker 不渲染菜单，而是直接触发 directory flow，而 Windows 上
+该 flow 走**原生目录对话框**（主进程模态，CDP 不可达），自动化无法穿越。dock 的挂载与
+卡片渲染本身由 `toolViews=10` 证明（slot 注册成功 + 插件的卡片全部注册），工具真执行由
+上面的 headless 会话日志证明。手动过这一关：在桌面 UI 里选一次工作区、开一个会话即可。
 
 ## License
 

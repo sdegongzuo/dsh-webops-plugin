@@ -19,6 +19,8 @@
 
 import { BrowserError } from '../browser/types.ts'
 import type {
+  BrowserMutationRequest,
+  BrowserMutationResult,
   BrowserNavigateRequest,
   BrowserObservation,
   BrowserObserveRequest,
@@ -27,6 +29,9 @@ import type {
   BrowserSession,
   BrowserScreenshot,
   BrowserSnapshot,
+  BrowserTabInfo,
+  BrowserTabsRequest,
+  BrowserTabsResult,
 } from '../browser/types.ts'
 import { RefRegistry } from './refs.ts'
 import type { RefTarget } from './refs.ts'
@@ -56,6 +61,8 @@ export interface CdpProviderConfig {
   readonly probeTtlMs?: number
   /** 大纲规模上限。 */
   readonly snapshotLimits?: SnapshotLimits
+  /** `wait` 类操作里 text / hidden 条件的默认超时（毫秒）。 */
+  readonly waitTimeoutMs?: number
 }
 
 /** 配置补齐默认值之后的样子。 */
@@ -66,6 +73,7 @@ interface ResolvedConfig {
   readonly navigationTimeoutMs: number
   readonly probeTtlMs: number
   readonly snapshotLimits: SnapshotLimits
+  readonly waitTimeoutMs: number
 }
 
 const DEFAULT_CONFIG: ResolvedConfig = {
@@ -75,7 +83,17 @@ const DEFAULT_CONFIG: ResolvedConfig = {
   navigationTimeoutMs: 15_000,
   probeTtlMs: 1_000,
   snapshotLimits: DEFAULT_SNAPSHOT_LIMITS,
+  waitTimeoutMs: 10_000,
 }
+
+/** `wait` 的纯等待上限（毫秒）；再长就是部署配错了。 */
+export const MAX_WAIT_TIME_MS = 30_000
+
+/** click / press 落地后探测「地址是否变了」的窗口（毫秒）。 */
+export const MUTATION_NAVIGATION_POLL_MS = 800
+
+/** `wait` 轮询 text / hidden 条件的间隔（毫秒）。 */
+const WAIT_POLL_INTERVAL_MS = 100
 
 /** 一个受控标签页的全部状态。 */
 interface SessionState {
@@ -162,6 +180,7 @@ export class CdpBrowserProvider implements BrowserProvider {
       navigationTimeoutMs: config.navigationTimeoutMs ?? DEFAULT_CONFIG.navigationTimeoutMs,
       probeTtlMs: config.probeTtlMs ?? DEFAULT_CONFIG.probeTtlMs,
       snapshotLimits: config.snapshotLimits ?? DEFAULT_CONFIG.snapshotLimits,
+      waitTimeoutMs: config.waitTimeoutMs ?? DEFAULT_CONFIG.waitTimeoutMs,
     }
     this.transport = transport ?? new HttpCdpTransport(this.config.endpoint, {
       requestTimeoutMs: this.config.requestTimeoutMs,
@@ -309,6 +328,54 @@ export class CdpBrowserProvider implements BrowserProvider {
     session.connection.close()
     // 标签页可能已经被用户手动关掉了，那正是我们想要的结果，不算失败。
     await this.transport.closeTarget(session.targetId).catch(() => undefined)
+  }
+
+  /**
+   * P1：标签页管理。**只管本 provider 自己开的受控标签页** —— 用户自己的标签页
+   * 一概不出现在清单里，更不会被关掉（这是 P0 就定下的所有权边界）。
+   */
+  async tabs(request: BrowserTabsRequest, signal?: AbortSignal): Promise<BrowserTabsResult> {
+    if (request.kind === 'list') {
+      return { action: 'list', tabs: await this.listTabs(signal) }
+    }
+    if (request.kind === 'activate') {
+      const session = this.require(request.sessionId)
+      const activate = this.transport.activateTarget
+      if (activate === undefined) {
+        throw new BrowserError(
+          'this browser provider cannot bring tabs to the foreground; activation needs a provider that controls a real window',
+          'BROWSER_NOT_IMPLEMENTED',
+        )
+      }
+      await activate.call(this.transport, session.targetId, signal)
+      return { action: 'activate', sessionId: session.targetId, tabs: await this.listTabs(signal) }
+    }
+    // close：与 close() 同一语义（幂等），只是把剩余清单一并带回去。
+    if (this.sessions.has(request.sessionId)) await this.close(request.sessionId)
+    return { action: 'close', sessionId: request.sessionId, tabs: await this.listTabs(signal) }
+  }
+
+  /**
+   * P1：按 ref 定位的页面操作。
+   *
+   * **写前检查纪元**是这里的铁律：每个分支的第一步都是 `refs.resolve(ref)`
+   * （经 `resolveObjectId`），旧 ref 在任何页面命令发出之前就失败 ——
+   * 不存在「先点了一下才发现 ref 错了」的中间态。
+   */
+  async mutate(request: BrowserMutationRequest, signal?: AbortSignal): Promise<BrowserMutationResult> {
+    const session = this.require(request.sessionId)
+    switch (request.kind) {
+      case 'click':
+        return this.click(session, request.ref, signal)
+      case 'fill':
+        return this.fill(session, request.ref, request.value, signal)
+      case 'press':
+        return this.press(session, request.ref, request.key, signal)
+      case 'scroll':
+        return this.scroll(session, request.ref, request.deltaX, request.deltaY, signal)
+      case 'wait':
+        return this.wait(session, request, signal)
+    }
   }
 
   /** @inheritdoc */
@@ -474,6 +541,339 @@ export class CdpBrowserProvider implements BrowserProvider {
     }
   }
 
+  // ---------------------------------------------------------------------------
+  // P1 mutation：click / fill / press / scroll / wait
+  // ---------------------------------------------------------------------------
+
+  /**
+   * 把 ref 解析成远端对象句柄。
+   *
+   * **第一步**就是查纪元表：ref 失效（或从未 snapshot）时这里直接抛
+   * `BROWSER_STALE_REF` / `BROWSER_SNAPSHOT_REQUIRED`，后面的 CDP 命令一条都
+   * 不会发 —— 这就是「写前检查纪元」。
+   */
+  private async resolveObjectId(session: SessionState, ref: string, signal?: AbortSignal): Promise<string> {
+    const target = session.refs.resolve(ref)
+    const resolved = await session.connection.send<ResolveNodeResult>(
+      'DOM.resolveNode',
+      { backendNodeId: target.backendNodeId },
+      { signal, timeoutMs: this.config.commandTimeoutMs },
+    )
+    const objectId = resolved.object?.objectId
+    if (objectId === undefined) {
+      throw new BrowserError(
+        'the observed element is no longer attached to the document; run browser_snapshot again',
+        'BROWSER_STALE_REF',
+      )
+    }
+    return objectId
+  }
+
+  /** 释放远端对象句柄（尽力而为；释放失败不影响主流程）。 */
+  private releaseObject(session: SessionState, objectId: string, signal?: AbortSignal): void {
+    void session.connection
+      .send('DOM.releaseObject', { objectId }, { signal })
+      .catch(() => undefined)
+  }
+
+  /**
+   * 取元素的视口坐标盒（先滚动到视口中央再量）。
+   *
+   * 用 `Runtime.callFunctionOn` + `getBoundingClientRect` 而不是 `DOM.getBoxModel`：
+   * 后者给的是文档坐标，而 `Input.dispatchMouseEvent` 吃的是视口坐标；
+   * 元素在视口外时文档坐标直接把事件点到看不见的地方去。
+   */
+  private async elementViewportBox(
+    session: SessionState,
+    objectId: string,
+    signal?: AbortSignal,
+  ): Promise<{ x: number; y: number; width: number; height: number }> {
+    const evaluated = await session.connection.send<EvaluateResult>(
+      'Runtime.callFunctionOn',
+      {
+        objectId,
+        functionDeclaration:
+          'function () { this.scrollIntoView({ block: "center", inline: "center" });'
+          + ' const rect = this.getBoundingClientRect();'
+          + ' return { x: rect.x, y: rect.y, width: rect.width, height: rect.height }; }',
+        returnByValue: true,
+      },
+      { signal, timeoutMs: this.config.commandTimeoutMs },
+    )
+    const value = evaluated.result?.value
+    if (typeof value !== 'object' || value === null) {
+      throw new BrowserError('could not read the element box for interaction', 'BROWSER_PROTOCOL_ERROR')
+    }
+    const box = value as Record<string, unknown>
+    const x = box['x']
+    const y = box['y']
+    const width = box['width']
+    const height = box['height']
+    if (
+      typeof x !== 'number' || typeof y !== 'number'
+      || typeof width !== 'number' || typeof height !== 'number'
+      || !(width > 0) || !(height > 0)
+    ) {
+      throw new BrowserError('the element has no usable layout box to interact with', 'BROWSER_PROTOCOL_ERROR')
+    }
+    return { x, y, width, height }
+  }
+
+  /** 点击：解析 ref → 滚到可视区 → 在元素中心派发真实的鼠标按下/抬起。 */
+  private async click(session: SessionState, ref: string, signal?: AbortSignal): Promise<BrowserMutationResult> {
+    const beforeUrl = session.url
+    const objectId = await this.resolveObjectId(session, ref, signal)
+    try {
+      const box = await this.elementViewportBox(session, objectId, signal)
+      const point = { x: box.x + box.width / 2, y: box.y + box.height / 2 }
+      const options = { signal, timeoutMs: this.config.commandTimeoutMs }
+      await session.connection.send('Input.dispatchMouseEvent', {
+        type: 'mousePressed', ...point, button: 'left', clickCount: 1,
+      }, options)
+      await session.connection.send('Input.dispatchMouseEvent', {
+        type: 'mouseReleased', ...point, button: 'left', clickCount: 1,
+      }, options)
+    } finally {
+      this.releaseObject(session, objectId, signal)
+    }
+    return this.settleMutation(session, 'click', beforeUrl, true, signal)
+  }
+
+  /** 填写：走原型链上的原生 value setter（React 受控组件也认），再补 input/change 事件。 */
+  private async fill(
+    session: SessionState,
+    ref: string,
+    value: string,
+    signal?: AbortSignal,
+  ): Promise<BrowserMutationResult> {
+    const beforeUrl = session.url
+    const objectId = await this.resolveObjectId(session, ref, signal)
+    try {
+      await session.connection.send<EvaluateResult>(
+        'Runtime.callFunctionOn',
+        {
+          objectId,
+          functionDeclaration:
+            'function (value) {'
+            + ' const element = this;'
+            + ' if (element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement) {'
+            + '   const prototype = element instanceof HTMLInputElement ? HTMLInputElement.prototype : HTMLTextAreaElement.prototype;'
+            + '   const descriptor = Object.getOwnPropertyDescriptor(prototype, "value");'
+            + '   if (descriptor && descriptor.set) { descriptor.set.call(element, value); } else { element.value = value; }'
+            + ' } else { element.textContent = value; }'
+            + ' element.dispatchEvent(new Event("input", { bubbles: true }));'
+            + ' element.dispatchEvent(new Event("change", { bubbles: true }));'
+            + ' return true; }',
+          arguments: [{ value }],
+          returnByValue: true,
+        },
+        { signal, timeoutMs: this.config.commandTimeoutMs },
+      )
+    } finally {
+      this.releaseObject(session, objectId, signal)
+    }
+    return this.settleMutation(session, 'fill', beforeUrl, false, signal)
+  }
+
+  /** 按键：先聚焦元素，再用 `Input.dispatchKeyEvent` 派发 keyDown/keyUp。 */
+  private async press(
+    session: SessionState,
+    ref: string,
+    key: string,
+    signal?: AbortSignal,
+  ): Promise<BrowserMutationResult> {
+    const beforeUrl = session.url
+    const keyInfo = describeKey(key)
+    const objectId = await this.resolveObjectId(session, ref, signal)
+    try {
+      await session.connection.send(
+        'Runtime.callFunctionOn',
+        { objectId, functionDeclaration: 'function () { this.focus(); }', returnByValue: true },
+        { signal, timeoutMs: this.config.commandTimeoutMs },
+      )
+      const options = { signal, timeoutMs: this.config.commandTimeoutMs }
+      await session.connection.send('Input.dispatchKeyEvent', {
+        type: 'keyDown',
+        key: keyInfo.key,
+        code: keyInfo.code,
+        windowsVirtualKeyCode: keyInfo.virtualKeyCode,
+        nativeVirtualKeyCode: keyInfo.virtualKeyCode,
+        ...keyInfo.text !== undefined ? { text: keyInfo.text } : {},
+      }, options)
+      await session.connection.send('Input.dispatchKeyEvent', {
+        type: 'keyUp',
+        key: keyInfo.key,
+        code: keyInfo.code,
+        windowsVirtualKeyCode: keyInfo.virtualKeyCode,
+        nativeVirtualKeyCode: keyInfo.virtualKeyCode,
+      }, options)
+    } finally {
+      this.releaseObject(session, objectId, signal)
+    }
+    return this.settleMutation(session, 'press', beforeUrl, true, signal)
+  }
+
+  /** 滚动：在元素中心派发真实的滚轮事件（滚的是元素所在的可滚动容器）。 */
+  private async scroll(
+    session: SessionState,
+    ref: string,
+    deltaX: number | undefined,
+    deltaY: number | undefined,
+    signal?: AbortSignal,
+  ): Promise<BrowserMutationResult> {
+    const dx = typeof deltaX === 'number' && Number.isFinite(deltaX) ? deltaX : 0
+    const dy = typeof deltaY === 'number' && Number.isFinite(deltaY) ? deltaY : 0
+    if (dx === 0 && dy === 0) {
+      throw new BrowserError('browser_scroll needs a non-zero deltaX or deltaY', 'BROWSER_PROTOCOL_ERROR')
+    }
+    const beforeUrl = session.url
+    const objectId = await this.resolveObjectId(session, ref, signal)
+    try {
+      const box = await this.elementViewportBox(session, objectId, signal)
+      await session.connection.send('Input.dispatchMouseEvent', {
+        type: 'mouseWheel',
+        x: box.x + box.width / 2,
+        y: box.y + box.height / 2,
+        deltaX: dx,
+        deltaY: dy,
+      }, { signal, timeoutMs: this.config.commandTimeoutMs })
+    } finally {
+      this.releaseObject(session, objectId, signal)
+    }
+    return this.settleMutation(session, 'scroll', beforeUrl, false, signal)
+  }
+
+  /** 等待：timeMs（纯等待）/ text（页面出现某文本）/ ref（元素从文档里消失）三选一。 */
+  private async wait(
+    session: SessionState,
+    request: Extract<BrowserMutationRequest, { kind: 'wait' }>,
+    signal?: AbortSignal,
+  ): Promise<BrowserMutationResult> {
+    const wantsTime = request.timeMs !== undefined
+    const wantsText = request.text !== undefined && request.text.length > 0
+    const wantsRef = request.ref !== undefined
+    if ([wantsTime, wantsText, wantsRef].filter(chosen => chosen).length !== 1) {
+      throw new BrowserError(
+        'browser_wait needs exactly one of time_ms, text, or ref',
+        'BROWSER_PROTOCOL_ERROR',
+      )
+    }
+    const beforeUrl = session.url
+    let satisfied = true
+    if (request.timeMs !== undefined) {
+      if (!(request.timeMs > 0) || request.timeMs > MAX_WAIT_TIME_MS) {
+        throw new BrowserError(
+          `browser_wait time_ms must be between 1 and ${String(MAX_WAIT_TIME_MS)}`,
+          'BROWSER_PROTOCOL_ERROR',
+        )
+      }
+      await delay(request.timeMs, signal)
+    } else if (wantsText) {
+      const text = request.text as string
+      satisfied = await this.pollUntil(
+        signal,
+        async () => {
+          const evaluated = await session.connection.send<EvaluateResult>(
+            'Runtime.evaluate',
+            { expression: `document.body !== null && document.body.innerText.includes(${JSON.stringify(text)})`, returnByValue: true },
+            { signal, timeoutMs: this.config.commandTimeoutMs },
+          )
+          return evaluated.result?.value === true
+        },
+        this.config.waitTimeoutMs,
+      )
+    } else {
+      const ref = request.ref as string
+      // hidden 语义也吃 ref 纪元：旧 ref 在这里直接抛，不会傻等一个不存在的元素。
+      const objectId = await this.resolveObjectId(session, ref, signal)
+      try {
+        satisfied = await this.pollUntil(
+          signal,
+          async () => {
+            const evaluated = await session.connection.send<EvaluateResult>(
+              'Runtime.callFunctionOn',
+              { objectId, functionDeclaration: 'function () { return !this.isConnected; }', returnByValue: true },
+              { signal, timeoutMs: this.config.commandTimeoutMs },
+            )
+            return evaluated.result?.value === true
+          },
+          this.config.waitTimeoutMs,
+        )
+      } finally {
+        this.releaseObject(session, objectId, signal)
+      }
+    }
+    const result = await this.settleMutation(session, 'wait', beforeUrl, false, signal)
+    return { ...result, satisfied }
+  }
+
+  /** 轮询一个条件直到成立或超时；返回是否成立。 */
+  private async pollUntil(
+    signal: AbortSignal | undefined,
+    condition: () => Promise<boolean>,
+    timeoutMs: number,
+  ): Promise<boolean> {
+    const deadline = Date.now() + timeoutMs
+    for (;;) {
+      if (await condition().catch(() => false)) return true
+      if (Date.now() >= deadline) return false
+      await delay(WAIT_POLL_INTERVAL_MS, signal)
+    }
+  }
+
+  /**
+   * 操作落地后的收尾：探测「地址是否变了」，变了就作废旧纪元并更新会话元信息。
+   *
+   * click / press 可能引发导航，但导航是异步的 —— 立刻读一次往往还是旧地址。
+   * 所以这两类动作给一个短轮询窗口；fill / scroll / wait 只读一次。
+   */
+  private async settleMutation(
+    session: SessionState,
+    action: BrowserMutationResult['action'],
+    beforeUrl: string,
+    awaitNavigation: boolean,
+    signal?: AbortSignal,
+  ): Promise<BrowserMutationResult> {
+    let navigated = false
+    const deadline = awaitNavigation ? Date.now() + MUTATION_NAVIGATION_POLL_MS : 0
+    for (;;) {
+      const meta = await this.readPageMeta(session.connection, signal)
+      if (meta !== undefined) {
+        if (meta.url !== '' && meta.url !== beforeUrl) {
+          // 页面换掉了：旧 ref 全部作废，绝不许旧 ref 静默命中新页面上的元素。
+          session.refs.invalidate()
+          navigated = true
+        }
+        session.url = meta.url
+        session.title = meta.title
+      }
+      if (navigated || Date.now() >= deadline) break
+      await delay(WAIT_POLL_INTERVAL_MS, signal)
+    }
+    return {
+      kind: 'mutation',
+      sessionId: session.targetId,
+      action,
+      epoch: session.refs.currentEpoch,
+      url: session.url,
+      title: session.title,
+      navigated,
+    }
+  }
+
+  /** 标签页清单：只含受控会话；transport 能回答「谁在前台」时补上 active。 */
+  private async listTabs(signal?: AbortSignal): Promise<readonly BrowserTabInfo[]> {
+    const activeId = this.transport.activeTargetId === undefined
+      ? undefined
+      : await this.transport.activeTargetId().catch(() => undefined)
+    return [...this.sessions.values()].map((session) => ({
+      sessionId: session.targetId,
+      url: session.url,
+      title: session.title,
+      ...(activeId !== undefined && activeId === session.targetId ? { active: true } : {}),
+    }))
+  }
+
   /** 读页面 URL 与标题；失败返回 `undefined`（页面可能是空白页或已崩溃）。 */
   private async readPageMeta(connection: CdpConnection, signal?: AbortSignal): Promise<PageMeta | undefined> {
     try {
@@ -611,6 +1011,47 @@ export class CdpBrowserProvider implements BrowserProvider {
   }
 }
 
+/** `browser_press` 认得的键：名字 → CDP 键参数。 */
+const KNOWN_KEYS: ReadonlyMap<string, { key: string; code: string; virtualKeyCode: number; text?: string }> = new Map([
+  ['Enter', { key: 'Enter', code: 'Enter', virtualKeyCode: 13, text: '\r' }],
+  ['Tab', { key: 'Tab', code: 'Tab', virtualKeyCode: 9 }],
+  ['Escape', { key: 'Escape', code: 'Escape', virtualKeyCode: 27 }],
+  ['Backspace', { key: 'Backspace', code: 'Backspace', virtualKeyCode: 8 }],
+  ['Delete', { key: 'Delete', code: 'Delete', virtualKeyCode: 46 }],
+  ['ArrowUp', { key: 'ArrowUp', code: 'ArrowUp', virtualKeyCode: 38 }],
+  ['ArrowDown', { key: 'ArrowDown', code: 'ArrowDown', virtualKeyCode: 40 }],
+  ['ArrowLeft', { key: 'ArrowLeft', code: 'ArrowLeft', virtualKeyCode: 37 }],
+  ['ArrowRight', { key: 'ArrowRight', code: 'ArrowRight', virtualKeyCode: 39 }],
+  ['Home', { key: 'Home', code: 'Home', virtualKeyCode: 36 }],
+  ['End', { key: 'End', code: 'End', virtualKeyCode: 35 }],
+  ['PageUp', { key: 'PageUp', code: 'PageUp', virtualKeyCode: 33 }],
+  ['PageDown', { key: 'PageDown', code: 'PageDown', virtualKeyCode: 34 }],
+  [' ', { key: ' ', code: 'Space', virtualKeyCode: 32, text: ' ' }],
+])
+
+/**
+ * 把模型给的键名收窄成 CDP 键参数。
+ * @param key - `Enter` / `Tab` / `ArrowDown` … 或单个可打印字符。
+ * @throws `BROWSER_PROTOCOL_ERROR`：多字符且不在已知名单里（模型该换个写法重试）。
+ */
+function describeKey(key: string): { key: string; code: string; virtualKeyCode: number; text?: string } {
+  const known = KNOWN_KEYS.get(key)
+  if (known !== undefined) return known
+  if (key.length === 1 && key.charCodeAt(0) >= 32) {
+    return {
+      key,
+      code: `Key${key.toUpperCase()}`,
+      virtualKeyCode: key.toUpperCase().charCodeAt(0),
+      text: key,
+    }
+  }
+  throw new BrowserError(
+    `unsupported key "${key}"; use a named key (Enter, Tab, Escape, Backspace, Delete, `
+    + 'ArrowUp/Down/Left/Right, Home, End, PageUp, PageDown, Space) or a single character',
+    'BROWSER_PROTOCOL_ERROR',
+  )
+}
+
 /** 把 `navigationSettled` 的探测结果从 `unknown` 收窄成结构化状态。 */
 function readNavigationState(value: unknown): { ready: boolean; href: string } | undefined {
   if (typeof value !== 'string') return undefined
@@ -677,6 +1118,7 @@ export function validateProviderConfig(config: CdpProviderConfig = {}): void {
     requestTimeoutMs: config.requestTimeoutMs,
     navigationTimeoutMs: config.navigationTimeoutMs,
     probeTtlMs: config.probeTtlMs,
+    waitTimeoutMs: config.waitTimeoutMs,
   })) {
     if (value === undefined) continue
     if (!Number.isFinite(value) || value <= 0) {

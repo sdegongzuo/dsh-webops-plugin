@@ -10,3 +10,5 @@ coverage/
 .desktop-shot.png
 .smoke-*.png
 .probe-*
+.verify-card*.png
+.workbuddy/

@@ -28,8 +28,8 @@
 const PORT = Number(process.env.RENDERER_PORT ?? 9222)
 const DEADLINE_MS = Number(process.env.CHECK_DEADLINE_MS ?? 60_000)
 const PLUGIN_ID = 'dsh-webops-plugin'
-/** 客户端应注册的工具卡片数：browser_open / navigate / snapshot / screenshot。 */
-const EXPECTED_TOOL_VIEWS = 4
+/** 客户端应注册的工具卡片数：open / navigate / snapshot / screenshot / tabs / click / fill / press / scroll / wait。 */
+const EXPECTED_TOOL_VIEWS = 10
 
 const PROBE = `(() => {
   const boot = globalThis.__DSH_BOOT__;

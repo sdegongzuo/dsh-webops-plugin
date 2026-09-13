@@ -154,6 +154,76 @@ export type BrowserObserveRequest =
 export type BrowserObservation = BrowserSnapshot | BrowserScreenshot
 
 /**
+ * P1 的页面操作请求。**全部按 ref 定位**（wait 的 hidden 语义也吃 ref）：
+ * provider 必须在发出**任何**页面命令之前先过 ref 纪元 —— 旧 ref 直接
+ * `BROWSER_STALE_REF` / `BROWSER_SNAPSHOT_REQUIRED`，绝不能先动页面再失败。
+ */
+export type BrowserMutationRequest =
+  | { readonly kind: 'click'; readonly sessionId: string; readonly ref: string }
+  | { readonly kind: 'fill'; readonly sessionId: string; readonly ref: string; readonly value: string }
+  | { readonly kind: 'press'; readonly sessionId: string; readonly ref: string; readonly key: string }
+  | {
+    readonly kind: 'scroll'
+    readonly sessionId: string
+    readonly ref: string
+    /** 横向滚动量（正 = 向右）；与 `deltaY` 至少给一个。 */
+    readonly deltaX?: number
+    /** 纵向滚动量（正 = 向下）；与 `deltaX` 至少给一个。 */
+    readonly deltaY?: number
+  }
+  | {
+    readonly kind: 'wait'
+    readonly sessionId: string
+    /** 纯等待。 */
+    readonly timeMs?: number
+    /** 等页面文本包含该串。 */
+    readonly text?: string
+    /** 等该 ref 的元素从文档里消失（spinner 消失之类）。 */
+    readonly ref?: string
+  }
+
+/** 一次页面操作的结果。 */
+export interface BrowserMutationResult {
+  readonly kind: 'mutation'
+  readonly sessionId: string
+  readonly action: 'click' | 'fill' | 'press' | 'scroll' | 'wait'
+  /**
+   * 操作落地后的 ref 纪元。click/press 引发导航时会**先作废旧纪元再推进**，
+   * 所以旧 ref 在结果返回后就已经不可用。
+   */
+  readonly epoch: number
+  readonly url: string
+  readonly title: string
+  /** 本次操作是否引发了导航（地址变了）。wait 恒为 false。 */
+  readonly navigated: boolean
+  /** wait 独有：条件是否在超时前成立（超时为 false，不是错误）。 */
+  readonly satisfied?: boolean
+}
+
+/** 标签页清单里的一项（本插件自己开的受控标签页）。 */
+export interface BrowserTabInfo {
+  readonly sessionId: string
+  readonly url: string
+  readonly title: string
+  /** 是否在前台；provider 判断不了时省略（外部 Chrome 没有可靠的「活动标签」信号）。 */
+  readonly active?: boolean
+}
+
+/** 标签页管理请求：清单 / 切前台 / 关闭。 */
+export type BrowserTabsRequest =
+  | { readonly kind: 'list' }
+  | { readonly kind: 'activate'; readonly sessionId: string }
+  | { readonly kind: 'close'; readonly sessionId: string }
+
+/** 标签页管理结果；`tabs` 是动作落地后的清单。 */
+export interface BrowserTabsResult {
+  readonly action: 'list' | 'activate' | 'close'
+  /** activate / close 的目标会话 id。 */
+  readonly sessionId?: string
+  readonly tabs: readonly BrowserTabInfo[]
+}
+
+/**
  * provider 契约。能力缝隙只认这个接口，不认识任何具体驱动方式
  * （CDP 直连、Playwright、Electron 代持都实现它）。
  */
@@ -164,6 +234,10 @@ export interface BrowserProvider {
   open(request: BrowserOpenRequest, signal?: AbortSignal): Promise<BrowserSession>
   navigate(request: BrowserNavigateRequest, signal?: AbortSignal): Promise<BrowserSession>
   observe(request: BrowserObserveRequest, signal?: AbortSignal): Promise<BrowserObservation>
+  /** P1：标签页管理（本插件自己开的受控标签页）。 */
+  tabs(request: BrowserTabsRequest, signal?: AbortSignal): Promise<BrowserTabsResult>
+  /** P1：按 ref 定位的页面操作。实现必须先过 ref 纪元再发任何页面命令。 */
+  mutate(request: BrowserMutationRequest, signal?: AbortSignal): Promise<BrowserMutationResult>
   /** 归还一个会话：关闭它的标签页并释放连接。 */
   close(sessionId: string): Promise<void>
   /** 释放 provider 持有的全部资源（连接、标签页、进程）。可省略。 */

@@ -33,6 +33,12 @@ class FakeChrome {
   png = pngBytes(640, 480)
   readyStateComplete = true
   boxModel: readonly number[] | undefined = [10, 20, 110, 20, 110, 60, 10, 60]
+  /** P1：点击是否引发导航（模拟链接点击）。 */
+  navigateOnClick = false
+  /** P1：wait-hidden 里元素是否还连在文档上。 */
+  elementConnected = true
+  /** P1：wait-text 里页面文本是否包含目标串。 */
+  waitTextFound = true
 
   /** 记录一条命令并给出它的结果。 */
   handle(socket: FakeSocket, method: string, params: Record<string, unknown>): unknown {
@@ -50,9 +56,26 @@ class FakeChrome {
             },
           }
         }
+        if (expression.includes('innerText')) {
+          return { result: { value: this.waitTextFound } }
+        }
         return expression.includes('readyState')
           ? { result: { value: this.readyStateComplete } }
           : { result: { value: { url: this.page.url, title: this.page.title } } }
+      }
+      case 'Runtime.callFunctionOn': {
+        const fn = String(params['functionDeclaration'])
+        if (fn.includes('getBoundingClientRect')) {
+          return { result: { value: { x: 10, y: 20, width: 100, height: 40 } } }
+        }
+        if (fn.includes('isConnected')) {
+          return { result: { value: !this.elementConnected } }
+        }
+        if (fn.includes('dispatchEvent')) {
+          return { result: { value: true } }
+        }
+        // focus() 之类没有返回值。
+        return { result: { value: undefined } }
       }
       case 'Accessibility.getFullAXTree':
         return { nodes: this.axeNodes }
@@ -66,6 +89,15 @@ class FakeChrome {
       case 'DOM.getBoxModel':
         return this.boxModel === undefined ? {} : { model: { border: [...this.boxModel] } }
       case 'DOM.releaseObject':
+        return {}
+      case 'Input.dispatchMouseEvent':
+        // 模拟「点在链接上会导航」：点击落点一变，地址跟着变。
+        if (this.navigateOnClick && params['type'] === 'mouseReleased') {
+          this.href = 'https://example.com/next'
+          this.page = { url: 'https://example.com/next', title: 'Next' }
+        }
+        return {}
+      case 'Input.dispatchKeyEvent':
         return {}
       default:
         throw new Error(`unscripted method ${method}`)
@@ -390,5 +422,267 @@ describe('CdpBrowserProvider', () => {
     const session = await provider.open({})
     expect(session.id).toBe('tab-1')
     expect(provider.available()).toBe(true)
+  })
+})
+
+describe('CdpBrowserProvider.tabs (P1)', () => {
+  let chrome: FakeChrome
+  let provider: CdpBrowserProvider
+
+  beforeEach(() => {
+    chrome = new FakeChrome()
+    chrome.axeNodes = PAGE_TREE
+    provider = new CdpBrowserProvider({ navigationTimeoutMs: 200 }, chrome.transport())
+  })
+
+  it('lists only the tabs this provider opened, and marks the active one when the transport can tell', async () => {
+    await provider.open({ url: 'https://example.com/a' })
+    await provider.open({ url: 'https://example.com/b' })
+
+    const plain = await provider.tabs({ kind: 'list' })
+    expect(plain.action).toBe('list')
+    expect(plain.tabs.map(tab => tab.sessionId)).toEqual(['tab-1', 'tab-2'])
+    expect(plain.tabs.some(tab => tab.active === true)).toBe(false)
+
+    // 换一个能回答「谁在前台」的 transport：Electron 宿主就是这个角色。
+    const activeChrome = new FakeChrome()
+    activeChrome.axeNodes = PAGE_TREE
+    const withActiveTransport = new CdpBrowserProvider({ navigationTimeoutMs: 200 }, {
+      ...activeChrome.transport(),
+      activeTargetId: () => Promise.resolve('tab-1'),
+    })
+    await withActiveTransport.open({})
+    const marked = await withActiveTransport.tabs({ kind: 'list' })
+    expect(marked.tabs).toEqual([
+      { sessionId: 'tab-1', url: 'https://example.com/', title: 'Example', active: true },
+    ])
+  })
+
+  it('activates through the transport when supported', async () => {
+    await provider.open({})
+    const activations: string[] = []
+    const activating: CdpTransport = {
+      ...chrome.transport(),
+      activateTarget: (targetId: string) => {
+        activations.push(targetId)
+        return Promise.resolve()
+      },
+    }
+    provider = new CdpBrowserProvider({ navigationTimeoutMs: 200 }, activating)
+    const session = await provider.open({})
+
+    const result = await provider.tabs({ kind: 'activate', sessionId: session.id })
+    expect(activations).toEqual([session.id])
+    expect(result).toMatchObject({ action: 'activate', sessionId: session.id })
+  })
+
+  it('reports BROWSER_NOT_IMPLEMENTED when the transport cannot activate', async () => {
+    await provider.open({})
+    await expect(provider.tabs({ kind: 'activate', sessionId: 'tab-1' }))
+      .rejects.toThrow(expect.objectContaining({ code: 'BROWSER_NOT_IMPLEMENTED' }))
+  })
+
+  it('closes a controlled tab through tabs(close) and returns the remaining list', async () => {
+    await provider.open({ url: 'https://example.com/a' })
+    await provider.open({ url: 'https://example.com/b' })
+
+    const result = await provider.tabs({ kind: 'close', sessionId: 'tab-1' })
+    expect(result.action).toBe('close')
+    expect(result.tabs.map(tab => tab.sessionId)).toEqual(['tab-2'])
+    expect(chrome.closedTargets).toEqual(['tab-1'])
+    await expect(provider.observe({ kind: 'snapshot', sessionId: 'tab-1' }))
+      .rejects.toThrow(expect.objectContaining({ code: 'BROWSER_TARGET_NOT_FOUND' }))
+  })
+
+  it('never lists or closes tabs it does not own', async () => {
+    chrome.targets.push({
+      id: 'user-tab',
+      type: 'page',
+      url: 'https://mail.example.com/',
+      title: 'Inbox',
+      webSocketDebuggerUrl: 'ws://127.0.0.1:9222/devtools/page/user-tab',
+    })
+    await provider.open({})
+
+    const result = await provider.tabs({ kind: 'list' })
+    expect(result.tabs.map(tab => tab.sessionId)).toEqual(['tab-2'])
+
+    // 对不认识的 id 语义上等同「没这个会话」：不动它，也不误伤用户自己的页面。
+    const closed = await provider.tabs({ kind: 'close', sessionId: 'user-tab' })
+    expect(closed.action).toBe('close')
+    expect(closed.tabs.map(tab => tab.sessionId)).toEqual(['tab-2'])
+    expect(chrome.closedTargets).toEqual([])
+  })
+})
+
+describe('CdpBrowserProvider.mutate (P1)', () => {
+  let chrome: FakeChrome
+  let provider: CdpBrowserProvider
+
+  beforeEach(() => {
+    chrome = new FakeChrome()
+    chrome.axeNodes = PAGE_TREE
+    provider = new CdpBrowserProvider({ navigationTimeoutMs: 200 }, chrome.transport())
+  })
+
+  /** 开会话并 snapshot，返回第一个 ref。 */
+  async function firstRef(): Promise<string> {
+    const session = await provider.open({})
+    const snapshot = await provider.observe({ kind: 'snapshot', sessionId: session.id })
+    if (snapshot.kind !== 'snapshot') throw new Error('expected a snapshot')
+    return snapshot.refs[0]?.ref as string
+  }
+
+  it('clicks the element center with real mouse events', async () => {
+    const ref = await firstRef()
+
+    const result = await provider.mutate({ kind: 'click', sessionId: 'tab-1', ref })
+    expect(result).toMatchObject({ kind: 'mutation', action: 'click', epoch: 1, navigated: false })
+
+    const presses = chrome.calls.filter(call => call.method === 'Input.dispatchMouseEvent')
+    expect(presses.map(call => call.params['type'])).toEqual(['mousePressed', 'mouseReleased'])
+    expect(presses[0]?.params).toMatchObject({ x: 60, y: 40, button: 'left', clickCount: 1 })
+    // 远端对象句柄用完即还。
+    expect(chrome.calls.map(call => call.method)).toContain('DOM.releaseObject')
+  })
+
+  it('fails a stale ref BEFORE any page command is issued (write-then-check is forbidden)', async () => {
+    const session = await provider.open({})
+    const snapshot = await provider.observe({ kind: 'snapshot', sessionId: session.id })
+    if (snapshot.kind !== 'snapshot') throw new Error('expected a snapshot')
+    const ref = snapshot.refs[0]?.ref as string
+
+    chrome.page = { url: 'https://example.com/next', title: 'Next' }
+    await provider.navigate({ sessionId: session.id, url: 'https://example.com/next' })
+
+    for (const kind of ['click', 'fill', 'press', 'scroll'] as const) {
+      const before = chrome.calls.length
+      const request = kind === 'fill'
+        ? { kind, sessionId: session.id, ref, value: 'x' }
+        : kind === 'press'
+          ? { kind, sessionId: session.id, ref, key: 'Enter' }
+          : kind === 'scroll'
+            ? { kind, sessionId: session.id, ref, deltaY: 100 }
+            : { kind, sessionId: session.id, ref }
+      await expect(provider.mutate(request as never))
+        .rejects.toThrow(expect.objectContaining({ code: 'BROWSER_STALE_REF' }))
+      // 关键断言：纪元检查在一切页面命令之前，失败时连一条新命令都没发。
+      expect(chrome.calls.slice(before)).toEqual([])
+    }
+
+    await expect(provider.mutate({ kind: 'click', sessionId: session.id, ref }))
+      .rejects.toThrow(expect.objectContaining({ code: 'BROWSER_STALE_REF' }))
+  })
+
+  it('requires a snapshot before mutating a page the model never observed', async () => {
+    const session = await provider.open({})
+    const before = chrome.calls.length
+
+    await expect(provider.mutate({ kind: 'click', sessionId: session.id, ref: 'e1' }))
+      .rejects.toThrow(expect.objectContaining({ code: 'BROWSER_SNAPSHOT_REQUIRED' }))
+    expect(chrome.calls.slice(before)).toEqual([])
+  })
+
+  it('reports navigated=true and invalidates the epoch when a click navigates', async () => {
+    const session = await provider.open({})
+    const snapshot = await provider.observe({ kind: 'snapshot', sessionId: session.id })
+    if (snapshot.kind !== 'snapshot') throw new Error('expected a snapshot')
+    const ref = snapshot.refs[0]?.ref as string
+    chrome.navigateOnClick = true
+
+    const result = await provider.mutate({ kind: 'click', sessionId: session.id, ref })
+    expect(result).toMatchObject({
+      action: 'click',
+      navigated: true,
+      url: 'https://example.com/next',
+      epoch: 2,
+    })
+    // 旧 ref 已随导航作废：旧 ref 再来一次点击必须立刻失败。
+    await expect(provider.mutate({ kind: 'click', sessionId: session.id, ref }))
+      .rejects.toThrow(expect.objectContaining({ code: 'BROWSER_STALE_REF' }))
+  })
+
+  it('fills through the native value setter and fires input + change', async () => {
+    const ref = await firstRef()
+
+    const result = await provider.mutate({ kind: 'fill', sessionId: 'tab-1', ref, value: 'me@example.com' })
+    expect(result).toMatchObject({ action: 'fill', navigated: false })
+
+    const call = chrome.calls.find(candidate => candidate.method === 'Runtime.callFunctionOn')
+    expect(call?.params['arguments']).toEqual([{ value: 'me@example.com' }])
+    expect(String(call?.params['functionDeclaration'])).toContain('dispatchEvent')
+  })
+
+  it('presses a named key after focusing the element, and rejects unknown keys', async () => {
+    const ref = await firstRef()
+
+    const result = await provider.mutate({ kind: 'press', sessionId: 'tab-1', ref, key: 'Enter' })
+    expect(result).toMatchObject({ action: 'press' })
+
+    const keyEvents = chrome.calls.filter(call => call.method === 'Input.dispatchKeyEvent')
+    expect(keyEvents.map(call => call.params['type'])).toEqual(['keyDown', 'keyUp'])
+    expect(keyEvents[0]?.params).toMatchObject({ key: 'Enter', windowsVirtualKeyCode: 13 })
+
+    await expect(provider.mutate({ kind: 'press', sessionId: 'tab-1', ref, key: 'Bogus' }))
+      .rejects.toThrow(expect.objectContaining({ code: 'BROWSER_PROTOCOL_ERROR' }))
+  })
+
+  it('presses a printable character with its text payload', async () => {
+    const ref = await firstRef()
+    await provider.mutate({ kind: 'press', sessionId: 'tab-1', ref, key: 'a' })
+
+    const down = chrome.calls.find(call =>
+      call.method === 'Input.dispatchKeyEvent' && call.params['type'] === 'keyDown')
+    expect(down?.params).toMatchObject({ key: 'a', text: 'a' })
+  })
+
+  it('scrolls with a wheel event at the element center and refuses zero deltas', async () => {
+    const ref = await firstRef()
+
+    const result = await provider.mutate({ kind: 'scroll', sessionId: 'tab-1', ref, deltaY: 600 })
+    expect(result).toMatchObject({ action: 'scroll' })
+
+    const wheel = chrome.calls.find(call => call.method === 'Input.dispatchMouseEvent')
+    expect(wheel?.params).toMatchObject({ type: 'mouseWheel', x: 60, y: 40, deltaY: 600 })
+
+    await expect(provider.mutate({ kind: 'scroll', sessionId: 'tab-1', ref }))
+      .rejects.toThrow(expect.objectContaining({ code: 'BROWSER_PROTOCOL_ERROR' }))
+  })
+
+  it('waits for a duration, for text to appear, or for an element to disappear', async () => {
+    await provider.open({})
+    const snapshot = await provider.observe({ kind: 'snapshot', sessionId: 'tab-1' })
+    if (snapshot.kind !== 'snapshot') throw new Error('expected a snapshot')
+    const ref = snapshot.refs[0]?.ref as string
+
+    const timed = await provider.mutate({ kind: 'wait', sessionId: 'tab-1', timeMs: 10 })
+    expect(timed).toMatchObject({ action: 'wait', satisfied: true })
+
+    chrome.waitTextFound = true
+    const text = await provider.mutate({ kind: 'wait', sessionId: 'tab-1', text: 'Hello' })
+    expect(text).toMatchObject({ action: 'wait', satisfied: true })
+
+    chrome.elementConnected = false
+    const hidden = await provider.mutate({ kind: 'wait', sessionId: 'tab-1', ref })
+    expect(hidden).toMatchObject({ action: 'wait', satisfied: true })
+  })
+
+  it('reports satisfied=false (not an error) when a wait times out, and rejects ambiguous waits', async () => {
+    chrome.waitTextFound = false
+    chrome.elementConnected = true
+    const timeoutProvider = new CdpBrowserProvider({ waitTimeoutMs: 150 }, chrome.transport())
+    await timeoutProvider.open({})
+    const snapshot = await timeoutProvider.observe({ kind: 'snapshot', sessionId: 'tab-1' })
+    if (snapshot.kind !== 'snapshot') throw new Error('expected a snapshot')
+
+    const timedOut = await timeoutProvider.mutate({ kind: 'wait', sessionId: 'tab-1', text: 'Never' })
+    expect(timedOut).toMatchObject({ action: 'wait', satisfied: false })
+
+    await expect(timeoutProvider.mutate({ kind: 'wait', sessionId: 'tab-1' }))
+      .rejects.toThrow(expect.objectContaining({ code: 'BROWSER_PROTOCOL_ERROR' }))
+    await expect(timeoutProvider.mutate({ kind: 'wait', sessionId: 'tab-1', timeMs: 100, text: 'x' }))
+      .rejects.toThrow(expect.objectContaining({ code: 'BROWSER_PROTOCOL_ERROR' }))
+    await expect(timeoutProvider.mutate({ kind: 'wait', sessionId: 'tab-1', timeMs: 40_000 }))
+      .rejects.toThrow(expect.objectContaining({ code: 'BROWSER_PROTOCOL_ERROR' }))
   })
 })

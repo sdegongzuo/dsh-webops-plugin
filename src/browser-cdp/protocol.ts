@@ -64,6 +64,17 @@ export interface CdpTransport {
   closeTarget(targetId: string, signal?: AbortSignal): Promise<void>
   /** 建立命令通道。 */
   connect(webSocketDebuggerUrl: string, signal?: AbortSignal): Promise<CdpConnection>
+  /**
+   * 把一个 target 切到前台（可选能力）。外部 Chrome 走 `/json/activate`；
+   * Electron 窗口宿主走 `{ op: 'activate' }`。没有实现时标签页管理会报
+   * `BROWSER_NOT_IMPLEMENTED`。
+   */
+  activateTarget?(targetId: string, signal?: AbortSignal): Promise<void>
+  /**
+   * 当前前台 target 的 id（可选能力）。Electron 宿主自己知道；外部 Chrome
+   * 没有可靠信号，默认不实现。
+   */
+  activeTargetId?(): Promise<string | undefined>
 }
 
 /** 默认的单条 CDP 命令超时。 */
@@ -368,6 +379,17 @@ export class HttpCdpTransport implements CdpTransport {
       await this.request(`/json/close/${encodeURIComponent(targetId)}`, signal, 'PUT')
     } catch (error: unknown) {
       // target 已经不存在时 Chrome 会回 404 —— 那正是我们想要的结果。
+      if (error instanceof BrowserError && error.code === 'BROWSER_PROTOCOL_ERROR') return
+      throw error
+    }
+  }
+
+  /** @inheritdoc */
+  async activateTarget(targetId: string, signal?: AbortSignal): Promise<void> {
+    try {
+      await this.request(`/json/activate/${encodeURIComponent(targetId)}`, signal, 'GET')
+    } catch (error: unknown) {
+      // target 已经不存在时 Chrome 会回 404 —— 幂等成功。
       if (error instanceof BrowserError && error.code === 'BROWSER_PROTOCOL_ERROR') return
       throw error
     }

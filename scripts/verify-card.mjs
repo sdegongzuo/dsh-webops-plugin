@@ -133,30 +133,50 @@ async function main() {
     })()`)
     console.log(`verify-card: 消息已发送（${sent}）`)
 
-    // 4) 轮询工具卡片。
-    let card = null
-    while (Date.now() < deadline) {
+    // 4) 轮询工具卡片：P0 的 open 卡片 + P1 扩展脚本里的 snapshot / tabs / click 卡片。
+    const EXPECTED_ROWS = ['browser_open', 'browser_snapshot', 'browser_tabs', 'browser_click']
+    /** row → { state, url }，出现即记录。 */
+    const cards = new Map()
+    while (Date.now() < deadline && cards.size < EXPECTED_ROWS.length) {
       await delay(2_000)
       const state = await evaluate(call, `(() => {
-        const row = document.querySelector('[data-dsh-browser-row="browser_open"]');
-        if (row === null) return null;
-        return JSON.stringify({
-          state: row.getAttribute('data-dsh-browser-state'),
-          url: row.querySelector('[data-dsh-browser-url]')?.textContent ?? null,
-          text: (row.textContent ?? '').slice(0, 200),
-        });
+        const found = {};
+        for (const name of ${JSON.stringify(EXPECTED_ROWS)}) {
+          const row = document.querySelector('[data-dsh-browser-row="' + name + '"]');
+          if (row !== null) {
+            found[name] = {
+              state: row.getAttribute('data-dsh-browser-state'),
+              url: row.querySelector('[data-dsh-browser-url]')?.textContent ?? null,
+              text: (row.textContent ?? '').slice(0, 200),
+            };
+          }
+        }
+        return JSON.stringify(found);
       })()`)
-      if (state !== null) { card = JSON.parse(state); break }
+      for (const [name, card] of Object.entries(JSON.parse(state))) {
+        if (!cards.has(name)) cards.set(name, card)
+      }
     }
-    if (card === null) throw new Error('超时：工具卡片 [data-dsh-browser-row=browser_open] 没渲染出来')
-    console.log(`verify-card: 工具卡片已渲染 → state=${card.state} url=${card.url ?? '（无）'}`)
+    const missing = EXPECTED_ROWS.filter(name => !cards.has(name))
+    if (missing.length > 0) {
+      throw new Error(`超时：工具卡片没渲染出来 → ${missing.join(', ')}（已见：${[...cards.keys()].join(', ') || '无'}）`)
+    }
+    for (const name of EXPECTED_ROWS) {
+      const card = cards.get(name)
+      console.log(`verify-card: 工具卡片 ${name} → state=${card.state} url=${card.url ?? '（无）'}`)
+    }
+    const bad = EXPECTED_ROWS.filter(name => cards.get(name).state !== 'ok')
+    if (bad.length > 0) {
+      throw new Error(`工具卡片执行失败 → ${bad.map(name => `${name}: ${cards.get(name).state}`).join(', ')}`)
+    }
 
     // 5) 整页截图。
     await delay(1_500)
     const shot = await call('Page.captureScreenshot', { format: 'png' })
     writeFileSync(SHOT_OUT, Buffer.from(shot.data, 'base64'))
     console.log(`verify-card: 截图 → ${SHOT_OUT}`)
-    console.log(`verify-card: PASS —— browser_open 真执行、工具卡片真渲染（state=${card.state}）`)
+    console.log('verify-card: PASS —— browser_open / snapshot / tabs / click 真执行、'
+      + `四张工具卡片真渲染且 state=ok（${EXPECTED_ROWS.map(name => `${name}=${cards.get(name).state}`).join(', ')}）`)
   })
 }
 

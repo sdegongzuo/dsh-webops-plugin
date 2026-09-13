@@ -170,6 +170,15 @@ describe('ElectronWindowTransport', () => {
     expect(host.activated).toEqual(['t1'])
   })
 
+  it('activeTargetId 从宿主的标签条状态里取前台 id', async () => {
+    const host = new FakeHost()
+    const transport = transportFor(host)
+    await transport.newTab('https://example.com/a')
+    await transport.newTab('https://example.com/b')
+
+    await expect(transport.activeTargetId()).resolves.toBe('t2')
+  })
+
   it('barState 透传宿主的标签条状态：持有数、渲染数、前台 id', async () => {
     const host = new FakeHost()
     const transport = transportFor(host)

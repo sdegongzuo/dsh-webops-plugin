@@ -1,7 +1,14 @@
 import { describe, expect, it } from 'vitest'
 import { Context } from '@deepseek-ai/cordis'
 import BrowserRuntime, { BrowserError } from './index.ts'
-import type { BrowserNavigateRequest, BrowserObserveRequest, BrowserOpenRequest, BrowserProvider } from './index.ts'
+import type {
+  BrowserMutationRequest,
+  BrowserNavigateRequest,
+  BrowserObserveRequest,
+  BrowserOpenRequest,
+  BrowserProvider,
+  BrowserTabsRequest,
+} from './index.ts'
 
 const SESSION = { id: 's1', url: 'https://example.com/', title: 'Example', epoch: 3 }
 
@@ -21,6 +28,16 @@ function makeProvider(id: string, available: boolean): BrowserProvider {
       outline: '',
       refs: [],
       truncated: false,
+    }),
+    tabs: (request: BrowserTabsRequest) => Promise.resolve({ action: request.kind, tabs: [] }),
+    mutate: (request: BrowserMutationRequest) => Promise.resolve({
+      kind: 'mutation',
+      sessionId: 'sessionId' in request ? request.sessionId : 's1',
+      action: request.kind === 'wait' ? 'wait' : request.kind,
+      epoch: SESSION.epoch,
+      url: SESSION.url,
+      title: SESSION.title,
+      navigated: false,
     }),
     close: () => Promise.resolve(),
   }
@@ -102,6 +119,16 @@ describe('BrowserRuntime forwarding', () => {
     browser.registerProvider(makeProvider('cdp', true))
     await expect(browser.navigate({ sessionId: 's1', url: 'https://example.com/next' }))
       .resolves.toMatchObject({ url: 'https://example.com/next' })
+  })
+
+  it('forwards tabs and mutate to the selected provider (P1)', async () => {
+    const browser = await mountBrowser()
+    browser.registerProvider(makeProvider('cdp', true))
+
+    await expect(browser.tabs({ kind: 'list' })).resolves.toEqual({ action: 'list', tabs: [] })
+    await expect(browser.tabs({ kind: 'close', sessionId: 's1' })).resolves.toMatchObject({ action: 'close' })
+    await expect(browser.mutate({ kind: 'click', sessionId: 's1', ref: 'e1' }))
+      .resolves.toMatchObject({ kind: 'mutation', action: 'click', sessionId: 's1' })
   })
 
   it('ignores providers without a dispose hook and reports the ones that fail', async () => {

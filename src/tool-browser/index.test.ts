@@ -2,7 +2,7 @@ import { beforeEach, describe, expect, it } from 'vitest'
 import type { Context } from '@deepseek-ai/cordis'
 import type { ToolDefinition, ToolRunContext } from '@deepseek-ai/dsh-tools'
 import { validateJsonSchemaValue } from '@deepseek-ai/dsh-tools'
-import { apply, name as pluginName, TOOL_BROWSER_SECTION_ORDER } from './index.ts'
+import { apply, BROWSER_TOOL_CAPABILITIES, name as pluginName, TOOL_BROWSER_SECTION_ORDER } from './index.ts'
 import type { BrowserObservation, BrowserSession, BrowserSnapshot } from '../browser/index.ts'
 
 const SESSION: BrowserSession = { id: 's1', url: 'https://example.com/', title: 'Example', epoch: 4 }
@@ -102,6 +102,27 @@ function mount(): Harness {
         browserCalls.push({ method: 'navigate', args })
         return Promise.resolve(SESSION)
       },
+      tabs: (args: { kind: string; sessionId?: string }) => {
+        browserCalls.push({ method: 'tabs', args })
+        return Promise.resolve({
+          action: args.kind,
+          ...args.sessionId !== undefined ? { sessionId: args.sessionId } : {},
+          tabs: [{ sessionId: 's1', url: SESSION.url, title: SESSION.title, active: true }],
+        })
+      },
+      mutate: (args: { kind: string; sessionId?: string; ref?: string; value?: string; key?: string; deltaX?: number; deltaY?: number; timeMs?: number; text?: string }) => {
+        browserCalls.push({ method: 'mutate', args })
+        return Promise.resolve({
+          kind: 'mutation',
+          sessionId: 's1',
+          action: args.kind,
+          epoch: 4,
+          url: SESSION.url,
+          title: SESSION.title,
+          navigated: false,
+          ...args.kind === 'wait' ? { satisfied: true } : {},
+        })
+      },
       observe: (args: { kind: string }) => {
         browserCalls.push({ method: 'observe', args })
         if (harness.failObserve !== undefined) return Promise.reject(harness.failObserve)
@@ -129,13 +150,36 @@ function tool(harness: Harness, toolName: string): ToolDefinition {
 }
 
 describe('registration', () => {
-  it('exposes exactly the four P0 read-only tools', () => {
+  it('exposes exactly the P0 read-only tools plus the P1 operation tools', () => {
     expect([...mount().tools.keys()].sort()).toEqual([
+      'browser_click',
+      'browser_fill',
       'browser_navigate',
       'browser_open',
+      'browser_press',
       'browser_screenshot',
+      'browser_scroll',
       'browser_snapshot',
+      'browser_tabs',
+      'browser_wait',
     ])
+  })
+
+  it('classifies read vs mutate tools in the capability metadata', () => {
+    expect(BROWSER_TOOL_CAPABILITIES).toMatchObject({
+      browser_open: 'read',
+      browser_navigate: 'read',
+      browser_snapshot: 'read',
+      browser_screenshot: 'read',
+      browser_wait: 'read',
+      browser_tabs: 'mutate',
+      browser_click: 'mutate',
+      browser_fill: 'mutate',
+      browser_press: 'mutate',
+      browser_scroll: 'mutate',
+    })
+    // 元数据必须覆盖全部已注册工具，新工具进来忘了分级会在这里炸。
+    expect(Object.keys(BROWSER_TOOL_CAPABILITIES).sort()).toEqual([...mount().tools.keys()].sort())
   })
 
   it('declares the plugin name and a section order right above the web tools', () => {
@@ -169,7 +213,7 @@ describe('registration', () => {
       tools: { register: (definition: ToolDefinition) => { tools.set(definition.name, definition); return () => undefined }, get: () => undefined },
       systemPrompt: { section: () => () => undefined },
     } as unknown as Context
-    apply(ctx, { snapshot: false, screenshot: false })
+    apply(ctx, { snapshot: false, screenshot: false, tabs: false, click: false, fill: false, press: false, scroll: false, wait: false })
 
     expect([...tools.keys()].sort()).toEqual(['browser_navigate', 'browser_open'])
   })
@@ -234,6 +278,88 @@ describe('argument and output contracts', () => {
     const text = String((blocks[0] as { text: string }).text)
     expect(text).toContain('[ref=e1]')
     expect(text).toContain('valid only for this epoch')
+    expect(text).toContain('untrusted')
+  })
+})
+
+describe('browser_tabs and the P1 mutation tools', () => {
+  let harness: Harness
+
+  beforeEach(() => {
+    harness = mount()
+  })
+
+  it('forwards list / activate / close to ctx.browser.tabs', async () => {
+    const definition = tool(harness, 'browser_tabs')
+    const listed = await definition.execute({ action: 'list' }, exec())
+    expect(harness.browserCalls).toEqual([{ method: 'tabs', args: { kind: 'list' } }])
+    expect(listed).toEqual({
+      action: 'list',
+      tabs: [{ session_id: 's1', url: SESSION.url, title: SESSION.title, active: true }],
+    })
+
+    harness.browserCalls.length = 0
+    const closed = await definition.execute({ action: 'close', session_id: 's1' }, exec())
+    expect(harness.browserCalls).toEqual([{ method: 'tabs', args: { kind: 'close', sessionId: 's1' } }])
+    expect(closed).toMatchObject({ action: 'close', session_id: 's1' })
+  })
+
+  it('rejects tabs actions that miss their session id or use an unknown action', async () => {
+    const definition = tool(harness, 'browser_tabs')
+    await expect(definition.execute({ action: 'activate' }, exec())).rejects.toThrow(/session_id/u)
+    await expect(definition.execute({ action: 'reboot', session_id: 's1' }, exec())).rejects.toThrow(/list, activate, close/u)
+  })
+
+  it('forwards click with the ref and reports the resulting epoch', async () => {
+    const definition = tool(harness, 'browser_click')
+    const value = await definition.execute({ session_id: 's1', ref: 'e1' }, exec())
+
+    expect(harness.browserCalls).toEqual([
+      { method: 'mutate', args: { kind: 'click', sessionId: 's1', ref: 'e1' } },
+    ])
+    expect(value).toEqual({
+      session_id: 's1',
+      action: 'click',
+      epoch: 4,
+      url: SESSION.url,
+      title: SESSION.title,
+      navigated: false,
+    })
+    expect(validateJsonSchemaValue(definition.output.schema, value)).toEqual([])
+  })
+
+  it('passes fill / press / scroll arguments through unchanged', async () => {
+    await tool(harness, 'browser_fill').execute({ session_id: 's1', ref: 'e1', value: 'hi' }, exec())
+    await tool(harness, 'browser_press').execute({ session_id: 's1', ref: 'e1', key: 'Enter' }, exec())
+    await tool(harness, 'browser_scroll').execute({ session_id: 's1', ref: 'e1', delta_y: 300 }, exec())
+
+    expect(harness.browserCalls).toEqual([
+      { method: 'mutate', args: { kind: 'fill', sessionId: 's1', ref: 'e1', value: 'hi' } },
+      { method: 'mutate', args: { kind: 'press', sessionId: 's1', ref: 'e1', key: 'Enter' } },
+      { method: 'mutate', args: { kind: 'scroll', sessionId: 's1', ref: 'e1', deltaY: 300 } },
+    ])
+  })
+
+  it('wait reports satisfied; the "exactly one condition" rule is enforced in the provider', async () => {
+    const value = await tool(harness, 'browser_wait').execute({ session_id: 's1', time_ms: 5 }, exec())
+    expect(value).toMatchObject({ action: 'wait', satisfied: true })
+    expect(harness.browserCalls).toEqual([{ method: 'mutate', args: { kind: 'wait', sessionId: 's1', timeMs: 5 } }])
+  })
+
+  it('renders a navigated mutation with the re-snapshot instruction', async () => {
+    const definition = tool(harness, 'browser_click')
+    const blocks = definition.output.render({ session_id: 's1' }, {
+      session_id: 's1',
+      action: 'click',
+      epoch: 5,
+      url: 'https://example.com/next',
+      title: 'Next',
+      navigated: true,
+    })
+
+    const text = String((blocks[0] as { text: string }).text)
+    expect(text).toContain('NAVIGATION DETECTED')
+    expect(text).toContain('browser_snapshot')
     expect(text).toContain('untrusted')
   })
 })

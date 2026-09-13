@@ -10,8 +10,20 @@
  * | `browser_snapshot` | 紧凑页面大纲（可访问性树 + 可操作 ref） |
  * | `browser_screenshot` | 截图 → attachment |
  *
- * P1 起再加 click / fill / press / scroll / wait，并引入能力分级：
- * 必须先有一次 observation 才解锁 mutation，否则模型会「盲点」。
+ * P1 补齐操作面：
+ *
+ * | 工具 | 能力级 | 作用 |
+ * |---|---|---|
+ * | `browser_tabs` | read/mixed | 受控标签页的 list / activate / close |
+ * | `browser_click` | **mutate** | 按 ref 点元素（真实鼠标事件） |
+ * | `browser_fill` | **mutate** | 按 ref 填输入框（原生 setter + input/change 事件） |
+ * | `browser_press` | **mutate** | 按 ref 聚焦并按键 |
+ * | `browser_scroll` | **mutate** | 按 ref 在元素处滚动滚轮 |
+ * | `browser_wait` | read | 等时间 / 等文本出现 / 等 ref 元素消失 |
+ *
+ * 能力分级落在 {@link BROWSER_TOOL_CAPABILITIES}：`mutate` 级工具全部要求先有
+ * 一次 observation 才有可用 ref（provider 侧的纪元表是执法者，`BROWSER_SNAPSHOT_REQUIRED`
+ * 就是「先 snapshot」的机器可读信号），防止模型对没看过的页面「盲操作」。
  *
  * ## 三条贯穿全文件的约定
  *
@@ -28,12 +40,12 @@
 
 import type { Context } from '@deepseek-ai/cordis'
 import { defineTool } from '@deepseek-ai/dsh-tools'
-import type { GenericCallView } from '@deepseek-ai/dsh-tools'
+import type { GenericCallView, ParameterSchemaSpec } from '@deepseek-ai/dsh-tools'
 import z from '@deepseek-ai/schemastery'
 import type { ImageAttachmentRef } from '@deepseek-ai/dsh-attachment'
 import type {} from '@deepseek-ai/dsh-system-prompt'
 import type {} from '../browser/index.ts'
-import type { BrowserSession } from '../browser/index.ts'
+import type { BrowserMutationRequest, BrowserSession } from '../browser/index.ts'
 import { noteLoaded } from '../debug.ts'
 
 /** Cordis 插件名，用于加载器诊断。 */
@@ -117,8 +129,56 @@ function formatScreenshotOutput(args: { session_id: string }, value: ScreenshotO
   return `Captured ${scope} at ${value.width}x${value.height} px (session_id=${args.session_id}, ref epoch ${value.epoch}), saved as image attachment ${value.attachment.attachmentId}.`
 }
 
-/** 待执行卡片：一条只读观察。 */
-function observeCall(title: string, kind: 'read' | 'fetch', rawInput: unknown): GenericCallView {
+/** `browser_tabs` 的输出。 */
+interface TabsOutput {
+  action: 'list' | 'activate' | 'close'
+  session_id?: string
+  tabs: { session_id: string; url: string; title: string; active?: boolean }[]
+}
+
+/** mutation 工具的输出。 */
+interface MutationOutput {
+  session_id: string
+  action: 'click' | 'fill' | 'press' | 'scroll' | 'wait'
+  epoch: number
+  url: string
+  title: string
+  navigated: boolean
+  satisfied?: boolean
+}
+
+/** 标签页清单的文本渲染。 */
+function formatTabsOutput(value: TabsOutput): string {
+  const header = value.action === 'list'
+    ? `${value.tabs.length} controlled tab(s) (tabs this session opened; user tabs are never listed or touched):`
+    : `${value.action === 'activate' ? 'Activated' : 'Closed'} session_id=${value.session_id ?? ''}. Controlled tab(s) now:`
+  const rows = value.tabs.length === 0
+    ? ['(none — open one with browser_open)']
+    : value.tabs.map(tab =>
+      `- session_id=${tab.session_id}${tab.active === true ? ' [foreground]' : ''} — ${tab.url}${tab.title.length > 0 ? ` (${tab.title})` : ''}`)
+  return [header, ...rows, '', UNTRUSTED_PAGE_CONTENT_NOTICE].join('\n')
+}
+
+/** mutation 结果的文本渲染：模型最需要知道的是「页面是否被导航、ref 是否还活着」。 */
+function formatMutationOutput(value: MutationOutput): string {
+  const navigation = value.navigated
+    ? '\nNAVIGATION DETECTED: every ref from earlier snapshots is now invalid — run browser_snapshot again before any ref-based call.'
+    : '\nRefs from the latest snapshot are still valid unless the page changed on its own.'
+  const wait = value.satisfied === undefined
+    ? ''
+    : value.satisfied
+      ? '\nThe awaited condition became true before the timeout.'
+      : '\nThe awaited condition did NOT become true before the timeout; decide whether to retry, re-snapshot, or give up.'
+  return [
+    `${value.action} done on session_id=${value.session_id} (now at ${value.url}, ref epoch ${value.epoch}).`,
+    navigation,
+    wait,
+    `\n${UNTRUSTED_PAGE_CONTENT_NOTICE}`,
+  ].join('')
+}
+
+/** 待执行卡片：一条观察/操作。`kind` 沿用 dsh 的 `ToolCallKind` 词表。 */
+function observeCall(title: string, kind: 'read' | 'fetch' | 'edit' | 'execute', rawInput: unknown): GenericCallView {
   return { card: 'generic', title, kind, rawInput }
 }
 
@@ -132,6 +192,18 @@ export interface Config {
   snapshot?: boolean
   /** 注册 `browser_screenshot`。默认 true。 */
   screenshot?: boolean
+  /** 注册 `browser_tabs`。默认 true。 */
+  tabs?: boolean
+  /** 注册 `browser_click`。默认 true。 */
+  click?: boolean
+  /** 注册 `browser_fill`。默认 true。 */
+  fill?: boolean
+  /** 注册 `browser_press`。默认 true。 */
+  press?: boolean
+  /** 注册 `browser_scroll`。默认 true。 */
+  scroll?: boolean
+  /** 注册 `browser_wait`。默认 true。 */
+  wait?: boolean
 }
 
 export const Config: z<Config> = z.object({
@@ -139,6 +211,34 @@ export const Config: z<Config> = z.object({
   navigate: z.boolean().default(true),
   snapshot: z.boolean().default(true),
   screenshot: z.boolean().default(true),
+  tabs: z.boolean().default(true),
+  click: z.boolean().default(true),
+  fill: z.boolean().default(true),
+  press: z.boolean().default(true),
+  scroll: z.boolean().default(true),
+  wait: z.boolean().default(true),
+})
+
+/**
+ * 能力分级：每个 `browser_*` 工具是只读（`read`）还是会改页面/状态（`mutate`）。
+ *
+ * `browser_tabs` 按动作分级没有单一答案（list 是读、close 是改），按最坏情况归为
+ * `mutate`；`browser_wait` 不改页面，归 `read`；`browser_navigate` 改的是地址栏
+ * 而非页面内容，且纪元作废语义已覆盖它，保持 P0 以来的 `read` 分类。
+ * 执法者在 provider 侧：`mutate` 类工具的 ref 解析一律先过纪元表，
+ * 没观察过页面就是 `BROWSER_SNAPSHOT_REQUIRED`。
+ */
+export const BROWSER_TOOL_CAPABILITIES: Readonly<Record<string, 'read' | 'mutate'>> = Object.freeze({
+  browser_open: 'read',
+  browser_navigate: 'read',
+  browser_snapshot: 'read',
+  browser_screenshot: 'read',
+  browser_wait: 'read',
+  browser_tabs: 'mutate',
+  browser_click: 'mutate',
+  browser_fill: 'mutate',
+  browser_press: 'mutate',
+  browser_scroll: 'mutate',
 })
 
 /**
@@ -187,6 +287,53 @@ const ATTACHMENT_SCHEMA = {
     width: { type: 'number', required: true },
     height: { type: 'number', required: true },
     name: { type: 'string' },
+  },
+} as const
+
+/** `browser_tabs` 清单里的一项。 */
+const TAB_ITEM_SCHEMA = {
+  type: 'object',
+  additionalProperties: false,
+  properties: {
+    session_id: { type: 'string', required: true },
+    url: { type: 'string', required: true },
+    title: { type: 'string', required: true },
+    active: { type: 'boolean' },
+  },
+} as const
+
+/** `browser_tabs` 的输出。 */
+const TABS_OUTPUT_SCHEMA = {
+  type: 'object',
+  additionalProperties: false,
+  properties: {
+    action: { type: 'string', required: true },
+    session_id: { type: 'string' },
+    tabs: { type: 'array', required: true, items: TAB_ITEM_SCHEMA },
+  },
+} as const
+
+/** 五个 mutation 工具共用的输出契约。 */
+const MUTATION_OUTPUT_SCHEMA = {
+  type: 'object',
+  additionalProperties: false,
+  properties: {
+    session_id: { type: 'string', required: true },
+    action: { type: 'string', required: true },
+    epoch: { type: 'integer', required: true },
+    url: { type: 'string', required: true },
+    title: { type: 'string', required: true },
+    navigated: { type: 'boolean', required: true },
+  },
+} as const
+
+/** `browser_wait` 在共用契约上多一个 `satisfied`。 */
+const WAIT_OUTPUT_SCHEMA = {
+  type: 'object',
+  additionalProperties: false,
+  properties: {
+    ...MUTATION_OUTPUT_SCHEMA.properties,
+    satisfied: { type: 'boolean', required: true },
   },
 } as const
 
@@ -382,9 +529,226 @@ function registerScreenshot(ctx: Context): void {
   }))
 }
 
+/**
+ * 注册 `browser_tabs`：受控标签页的 list / activate / close。
+ *
+ * 所有权边界与 P0 一致 —— 清单里只有**本插件自己开**的标签页；用户的标签页
+ * 既不出现也不会被关掉。
+ */
+function registerTabs(ctx: Context): void {
+  ctx.tools.register(defineTool({
+    name: 'browser_tabs',
+    description:
+      'Manage the browser tabs THIS plugin opened. action=list returns every controlled tab with its session_id, url and title (and which one is in the foreground when the provider can tell). action=activate brings a controlled tab to the foreground (only meaningful for providers that own a real window). action=close closes a controlled tab and releases it; the session id becomes unusable afterwards. Tabs the user opened themselves are never listed, activated or closed. '
+      + UNTRUSTED_PAGE_CONTENT_NOTICE,
+    parameters: {
+      action: {
+        type: 'string',
+        required: true,
+        description: 'One of: list, activate, close.',
+      },
+      session_id: {
+        type: 'string',
+        description: 'Session id to activate or close. Required for activate and close; omit for list.',
+      },
+    },
+    output: {
+      schema: TABS_OUTPUT_SCHEMA,
+      // schema DSL 的 value 类型把 action 推成 string；这里收口成具体形态。
+      render: (_args, value) => [{ type: 'text', text: formatTabsOutput(value as TabsOutput) }],
+    },
+    timeoutMs: BROWSER_OBSERVE_TIMEOUT_MS,
+    async execute(args, exec) {
+      if (args.action !== 'list' && args.action !== 'activate' && args.action !== 'close') {
+        throw new Error('action must be one of: list, activate, close')
+      }
+      if (args.action !== 'list' && args.session_id === undefined) {
+        throw new Error(`action "${args.action}" requires session_id`)
+      }
+      const request = args.action === 'list'
+        ? { kind: 'list' as const }
+        : args.action === 'activate'
+          ? { kind: 'activate' as const, sessionId: args.session_id as string }
+          : { kind: 'close' as const, sessionId: args.session_id as string }
+      const result = await ctx.browser.tabs(request, exec.signal)
+      return {
+        action: result.action,
+        ...result.sessionId !== undefined ? { session_id: result.sessionId } : {},
+        tabs: result.tabs.map(tab => ({
+          session_id: tab.sessionId,
+          url: tab.url,
+          title: tab.title,
+          ...tab.active !== undefined ? { active: tab.active } : {},
+        })),
+      }
+    },
+    presentCall: args => observeCall(
+      args.action === 'list' ? 'List browser tabs' : `${args.action === 'activate' ? 'Activate' : 'Close'} tab ${args.session_id ?? ''}`,
+      args.action === 'list' ? 'read' : 'execute',
+      args.session_id ?? args.action,
+    ),
+  }))
+}
+
+/**
+ * 五个 mutation 工具共用的注册壳：输出契约、渲染、错误语义完全一致，
+ * 只有参数、描述与请求体不同。`build` 收到规范化后的参数（session_id 必有）。
+ */
+function registerMutationTool(
+  ctx: Context,
+  spec: {
+    name: string
+    action: 'click' | 'fill' | 'press' | 'scroll' | 'wait'
+    description: string
+    parameters: ParameterSchemaSpec
+    timeoutMs: number
+    build: (args: Record<string, unknown>, sessionId: string) => BrowserMutationRequest
+    presentTitle: (args: Record<string, unknown>) => string
+  },
+): void {
+  ctx.tools.register(defineTool({
+    name: spec.name,
+    description: spec.description,
+    parameters: spec.parameters,
+    output: {
+      schema: spec.action === 'wait' ? WAIT_OUTPUT_SCHEMA : MUTATION_OUTPUT_SCHEMA,
+      render: (_args, value) => [{ type: 'text', text: formatMutationOutput(value as MutationOutput) }],
+    },
+    timeoutMs: spec.timeoutMs,
+    async execute(rawArgs, exec) {
+      const args = rawArgs as Record<string, unknown>
+      const sessionId = args['session_id'] as string
+      const result = await ctx.browser.mutate(spec.build(args, sessionId), exec.signal)
+      return {
+        session_id: result.sessionId,
+        action: result.action,
+        epoch: result.epoch,
+        url: result.url,
+        title: result.title,
+        navigated: result.navigated,
+        ...result.satisfied !== undefined ? { satisfied: result.satisfied } : {},
+      }
+    },
+    presentCall: rawArgs => observeCall(
+      spec.presentTitle(rawArgs as Record<string, unknown>),
+      'edit',
+      (rawArgs as Record<string, unknown>)['ref'],
+    ),
+  }))
+}
+
+/** 注册 `browser_click` / `browser_fill` / `browser_press` / `browser_scroll` / `browser_wait`（可逐个关闭）。 */
+function registerMutations(
+  ctx: Context,
+  enabled: { click: boolean; fill: boolean; press: boolean; scroll: boolean; wait: boolean },
+): void {
+  const STALE_NOTICE =
+    'The ref must come from the LATEST browser_snapshot; a ref from an older epoch fails with BROWSER_STALE_REF and the only recovery is a fresh snapshot.'
+
+  if (enabled.click) registerMutationTool(ctx, {
+    name: 'browser_click',
+    action: 'click',
+    description:
+      'Click an element by ref (from the latest browser_snapshot) with real mouse events at its center; the element is scrolled into view first. Use browser_snapshot first so refs exist. A click may navigate the page; when it does, the result reports navigated=true and every earlier ref becomes invalid. '
+      + STALE_NOTICE + ' ' + UNTRUSTED_PAGE_CONTENT_NOTICE,
+    parameters: {
+      session_id: SESSION_ID_PARAMETER,
+      ref: { type: 'string', required: true, description: 'Element ref from the latest browser_snapshot, like e12.' },
+    },
+    timeoutMs: BROWSER_NAVIGATION_TIMEOUT_MS,
+    build: (args, sessionId) => ({ kind: 'click', sessionId, ref: args['ref'] as string }),
+    presentTitle: args => `Click ${String(args['ref'])}`,
+  })
+
+  if (enabled.fill) registerMutationTool(ctx, {
+    name: 'browser_fill',
+    action: 'fill',
+    description:
+      'Fill an input or textarea by ref (from the latest browser_snapshot) with value; sets the value through the native setter and fires input + change events, so framework-controlled fields (React etc.) notice it. For non-editable elements it replaces textContent. '
+      + STALE_NOTICE + ' ' + UNTRUSTED_PAGE_CONTENT_NOTICE,
+    parameters: {
+      session_id: SESSION_ID_PARAMETER,
+      ref: { type: 'string', required: true, description: 'Element ref of the field, from the latest browser_snapshot.' },
+      value: { type: 'string', required: true, description: 'Text to put into the field (replaces the current value).' },
+    },
+    timeoutMs: BROWSER_OBSERVE_TIMEOUT_MS,
+    build: (args, sessionId) => ({ kind: 'fill', sessionId, ref: args['ref'] as string, value: args['value'] as string }),
+    presentTitle: args => `Fill ${String(args['ref'])}`,
+  })
+
+  if (enabled.press) registerMutationTool(ctx, {
+    name: 'browser_press',
+    action: 'press',
+    description:
+      'Focus an element by ref (from the latest browser_snapshot) and press a key on the keyboard. Key is a named key (Enter, Tab, Escape, Backspace, Delete, ArrowUp/Down/Left/Right, Home, End, PageUp, PageDown, Space) or a single character. Pressing Enter on a form field may submit and navigate; navigated=true then means earlier refs are invalid. '
+      + STALE_NOTICE + ' ' + UNTRUSTED_PAGE_CONTENT_NOTICE,
+    parameters: {
+      session_id: SESSION_ID_PARAMETER,
+      ref: { type: 'string', required: true, description: 'Element ref to focus, from the latest browser_snapshot.' },
+      key: { type: 'string', required: true, description: 'Named key or a single character, e.g. Enter, Tab, ArrowDown, a.' },
+    },
+    timeoutMs: BROWSER_NAVIGATION_TIMEOUT_MS,
+    build: (args, sessionId) => ({ kind: 'press', sessionId, ref: args['ref'] as string, key: args['key'] as string }),
+    presentTitle: args => `Press ${String(args['key'])} on ${String(args['ref'])}`,
+  })
+
+  if (enabled.scroll) registerMutationTool(ctx, {
+    name: 'browser_scroll',
+    action: 'scroll',
+    description:
+      'Scroll by ref: dispatches a real mouse-wheel event at the center of the element (scrolled into view first), so the scrollable container under it moves. Give deltaX and/or deltaY in pixels (positive = right/down). '
+      + STALE_NOTICE + ' ' + UNTRUSTED_PAGE_CONTENT_NOTICE,
+    parameters: {
+      session_id: SESSION_ID_PARAMETER,
+      ref: { type: 'string', required: true, description: 'Element ref to scroll at, from the latest browser_snapshot.' },
+      delta_x: { type: 'number', description: 'Horizontal scroll amount in pixels; positive scrolls right.' },
+      delta_y: { type: 'number', description: 'Vertical scroll amount in pixels; positive scrolls down.' },
+    },
+    timeoutMs: BROWSER_OBSERVE_TIMEOUT_MS,
+    build: (args, sessionId) => ({
+      kind: 'scroll',
+      sessionId,
+      ref: args['ref'] as string,
+      ...typeof args['delta_x'] === 'number' ? { deltaX: args['delta_x'] } : {},
+      ...typeof args['delta_y'] === 'number' ? { deltaY: args['delta_y'] } : {},
+    }),
+    presentTitle: args => `Scroll at ${String(args['ref'])}`,
+  })
+
+  if (enabled.wait) registerMutationTool(ctx, {
+    name: 'browser_wait',
+    action: 'wait',
+    description:
+      'Wait for exactly ONE condition on a controlled tab: time_ms (plain sleep), text (poll until the page text contains it), or ref (poll until the element for that ref is removed from the document, e.g. a spinner disappears). Text/ref waits give up after the provider wait timeout and report satisfied=false instead of failing. '
+      + STALE_NOTICE + ' ' + UNTRUSTED_PAGE_CONTENT_NOTICE,
+    parameters: {
+      session_id: SESSION_ID_PARAMETER,
+      time_ms: { type: 'integer', description: 'Plain wait duration in milliseconds (1-30000). Exactly one of time_ms / text / ref.' },
+      text: { type: 'string', description: 'Wait until the page text contains this string. Exactly one of time_ms / text / ref.' },
+      ref: { type: 'string', description: 'Wait until this ref (from the latest browser_snapshot) is gone from the document. Exactly one of time_ms / text / ref.' },
+    },
+    timeoutMs: BROWSER_NAVIGATION_TIMEOUT_MS,
+    build: (args, sessionId) => ({
+      kind: 'wait',
+      sessionId,
+      ...typeof args['time_ms'] === 'number' ? { timeMs: args['time_ms'] } : {},
+      ...typeof args['text'] === 'string' && args['text'] !== '' ? { text: args['text'] } : {},
+      ...typeof args['ref'] === 'string' ? { ref: args['ref'] } : {},
+    }),
+    presentTitle: (args) => {
+      const what = args['time_ms'] !== undefined
+        ? `${String(args['time_ms'])}ms`
+        : args['text'] !== undefined
+          ? `text "${String(args['text'])}"`
+          : `ref ${String(args['ref'])}`
+      return `Wait for ${what}`
+    },
+  })
+}
+
 /** `presentResult` 占位：P0 不做图片回放呈现，交回通用卡片。 */
 /**
- * 注册 P0 的四个只读工具与系统提示分段。
+ * 注册 P0 的只读工具、P1 的操作工具与系统提示分段。
  *
  * `config` 容忍 `undefined`：本插件的 patch 行不带 `config:` 键，此时加载器传进来的是空值。
  *
@@ -401,14 +765,23 @@ export function apply(ctx: Context, config: Config = {}): void {
     navigate: config.navigate ?? true,
     snapshot: config.snapshot ?? true,
     screenshot: config.screenshot ?? true,
+    tabs: config.tabs ?? true,
+    click: config.click ?? true,
+    fill: config.fill ?? true,
+    press: config.press ?? true,
+    scroll: config.scroll ?? true,
+    wait: config.wait ?? true,
   }
 
   ctx.systemPrompt.section({
     name: 'tool:browser',
     order: TOOL_BROWSER_SECTION_ORDER,
     text: ({ scope }) => ctx.tools.get('browser_snapshot', scope) === undefined ? '' : [
-      'Use the browser tools to read a real Chrome tab driven over CDP, not to run code in the page.',
-      'browser_open returns a session_id; pass it to every later call. browser_snapshot returns a compact accessibility outline in which each actionable element carries a ref like [ref=e12]; refs exist only for the epoch that produced them, and both browser_navigate and a further browser_snapshot invalidate them. When a ref call fails with BROWSER_STALE_REF, take a fresh snapshot rather than retrying the same ref.',
+      'Use the browser tools to read and operate a real Chrome tab driven over CDP, not to run code in the page.',
+      'browser_open returns a session_id; pass it to every later call. browser_snapshot returns a compact accessibility outline in which each actionable element carries a ref like [ref=e12]; refs exist only for the epoch that produced them, and both browser_navigate and a further browser_snapshot invalidate them.',
+      'browser_click, browser_fill, browser_press and browser_scroll act on an element by ref; ALWAYS run browser_snapshot first — mutating a page you never observed fails with BROWSER_SNAPSHOT_REQUIRED, and using a ref from an older epoch fails with BROWSER_STALE_REF. Both are recovered the same way: take a fresh snapshot and use its refs, never retry the old one.',
+      'browser_wait waits for a timeout, a text to appear, or an element (ref) to disappear. browser_tabs lists, activates or closes the tabs this session opened.',
+      'If an action reports navigated=true, or a ref call fails with BROWSER_STALE_REF, the page has changed: re-snapshot before further ref use.',
       'browser_screenshot stores its PNG as an attachment.',
       UNTRUSTED_PAGE_CONTENT_NOTICE,
     ].join(' '),
@@ -418,10 +791,15 @@ export function apply(ctx: Context, config: Config = {}): void {
   if (enabled.navigate) registerNavigate(ctx)
   if (enabled.snapshot) registerSnapshot(ctx)
   if (enabled.screenshot) registerScreenshot(ctx)
+  if (enabled.tabs) registerTabs(ctx)
+  if (enabled.click || enabled.fill || enabled.press || enabled.scroll || enabled.wait) {
+    registerMutations(ctx, { click: enabled.click, fill: enabled.fill, press: enabled.press, scroll: enabled.scroll, wait: enabled.wait })
+  }
 
-  // 四个工具全部注册完再报，这样这一行同时证明了 browser 能力与 systemPrompt / attachments
+  // 全部注册完再报，这样这一行同时证明 browser 能力与 systemPrompt / attachments
   // 都已就绪 —— 任一个 inject 没解析成功，本函数根本不会被执行。
-  const registered = Object.entries(enabled).filter(([, on]) => on).map(([key]) => key)
+  const registered = (Object.keys(enabled) as (keyof typeof enabled)[])
+    .filter(key => enabled[key])
   noteLoaded('tool-browser', `registered ${registered.join(', ')}`)
 }
 

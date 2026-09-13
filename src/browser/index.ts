@@ -14,17 +14,23 @@ import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import { BrowserError } from './types.ts'
 import type {
+  BrowserMutationRequest,
+  BrowserMutationResult,
   BrowserNavigateRequest,
   BrowserObservation,
   BrowserObserveRequest,
   BrowserOpenRequest,
   BrowserProvider,
   BrowserSession,
+  BrowserTabsRequest,
+  BrowserTabsResult,
 } from './types.ts'
 
 export { BrowserError, isBrowserError } from './types.ts'
 export type {
   BrowserErrorCode,
+  BrowserMutationRequest,
+  BrowserMutationResult,
   BrowserNavigateRequest,
   BrowserObservation,
   BrowserObserveRequest,
@@ -34,6 +40,9 @@ export type {
   BrowserScreenshot,
   BrowserSession,
   BrowserSnapshot,
+  BrowserTabInfo,
+  BrowserTabsRequest,
+  BrowserTabsResult,
 } from './types.ts'
 
 declare module '@deepseek-ai/cordis' {
@@ -118,6 +127,25 @@ export class BrowserRuntime extends Service {
    */
   async observe(request: BrowserObserveRequest, signal?: AbortSignal): Promise<BrowserObservation> {
     return this.resolve().observe(request, signal)
+  }
+
+  /**
+   * P1：标签页管理（本插件自己开的受控标签页）。
+   * @param request - 清单 / 切前台 / 关闭。
+   * @param signal - 可选取消信号，转发给 provider。
+   */
+  async tabs(request: BrowserTabsRequest, signal?: AbortSignal): Promise<BrowserTabsResult> {
+    return this.resolve().tabs(request, signal)
+  }
+
+  /**
+   * P1：按 ref 定位的页面操作。provider 侧先过 ref 纪元再发命令，
+   * 旧 ref 一律 `BROWSER_STALE_REF` / `BROWSER_SNAPSHOT_REQUIRED`。
+   * @param request - click / fill / press / scroll / wait。
+   * @param signal - 可选取消信号，转发给 provider。
+   */
+  async mutate(request: BrowserMutationRequest, signal?: AbortSignal): Promise<BrowserMutationResult> {
+    return this.resolve().mutate(request, signal)
   }
 
   /**

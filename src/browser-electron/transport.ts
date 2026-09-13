@@ -126,6 +126,16 @@ export class ElectronWindowTransport implements CdpTransport {
     await bridge.activate(targetId)
   }
 
+  /**
+   * 当前前台标签 id。宿主的标签条自己维护「谁在前台」，问它要就行；
+   * 这也是 electron provider 的 `browser_tabs(list)` 能标出 `active` 的原因。
+   */
+  async activeTargetId(): Promise<string | undefined> {
+    const bridge = await this.requireBridge()
+    const bar = await bridge.bar().catch(() => undefined)
+    return bar?.active
+  }
+
   /** @inheritdoc */
   async connect(webSocketDebuggerUrl: string): Promise<CdpConnection> {
     const tabId = tabIdFromHandle(webSocketDebuggerUrl)
