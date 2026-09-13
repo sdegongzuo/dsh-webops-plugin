@@ -10,20 +10,23 @@
  * `Page.navigate` / `Runtime.evaluate` / `Accessibility.getFullAXTree` / `Page.captureScreenshot`
  * 一个都不用改。
  *
- * ## 窗口结构：一个壳 + 若干 `WebContentsView`
+ * ## 窗口结构：`BaseWindow` + 两个 `WebContentsView`
  *
  * ```
- * ┌─ BrowserWindow（壳）───────────────────────────┐
- * │ 主 webContents：tabbar.html  （顶部 40px 标签条） │
- * │ ┌─ WebContentsView（当前标签）────────────────┐ │
- * │ │ 页面内容，attach 了 debugger                 │ │
- * │ └─────────────────────────────────────────────┘ │
+ * ┌─ BaseWindow（壳）──────────────────────────────┐
+ * │ WebContentsView #1：tabbar.html（顶部 40px 标签条）│
+ * │ WebContentsView #2：当前标签（z 序在标签条之下）    │
+ * │  └ 页面内容，attach 了 debugger                  │
  * └─────────────────────────────────────────────────┘
  * ```
  *
- * Electron 没有原生标签页，所以标签条自己画：壳的主 `webContents` 加载
- * `tabbar.html`，点击通过 preload 的 IPC 回到主进程。标签内容用
- * `WebContentsView`（`BrowserView` 已废弃）—— 它是被 embed 的 `webContents`，
+ * Electron 没有原生标签页，所以标签条自己画。**为什么用 `BaseWindow` 而不是
+ * `BrowserWindow`**：`BrowserWindow` 自带的主 `webContents` 是一块全窗口的合成层，
+ * 实测（Electron 44 / Windows）它会盖住 `contentView.addChildView` 加进来的子视图 ——
+ * 表现是「标签条画出来了、页面内容永远灰屏」。`BaseWindow` 没有主 webContents，
+ * 标签条和页面内容都是显式定界的 `WebContentsView`，层级只由插入顺序决定：
+ * 标签条永远最后插入（最顶层）。点击通过 preload 的 IPC 回到主进程。
+ * 标签内容用 `WebContentsView` —— 它是被 embed 的 `webContents`，
  * 因此和单窗口时代一样能 attach debugger。
  *
  * ## 通道：TCP，不是 stdio
@@ -62,7 +65,7 @@
  * @module dsh-webops-plugin/browser-electron/host
  */
 
-const { app, BrowserWindow, WebContentsView, ipcMain } = require('electron')
+const { app, BaseWindow, WebContentsView, ipcMain } = require('electron')
 const net = require('node:net')
 const path = require('node:path')
 
@@ -72,6 +75,8 @@ const TAB_BAR_HEIGHT = 40
 /** 标签页；`debugger` 在 `dom-ready` 之后才有。 */
 const tabs = new Map()
 let shell
+/** 标签条视图：独立 `WebContentsView`，永远保持最顶层。 */
+let tabBar
 let activeTabId
 let sequence = 0
 let connection
@@ -85,10 +90,10 @@ function send(message) {
   connection.write(`${JSON.stringify(message)}\n`)
 }
 
-/** 把当前标签列表推给标签条页面。 */
+/** 往标签条页面推当前标签列表。 */
 function sendTabBar() {
-  if (shell === undefined || shell.isDestroyed() || shell.webContents.isDestroyed()) return
-  shell.webContents.send('dsh-tabs', [...tabs.values()].map(tab => ({
+  if (tabBar === undefined || tabBar.webContents.isDestroyed()) return
+  tabBar.webContents.send('dsh-tabs', [...tabs.values()].map(tab => ({
     id: tab.id,
     title: tab.view.webContents.getTitle(),
     url: tab.view.webContents.getURL(),
@@ -97,17 +102,24 @@ function sendTabBar() {
 }
 
 /**
- * 重算所有标签的位置：内容区从标签条下面开始，只有活动标签可见。
+ * 重算所有视图的位置：标签条占顶部 40px，内容区从这条线开始，只有活动标签可见。
  *
  * 用 `setVisible` 而不是把非活动标签从视图树上摘下来 —— 摘下来的 `webContents`
  * 尺寸会变成 0，之后再对它 `Page.captureScreenshot` 会拿到空白或报错。
+ *
+ * 标签条每次都重新插入到末尾（最顶层）：`addChildView` 是「追加到顶」语义，
+ * 新开的标签视图会盖住它，不重排的话标签条就被页面盖住了。
  */
 function layout() {
   if (shell === undefined || shell.isDestroyed()) return
-  const [width, height] = shell.getContentSize()
-  const contentHeight = Math.max(0, height - TAB_BAR_HEIGHT)
+  const bounds = shell.getContentBounds()
+  const contentHeight = Math.max(0, bounds.height - TAB_BAR_HEIGHT)
+  tabBar.setBounds({ x: 0, y: 0, width: bounds.width, height: TAB_BAR_HEIGHT })
+  const container = shell.contentView
+  container.removeChildView(tabBar)
+  container.addChildView(tabBar)
   for (const tab of tabs.values()) {
-    tab.view.setBounds({ x: 0, y: TAB_BAR_HEIGHT, width, height: contentHeight })
+    tab.view.setBounds({ x: 0, y: TAB_BAR_HEIGHT, width: bounds.width, height: contentHeight })
     if (typeof tab.view.setVisible === 'function') tab.view.setVisible(tab.id === activeTabId)
   }
 }
@@ -122,19 +134,23 @@ function ensureShell(size) {
     shell.focus()
     return shell
   }
-  shell = new BrowserWindow({
+  shell = new BaseWindow({
     width: size?.width ?? 1200,
     height: size?.height ?? 860,
     show: true,
     title: 'dsh browser',
     backgroundColor: '#f2f3f5',
+  })
+  tabBar = new WebContentsView({
     webPreferences: {
       preload: path.join(__dirname, 'tabbar-preload.cjs'),
       contextIsolation: true,
       sandbox: true,
     },
   })
-  shell.loadFile(path.join(__dirname, 'tabbar.html'))
+  shell.contentView.addChildView(tabBar)
+  layout()
+  void tabBar.webContents.loadFile(path.join(__dirname, 'tabbar.html'))
   shell.on('resize', layout)
   shell.on('closed', () => {
     shell = undefined
@@ -292,9 +308,9 @@ async function handle(command) {
     case 'bar': {
       // 「标签条到底画出来没有」必须可断言：它是这个宿主唯一一块自己写的 UI，
       // 而宿主没有 stdout 之外的人能看见它。数一下 DOM 里的 `.tab` 节点即可。
-      const rendered = shell === undefined || shell.isDestroyed()
+      const rendered = tabBar === undefined || !tabBar.webContents || tabBar.webContents.isDestroyed()
         ? -1
-        : await shell.webContents.executeJavaScript('document.querySelectorAll(".tab").length').catch(() => -1)
+        : await tabBar.webContents.executeJavaScript('document.querySelectorAll(".tab").length').catch(() => -1)
       send({
         type: 'bar',
         id: command.id,
