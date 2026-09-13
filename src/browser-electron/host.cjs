@@ -14,7 +14,9 @@
  *
  * ```
  * ┌─ BaseWindow（壳）──────────────────────────────┐
- * │ WebContentsView #1：tabbar.html（顶部 40px 标签条）│
+ * │ WebContentsView #1：tabbar.html（顶部 76px 标签条）│
+ * │  ├ 标签行 40px（+ 号、标签、hint）                 │
+ * │  └ 地址栏行 36px（←/→/⟳ + URL 输入框）            │
  * │ WebContentsView #2：当前标签（z 序在标签条之下）    │
  * │  └ 页面内容，attach 了 debugger                  │
  * └─────────────────────────────────────────────────┘
@@ -28,6 +30,14 @@
  * 标签条永远最后插入（最顶层）。点击通过 preload 的 IPC 回到主进程。
  * 标签内容用 `WebContentsView` —— 它是被 embed 的 `webContents`，
  * 因此和单窗口时代一样能 attach debugger。
+ *
+ * ## 主进程 ↔ tabbar 页的 IPC 约定
+ *
+ * - 主进程 `webContents.send('dsh-tabs', tabs)` → tabbar 页重画标签行；
+ *   tabbar 页 `window.dshTabBar.{select,close,create}` → `ipcMain.on('dsh-tab-*')`。
+ * - 主进程 `webContents.send('dsh-nav-state', state)` → tabbar 页同步地址栏
+ *   （`{ url, canGoBack, canForward }`）；tabbar 页 `window.dshTabBar.nav(action, url?)`
+ *   → `ipcMain.on('dsh-nav')`，`action ∈ 'back' | 'forward' | 'reload' | 'navigate'`。
  *
  * ## 通道：TCP，不是 stdio
  *
@@ -76,8 +86,12 @@ const { app, BaseWindow, WebContentsView, ipcMain, Menu } = require('electron')
 const net = require('node:net')
 const path = require('node:path')
 
-/** 标签条高度（像素）；标签内容区从这条线开始。 */
-const TAB_BAR_HEIGHT = 40
+/** 标签行高度（像素）。 */
+const TAB_STRIP_HEIGHT = 40
+/** 地址栏行高度（像素）。 */
+const ADDRESS_BAR_HEIGHT = 36
+/** 顶部两行（标签行 + 地址栏）合计高度；标签内容区从这条线开始。 */
+const TAB_BAR_HEIGHT = TAB_STRIP_HEIGHT + ADDRESS_BAR_HEIGHT
 /** 等 `devtools-opened` / `devtools-closed` 落定的上限；超时一律按「没开成」处理。 */
 const DEVTOOLS_SETTLE_TIMEOUT_MS = 3000
 /**
@@ -105,8 +119,9 @@ function send(message) {
   connection.write(`${JSON.stringify(message)}\n`)
 }
 
-/** 往标签条页面推当前标签列表。 */
+/** 往标签条页面推当前标签列表；顺带把地址栏状态一并推过去。 */
 function sendTabBar() {
+  sendNavState()
   if (tabBar === undefined || tabBar.webContents.isDestroyed()) return
   tabBar.webContents.send('dsh-tabs', [...tabs.values()].map(tab => ({
     id: tab.id,
@@ -117,7 +132,61 @@ function sendTabBar() {
 }
 
 /**
- * 重算所有视图的位置：标签条占顶部 40px，内容区从这条线开始，只有活动标签可见。
+ * 往标签条页面推地址栏状态（只看活动标签）。
+ *
+ * 没有活动标签时推一份空快照，让输入框清空、前进/后退按钮置灰。
+ */
+function sendNavState() {
+  if (tabBar === undefined || tabBar.webContents.isDestroyed()) return
+  const entry = activeTabId !== undefined ? tabs.get(activeTabId) : undefined
+  if (entry === undefined) {
+    tabBar.webContents.send('dsh-nav-state', { url: '', canGoBack: false, canForward: false })
+    return
+  }
+  const wc = entry.view.webContents
+  tabBar.webContents.send('dsh-nav-state', {
+    url: wc.getURL(),
+    canGoBack: wc.canGoBack(),
+    canForward: wc.canGoForward(),
+  })
+}
+
+/**
+ * 地址栏输入的最小规范化：`trim()` 后若不含 `://` 就补 `https://` 前缀。
+ * 空串原样返回（调用方按「忽略」处理）。
+ */
+function normalizeAddress(input) {
+  const trimmed = String(input ?? '').trim()
+  if (trimmed === '' || trimmed.includes('://')) return trimmed
+  return `https://${trimmed}`
+}
+
+/**
+ * 处理地址栏的导航指令；没有活动标签时忽略。
+ *
+ * 导航是异步的：committed 后 `did-navigate` 会再推一次状态，这里在动作之后
+ * `setTimeout(0)` 补一次 —— 让输入框 / 按钮先动起来，两道保险。
+ */
+function handleNav(action, url) {
+  const entry = activeTabId !== undefined ? tabs.get(activeTabId) : undefined
+  if (entry === undefined) return
+  const wc = entry.view.webContents
+  if (action === 'back') wc.goBack()
+  else if (action === 'forward') wc.goForward()
+  else if (action === 'reload') wc.reload()
+  else if (action === 'navigate') {
+    const target = normalizeAddress(url)
+    if (target === '') return
+    void wc.loadURL(target)
+  } else return
+  setTimeout(() => {
+    if (!tabs.has(entry.id)) return
+    sendTabBar()
+  }, 0)
+}
+
+/**
+ * 重算所有视图的位置：标签行 + 地址栏占顶部 76px，内容区从这条线开始，只有活动标签可见。
  *
  * 用 `setVisible` 而不是把非活动标签从视图树上摘下来 —— 摘下来的 `webContents`
  * 尺寸会变成 0，之后再对它 `Page.captureScreenshot` 会拿到空白或报错。
@@ -214,6 +283,18 @@ function openTab(url, size) {
       return
     }
     send({ type: 'event', tabId: id, method: 'Inspector.detached', params: { reason } })
+  })
+  // 页面发起的弹窗（window.open / target=_blank）：Electron 默认放行成原生新窗口，
+  // 这里拦下并转成我们标签系统里的**新标签页**——与真浏览器行为一致。
+  // 只放行 http(s)；about:blank 与自定义 scheme 一律拒绝（防 javascript: 注入）。
+  view.webContents.setWindowOpenHandler(({ url }) => {
+    if (!/^https?:/i.test(url ?? '')) return { action: 'deny' }
+    try {
+      openTab(url)
+    } catch {
+      // 开不出来就只拒绝：页面侧表现为 window.open 返回 null，与弹窗拦截一致。
+    }
+    return { action: 'deny' }
   })
   entry.ready = new Promise((resolveReady) => {
     view.webContents.once('dom-ready', () => {
@@ -525,6 +606,10 @@ app.whenReady().then(() => {
   ipcMain.on('dsh-tab-select', (_event, id) => { activateTab(id) })
   ipcMain.on('dsh-tab-close', (_event, id) => { closeTab(id) })
   ipcMain.on('dsh-tab-create', () => { void openTab('about:blank') })
+  ipcMain.on('dsh-nav', (_event, payload) => {
+    const { action, url } = payload ?? {}
+    handleNav(action, url)
+  })
 
   // BaseWindow 没有 webContents，默认菜单的「切换开发者工具」打在空处。
   // 这里显式接管：指向活动标签的 webContents。与插件 CDP 调试器**不是互斥** ——
@@ -582,3 +667,7 @@ app.whenReady().then(() => {
     process.stdout.write(`${JSON.stringify({ type: 'listening', port: address.port })}\n`)
   })
 })
+
+// 供单测使用：地址规范化与导航处理不依赖 Electron 运行时，导出后单测可以直接钉住
+// 「规范化补 https://」与「无活动标签时忽略」；作为 Electron 入口运行时无副作用。
+module.exports = { normalizeAddress, handleNav }
