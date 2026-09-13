@@ -1,0 +1,131 @@
+name: release
+
+# 发版流程：推 `v*` tag 即触发，产出 Windows x64 便携版 zip 并挂到 GitHub Release。
+#
+# 为什么必须在这里 clone deepseek-harness：本仓 devDependencies 里 13 个 dsh 包用的是
+# pnpm 的 `link:../deepseek-harness/...`，指向**本机的 harness checkout**（README「接进
+# dsh」有完整理由：npm 上的 dsh 包停在 0.0.1-rc.1，且 `@deepseek-ai/dsh-type-meta`
+# 根本没发布）。所以 Actions 里不做这一步，`pnpm install` 必然失败。
+#
+# 也可以手动触发（Actions → Run workflow），用来补发某个已存在的 tag。
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 要发布的 tag（必须已推送到远端）
+        required: true
+        type: string
+      harness_ref:
+        description: deepseek-harness 的 ref（tag / branch / sha）
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  # 默认 pin 到与本机 checkout 一致的提交，避免上游 main 漂移把构建搞挂。
+  HARNESS_REF: ${{ inputs.harness_ref || 'c291e7961a515f6d7af9304e7fd1d257929aef26' }}
+  TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+
+jobs:
+  portable-win-x64:
+    runs-on: windows-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: 签出本仓
+        uses: actions/checkout@v4
+
+      - name: 装 pnpm + Node
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11.12.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: 取 deepseek-harness 源码
+        shell: pwsh
+        run: |
+          $dest = Join-Path (Split-Path $PWD) 'deepseek-harness'
+          Write-Host "harness ref: $env:HARNESS_REF → $dest"
+          New-Item -ItemType Directory -Path $dest -Force | Out-Null
+          Set-Location $dest
+          git init --quiet
+          git remote add origin https://github.com/deepseek-ai/deepseek-harness.git
+          git fetch --depth 1 origin $env:HARNESS_REF
+          git checkout --quiet FETCH_HEAD
+          Get-Content package.json | Select-Object -First 3
+
+      - name: 装 harness 的依赖
+        # link 目标内部会 import 第三方包，而 pnpm 对 `link:` 依赖不装目标的依赖，
+        # 得靠 harness 根自己的 node_modules 兜住解析。这一步失败不必然导致构建失败
+        # （first-party 包在 tsdown 里是 external，多数情况不读源码），所以不阻断。
+        shell: pwsh
+        continue-on-error: true
+        timeout-minutes: 25
+        run: |
+          Set-Location (Join-Path (Split-Path $PWD) 'deepseek-harness')
+          pnpm install --ignore-scripts --no-frozen-lockfile
+
+      - name: 装本仓依赖
+        run: pnpm install --no-frozen-lockfile
+
+      - name: 构建
+        run: pnpm build
+
+      - name: 打便携版 zip
+        shell: pwsh
+        run: |
+          $version = $env:TAG -replace '^v', ''
+          Write-Host "version: $version"
+          node scripts/package-portable.mjs $version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $zip = Get-ChildItem dist/*.zip | Select-Object -First 1
+          $hash = (Get-FileHash $zip.FullName -Algorithm SHA256).Hash.ToLower()
+          Add-Content -Path $env:GITHUB_ENV -Value "ZIP_NAME=$($zip.Name)"
+          Add-Content -Path $env:GITHUB_ENV -Value "ZIP_SHA256=$hash"
+
+      - name: 写 release 说明
+        shell: pwsh
+        run: |
+          # 单引号 here-string：内容不插值也不转义（反引号在双引号 here-string 里是转义符）。
+          $notes = @'
+          ## dsh-webops-plugin __TAG__
+
+          为 DeepSeek Harness 增加客户端网页操作与调试能力的插件：browser_* 工具 +
+          CDP provider + Electron 窗口 provider + 客户端观察面板。
+
+          ### 安装
+
+          解压到不含中文与空格的路径后执行：
+
+              dsh plugin --profile <profile> add <解压目录>
+
+          完整步骤与验证见包内 `INSTALL.md`。
+
+          ### 产物
+
+          | 文件 | SHA-256 |
+          | --- | --- |
+          | __ZIP__ | __SHA__ |
+          '@
+          $notes = $notes -replace '__TAG__', $env:TAG `
+                           -replace '__ZIP__', $env:ZIP_NAME `
+                           -replace '__SHA__', $env:ZIP_SHA256
+          $notes | Out-File -FilePath dist/notes.md -Encoding utf8
+
+      - name: 发布 Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "$env:TAG" `
+            --title "$env:TAG" `
+            --notes-file dist/notes.md `
+            (Get-ChildItem dist/*.zip).FullName
