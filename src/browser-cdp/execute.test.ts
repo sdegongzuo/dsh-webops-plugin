@@ -1,0 +1,117 @@
+import { describe, expect, it } from 'vitest'
+import { BrowserError } from '../browser/types.ts'
+import {
+  assertExecuteAllowed,
+  BROWSER_EXECUTE_ALLOWED,
+  extractEvaluateValue,
+  translateEvaluateError,
+} from './execute.ts'
+
+/** 方案 3.3 点名必须拒绝的命令（前缀类 + 单条类），外加一个完全未知的命令。 */
+const DENIED_METHODS = [
+  'Emulation.setDeviceMetricsOverride',
+  'Emulation.setUserAgentOverride',
+  'Target.attachToTarget',
+  'Browser.close',
+  'Fetch.enable',
+  'Overlay.highlightNode',
+  'Input.dispatchMouseEvent',
+  'Network.emulateNetworkConditions',
+  'Network.setExtraHTTPHeaders',
+  'Network.setCacheDisabled',
+  'Page.addScriptToEvaluateOnNewDocument',
+  'Page.removeScriptToEvaluateOnNewDocument',
+  'Page.setBypassCSP',
+  'Debugger.enable',
+  'completely.unknown.command',
+]
+
+describe('assertExecuteAllowed', () => {
+  it('rejects every denied command with the full method name in the message', () => {
+    for (const method of DENIED_METHODS) {
+      try {
+        assertExecuteAllowed(method)
+        throw new Error(`expected "${method}" to be rejected`)
+      } catch (error: unknown) {
+        // 循环体内部的哨兵错误要重新抛出，别把它当成「被正确拒绝」。
+        if (!(error instanceof BrowserError)) throw error
+        expect(error.code, method).toBe('BROWSER_EXECUTE_NOT_ALLOWED')
+        expect(error.message, method).toContain(method)
+      }
+    }
+  })
+
+  it('accepts exactly the allow-listed commands and nothing else', () => {
+    for (const method of BROWSER_EXECUTE_ALLOWED) {
+      expect(() => assertExecuteAllowed(method), method).not.toThrow()
+    }
+    // 未列入名单的新命令默认拒 —— 这条是白名单制的立身之本。
+    expect(() => assertExecuteAllowed('Network.setBlockedURLs')).toThrow(BrowserError)
+  })
+})
+
+describe('extractEvaluateValue', () => {
+  it('rejects a DOM node that silently serializes to {} ([V22])', () => {
+    for (const remote of [
+      { type: 'object', subtype: 'node', value: {} },
+      { type: 'object', subtype: 'node' },
+      { type: 'object', value: {} },
+    ]) {
+      try {
+        extractEvaluateValue({ result: remote })
+        throw new Error('expected an unserializable rejection')
+      } catch (error: unknown) {
+        if (!(error instanceof BrowserError)) throw error
+        expect(error.code).toBe('BROWSER_EXECUTE_RESULT_UNSERIALIZABLE')
+        expect(error.message).toContain('JSON string')
+      }
+    }
+  })
+
+  it('passes plain values through unchanged', () => {
+    expect(extractEvaluateValue({ result: { type: 'number', value: 2 } })).toBe(2)
+    expect(extractEvaluateValue({ result: { type: 'string', value: 'ok' } })).toBe('ok')
+    expect(extractEvaluateValue({ result: { type: 'object', value: { a: 1 } } })).toEqual({ a: 1 })
+    expect(extractEvaluateValue({ result: { type: 'object', value: [1, 2] } })).toEqual([1, 2])
+    expect(extractEvaluateValue({ result: { type: 'undefined' } })).toBeUndefined()
+    expect(extractEvaluateValue({ result: { type: 'boolean', value: null } })).toBeNull()
+  })
+
+  it('rejects function and symbol results that cannot cross the CDP boundary', () => {
+    for (const type of ['function', 'symbol']) {
+      expect(() => extractEvaluateValue({ result: { type } }))
+        .toThrow(expect.objectContaining({ code: 'BROWSER_EXECUTE_RESULT_UNSERIALIZABLE' }))
+    }
+  })
+
+  it('rejects a malformed CDP result body', () => {
+    expect(() => extractEvaluateValue(undefined))
+      .toThrow(expect.objectContaining({ code: 'BROWSER_EXECUTE_RESULT_UNSERIALIZABLE' }))
+    expect(() => extractEvaluateValue({}))
+      .toThrow(expect.objectContaining({ code: 'BROWSER_EXECUTE_RESULT_UNSERIALIZABLE' }))
+  })
+})
+
+describe('translateEvaluateError', () => {
+  it('maps both [V22] serialization error messages to the unserializable code', () => {
+    for (const message of [
+      'Object reference chain is too long',
+      "Object couldn't be returned by value",
+    ]) {
+      const mapped = translateEvaluateError(new BrowserError(`CDP error: ${message}`, 'BROWSER_PROTOCOL_ERROR'))
+      expect(mapped).toBeInstanceOf(BrowserError)
+      expect((mapped as BrowserError).code).toBe('BROWSER_EXECUTE_RESULT_UNSERIALIZABLE')
+    }
+  })
+
+  it('passes unrelated errors through untouched', () => {
+    const protocol = new BrowserError('CDP error: something else', 'BROWSER_PROTOCOL_ERROR')
+    expect(translateEvaluateError(protocol)).toBe(protocol)
+
+    const detached = new BrowserError('the CDP debugger is detached', 'BROWSER_DEBUGGER_DETACHED')
+    expect(translateEvaluateError(detached)).toBe(detached)
+
+    const plain = new Error('not ours')
+    expect(translateEvaluateError(plain)).toBe(plain)
+  })
+})

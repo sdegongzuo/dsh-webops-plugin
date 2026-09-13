@@ -8,7 +8,7 @@
 
 import { describe, expect, it, vi } from 'vitest'
 import { CdpConnection } from '../browser-cdp/protocol.ts'
-import type { BridgeTab, BridgeTabBar, EventListener, TabHostChannel } from './bridge.ts'
+import type { BridgeDevTools, BridgeTab, BridgeTabBar, EventListener, TabHostChannel, TakeoverListener } from './bridge.ts'
 import { ElectronBrowserProvider } from './provider.ts'
 import { WindowCdpSocket } from './socket.ts'
 import { ElectronWindowTransport, tabHandle, tabIdFromHandle } from './transport.ts'
@@ -23,8 +23,9 @@ class FakeHost implements TabHostChannel {
   disposed = false
   isClosed = false
   /** 命令的固定结果；设成 Error 表示这条命令失败。 */
-  respond: (method: string) => unknown = () => ({})
+  respond: (method: string, params: Record<string, unknown>) => unknown = () => ({})
   private readonly eventListeners = new Map<string, Set<EventListener>>()
+  private readonly takeoverListeners = new Set<TakeoverListener>()
   private readonly closeListeners = new Set<() => void>()
 
   open(url: string): Promise<BridgeTab> {
@@ -45,7 +46,7 @@ class FakeHost implements TabHostChannel {
 
   command(tabId: string, method: string, params: Record<string, unknown>): Promise<unknown> {
     this.commands.push({ tabId, method, params })
-    const result = this.respond(method)
+    const result = this.respond(method, params)
     return result instanceof Error ? Promise.reject(result) : Promise.resolve(result)
   }
 
@@ -63,6 +64,21 @@ class FakeHost implements TabHostChannel {
   activate(tabId: string): Promise<void> {
     this.activated.push(tabId)
     return Promise.resolve()
+  }
+
+  /** 每次 DevTools 切换的动作序列，供断言。 */
+  readonly devToolsToggles: string[] = []
+  /** 宿主回报的打开状态；`toggleDevTools` 每次翻转它。 */
+  devToolsIsOpen = false
+
+  toggleDevTools(): Promise<BridgeDevTools> {
+    this.devToolsIsOpen = !this.devToolsIsOpen
+    this.devToolsToggles.push(this.devToolsIsOpen ? 'opened' : 'closed')
+    return Promise.resolve({
+      action: this.devToolsIsOpen ? 'opened' : 'closed',
+      isOpen: this.devToolsIsOpen,
+      tabId: undefined,
+    })
   }
 
   closeTab(tabId: string): Promise<void> {
@@ -84,6 +100,11 @@ class FakeHost implements TabHostChannel {
     return () => { set.delete(listener) }
   }
 
+  onTakeover(listener: TakeoverListener): () => void {
+    this.takeoverListeners.add(listener)
+    return () => { this.takeoverListeners.delete(listener) }
+  }
+
   onClose(listener: () => void): () => void {
     this.closeListeners.add(listener)
     return () => { this.closeListeners.delete(listener) }
@@ -92,6 +113,11 @@ class FakeHost implements TabHostChannel {
   /** 推一条 CDP 事件给某个窗口的订阅者。 */
   emit(tabId: string, method: string, params: unknown): void {
     for (const listener of [...this.eventListeners.get(tabId) ?? []]) listener(method, params)
+  }
+
+  /** 推一条人工接管通知（宿主发的是 `{ type: 'takeover', tabId, active }`）。 */
+  emitTakeover(tabId: string, active: boolean): void {
+    for (const listener of [...this.takeoverListeners]) listener(tabId, active)
   }
 
   /** 模拟整条通道断开。 */
@@ -107,6 +133,20 @@ function transportFor(host: FakeHost): ElectronWindowTransport {
     { electronPath: 'ignored', hostScript: 'ignored' },
     () => Promise.resolve(host),
   )
+}
+
+/** 让假宿主的 CDP 命令够 `provider.open` + `observe` 跑完：空白页 + 空 AX 树。 */
+function wireFakePage(host: FakeHost): void {
+  host.respond = (method, params) => {
+    if (method === 'Accessibility.getFullAXTree') return { nodes: [] }
+    if (method === 'Runtime.evaluate') {
+      const expression = String(params['expression'] ?? '')
+      return expression.includes('readyState')
+        ? { result: { value: true } }
+        : { result: { value: { url: 'about:blank', title: '' } } }
+    }
+    return {}
+  }
 }
 
 describe('窗口句柄', () => {
@@ -168,6 +208,24 @@ describe('ElectronWindowTransport', () => {
     await transport.activateTarget('t1')
 
     expect(host.activated).toEqual(['t1'])
+  })
+
+  it('toggleDevTools 透传到宿主，并回报宿主的真实状态', async () => {
+    const host = new FakeHost()
+    const transport = transportFor(host)
+
+    await expect(transport.toggleDevTools()).resolves.toEqual({ action: 'opened', isOpen: true, tabId: undefined })
+    await expect(transport.toggleDevTools()).resolves.toEqual({ action: 'closed', isOpen: false, tabId: undefined })
+    expect(host.devToolsToggles).toEqual(['opened', 'closed'])
+  })
+
+  it('不掩盖「openDevTools 静默失败」：action 说开了、真实状态说没开', async () => {
+    const host = new FakeHost()
+    const transport = transportFor(host)
+    host.toggleDevTools = () => Promise.resolve({ action: 'opened', isOpen: false, tabId: undefined })
+
+    // 宿主回什么就传什么 —— 抹平成「成功」就等于把静默失败这个坑盖住了。
+    await expect(transport.toggleDevTools()).resolves.toEqual({ action: 'opened', isOpen: false, tabId: undefined })
   })
 
   it('activeTargetId 从宿主的标签条状态里取前台 id', async () => {
@@ -246,6 +304,60 @@ describe('ElectronWindowTransport', () => {
     const host = new FakeHost()
     await expect(transportFor(host).dispose()).resolves.toBeUndefined()
     expect(host.disposed).toBe(false)
+  })
+})
+
+describe('人工接管（takeover）通知通道', () => {
+  it('transport 把宿主的 takeover 通知分发给订阅者，退订后不再收到', async () => {
+    const host = new FakeHost()
+    const transport = transportFor(host)
+    const seen: { tabId: string; active: boolean }[] = []
+    const unsubscribe = await transport.onTakeover((tabId, active) => { seen.push({ tabId, active }) })
+
+    host.emitTakeover('t1', true)
+    host.emitTakeover('t1', false)
+    unsubscribe()
+    host.emitTakeover('t1', true)
+
+    expect(seen).toEqual([{ tabId: 't1', active: true }, { tabId: 't1', active: false }])
+  })
+
+  it('provider 在 DevTools 打开时给 snapshot 带 takeover=true，且不推进 ref 纪元', async () => {
+    const host = new FakeHost()
+    wireFakePage(host)
+    const provider = new ElectronBrowserProvider({}, transportFor(host), true)
+    const session = await provider.open({})
+    // 订阅是异步挂上的（transport → bridge）；等一轮宏任务，别让测试靠时序侥幸。
+    await new Promise(resolve => setTimeout(resolve, 0))
+
+    const baseline = await provider.observe({ kind: 'snapshot', sessionId: session.id })
+    if (baseline.kind !== 'snapshot') throw new Error('expected a snapshot')
+    expect(baseline.takeover).toBeUndefined()
+    expect(baseline.epoch).toBe(1)
+
+    host.emitTakeover(session.id, true)
+    const during = await provider.observe({ kind: 'snapshot', sessionId: session.id })
+    if (during.kind !== 'snapshot') throw new Error('expected a snapshot')
+    expect(during.takeover).toBe(true)
+    // 接管只加提示：纪元照常「每次 snapshot +1」，没有额外跳跃（[V31]）。
+    expect(during.epoch).toBe(2)
+
+    host.emitTakeover(session.id, false)
+    const after = await provider.observe({ kind: 'snapshot', sessionId: session.id })
+    if (after.kind !== 'snapshot') throw new Error('expected a snapshot')
+    expect(after.takeover).toBeUndefined()
+    expect(after.epoch).toBe(3)
+  })
+
+  it('takeover 通知不进 CDP 事件流（不会被 WindowCdpSocket 当成事件收下）', async () => {
+    const host = new FakeHost()
+    const socket = new WindowCdpSocket(host, 't1')
+    const messages: string[] = []
+    socket.addEventListener('message', event => { messages.push((event as { data: string }).data) })
+
+    host.emitTakeover('t1', true)
+
+    expect(messages).toHaveLength(0)
   })
 })
 
@@ -363,6 +475,20 @@ describe('ElectronBrowserProvider', () => {
 
     expect(provider.isEnabled).toBe(true)
     expect(provider.available()).toBe(true)
+  })
+
+  it('dispose 连宿主一起收掉（基类只关会话，宿主是本插件 spawn 的）', async () => {
+    const host = new FakeHost()
+    const transport = transportFor(host)
+    const provider = new ElectronBrowserProvider({}, transport, true)
+    // 先把桥起起来：没起过桥时 `transport.dispose()` 是空操作，测不到东西。
+    await transport.version()
+
+    await provider.dispose()
+
+    // 只关会话的话，桥上的 TCP socket 会一直活着 —— 脚本和桌面端就都退不掉。
+    expect(host.disposed).toBe(true)
+    expect(provider.sessionCount).toBe(0)
   })
 })
 

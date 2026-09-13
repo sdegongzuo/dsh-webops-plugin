@@ -2,8 +2,12 @@ import { describe, expect, it } from 'vitest'
 import { Context } from '@deepseek-ai/cordis'
 import BrowserRuntime, { BrowserError } from './index.ts'
 import type {
+  BrowserConsoleRequest,
+  BrowserExecuteRequest,
+  BrowserLocateRequest,
   BrowserMutationRequest,
   BrowserNavigateRequest,
+  BrowserNetworkRequest,
   BrowserObserveRequest,
   BrowserOpenRequest,
   BrowserProvider,
@@ -40,6 +44,40 @@ function makeProvider(id: string, available: boolean): BrowserProvider {
       navigated: false,
     }),
     close: () => Promise.resolve(),
+    console: (request: BrowserConsoleRequest) => Promise.resolve({
+      kind: 'console',
+      sessionId: request.sessionId,
+      entries: [],
+      buffered: 0,
+      truncated: false,
+      replayTruncated: false,
+    }),
+    network: (request: BrowserNetworkRequest) => Promise.resolve({
+      kind: 'network',
+      sessionId: request.sessionId,
+      action: request.kind,
+      requests: [],
+    }),
+    execute: (request: BrowserExecuteRequest) => Promise.resolve({
+      kind: 'execute',
+      sessionId: request.sessionId,
+      method: request.method,
+      epoch: SESSION.epoch,
+      url: SESSION.url,
+      navigated: false,
+      truncated: false,
+    }),
+    locate: (request: BrowserLocateRequest) => Promise.resolve({
+      kind: 'locate',
+      sessionId: request.sessionId,
+      epoch: SESSION.epoch,
+      ref: request.ref,
+      x: 10,
+      y: 20,
+      width: 100,
+      height: 40,
+      centered: request.scroll ?? true,
+    }),
   }
 }
 
@@ -129,6 +167,26 @@ describe('BrowserRuntime forwarding', () => {
     await expect(browser.tabs({ kind: 'close', sessionId: 's1' })).resolves.toMatchObject({ action: 'close' })
     await expect(browser.mutate({ kind: 'click', sessionId: 's1', ref: 'e1' }))
       .resolves.toMatchObject({ kind: 'mutation', action: 'click', sessionId: 's1' })
+  })
+
+  it('forwards console, network and execute to the selected provider (P2)', async () => {
+    const browser = await mountBrowser()
+    browser.registerProvider(makeProvider('cdp', true))
+
+    await expect(browser.console({ sessionId: 's1' }))
+      .resolves.toMatchObject({ kind: 'console', sessionId: 's1' })
+    await expect(browser.network({ kind: 'list', sessionId: 's1' }))
+      .resolves.toMatchObject({ kind: 'network', action: 'list' })
+    await expect(browser.execute({ sessionId: 's1', method: 'Runtime.evaluate' }))
+      .resolves.toMatchObject({ kind: 'execute', method: 'Runtime.evaluate' })
+  })
+
+  it('forwards locate to the selected provider (P3)', async () => {
+    const browser = await mountBrowser()
+    browser.registerProvider(makeProvider('cdp', true))
+
+    await expect(browser.locate({ sessionId: 's1', ref: 'e1' }))
+      .resolves.toMatchObject({ kind: 'locate', sessionId: 's1', ref: 'e1', centered: true })
   })
 
   it('ignores providers without a dispose hook and reports the ones that fail', async () => {

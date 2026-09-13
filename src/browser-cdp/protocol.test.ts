@@ -89,6 +89,19 @@ describe('CdpConnection', () => {
     }))
   })
 
+  it('maps "No target available" onto the recoverable BROWSER_DEBUGGER_DETACHED', async () => {
+    const connection = new CdpConnection(socket)
+    const pending = connection.send('Runtime.evaluate', { expression: '1' })
+    socket.respond({ id: 1, error: { message: 'No target available' } })
+
+    // [V16]：detach 期间命令同步抛这条消息，re-attach 后恢复 —— 所以它是可恢复错误，
+    // 不是协议错误。
+    await expect(pending).rejects.toThrow(expect.objectContaining({
+      code: 'BROWSER_DEBUGGER_DETACHED',
+      message: expect.stringContaining('No target available') as unknown as string,
+    }))
+  })
+
   it('rejects every in-flight command when the socket closes, instead of hanging', async () => {
     const connection = new CdpConnection(socket)
     const pending = connection.send('Page.captureScreenshot')

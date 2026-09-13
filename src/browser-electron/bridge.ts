@@ -85,8 +85,31 @@ export interface BridgeTabBar {
   readonly active: string | undefined
 }
 
+/** 宿主报告的 DevTools 切换结果，见 {@link TabHostChannel.toggleDevTools}。 */
+export interface BridgeDevTools {
+  /** 这次动作是打开还是关闭。 */
+  readonly action: 'opened' | 'closed'
+  /**
+   * 宿主的**真实**打开状态。
+   *
+   * `action: 'opened'` 却带 `isOpen: false`，就是「`openDevTools` 静默失败」——
+   * 让位没成功（调试器还 attach 着）。这一条把它暴露出来，而不是回一个说谎的 ack。
+   */
+  readonly isOpen: boolean
+  /** 被操作的标签 id；没有活动标签时 `undefined`。 */
+  readonly tabId: string | undefined
+}
+
 /** 宿主事件监听器集合，按标签 id 归拢。 */
 export type EventListener = (method: string, params: unknown) => void
+
+/**
+ * 人工接管通知的监听器。
+ *
+ * `active` 是**幂等状态位**（有人正开着 DevTools），不是计数器 —— agent 自己
+ * `toggleDevTools()` 时也会收到同一条，调用方无需去重（方案 4.1.1）。
+ */
+export type TakeoverListener = (tabId: string, active: boolean) => void
 
 /**
  * 窗口宿主通道的公共面。
@@ -113,12 +136,26 @@ export interface TabHostChannel {
   command: (tabId: string, method: string, params: Record<string, unknown>) => Promise<unknown>
   /** 把某个标签页切到前台。 */
   activate: (tabId: string) => Promise<void>
+  /**
+   * 切换活动标签的开发者工具。
+   *
+   * 宿主只在「打开那一瞬」让位，随后立刻把调试器接回，所以调用返回时 CDP 通道应当
+   * 仍然可用。`isOpen` 是宿主的真实回报，用来暴露 `openDevTools` 的静默失败。
+   */
+  toggleDevTools: () => Promise<BridgeDevTools>
   /** 关掉一个标签页。 */
   closeTab: (tabId: string) => Promise<void>
   /** 关掉宿主与它开的所有窗口。 */
   dispose: () => Promise<void>
   /** 订阅某个标签页的 CDP 事件。 */
   onEvent: (tabId: string, listener: EventListener) => () => void
+  /**
+   * 订阅人工接管通知（方案 4.1.1）。
+   *
+   * 与 `onEvent` 并列但**故意不混进 CDP 事件流** —— `{ type: 'takeover' }` 是私有编排消息，
+   * 不是 CDP 方法；混进去会让「这哪来的 CDP 事件」变成下一个人要查的问题。
+   */
+  onTakeover: (listener: TakeoverListener) => () => void
   /** 订阅通道断开。 */
   onClose: (listener: () => void) => () => void
 }
@@ -136,6 +173,7 @@ export class ElectronWindowBridge implements TabHostChannel {
   private readonly commandTimeoutMs: number
   private readonly pending = new Map<number, Pending>()
   private readonly listeners = new Map<string, Set<EventListener>>()
+  private readonly takeoverListeners = new Set<TakeoverListener>()
   private readonly closeListeners = new Set<() => void>()
   private readonly windowSize: { readonly width: number; readonly height: number } | undefined
   private readonly keepAlive: boolean
@@ -254,6 +292,16 @@ export class ElectronWindowBridge implements TabHostChannel {
   }
 
   /**
+   * 订阅人工接管通知（方案 4.1.1）。
+   * @param listener - 每次收到 `{ type: 'takeover' }` 调用一次。
+   * @returns 退订函数。
+   */
+  onTakeover(listener: TakeoverListener): () => void {
+    this.takeoverListeners.add(listener)
+    return () => this.takeoverListeners.delete(listener)
+  }
+
+  /**
    * 让宿主开一个标签页（同一个壳窗口里）。
    *
    * @param url - 初始地址。
@@ -325,6 +373,23 @@ export class ElectronWindowBridge implements TabHostChannel {
    */
   async activate(tabId: string): Promise<void> {
     await this.request({ op: 'activate', tabId })
+  }
+
+  /**
+   * 切换活动标签的开发者工具，等宿主把状态落定后返回。
+   * @returns 这次是开还是关，以及宿主的真实打开状态。
+   */
+  async toggleDevTools(): Promise<BridgeDevTools> {
+    const response = await this.request({ op: 'devtools' })
+    const isOpen = response['isOpen'] === true
+    const reported = response['action']
+    return {
+      // 宿主没回 `action` 时**不替它猜「打开」** —— 用权威的 `isOpen` 反推。同一个类的
+      // `bar()` 对未知字段一律取保守值，这里保持同一种归一风格。
+      action: reported === 'opened' || reported === 'closed' ? reported : (isOpen ? 'opened' : 'closed'),
+      isOpen,
+      tabId: typeof response['tabId'] === 'string' ? response['tabId'] : undefined,
+    }
   }
 
   /**
@@ -402,6 +467,15 @@ export class ElectronWindowBridge implements TabHostChannel {
       return
     }
 
+    if (type === 'takeover') {
+      // 私有编排消息，**不进 CDP 事件流**：它既不是 `{ method, params }` 也不属于
+      // 任何 CDP domain。`active` 缺失时按「没在接管」处理（保守：不谎报人工介入）。
+      const tabId = String(message['tabId'])
+      const active = message['active'] === true
+      for (const listener of [...this.takeoverListeners]) listener(tabId, active)
+      return
+    }
+
     if (type === 'closed' && typeof id !== 'number') {
       // 用户自己在标签条上点了叉：当成一条 CDP 断连事件，让上层摘掉会话。
       const tabId = String(message['tabId'])
@@ -438,6 +512,7 @@ export class ElectronWindowBridge implements TabHostChannel {
     for (const listener of [...this.closeListeners]) listener()
     this.closeListeners.clear()
     this.listeners.clear()
+    this.takeoverListeners.clear()
     try {
       this.socket.destroy()
     } catch {

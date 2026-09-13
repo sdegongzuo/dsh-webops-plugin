@@ -1,0 +1,208 @@
+import { describe, expect, it } from 'vitest'
+import { CONSOLE_RING_CAPACITY, ConsoleCollector } from './console.ts'
+import { CdpConnection } from './protocol.ts'
+import type { CdpSocket } from './protocol.ts'
+
+/**
+ * 记录命令、可注入 CDP 事件的假 socket：所有命令都以空 result 回复。
+ * `refresh()` 发出的 `Runtime.enable` / `Log.enable` 依赖这个回复路径才能 resolve。
+ */
+class EventSocket implements CdpSocket {
+  closed = false
+  readonly methods: string[] = []
+  private readonly handlers = new Map<string, ((event: unknown) => void)[]>()
+
+  send(data: string): void {
+    const request = JSON.parse(data) as { id: number; method: string }
+    this.methods.push(request.method)
+    queueMicrotask(() => {
+      this.dispatch('message', { data: JSON.stringify({ id: request.id, result: {} }) })
+    })
+  }
+
+  close(): void {
+    this.closed = true
+  }
+
+  addEventListener(type: string, listener: (event: unknown) => void): void {
+    const list = this.handlers.get(type) ?? []
+    list.push(listener)
+    this.handlers.set(type, list)
+  }
+
+  /** 注入一条 CDP 事件（与真实 WebSocket 的 `{ method, params }` 帧同形）。 */
+  emit(method: string, params: unknown): void {
+    this.dispatch('message', { data: JSON.stringify({ method, params }) })
+  }
+
+  private dispatch(type: string, event: unknown): void {
+    for (const listener of [...this.handlers.get(type) ?? []]) listener(event)
+  }
+}
+
+/** 造一条 `Runtime.consoleAPICalled` 参数。timestamp 按协议是**微秒**。 */
+function rtParams(timestampMicros: number, text: string, type = 'log', contextId = 1): Record<string, unknown> {
+  return {
+    type,
+    timestamp: timestampMicros,
+    executionContextId: contextId,
+    args: [{ type: 'string', value: text }],
+  }
+}
+
+/** 造一条 `Log.entryAdded` 参数。timestamp 是毫秒（截断提示恒为 0）。 */
+function logParams(timestamp: number, text: string, source = 'javascript', level = 'error'): Record<string, unknown> {
+  return { entry: { source, level, text, timestamp } }
+}
+
+/** 一次 refresh + 紧随其后的重放：`[V13]` 里「每次 enable 都全量重放」的最小模拟。 */
+async function enableAndReplay(socket: EventSocket, collector: ConsoleCollector, replay: () => void): Promise<void> {
+  await collector.refresh({ timeoutMs: 100 })
+  replay()
+}
+
+describe('ConsoleCollector', () => {
+  it('survives three enable/replay rounds with exactly four distinct entries ([V13])', async () => {
+    const socket = new EventSocket()
+    const collector = new ConsoleCollector(new CdpConnection(socket))
+
+    // 实时收到 M1、M2（微秒时间戳，同桶内严格递增）。
+    socket.emit('Runtime.consoleAPICalled', rtParams(1000_500, 'M1'))
+    socket.emit('Runtime.consoleAPICalled', rtParams(1000_700, 'M2'))
+
+    // 第一次 enable → 全量重放 M1M2；随后实时来 M3。
+    await enableAndReplay(socket, collector, () => {
+      socket.emit('Runtime.consoleAPICalled', rtParams(1000_500, 'M1'))
+      socket.emit('Runtime.consoleAPICalled', rtParams(1000_700, 'M2'))
+    })
+    socket.emit('Runtime.consoleAPICalled', rtParams(1000_900, 'M3'))
+
+    // 第二次 enable → 重放 M1M2M3；随后实时来 M4。
+    await enableAndReplay(socket, collector, () => {
+      socket.emit('Runtime.consoleAPICalled', rtParams(1000_500, 'M1'))
+      socket.emit('Runtime.consoleAPICalled', rtParams(1000_700, 'M2'))
+      socket.emit('Runtime.consoleAPICalled', rtParams(1000_900, 'M3'))
+    })
+    socket.emit('Runtime.consoleAPICalled', rtParams(1001_200, 'M4'))
+
+    // 第三次 enable → 重放 M1M2M3M4。
+    await enableAndReplay(socket, collector, () => {
+      socket.emit('Runtime.consoleAPICalled', rtParams(1000_500, 'M1'))
+      socket.emit('Runtime.consoleAPICalled', rtParams(1000_700, 'M2'))
+      socket.emit('Runtime.consoleAPICalled', rtParams(1000_900, 'M3'))
+      socket.emit('Runtime.consoleAPICalled', rtParams(1001_200, 'M4'))
+    })
+
+    const result = collector.read({ limit: 50 })
+    // read 从最新往回返回。
+    expect(result.entries.map(entry => entry.text)).toEqual(['M4', 'M3', 'M2', 'M1'])
+    expect(result.buffered).toBe(4)
+    expect(result.truncated).toBe(false)
+  })
+
+  it('dedupes a 1000-entry replay after 1500 realtime entries ([V24]) without any duplication', async () => {
+    const socket = new EventSocket()
+    const collector = new ConsoleCollector(new CdpConnection(socket))
+
+    for (let index = 1; index <= 1500; index += 1) {
+      socket.emit('Runtime.consoleAPICalled', rtParams(index * 1000 + 7, `msg-${index}`))
+    }
+
+    // re-enable 后重放只回最新的 1000 条（msg-501 .. msg-1500），全部应被高水位吃掉。
+    await enableAndReplay(socket, collector, () => {
+      for (let index = 501; index <= 1500; index += 1) {
+        socket.emit('Runtime.consoleAPICalled', rtParams(index * 1000 + 7, `msg-${index}`))
+      }
+    })
+
+    const result = collector.read({ limit: 2000 })
+    expect(result.buffered).toBe(1000)
+    expect(result.entries.map(entry => entry.text)).toEqual(
+      Array.from({ length: 1000 }, (_, offset) => `msg-${1500 - offset}`),
+    )
+    expect(new Set(result.entries.map(entry => entry.text)).size).toBe(1000)
+  })
+
+  it('clips the ring buffer to its capacity, dropping the oldest entries first', () => {
+    const socket = new EventSocket()
+    const collector = new ConsoleCollector(new CdpConnection(socket))
+
+    for (let index = 1; index <= CONSOLE_RING_CAPACITY + 5; index += 1) {
+      socket.emit('Runtime.consoleAPICalled', rtParams(index * 1000 + 7, `msg-${index}`))
+    }
+
+    expect(collector.buffered).toBe(CONSOLE_RING_CAPACITY)
+    const oldest = collector.read({ limit: CONSOLE_RING_CAPACITY }).entries.at(-1)
+    const newest = collector.read({ limit: 1 }).entries[0]
+    expect(oldest?.text).toBe('msg-6')
+    expect(newest?.text).toBe(`msg-${CONSOLE_RING_CAPACITY + 5}`)
+  })
+
+  it('lets the [V39] truncation notice (timestamp=0) through the watermark exactly once', () => {
+    const socket = new EventSocket()
+    const collector = new ConsoleCollector(new CdpConnection(socket))
+
+    socket.emit('Log.entryAdded', logParams(5000, 'boom'))
+    // 提示条目 timestamp 恒为 0；重复 enable 会重复投递，必须只入账一次。
+    socket.emit('Log.entryAdded', logParams(0, '2010 log entries are not shown.', 'other', 'info'))
+    socket.emit('Log.entryAdded', logParams(0, '2010 log entries are not shown.', 'other', 'info'))
+    // 提示之后的新条目照常入账 —— 高水位没有被 timestamp=0 拉低。
+    socket.emit('Log.entryAdded', logParams(6000, 'after'))
+
+    expect(collector.truncatedReplay).toBe(true)
+    const texts = collector.read({ limit: 50 }).entries.map(entry => entry.text)
+    expect(texts).toEqual(['after', '2010 log entries are not shown.', 'boom'])
+    expect(texts.filter(text => text.includes('log entries are not shown'))).toHaveLength(1)
+  })
+
+  it('keeps per-domain buckets independent: identical timestamps in different domains both survive', () => {
+    const socket = new EventSocket()
+    const collector = new ConsoleCollector(new CdpConnection(socket))
+
+    // 两域时间戳口径不同（[V37]），跨域比大小本来就是错的；同值也不能互相挤掉。
+    socket.emit('Runtime.consoleAPICalled', rtParams(1789289442861_960, 'from-runtime'))
+    socket.emit('Log.entryAdded', logParams(1789289442861.96, 'from-log'))
+
+    const entries = collector.read({ limit: 50 }).entries
+    expect(entries.map(entry => entry.text).sort()).toEqual(['from-log', 'from-runtime'])
+    expect(entries.map(entry => entry.source).sort()).toEqual(['log', 'runtime'])
+  })
+
+  it('drops the second of two same-bucket entries with an identical timestamp (documented side effect)', () => {
+    const socket = new EventSocket()
+    const collector = new ConsoleCollector(new CdpConnection(socket))
+
+    socket.emit('Runtime.consoleAPICalled', rtParams(1000_500, 'first'))
+    socket.emit('Runtime.consoleAPICalled', rtParams(1000_500, 'second'))
+
+    expect(collector.read({ limit: 50 }).entries.map(entry => entry.text)).toEqual(['first'])
+  })
+
+  it('reads newest first and applies level and case-insensitive text filters', () => {
+    const socket = new EventSocket()
+    const collector = new ConsoleCollector(new CdpConnection(socket))
+
+    socket.emit('Runtime.consoleAPICalled', rtParams(1000, 'Cache miss', 'log'))
+    socket.emit('Runtime.consoleAPICalled', rtParams(2000, 'Failed to load', 'error'))
+    socket.emit('Runtime.consoleAPICalled', rtParams(3000, 'Another error', 'error'))
+    socket.emit('Log.entryAdded', logParams(4000, 'network hiccup', 'network', 'warning'))
+
+    expect(collector.read({ limit: 2 }).entries.map(entry => entry.text)).toEqual(['network hiccup', 'Another error'])
+    expect(collector.read({ limit: 50, level: 'ERROR' }).entries.map(entry => entry.text))
+      .toEqual(['Another error', 'Failed to load'])
+    expect(collector.read({ limit: 50, text: 'CACHE' }).entries.map(entry => entry.text)).toEqual(['Cache miss'])
+    expect(collector.read({ limit: 50, text: 'nomatch' }).entries).toEqual([])
+  })
+
+  it('sends Runtime.enable before Log.enable on every refresh and never disables anything', async () => {
+    const socket = new EventSocket()
+    const collector = new ConsoleCollector(new CdpConnection(socket))
+
+    await collector.refresh({ timeoutMs: 100 })
+    await collector.refresh({ timeoutMs: 100 })
+
+    expect(socket.methods.filter(method => method === 'Runtime.enable')).toHaveLength(2)
+    expect(socket.methods.filter(method => method === 'Log.enable')).toHaveLength(2)
+    expect(socket.methods.some(method => method.includes('disable'))).toBe(false)
+  })
+})

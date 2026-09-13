@@ -142,7 +142,7 @@ export class CdpConnection {
    * @param params - 方法参数。
    * @param options - 单次调用的超时与取消信号。
    * @returns 该方法的 `result`。
-   * @throws `BROWSER_CONNECTION_LOST` / `BROWSER_PROTOCOL_ERROR`。
+   * @throws `BROWSER_CONNECTION_LOST` / `BROWSER_PROTOCOL_ERROR` / `BROWSER_DEBUGGER_DETACHED`。
    */
   send<T>(method: string, params?: Record<string, unknown>, options?: CdpCommandOptions): Promise<T> {
     if (this.closed) {
@@ -245,10 +245,7 @@ export class CdpConnection {
       const error = message.error
       this.settle(message.id, (entry) => {
         if (error !== undefined) {
-          entry.reject(new BrowserError(
-            `CDP error: ${error.message ?? 'unknown error'}${error.code === undefined ? '' : ` (code ${error.code})`}`,
-            'BROWSER_PROTOCOL_ERROR',
-          ))
+          entry.reject(mapCdpError(error))
           return
         }
         entry.resolve(message.result)
@@ -288,6 +285,31 @@ export class CdpConnection {
 /** 统一的「连接没了」错误。 */
 function connectionLost(message: string): BrowserError {
   return new BrowserError(message, 'BROWSER_CONNECTION_LOST')
+}
+
+/**
+ * 把一条 CDP 错误负载翻译成能力错误。
+ *
+ * 只特判一种消息：`No target available`（`[V16]` 实测）。它只在「调试器被 detach」时出现 ——
+ * 例如宿主为了让位给 DevTools 而 detach 的那一瞬（detach 期间命令**同步**抛错、不挂起，
+ * re-attach 后自动恢复）。所以它映射成**可恢复**的 `BROWSER_DEBUGGER_DETACHED`，让模型知道
+ * 「重新观察 / 稍后重试」是对的，而不是把它当成协议错误。
+ *
+ * 其余一律保持原有的 `BROWSER_PROTOCOL_ERROR` 语义 —— 这条映射**只加一个分支**。
+ */
+function mapCdpError(error: CdpErrorPayload): BrowserError {
+  const detail = error.message ?? 'unknown error'
+  if (detail.includes('No target available')) {
+    return new BrowserError(
+      `the CDP debugger is detached from this target (${detail}); it re-attaches by itself once DevTools `
+      + 'finishes opening — retry the same call or take a fresh browser_snapshot',
+      'BROWSER_DEBUGGER_DETACHED',
+    )
+  }
+  return new BrowserError(
+    `CDP error: ${detail}${error.code === undefined ? '' : ` (code ${error.code})`}`,
+    'BROWSER_PROTOCOL_ERROR',
+  )
 }
 
 /** 把 fetch 的网络层失败翻译成能力错误码。 */

@@ -39,12 +39,27 @@ class FakeChrome {
   elementConnected = true
   /** P1：wait-text 里页面文本是否包含目标串。 */
   waitTextFound = true
+  /**
+   * P2：设置后**所有**命令都抛这条消息 —— 模拟 detach 期间 `webContents.debugger` 的
+   * 同步失败（`No target available`，`[V16]`）。
+   */
+  detachError: string | undefined
+  /** P2：`Network.getResponseBody` 的返回体。 */
+  responseBody = 'pong'
+  /** P3：`getBoundingClientRect` 的返回值（locate / click 共用）。 */
+  elementRect = { x: 10, y: 20, width: 100, height: 40 }
+  /** P3：设置后 `DOM.resolveNode` 抛这条消息（模拟节点已被销毁）。 */
+  resolveNodeError: string | undefined
 
   /** 记录一条命令并给出它的结果。 */
   handle(socket: FakeSocket, method: string, params: Record<string, unknown>): unknown {
+    if (this.detachError !== undefined) throw new Error(this.detachError)
     this.calls.push({ method, params })
     switch (method) {
       case 'Page.enable':
+      case 'Runtime.enable':
+      case 'Log.enable':
+      case 'Network.enable':
         return {}
       case 'Runtime.evaluate': {
         const expression = String(params['expression'])
@@ -59,6 +74,9 @@ class FakeChrome {
         if (expression.includes('innerText')) {
           return { result: { value: this.waitTextFound } }
         }
+        if (expression === '1 + 1') {
+          return { result: { value: 2 } }
+        }
         return expression.includes('readyState')
           ? { result: { value: this.readyStateComplete } }
           : { result: { value: { url: this.page.url, title: this.page.title } } }
@@ -66,10 +84,15 @@ class FakeChrome {
       case 'Runtime.callFunctionOn': {
         const fn = String(params['functionDeclaration'])
         if (fn.includes('getBoundingClientRect')) {
-          return { result: { value: { x: 10, y: 20, width: 100, height: 40 } } }
+          return { result: { value: { ...this.elementRect } } }
+        }
+        if (fn.includes('!this.isConnected')) {
+          // wait-hidden 的判据：true = 元素已从文档移除。
+          return { result: { value: !this.elementConnected } }
         }
         if (fn.includes('isConnected')) {
-          return { result: { value: !this.elementConnected } }
+          // locate 的守卫判据：true = 元素还连在文档上。
+          return { result: { value: this.elementConnected } }
         }
         if (fn.includes('dispatchEvent')) {
           return { result: { value: true } }
@@ -79,16 +102,27 @@ class FakeChrome {
       }
       case 'Accessibility.getFullAXTree':
         return { nodes: this.axeNodes }
+      case 'Network.getResponseBody':
+        return { body: this.responseBody, base64Encoded: false }
       case 'Page.navigate':
         this.href = String(params['url'])
         return this.navigateErrorText === undefined ? {} : { errorText: this.navigateErrorText }
       case 'Page.captureScreenshot':
         return { data: Buffer.from(this.png).toString('base64') }
       case 'DOM.resolveNode':
+        if (this.resolveNodeError !== undefined) throw new Error(this.resolveNodeError)
         return params['backendNodeId'] === 0 ? {} : { object: { objectId: 'obj-1' } }
       case 'DOM.getBoxModel':
         return this.boxModel === undefined ? {} : { model: { border: [...this.boxModel] } }
       case 'DOM.releaseObject':
+        return {}
+      case 'DOM.enable':
+        return {}
+      case 'Overlay.enable':
+        return {}
+      case 'Overlay.highlightNode':
+        return {}
+      case 'Overlay.hideHighlight':
         return {}
       case 'Input.dispatchMouseEvent':
         // 模拟「点在链接上会导航」：点击落点一变，地址跟着变。
@@ -684,5 +718,274 @@ describe('CdpBrowserProvider.mutate (P1)', () => {
       .rejects.toThrow(expect.objectContaining({ code: 'BROWSER_PROTOCOL_ERROR' }))
     await expect(timeoutProvider.mutate({ kind: 'wait', sessionId: 'tab-1', timeMs: 40_000 }))
       .rejects.toThrow(expect.objectContaining({ code: 'BROWSER_PROTOCOL_ERROR' }))
+  })
+})
+
+/** 往一条已建立的连接里注入一条 CDP 事件。 */
+function emitCdp(socket: FakeSocket, method: string, params: unknown): void {
+  socket.dispatch('message', { data: JSON.stringify({ method, params }) })
+}
+
+describe('P2: console / network / execute', () => {
+  let chrome: FakeChrome
+  let provider: CdpBrowserProvider
+
+  beforeEach(() => {
+    chrome = new FakeChrome()
+    chrome.axeNodes = PAGE_TREE
+    provider = new CdpBrowserProvider({ navigationTimeoutMs: 200 }, chrome.transport())
+  })
+
+  it('forces returnByValue on Runtime.evaluate and returns the value', async () => {
+    await provider.open({})
+
+    const result = await provider.execute({
+      sessionId: 'tab-1',
+      method: 'Runtime.evaluate',
+      params: { expression: '1 + 1' },
+    })
+
+    expect(result).toMatchObject({ kind: 'execute', method: 'Runtime.evaluate', value: 2, truncated: false })
+    const call = chrome.calls.filter(entry => entry.method === 'Runtime.evaluate')
+      .find(entry => entry.params['expression'] === '1 + 1')
+    expect(call?.params['returnByValue']).toBe(true)
+  })
+
+  it('refuses a non-allow-listed command before anything is sent', async () => {
+    await provider.open({})
+
+    await expect(provider.execute({
+      sessionId: 'tab-1',
+      method: 'Network.emulateNetworkConditions',
+      params: { offline: true },
+    })).rejects.toThrow(expect.objectContaining({
+      code: 'BROWSER_EXECUTE_NOT_ALLOWED',
+      message: expect.stringContaining('Network.emulateNetworkConditions') as unknown as string,
+    }))
+
+    expect(chrome.calls.some(call => call.method === 'Network.emulateNetworkConditions')).toBe(false)
+  })
+
+  it('runs a navigation command through the existing epoch path ([Page.navigate])', async () => {
+    await provider.open({})
+    const snapshot = await provider.observe({ kind: 'snapshot', sessionId: 'tab-1' })
+    if (snapshot.kind !== 'snapshot') throw new Error('expected a snapshot')
+    const epochBefore = snapshot.epoch
+    const staleRef = snapshot.refs[0]?.ref as string
+
+    const result = await provider.execute({
+      sessionId: 'tab-1',
+      method: 'Page.navigate',
+      params: { url: 'https://other.example/' },
+    })
+
+    // FakeChrome 里 page.url 不变 → detectNavigation 判定「地址没变」，
+    // 但导航类命令仍无条件作废旧纪元（Page.reload 语义）。
+    expect(result).toMatchObject({ kind: 'execute', method: 'Page.navigate', navigated: true })
+    expect(result.epoch).toBeGreaterThan(epochBefore)
+    // 旧 ref 已随纪元作废：再用必须立刻报 BROWSER_STALE_REF。
+    await expect(provider.observe({ kind: 'screenshot', sessionId: 'tab-1', ref: staleRef }))
+      .rejects.toThrow(expect.objectContaining({ code: 'BROWSER_STALE_REF' }))
+  })
+
+  it('re-enables both console domains before reading and propagates the detached error', async () => {
+    await provider.open({})
+    const socket = chrome.sockets[0]
+    if (socket === undefined) throw new Error('no connection was opened')
+
+    // detach 期间读 console：enable 命令同步抛 `No target available` → 可恢复错误上抛。
+    chrome.detachError = 'No target available'
+    await expect(provider.console({ sessionId: 'tab-1', limit: 10 }))
+      .rejects.toThrow(expect.objectContaining({ code: 'BROWSER_DEBUGGER_DETACHED' }))
+    const enablesBefore = chrome.calls.filter(call => call.method === 'Runtime.enable').length
+
+    // re-attach 后恢复：实时事件入缓冲，读取前先补发 enable，重放被高水位吃掉。
+    chrome.detachError = undefined
+    emitCdp(socket, 'Runtime.consoleAPICalled', {
+      type: 'log',
+      timestamp: 1000_500,
+      executionContextId: 1,
+      args: [{ type: 'string', value: 'hello' }],
+    })
+    const result = await provider.console({ sessionId: 'tab-1', limit: 10 })
+
+    expect(result).toMatchObject({ kind: 'console', replayTruncated: false })
+    expect(result.entries.map(entry => entry.text)).toEqual(['hello'])
+    expect(chrome.calls.filter(call => call.method === 'Runtime.enable').length).toBeGreaterThan(enablesBefore)
+    expect(chrome.calls.filter(call => call.method === 'Log.enable').length).toBeGreaterThan(0)
+  })
+
+  it('lists collected requests and fetches a body by the id from the events', async () => {
+    await provider.open({})
+    const socket = chrome.sockets[0]
+    if (socket === undefined) throw new Error('no connection was opened')
+
+    emitCdp(socket, 'Network.requestWillBeSent', {
+      requestId: '37668.2',
+      request: { method: 'GET', url: 'https://api.example.com/ping' },
+    })
+    emitCdp(socket, 'Network.responseReceived', {
+      requestId: '37668.2',
+      response: { url: 'https://api.example.com/ping', status: 200, mimeType: 'application/json' },
+    })
+
+    const listed = await provider.network({ kind: 'list', sessionId: 'tab-1' })
+    expect(listed).toMatchObject({ kind: 'network', action: 'list' })
+    expect(listed.requests).toEqual([
+      expect.objectContaining({
+        requestId: '37668.2',
+        method: 'GET',
+        url: 'https://api.example.com/ping',
+        status: 200,
+        mimeType: 'application/json',
+      }),
+    ])
+
+    const body = await provider.network({ kind: 'body', sessionId: 'tab-1', requestId: '37668.2' })
+    expect(body).toMatchObject({ kind: 'network', action: 'body', requestId: '37668.2', body: 'pong' })
+    const call = chrome.calls.filter(entry => entry.method === 'Network.getResponseBody').at(-1)
+    expect(call?.params).toEqual({ requestId: '37668.2' })
+  })
+})
+
+describe('P3: locate', () => {
+  let chrome: FakeChrome
+  let provider: CdpBrowserProvider
+
+  beforeEach(() => {
+    chrome = new FakeChrome()
+    chrome.axeNodes = PAGE_TREE
+    provider = new CdpBrowserProvider({ navigationTimeoutMs: 200 }, chrome.transport())
+  })
+
+  /** 开会话并 snapshot，返回第一个 ref（以及 snapshot 结束时的调用数）。 */
+  async function firstRef(): Promise<{ ref: string; before: number }> {
+    const session = await provider.open({})
+    const snapshot = await provider.observe({ kind: 'snapshot', sessionId: session.id })
+    if (snapshot.kind !== 'snapshot') throw new Error('expected a snapshot')
+    return { ref: snapshot.refs[0]?.ref as string, before: chrome.calls.length }
+  }
+
+  it('resolves the ref, checks isConnected, then measures a fresh rect — in that order', async () => {
+    const { ref, before } = await firstRef()
+
+    const result = await provider.locate({ sessionId: 'tab-1', ref })
+    expect(result).toEqual({
+      kind: 'locate',
+      sessionId: 'tab-1',
+      epoch: 1,
+      ref,
+      x: 10,
+      y: 20,
+      width: 100,
+      height: 40,
+      centered: true,
+    })
+
+    // 链路顺序（[V36]）：resolveNode → isConnected 守卫 → callFunctionOn 现算 rect。
+    const trace = chrome.calls.slice(before).map(call => call.method === 'Runtime.callFunctionOn'
+      ? String(call.params['functionDeclaration'])
+      : call.method)
+    expect(trace[0]).toBe('DOM.resolveNode')
+    expect(trace[1]).toContain('isConnected')
+    expect(trace[2]).toContain('getBoundingClientRect')
+    // 居中语义与 click 落点一致：量之前先 scrollIntoView。
+    expect(trace[2]).toContain('scrollIntoView')
+    // 远端对象句柄用完即还，且没有 DOM.enable / Overlay 之类的多余命令。
+    expect(trace).toContain('DOM.releaseObject')
+    expect(trace).not.toContain('Overlay.highlightNode')
+  })
+
+  it('skips scrollIntoView when scroll=false and reports centered=false', async () => {
+    const { ref } = await firstRef()
+
+    const result = await provider.locate({ sessionId: 'tab-1', ref, scroll: false })
+    expect(result.centered).toBe(false)
+
+    const rectCall = chrome.calls.filter(call =>
+      call.method === 'Runtime.callFunctionOn'
+      && String(call.params['functionDeclaration']).includes('getBoundingClientRect')).at(-1)
+    expect(String(rectCall?.params['functionDeclaration'])).not.toContain('scrollIntoView')
+  })
+
+  it('reports BROWSER_STALE_REF when resolveNode says the node is gone', async () => {
+    const { ref } = await firstRef()
+    chrome.resolveNodeError = 'No node with given id found'
+
+    await expect(provider.locate({ sessionId: 'tab-1', ref }))
+      .rejects.toThrow(expect.objectContaining({ code: 'BROWSER_STALE_REF' }))
+  })
+
+  it('keeps BROWSER_DEBUGGER_DETACHED distinct from a stale ref', async () => {
+    const { ref } = await firstRef()
+    // [V16]：detach 期间的同步失败是会话级状态，不该被守卫吞成 BROWSER_STALE_REF。
+    chrome.resolveNodeError = 'No target available'
+
+    await expect(provider.locate({ sessionId: 'tab-1', ref }))
+      .rejects.toThrow(expect.objectContaining({ code: 'BROWSER_DEBUGGER_DETACHED' }))
+  })
+
+  it('reports BROWSER_STALE_REF when isConnected is false ([V36]: resolveNode alone would miss this)', async () => {
+    const { ref } = await firstRef()
+    // replaceWith 换掉元素后 resolveNode 仍然成功，只有 isConnected 变 false —— 唯一会漏的场景。
+    chrome.elementConnected = false
+
+    await expect(provider.locate({ sessionId: 'tab-1', ref }))
+      .rejects.toThrow(expect.objectContaining({ code: 'BROWSER_STALE_REF' }))
+  })
+
+  it('reports a zero-sized box as not visible instead of returning 0 coordinates', async () => {
+    const { ref } = await firstRef()
+    chrome.elementRect = { x: 0, y: 0, width: 0, height: 0 }
+
+    await expect(provider.locate({ sessionId: 'tab-1', ref }))
+      .rejects.toThrow(expect.objectContaining({ code: 'BROWSER_PROTOCOL_ERROR' }))
+  })
+
+  it('requires a snapshot first and fails stale refs before any command', async () => {
+    await provider.open({})
+    await expect(provider.locate({ sessionId: 'tab-1', ref: 'e1' }))
+      .rejects.toThrow(expect.objectContaining({ code: 'BROWSER_SNAPSHOT_REQUIRED' }))
+    expect(chrome.calls.some(call => call.method === 'DOM.resolveNode')).toBe(false)
+  })
+
+  it('highlights through DOM.enable + Overlay.enable + highlightNode, never highlightRect', async () => {
+    const { ref, before } = await firstRef()
+
+    await provider.locate({ sessionId: 'tab-1', ref, highlight: true })
+
+    // 两道门的顺序（[V15][V20]）：DOM.enable → Overlay.enable → highlightNode。
+    const trace = chrome.calls.slice(before).map(call => call.method)
+    const domAt = trace.indexOf('DOM.enable')
+    const overlayAt = trace.indexOf('Overlay.enable')
+    const highlightAt = trace.indexOf('Overlay.highlightNode')
+    expect(domAt).toBeGreaterThanOrEqual(0)
+    expect(overlayAt).toBeGreaterThan(domAt)
+    expect(highlightAt).toBeGreaterThan(overlayAt)
+    // [V32]：highlightRect 会把整个视口染色，绝不允许出现。
+    expect(trace).not.toContain('Overlay.highlightRect')
+    const highlight = chrome.calls.slice(before).find(call => call.method === 'Overlay.highlightNode')
+    expect(highlight?.params['objectId']).toBe('obj-1')
+    expect(highlight?.params['highlightConfig']).toMatchObject({
+      contentColor: { r: 250, g: 200, b: 60, a: 0.5 },
+      borderColor: { r: 220, g: 120, b: 0, a: 1 },
+    })
+  })
+
+  it('clears its own highlight on a later locate without highlight, and never unprompted', async () => {
+    const { ref } = await firstRef()
+    await provider.locate({ sessionId: 'tab-1', ref, highlight: true })
+    await provider.locate({ sessionId: 'tab-1', ref })
+    expect(chrome.calls.some(call => call.method === 'Overlay.hideHighlight')).toBe(true)
+
+    // 没画过的会话不得多手去弹别人的层（[V31]：hideHighlight 只弹自己那层，但没画就该闭嘴）。
+    const fresh = new FakeChrome()
+    fresh.axeNodes = PAGE_TREE
+    const freshProvider = new CdpBrowserProvider({ navigationTimeoutMs: 200 }, fresh.transport())
+    await freshProvider.open({})
+    const snapshot = await freshProvider.observe({ kind: 'snapshot', sessionId: 'tab-1' })
+    if (snapshot.kind !== 'snapshot') throw new Error('expected a snapshot')
+    await freshProvider.locate({ sessionId: 'tab-1', ref: snapshot.refs[0]?.ref as string })
+    expect(fresh.calls.some(call => call.method === 'Overlay.hideHighlight')).toBe(false)
   })
 })

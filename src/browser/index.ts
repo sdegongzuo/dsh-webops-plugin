@@ -14,9 +14,17 @@ import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import { BrowserError } from './types.ts'
 import type {
+  BrowserConsoleRequest,
+  BrowserConsoleResult,
+  BrowserExecuteRequest,
+  BrowserExecuteResult,
+  BrowserLocateRequest,
+  BrowserLocateResult,
   BrowserMutationRequest,
   BrowserMutationResult,
   BrowserNavigateRequest,
+  BrowserNetworkRequest,
+  BrowserNetworkResult,
   BrowserObservation,
   BrowserObserveRequest,
   BrowserOpenRequest,
@@ -28,10 +36,20 @@ import type {
 
 export { BrowserError, isBrowserError } from './types.ts'
 export type {
+  BrowserConsoleEntry,
+  BrowserConsoleRequest,
+  BrowserConsoleResult,
   BrowserErrorCode,
+  BrowserExecuteRequest,
+  BrowserExecuteResult,
+  BrowserLocateRequest,
+  BrowserLocateResult,
   BrowserMutationRequest,
   BrowserMutationResult,
   BrowserNavigateRequest,
+  BrowserNetworkEntry,
+  BrowserNetworkRequest,
+  BrowserNetworkResult,
   BrowserObservation,
   BrowserObserveRequest,
   BrowserOpenRequest,
@@ -146,6 +164,43 @@ export class BrowserRuntime extends Service {
    */
   async mutate(request: BrowserMutationRequest, signal?: AbortSignal): Promise<BrowserMutationResult> {
     return this.resolve().mutate(request, signal)
+  }
+
+  /**
+   * P2：读取会话的 console 环形缓冲。provider 在读取前会补发 `Runtime.enable` /
+   * `Log.enable`（re-attach 后 enable 状态不保证还在，重放由高水位吃掉）。
+   * @param request - 会话 id 与 limit / level / text 过滤。
+   * @param signal - 可选取消信号，转发给 provider。
+   */
+  async console(request: BrowserConsoleRequest, signal?: AbortSignal): Promise<BrowserConsoleResult> {
+    return this.resolve().console(request, signal)
+  }
+
+  /**
+   * P2：列出网络请求或按 `requestId` 取响应体。`requestId` 直接用事件里的值，不做映射。
+   * @param request - `list`（limit / url 过滤）或 `body`（requestId）。
+   * @param signal - 可选取消信号，转发给 provider。
+   */
+  async network(request: BrowserNetworkRequest, signal?: AbortSignal): Promise<BrowserNetworkResult> {
+    return this.resolve().network(request, signal)
+  }
+
+  /**
+   * P2：白名单制的高危逃生舱。provider 在发命令前先过白名单（默认拒）。
+   * @param request - `domain.method` 与参数。
+   * @param signal - 可选取消信号，转发给 provider。
+   */
+  async execute(request: BrowserExecuteRequest, signal?: AbortSignal): Promise<BrowserExecuteResult> {
+    return this.resolve().execute(request, signal)
+  }
+
+  /**
+   * P3：按 ref 现算元素的视口坐标盒（每次 locate 重新计算，绝不缓存 snapshot 时的几何）。
+   * @param request - 会话 id、ref 与 highlight / scroll 选项。
+   * @param signal - 可选取消信号，转发给 provider。
+   */
+  async locate(request: BrowserLocateRequest, signal?: AbortSignal): Promise<BrowserLocateResult> {
+    return this.resolve().locate(request, signal)
   }
 
   /**

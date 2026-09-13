@@ -47,6 +47,27 @@ export type BrowserErrorCode =
   | 'BROWSER_CONNECTION_LOST'
   /** 卸载时某个 provider 未能干净释放资源。 */
   | 'BROWSER_DISPOSE_FAILED'
+  /**
+   * P2：CDP 命令抛出 `No target available` —— 调试器在「打开 DevTools 那一瞬让位」期间
+   * 被 detach 了（`[V16]`）。**可恢复**：re-attach 后自动恢复，不需要探测式重试。
+   */
+  | 'BROWSER_DEBUGGER_DETACHED'
+  /**
+   * P2：要写一个冲突的 target 级状态。判定条件与处置见方案 2.3.1，恢复路径见 2.1.1。
+   * **不可重试**（状态没变，原样重发必然再失败），但允许显式 `force` 覆盖。
+   */
+  | 'BROWSER_STATE_CONTENDED'
+  /**
+   * P2：`browser_execute` 的返回值无法序列化（`document.body` 会**静默**变成 `{}`，
+   * 循环引用 / `Symbol` 会抛错，`[V22]`）。提示模型改用原始值或 JSON 字符串。
+   */
+  | 'BROWSER_EXECUTE_RESULT_UNSERIALIZABLE'
+  /**
+   * P2：`browser_execute` 只放行白名单里的 CDP 命令（方案 3.3）。不在允许列表里的
+   * `domain.method` 一律拒绝 —— **新命令默认拒**，避免黑名单永远追不上协议演进。
+   * 错误消息里带被拒的 method 全文。
+   */
+  | 'BROWSER_EXECUTE_NOT_ALLOWED'
 
 /** 能力缝隙与 provider 唯一抛出的错误类型。 */
 export class BrowserError extends Error {
@@ -123,6 +144,15 @@ export interface BrowserSnapshot {
   readonly refs: readonly BrowserRef[]
   /** 大纲是否因规模上限被截断（截断后 ref 只覆盖已输出的部分）。 */
   readonly truncated: boolean
+  /**
+   * P3 人工接管状态位：`true` 表示有人正开着 DevTools 操作这个页面，**本结果可能随时失效**，
+   * 模型应当把它当作「需要重新观察」的信号。
+   *
+   * 注意它**不影响 ref 纪元** —— `[V31]` 实测人工在 DevTools 里选元素与 agent 的高亮
+   * 互不干扰，所以开合 DevTools 绝不推进纪元（否则每次人工看一眼都会把模型的 ref 全废掉）。
+   * 缺省 = 未知 / 无接管；直连外部 Chrome 的 provider 不实现这条通道，恒为 `undefined`。
+   */
+  readonly takeover?: boolean
 }
 
 /** 截图。字节落盘走 `ctx.attachments.saveImage`，消息里只留引用。 */
@@ -223,6 +253,139 @@ export interface BrowserTabsResult {
   readonly tabs: readonly BrowserTabInfo[]
 }
 
+/** P2：从会话的 console 环形缓冲读取条目。 */
+export interface BrowserConsoleRequest {
+  readonly sessionId: string
+  /** 最多返回多少条（从最新往回）。省略 = provider 默认（50）。 */
+  readonly limit?: number
+  /** 只保留该 level 的条目（大小写不敏感，例如 `error`）。 */
+  readonly level?: string
+  /** 只保留文本包含该子串的条目（大小写不敏感）。 */
+  readonly text?: string
+}
+
+/** 一条归一化后的 console 条目。 */
+export interface BrowserConsoleEntry {
+  /** `Runtime` 用事件 type；`Log` 用 `entry.level`。 */
+  readonly level: string
+  readonly text: string
+  /** 毫秒时间戳（Runtime 的微秒已折算成毫秒）。 */
+  readonly timestamp: number
+  /** 来源域：`runtime` = `Runtime.consoleAPICalled`，`log` = `Log.entryAdded`。 */
+  readonly source: 'runtime' | 'log'
+}
+
+/** `browser_console` 的结果。 */
+export interface BrowserConsoleResult {
+  readonly kind: 'console'
+  readonly sessionId: string
+  readonly entries: readonly BrowserConsoleEntry[]
+  /** 过滤前缓冲里的条目总数。 */
+  readonly buffered: number
+  /** 匹配的条目多于 `limit`。 */
+  readonly truncated: boolean
+  /**
+   * `Log` 域曾发生过重放截断（即收到过 `[V39]` 那条 `timestamp=0` 的提示条目）——
+   * 说明有 console 内容永久缺失，模型应据此判断窗口是否完整。
+   */
+  readonly replayTruncated: boolean
+}
+
+/** P2：网络采集的两种动作。 */
+export type BrowserNetworkRequest =
+  | {
+    readonly kind: 'list'
+    readonly sessionId: string
+    /** 最多返回多少条（从最新往回）。省略 = provider 默认（50）。 */
+    readonly limit?: number
+    /** 只保留 URL 包含该子串的条目（大小写不敏感）。 */
+    readonly url?: string
+  }
+  | { readonly kind: 'body'; readonly sessionId: string; readonly requestId: string }
+
+/** 一条网络请求记录（可能是缺请求头的降级记录）。 */
+export interface BrowserNetworkEntry {
+  readonly requestId: string
+  /** 请求方法；缺 `requestWillBeSent` 的降级记录里未知。 */
+  readonly method?: string
+  readonly url: string
+  readonly status?: number
+  readonly mimeType?: string
+  readonly fromDiskCache?: boolean
+  /** 是否缺 `requestWillBeSent` 的降级记录（`[V40]`）。 */
+  readonly partial?: boolean
+  /** 降级原因；目前只有 `request-headers-missing`。 */
+  readonly reason?: string
+  /** `loadingFailed` 的错误文本。 */
+  readonly errorText?: string
+}
+
+/** `browser_network` 的结果。 */
+export interface BrowserNetworkResult {
+  readonly kind: 'network'
+  readonly sessionId: string
+  readonly action: 'list' | 'body'
+  readonly requests: readonly BrowserNetworkEntry[]
+  /** body 动作才有。 */
+  readonly requestId?: string
+  /** body 动作才有：响应体（可能被裁剪）。 */
+  readonly body?: string
+  readonly base64Encoded?: boolean
+  readonly truncated?: boolean
+}
+
+/** P2：`browser_execute` —— 唯一能直接发任意 CDP 命令的逃生舱。 */
+export interface BrowserExecuteRequest {
+  readonly sessionId: string
+  /** `domain.method` 全文，例如 `Runtime.evaluate`。 */
+  readonly method: string
+  readonly params?: Record<string, unknown>
+}
+
+/** `browser_execute` 的结果。 */
+export interface BrowserExecuteResult {
+  readonly kind: 'execute'
+  readonly sessionId: string
+  readonly method: string
+  /** 执行后的 ref 纪元；导航类命令会推进它。 */
+  readonly epoch: number
+  readonly url: string
+  /** 该命令是否属于导航类（`Page.navigate` / `Page.reload`），或探测到地址变化。 */
+  readonly navigated: boolean
+  /** `Runtime.evaluate` 的返回值（已确认可序列化）。 */
+  readonly value?: unknown
+  /** 其它命令的原始 CDP result。 */
+  readonly result?: unknown
+  /** 结果是否因过大被裁剪成字符串。 */
+  readonly truncated: boolean
+}
+
+/** P3：`browser_locate` —— 按 ref 现算元素的视口坐标盒（方案 4.3）。 */
+export interface BrowserLocateRequest {
+  readonly sessionId: string
+  /** 最新一次 snapshot 里的元素 ref。旧 ref 一律 `BROWSER_STALE_REF`。 */
+  readonly ref: string
+  /** 在元素上画一层高亮（`Overlay.highlightNode`；保持到 hideHighlight / 导航）。 */
+  readonly highlight?: boolean
+  /** 先 `scrollIntoView` 居中再量（默认 true）。 */
+  readonly scroll?: boolean
+}
+
+/** `browser_locate` 的结果：视口坐标（语义与 click 的落点计算一致）。 */
+export interface BrowserLocateResult {
+  readonly kind: 'locate'
+  readonly sessionId: string
+  /** 量取时刻的 ref 纪元。 */
+  readonly epoch: number
+  readonly ref: string
+  readonly x: number
+  readonly y: number
+  readonly width: number
+  readonly height: number
+  /** `scroll=true` 时元素先被滚到视口中央再量，为 true。 */
+  readonly centered: boolean
+}
+
 /**
  * provider 契约。能力缝隙只认这个接口，不认识任何具体驱动方式
  * （CDP 直连、Playwright、Electron 代持都实现它）。
@@ -238,6 +401,17 @@ export interface BrowserProvider {
   tabs(request: BrowserTabsRequest, signal?: AbortSignal): Promise<BrowserTabsResult>
   /** P1：按 ref 定位的页面操作。实现必须先过 ref 纪元再发任何页面命令。 */
   mutate(request: BrowserMutationRequest, signal?: AbortSignal): Promise<BrowserMutationResult>
+  /** P2：读取会话的 console 环形缓冲（读取前会补发 `Runtime.enable` / `Log.enable`）。 */
+  console(request: BrowserConsoleRequest, signal?: AbortSignal): Promise<BrowserConsoleResult>
+  /** P2：读取 / 取回网络请求（`requestId` 直接用，不做映射）。 */
+  network(request: BrowserNetworkRequest, signal?: AbortSignal): Promise<BrowserNetworkResult>
+  /** P2：白名单制的高危逃生舱，只放行只读 / session 私有 / 只导航的 CDP 命令。 */
+  execute(request: BrowserExecuteRequest, signal?: AbortSignal): Promise<BrowserExecuteResult>
+  /**
+   * P3：按 ref 现算元素的视口坐标盒。**每次调用都重新计算，绝不缓存 snapshot 时的几何**
+   * （方案 4.4 的硬要求）—— 「现算」配合 `isConnected` 守卫才是 ref 失效的真正兜底。
+   */
+  locate(request: BrowserLocateRequest, signal?: AbortSignal): Promise<BrowserLocateResult>
   /** 归还一个会话：关闭它的标签页并释放连接。 */
   close(sessionId: string): Promise<void>
   /** 释放 provider 持有的全部资源（连接、标签页、进程）。可省略。 */

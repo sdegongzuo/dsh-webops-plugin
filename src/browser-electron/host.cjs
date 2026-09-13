@@ -47,6 +47,7 @@
  * - `{ op: 'open', id, url, size?, keepAlive? }`
  * - `{ op: 'cdp', id, tabId, method, params }`
  * - `{ op: 'activate', id, tabId }`
+ * - `{ op: 'devtools', id }`（切换活动标签的开发者工具；等状态落定才回）
  * - `{ op: 'close', id, tabId }`
  * - `{ op: 'list', id }`
  * - `{ op: 'bar', id }`
@@ -56,10 +57,16 @@
  * - `{ type: 'listening', port }`
  * - `{ type: 'opened', id, tabId, url, title }`
  * - `{ type: 'cdp', id, result | error }`
+ * - `{ type: 'devtools', id, tabId, action, isOpen }`（`isOpen` 是**真实**状态，用来把
+ *   `openDevTools` 的静默失败暴露给调用方）
  * - `{ type: 'closed', id?, tabId }`（无 `id` 表示用户自己关的）
  * - `{ type: 'list', id, tabs }`
  * - `{ type: 'bar', id, tabs, rendered, active }`（`rendered` 是标签条 DOM 里的 `.tab` 数，`-1` = 没画出来）
- * - `{ type: 'event', tabId, method, params }`
+ * - `{ type: 'event', tabId, method, params }`（其中 `Inspector.detached` 是**宿主合成**的让位
+ *   信号，`reason` 为 `'devtools-opened'`，与 Electron 原生恒为 `'target closed'` 的 reason 区分；
+ *   父进程不得据此推进会话失效）
+ * - `{ type: 'takeover', tabId, active }`（人工**或** agent 开合 DevTools；`active` 是**幂等状态位**，
+ *   不是计数器 —— agent 自己 toggle 也会收到，父进程无需去重。见方案 4.1.1）
  * - `{ type: 'error', id?, message }`
  *
  * @module dsh-webops-plugin/browser-electron/host
@@ -71,6 +78,14 @@ const path = require('node:path')
 
 /** 标签条高度（像素）；标签内容区从这条线开始。 */
 const TAB_BAR_HEIGHT = 40
+/** 等 `devtools-opened` / `devtools-closed` 落定的上限；超时一律按「没开成」处理。 */
+const DEVTOOLS_SETTLE_TIMEOUT_MS = 3000
+/**
+ * 单条 CDP 命令的等待上限（与父进程 bridge 的默认 `commandTimeoutMs` 对齐）。
+ * 超时照样回错误，别让宿主里的 await 永远悬着（`[V33]` 的挂死形态：`Page.captureScreenshot`
+ * 在异常路径可能永久不返回；父进程超时后 pending 已删，宿主侧必须自己有终点）。
+ */
+const CDP_COMMAND_TIMEOUT_MS = 30000
 
 /** 标签页；`debugger` 在 `dom-ready` 之后才有。 */
 const tabs = new Map()
@@ -177,13 +192,27 @@ function openTab(url, size) {
   })
   window.contentView.addChildView(view)
 
-  const entry = { id, view, debugger: view.webContents.debugger, ready: undefined, debuggerAttached: false }
+  const entry = {
+    id,
+    view,
+    debugger: view.webContents.debugger,
+    ready: undefined,
+    debuggerAttached: false,
+    // 「这次 detach 是我们自己为了开 DevTools 让位」—— 见下面的监听器与 `toggleDevTools`。
+    // 用状态位区分，不靠 reason（Electron 给的 reason 恒为 `target closed`）。
+    lettingGo: false,
+  }
   // 调试器的监听只注册一次（对象与 view 同生命周期），attach/detach 可反复。
   entry.debugger.on('message', (_event, method, params) => {
     send({ type: 'event', tabId: id, method, params })
   })
   entry.debugger.on('detach', (_event, reason) => {
     entry.debuggerAttached = false
+    // 人为让位时由 `toggleDevTools` 补发一条 reason 更准的事件 —— 两条都发只会互相矛盾。
+    if (entry.lettingGo) {
+      entry.lettingGo = false
+      return
+    }
     send({ type: 'event', tabId: id, method: 'Inspector.detached', params: { reason } })
   })
   entry.ready = new Promise((resolveReady) => {
@@ -195,8 +224,16 @@ function openTab(url, size) {
       send({ type: 'error', tabId: id, message: `renderer gone: ${JSON.stringify(details)}` })
     })
   })
-  // DevTools 关掉后把插件的调试器接回来，agent 工具自动恢复。
+  // 兜底：正常情况下 `toggleDevTools` 在 `devtools-opened` 时就把调试器接回来了，
+  // 这一条只保证「关掉 DevTools 之后一定还连着」（`attachDebugger` 是幂等的）。
   view.webContents.on('devtools-closed', () => { attachDebugger(entry) })
+
+  // 「观察失效」的通知通道（方案 4.1.1）。这两个事件对「agent 触发」与「人工走菜单 / 快捷键 触发」
+  // 一视同仁 —— 正是 `toggleDevTools()` 返回值覆盖不到的缺口。必须是**持久**的 `on`（不是 `once`）：
+  // 每次开 / 关都要报，`active` 是幂等状态位而非计数器。
+  // 与 `waitForDevTools` 里那两个 `once` 并存不冲突 —— `once` 只消费它自己那一次。
+  view.webContents.on('devtools-opened', () => { send({ type: 'takeover', tabId: id, active: true }) })
+  view.webContents.on('devtools-closed', () => { send({ type: 'takeover', tabId: id, active: false }) })
 
   // 标题与地址随时会变，标签条要跟着变。
   view.webContents.on('page-title-updated', () => { sendTabBar() })
@@ -253,8 +290,15 @@ function closeTab(id) {
  * 给标签接上 CDP 调试器（幂等）。
  *
  * 消息/分离监听在 `openTab` 里注册一次 —— `debugger` 对象与 view 同生命周期，
- * detach 后再 attach 不需要重复注册。Chrome 一个 target 只允许一个调试客户端，
- * DevTools 打开期间这里必须让位（见 `toggleDevTools`）。
+ * detach 后再 attach 不需要重复注册。
+ *
+ * 与 DevTools 的关系**不是互斥**：只在「打开 DevTools 那一瞬」让位，随后立刻接回，
+ * 详见 `toggleDevTools`。
+ *
+ * ⚠ **re-attach 不保证之前 enable 过的 domain 还在**（实测：每次 attach 后要重新
+ * `Runtime.enable` 才能收到 console 事件）。当前工具面不依赖任何 enable 过的 domain，
+ * 所以这里没做额外的事；P2 的 console / network 采集器一旦接上，**必须在这里补一次
+ * re-enable**，否则人工开关一次 DevTools 就会漏消息。
  */
 function attachDebugger(entry) {
   if (entry.debuggerAttached) return
@@ -267,27 +311,88 @@ function attachDebugger(entry) {
 }
 
 /**
- * 切换活动标签的开发者工具。
+ * 等一次 DevTools 状态事件。
  *
- * 实测（Electron 44）：插件 debugger 已 attach 时 `openDevTools` 会静默失败 ——
- * 一个 target 只允许一个调试客户端。所以打开前先把插件的调试器 detach 让位
- * （父进程会收到 `Inspector.detached`，CDP 命令此期间会失败），关闭 DevTools
- * 后自动重新 attach，agent 工具恢复。
+ * 必须带超时：`openDevTools` 静默失败时不抛错、事件也不来，没有超时就会永远挂住
+ * （`[V3]` 那个坑在调用方一侧的形态）。
+ *
+ * @param wc - 目标标签的 webContents。
+ * @param event - `devtools-opened` 或 `devtools-closed`。
  */
-function toggleDevTools() {
+function waitForDevTools(wc, event) {
+  return new Promise((resolve) => {
+    const timer = setTimeout(resolve, DEVTOOLS_SETTLE_TIMEOUT_MS)
+    wc.once(event, () => { clearTimeout(timer); resolve() })
+  })
+}
+
+/**
+ * 切换活动标签的开发者工具，等状态落定才返回。
+ *
+ * 实测（Electron 44）拿到两条硬结论：
+ *
+ * 1. **打开前必须先 detach**：插件调试器还 attach 着时调 `openDevTools` 会**静默失败**
+ *    —— 不抛错，但 `isDevToolsOpened()` 保持 false。所以让位这一步不可省，而且**只能靠
+ *    校验 `isDevToolsOpened()` 判成败**，`try/catch` 什么也抓不到。
+ * 2. **打开后可以立刻接回**：DevTools 打开之后，这个 target 就不再排斥第二个调试
+ *    客户端了，`devtools-opened` 一落定就 `attach` 即成功（连延迟都不需要）；此后人工
+ *    在 DevTools 里操作期间，agent 的 snapshot / 截图 / evaluate 全部照常返回。
+ *
+ * 所以「让位」只发生在打开那一瞬，不是整个查看期。这推翻了本文件早先版本
+ * （`6a0dc8b`）的写法 —— 那里要等到 `devtools-closed` 才接回，等于人工看 DevTools
+ * 的全程 agent 都是瞎的。
+ *
+ * @returns `{ entry, action, isOpen }`；没有活动标签时 `undefined`。
+ *   `isOpen` 是宿主的**真实**状态 —— `action: 'opened'` 却带 `isOpen: false` 就是
+ *   「让位没成功」，调用方据此报警，而不是当成成功。
+ */
+async function toggleDevTools() {
   const entry = activeTabId !== undefined ? tabs.get(activeTabId) : undefined
-  if (entry === undefined) return
+  if (entry === undefined) return undefined
   const wc = entry.view.webContents
+
   if (wc.isDevToolsOpened()) {
+    const settled = waitForDevTools(wc, 'devtools-closed')
     wc.closeDevTools()
-    return
+    await settled
+    return { entry, action: 'closed', isOpen: wc.isDevToolsOpened() }
   }
+
+  // 让位。失败必须报出来 —— 吞掉它就等于让随后的 `openDevTools` 静默失败且无从查起。
   if (entry.debuggerAttached) {
-    entry.debuggerAttached = false
-    try { entry.debugger.detach() } catch { /* 已分离就算了 */ }
-    send({ type: 'event', tabId: entry.id, method: 'Inspector.detached', params: { reason: 'devtools-opened' } })
+    try {
+      entry.lettingGo = true
+      entry.debugger.detach()
+      entry.debuggerAttached = false
+      // reason 实测恒为 `target closed`（主动 detach 也是），区分不出「人为让位」，
+      // 所以由这边补一条语义明确的事件；`openTab` 里的监听器会因为 `lettingGo` 让路。
+      send({ type: 'event', tabId: entry.id, method: 'Inspector.detached', params: { reason: 'devtools-opened' } })
+    } catch (error) {
+      entry.lettingGo = false
+      send({ type: 'error', tabId: entry.id, message: `debugger.detach failed: ${String(error?.message ?? error)}` })
+    }
   }
+
+  // 先把等待挂上再触发动作，否则事件可能在我们开始等之前就过去了。
+  const settled = waitForDevTools(wc, 'devtools-opened')
   wc.openDevTools({ mode: 'undocked' })
+  await settled
+
+  if (wc.isDestroyed() || !wc.isDevToolsOpened()) {
+    // 静默失败：不抛错、也没打开。窗口已经关了的话就不用再报。
+    if (!wc.isDestroyed()) {
+      send({
+        type: 'error',
+        tabId: entry.id,
+        message: 'openDevTools did not open (the CDP debugger was probably still attached)',
+      })
+    }
+    return { entry, action: 'opened', isOpen: false }
+  }
+
+  // 接回来：DevTools 打开之后 target 不再排斥第二个 client。
+  attachDebugger(entry)
+  return { entry, action: 'opened', isOpen: true }
 }
 
 /** 处理一条来自父进程的命令。 */
@@ -314,7 +419,21 @@ async function handle(command) {
       }
       try {
         await entry.ready
-        const result = await entry.debugger.sendCommand(command.method, command.params ?? {})
+        // 给命令包一层超时：超时与真正的命令失败走同一个 catch，复用 cdp 错误消息。
+        // timer 必须在 promise settle 后 clearTimeout，别留悬挂的 setTimeout；
+        // 否则 [V33]（命令永久挂起）会让宿主里的 await 永远悬着，父进程侧 pending 已删也没用。
+        let timer
+        const timeout = new Promise((resolve, reject) => {
+          timer = setTimeout(() => {
+            reject(new Error(`cdp command timed out after ${CDP_COMMAND_TIMEOUT_MS}ms: ${command.method}`))
+          }, CDP_COMMAND_TIMEOUT_MS)
+        })
+        let result
+        try {
+          result = await Promise.race([entry.debugger.sendCommand(command.method, command.params ?? {}), timeout])
+        } finally {
+          clearTimeout(timer)
+        }
         send({ type: 'cdp', id: command.id, result: result === undefined ? {} : result })
       } catch (error) {
         send({ type: 'cdp', id: command.id, error: { message: String(error?.message ?? error) } })
@@ -324,6 +443,29 @@ async function handle(command) {
     case 'activate': {
       activateTab(command.tabId)
       send({ type: 'activated', id: command.id, tabId: command.tabId })
+      return
+    }
+    case 'devtools': {
+      // 切换活动标签的开发者工具。
+      //
+      // 存在意义有二：让端到端脚本能验证「DevTools 打开后 agent 仍可用」，以及 P3 的
+      // 人工接管需要这条通道 —— 菜单里那条只能靠模拟按键触发，验证不了。
+      //
+      // `toggleDevTools` 落定才回，并把**真实**的 `isOpen` 一起带回：`openDevTools` 会
+      // 静默失败（不抛错、`isDevToolsOpened()` 保持 false），回一个说谎的 ack 就是把这个
+      // 坑盖住。
+      const result = await toggleDevTools()
+      if (result === undefined) {
+        send({ type: 'devtools', id: command.id, error: { message: 'no active tab to toggle devtools on' } })
+        return
+      }
+      send({
+        type: 'devtools',
+        id: command.id,
+        tabId: result.entry.id,
+        action: result.action,
+        isOpen: result.isOpen,
+      })
       return
     }
     case 'close': {
@@ -385,7 +527,8 @@ app.whenReady().then(() => {
   ipcMain.on('dsh-tab-create', () => { void openTab('about:blank') })
 
   // BaseWindow 没有 webContents，默认菜单的「切换开发者工具」打在空处。
-  // 这里显式接管：指向活动标签的 webContents，并处理与插件 CDP 调试器的互斥。
+  // 这里显式接管：指向活动标签的 webContents。与插件 CDP 调试器**不是互斥** ——
+  // 只在打开那一瞬让位，见 `toggleDevTools`。
   Menu.setApplicationMenu(Menu.buildFromTemplate([
     { role: 'fileMenu' },
     { role: 'editMenu' },
@@ -393,7 +536,7 @@ app.whenReady().then(() => {
       label: 'View',
       submenu: [
         { role: 'forceReload' },
-        { label: '切换开发者工具', accelerator: 'Ctrl+Shift+I', click: () => { toggleDevTools() } },
+        { label: '切换开发者工具', accelerator: 'Ctrl+Shift+I', click: () => { void toggleDevTools() } },
         { type: 'separator' },
         { role: 'resetZoom' },
         { role: 'zoomIn' },

@@ -33,8 +33,8 @@ spawn 一个窗口宿主，开真正的 `BrowserWindow`，用它的 `webContents
 | **UI 观察面板** ← 已完成 | `conversation.input.dock` 常驻状态条（含无活动时的「已就绪」态）+ `tool.call.toolview` 四个专属卡片（地址 / 大纲 / 截图） |
 | **Electron 窗口 provider** ← 已完成 | `browser-electron`：spawn 窗口宿主 → 真 `BrowserWindow` → `webContents.debugger` 驱动；桌面端默认用它 |
 | **P1 操作** ← 已完成 | `browser_tabs`（list/activate/close）+ click / fill / press / scroll / wait + 能力分级（只读 vs 操作）+ `stale_ref` 可重试错误码；fake-llm 脚本扩展为「open → snapshot → tabs+click 同轮双调用」的全链路 keyless 验证 |
-| P2 调试 | console / network 采集 + 受限 `browser_execute` + 进度策略 |
-| P3 协作 | 人工接管 / 回收 + `browser_find` / `browser_locate` |
+| **P2 调试** ← 已完成 | `browser_console` / `browser_network` / `browser_execute` + 3 个错误码 + targetState 簿记骨架 |
+| **P3 协作** ← 已完成 | 人工接管（takeover 通道）+ `browser_find` / `browser_locate`（backendNodeId 三守卫） |
 
 ### 用法（三步）
 
@@ -449,7 +449,7 @@ pnpm dsh --profile browserp0
 ```bash
 pnpm install       # 工具链 + link 本地 dsh 包；不查 registry
 pnpm typecheck     # tsc --noEmit
-pnpm test          # vitest；147 个用例通过（另有 3 个 live，端点不是真 Chrome 时整组跳过）
+pnpm test          # vitest；174 个用例通过（另有 3 个 live，端点不是真 Chrome 时整组跳过）
 pnpm build         # tsdown 加 copy-assets；产出 lib/（host 四面 + 包根 + 客户端 bundle + host.cjs）
 ```
 
@@ -553,6 +553,63 @@ toolViews=10 三项硬证据通过。
 该 flow 走**原生目录对话框**（主进程模态，CDP 不可达），自动化无法穿越。dock 的挂载与
 卡片渲染本身由 `toolViews=10` 证明（slot 注册成功 + 插件的卡片全部注册），工具真执行由
 上面的 headless 会话日志证明。手动过这一关：在桌面 UI 里选一次工作区、开一个会话即可。
+
+### 修正：DevTools 不是互斥（2026-09-13 收尾）
+
+`6a0dc8b` 给窗口宿主加 DevTools 支持时，把「一个 target 只允许一个调试客户端」当成了事实，
+于是设计成「人工开 DevTools 前先 `detach` 让位，直到 `devtools-closed` 才接回」—— 等于人工
+看 DevTools 的**全程** agent 都是瞎的。
+
+实测推翻了这条：真实约束只是 `openDevTools` 的**调用时机**。调试器还 attach 着时它会
+**静默失败**（不抛错，`isDevToolsOpened()` 保持 false）；但 DevTools 打开之后，这个 target
+就不再排斥第二个客户端，可以在 `devtools-opened` 回调里直接接回来。
+
+改成「让位 → `openDevTools` → `devtools-opened` 里立刻 re-attach」之后，人工看 DevTools 期间
+agent 的 snapshot / 截图 / evaluate 全部照常返回。
+
+- **验证**：`pnpm run smoke:devtools` —— 起真宿主 → 开标签 → 开 DevTools（断言宿主回报
+  `isOpen=true`，排除静默失败）→ **断言 `provider.observe(snapshot)` 仍成功** → 关掉 → 再断言。
+  另外断言让位只发出**一条** `Inspector.detached`（reason=`devtools-opened`）：Electron 自己
+  给的那条 reason 恒为 `target closed`，由宿主的状态位拦下，两条都发只会互相矛盾。
+- **顺带修掉一个进程泄漏**：`ElectronBrowserProvider` 之前没有覆盖 `dispose()`，而基类只关
+  会话、不关 transport。窗口宿主是本插件自己 spawn 的，不回收的话桥上的 TCP socket 一直活着，
+  node 进程就退不掉（修复前该脚本挂 2m45s 被强杀，修复后 13.2s 干净退出）。
+- **新增 `devtools` op**：菜单之外的第二条触发路径，让这条行为可被脚本断言；P3 的人工接管会复用它。
+
+## P2/P3 调试与协作交付（2026-09-13）
+
+### 工具（5 个新工具）
+
+| 工具 | 能力级 | 一句话 |
+|---|---|---|
+| `browser_console` | read | 读会话的 console 环形缓冲（Runtime + Log 两域合流，按 message 高水位去重，最新在前） |
+| `browser_network` | read | 列网络请求 / 按 requestId 取响应体（Network 事件从不重放，断开窗口期的请求按「会丢」处理） |
+| `browser_execute` | **mutate** | 白名单制的高危逃生舱：一次发一条允许列表内的 CDP 命令（`Runtime.evaluate` 会执行任意表达式） |
+| `browser_find` | read | 在最近一次 snapshot 的大纲上做零状态文本检索，不发任何 CDP 命令 |
+| `browser_locate` | read | 按 ref 现算视口坐标盒（backendNodeId 路线），可选 `Overlay.highlightNode` 高亮 + 滚动居中 |
+
+### 通用层
+
+- **3+1 个新错误码**（`src/browser/types.ts`）：
+  - `BROWSER_DEBUGGER_DETACHED` —— **可恢复**：DevTools 开合期的断连，re-attach 后自动恢复，模型重新采集即可（与 stale ref 刻意区分）；
+  - `BROWSER_STATE_CONTENDED` —— 人工持有期间 agent 让渡，错误正文带 `stateKey` / `holder` / `at`；
+  - `BROWSER_EXECUTE_RESULT_UNSERIALIZABLE` —— 循环引用 / Symbol / DOM 节点等结果的三态收口，保证工具输出永远是合法 JSON；
+  - `BROWSER_EXECUTE_NOT_ALLOWED` —— 命中拒绝列表、或不在允许列表里（默认拒），消息里带被拒 `domain.method` 全文。
+- **targetState 簿记骨架**（`src/browser-cdp/state.ts`）：每个 target 一份所有权簿记；owner 为 agent 且值被外部改写、或处于接管窗口内时抛 `BROWSER_STATE_CONTENDED` —— 这是 P3 接管语义的判分依据。
+- **takeover 通道**：人工开 DevTools 即触发让位 → `openDevTools` → `devtools-opened` 里立刻 re-attach；此后 snapshot 带 takeover 提示，agent 与人工可同时观察；**ref 纪元不受影响**（DevTools 开合不推进纪元，旧 ref 语义不变）。
+
+### 关键设计约束（各一句）
+
+- **console**：高水位去重 + ≥1000 条环形缓冲，重复刷屏不挤占有效窗口。
+- **network**：`Network` 域事件从不重放，调试器断开期间完成的请求就是拿不回来，工具描述明说而非假装兜底。
+- **execute**：白名单默认拒 —— 拒绝列表 + 允许列表双向收口，任何未列出的 `domain.method` 一律 `BROWSER_EXECUTE_NOT_ALLOWED`。
+- **locate**：backendNodeId 三守卫 —— ① `DOM.resolveNode` 抛错 / 拿不到 objectId → stale ref；② resolve 成功但 `isConnected === false` → stale ref（`replaceWith` 换掉元素后 resolveNode 仍成功，只查一条会漏）；③ rect 宽高为 0 → 协议错误。rect 每次现算，绝不缓存 snapshot 时的几何。
+- **高亮**：只用 `Overlay.highlightNode`，绝不用 `highlightRect`（后者会把传入 rect 之外的整个视口都罩住）。
+
+### 验证与设计依据
+
+回归以 `pnpm test` 的输出为准（238 passed / 3 skipped，3 个 live 用例在端点非真 Chrome 时整组跳过）。
+P2/P3 的设计依据见 `docs/P2-P3-开发方案.md` 与 `docs/P2-P3-状态归属与接入规范.md`。
 
 ## License
 

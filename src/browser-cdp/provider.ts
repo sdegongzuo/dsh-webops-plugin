@@ -19,9 +19,17 @@
 
 import { BrowserError } from '../browser/types.ts'
 import type {
+  BrowserConsoleRequest,
+  BrowserConsoleResult,
+  BrowserExecuteRequest,
+  BrowserExecuteResult,
+  BrowserLocateRequest,
+  BrowserLocateResult,
   BrowserMutationRequest,
   BrowserMutationResult,
   BrowserNavigateRequest,
+  BrowserNetworkRequest,
+  BrowserNetworkResult,
   BrowserObservation,
   BrowserObserveRequest,
   BrowserOpenRequest,
@@ -39,6 +47,9 @@ import { buildOutline, DEFAULT_SNAPSHOT_LIMITS, renderOutline } from './snapshot
 import type { AxNode, SnapshotLimits } from './snapshot.ts'
 import { HttpCdpTransport } from './protocol.ts'
 import type { CdpConnection, CdpTarget, CdpTransport } from './protocol.ts'
+import { ConsoleCollector, CONSOLE_RING_CAPACITY } from './console.ts'
+import { NetworkCollector, NETWORK_TABLE_CAPACITY } from './network.ts'
+import { assertExecuteAllowed, extractEvaluateValue, translateEvaluateError } from './execute.ts'
 import { validateEndpoint, validateTargetUrl } from './url-policy.ts'
 
 /** provider 的 id，也是 `ctx.browser` 配置里 `provider` 字段要填的值。 */
@@ -95,13 +106,40 @@ export const MUTATION_NAVIGATION_POLL_MS = 800
 /** `wait` 轮询 text / hidden 条件的间隔（毫秒）。 */
 const WAIT_POLL_INTERVAL_MS = 100
 
+/** `browser_console` / `browser_network` 的默认返回条数（从最新往回）。 */
+export const DEFAULT_P2_LIMIT = 50
+
+/** `browser_execute` 结果的裁剪上限（字符）；逃生舱可能返回极大对象，别撑爆上下文。 */
+export const EXECUTE_MAX_RESULT_CHARS = 20_000
+
+/**
+ * 命令白名单判定里的「导航类」命令：执行后要走既有的导航检测 / 纪元推进路径。
+ * 这两条会替换文档，旧 ref 一律作废 —— `Page.reload` 地址不变，所以必须**无条件**作废。
+ */
+const NAVIGATION_COMMANDS: ReadonlySet<string> = new Set(['Page.navigate', 'Page.reload'])
+
 /** 一个受控标签页的全部状态。 */
 interface SessionState {
   readonly targetId: string
   readonly connection: CdpConnection
   readonly refs: RefRegistry
+  /** P2 console 采集器（Runtime + Log 两域，按域分桶去重）。 */
+  readonly consoleCollector: ConsoleCollector
+  /** P2 network 采集器（requestId 直接用，不做映射）。 */
+  readonly networkCollector: NetworkCollector
   url: string
   title: string
+  /**
+   * P3 人工接管状态位（方案 4.1.1）：有人正开着 DevTools 操作这个页面。
+   * **幂等状态位，不是计数器** —— agent 自己 toggle DevTools 时也会被置位，无需去重。
+   * 它只影响 snapshot 结果里的提示，**绝不推进 ref 纪元**（`[V31]`）。
+   */
+  takeover: boolean
+  /**
+   * P3 locate 高亮状态位：本 session 是否画过一层 `Overlay.highlightNode` 高亮。
+   * 用于 `highlight: false` 时决定要不要补发 `Overlay.hideHighlight`（只弹自己那层，`[V31]`）。
+   */
+  highlightPainted: boolean
 }
 
 /** 页面元信息，由一次 `Runtime.evaluate` 取回。 */
@@ -232,11 +270,26 @@ export class CdpBrowserProvider implements BrowserProvider {
       targetId: target.id,
       connection,
       refs: new RefRegistry(),
+      // 采集器在构造时就订阅事件，所以必须在下面 `*.enable` 之前建好 —— 否则第一批
+      // 重放 / 实时事件会在订阅前溜走。
+      consoleCollector: new ConsoleCollector(connection),
+      networkCollector: new NetworkCollector(connection),
       url: target.url,
       title: target.title,
+      takeover: false,
+      highlightPainted: false,
     }
     try {
       await connection.send('Page.enable', {}, { signal, timeoutMs: this.config.commandTimeoutMs })
+      // 立刻打开 console / network 两路采集，让「实时落缓冲」从这一刻起生效，而不是等到第一次
+      // read —— `Network` 不做重放（`[V38]`），不早开就会整段丢失。
+      //
+      // 这里是**尽力而为**：这几条 enable 的失败不该让整个 open 失败（会话本体已经建好，P0/P1
+      // 工具照常可用）。真正的权威补发在每次 read 前（见 provider.console / provider.network），
+      // 那里失败会按可恢复错误上抛。
+      for (const domain of ['Runtime.enable', 'Log.enable', 'Network.enable']) {
+        await connection.send(domain, {}, { signal, timeoutMs: this.config.commandTimeoutMs }).catch(() => undefined)
+      }
       // 等加载完成。超时**不**抛错：此时标签页已经建好，抛错会让调用方拿不到 session id，
       // 反而留下一个谁也管不着的孤儿标签。加载慢的页面交给模型自己再 snapshot。
       await this.navigateTo(connection, url, session.url, signal)
@@ -325,6 +378,9 @@ export class CdpBrowserProvider implements BrowserProvider {
     // 幂等：重复关闭不是错误。
     if (session === undefined) return
     this.sessions.delete(sessionId)
+    // 先摘采集器的订阅，再关连接：连接关闭会清掉全部监听，但显式退订让所有权更清楚。
+    session.consoleCollector.dispose()
+    session.networkCollector.dispose()
     session.connection.close()
     // 标签页可能已经被用户手动关掉了，那正是我们想要的结果，不算失败。
     await this.transport.closeTarget(session.targetId).catch(() => undefined)
@@ -378,11 +434,224 @@ export class CdpBrowserProvider implements BrowserProvider {
     }
   }
 
+  /**
+   * P2：读取 console 缓冲。
+   *
+   * **每次 read 前先补发 `Runtime.enable` + `Log.enable` 再读缓冲**：host 侧 re-attach 之后
+   * 不保证 enable 状态还在，而 provider 看不到 re-attach 的确切时刻；enable 触发的全量重放
+   * 正好被采集器的高水位吃掉（见 `console.ts` 文件头）。命令失败（例如 detach 期间抛
+   * `No target available` → `BROWSER_DEBUGGER_DETACHED`）原样上抛，模型据此重新采集。
+   */
+  async console(request: BrowserConsoleRequest, signal?: AbortSignal): Promise<BrowserConsoleResult> {
+    const session = this.require(request.sessionId)
+    const options = { signal, timeoutMs: this.config.commandTimeoutMs }
+    await session.consoleCollector.refresh(options)
+    const limit = normalizeLimit(request.limit)
+    const result = session.consoleCollector.read({ limit, level: request.level, text: request.text })
+    return {
+      kind: 'console',
+      sessionId: session.targetId,
+      entries: result.entries,
+      buffered: result.buffered,
+      truncated: result.truncated,
+      replayTruncated: session.consoleCollector.truncatedReplay,
+    }
+  }
+
+  /**
+   * P2：网络采集读取。
+   *
+   * `list` 直接从采集器读表（`requestId` 是事件里原样的值，`[V18]`，不做映射）；
+   * `body` 直接用给定的 `requestId` 调 `Network.getResponseBody`（裁剪超大响应体）。
+   * 读取前补发 `Network.enable` 以覆盖 re-attach 后 enable 状态丢失的情况 —— 注意
+   * `Network` **不重放历史**（`[V38]`），补发只保证此后的请求不再丢，过渡窗口内的请求
+   * 可能缺失，这一点在工具描述与结果里都要说清。
+   */
+  async network(request: BrowserNetworkRequest, signal?: AbortSignal): Promise<BrowserNetworkResult> {
+    const session = this.require(request.sessionId)
+    const options = { signal, timeoutMs: this.config.commandTimeoutMs }
+    await session.networkCollector.refresh(options)
+    if (request.kind === 'body') {
+      const body = await session.networkCollector.body(request.requestId, options)
+      return {
+        kind: 'network',
+        sessionId: session.targetId,
+        action: 'body',
+        requests: [],
+        requestId: request.requestId,
+        body: body.body,
+        base64Encoded: body.base64Encoded,
+        truncated: body.truncated,
+      }
+    }
+    return {
+      kind: 'network',
+      sessionId: session.targetId,
+      action: 'list',
+      requests: session.networkCollector.list(normalizeLimit(request.limit), request.url),
+    }
+  }
+
+  /**
+   * P2：白名单制的逃生舱（方案 3.3）。
+   *
+   * 顺序是**先过白名单再发命令**（默认拒，`assertExecuteAllowed`）；`Runtime.evaluate` 强制
+   * `returnByValue: true` 并按三态处理返回值；导航类命令（`Page.navigate` / `Page.reload`）
+   * 走既有的导航检测 / 纪元推进路径，`Page.reload` 即使地址不变也**无条件**作废旧 ref。
+   *
+   * ⚠ `expression` 会被**页面直接执行** —— 这是全插件最高危的入口，工具描述里已写明只执行
+   * 可信代码；页面内容永远是数据不是代码。
+   */
+  async execute(request: BrowserExecuteRequest, signal?: AbortSignal): Promise<BrowserExecuteResult> {
+    const session = this.require(request.sessionId)
+    assertExecuteAllowed(request.method)
+    const beforeUrl = session.url
+    const params: Record<string, unknown> = { ...request.params }
+    if (request.method === 'Runtime.evaluate') {
+      // 强制按值返回（`[V22]`）：返回引用的话拿到的 objectId 会随会话泄漏。
+      params['returnByValue'] = true
+    }
+    let raw: unknown
+    try {
+      raw = await session.connection.send(request.method, params, {
+        signal,
+        timeoutMs: this.config.commandTimeoutMs,
+      })
+    } catch (error: unknown) {
+      // 把「循环引用 / Symbol」这两条序列化错误映射成 BROWSER_EXECUTE_RESULT_UNSERIALIZABLE。
+      throw translateEvaluateError(error)
+    }
+    if (NAVIGATION_COMMANDS.has(request.method)) {
+      // 显式导航：地址变了 detectNavigation 会作废；地址没变（reload）这里再作废一次。
+      const changed = await this.detectNavigation(session, beforeUrl, true, signal)
+      if (!changed) session.refs.invalidate()
+      const capped = capResult(raw)
+      return {
+        kind: 'execute',
+        sessionId: session.targetId,
+        method: request.method,
+        epoch: session.refs.currentEpoch,
+        url: session.url,
+        navigated: true,
+        result: capped.payload,
+        truncated: capped.truncated,
+      }
+    }
+    if (request.method === 'Runtime.evaluate') {
+      const value = extractEvaluateValue(raw)
+      const capped = capResult(value)
+      return {
+        kind: 'execute',
+        sessionId: session.targetId,
+        method: request.method,
+        epoch: session.refs.currentEpoch,
+        url: session.url,
+        navigated: false,
+        value: capped.payload,
+        truncated: capped.truncated,
+      }
+    }
+    const capped = capResult(raw)
+    return {
+      kind: 'execute',
+      sessionId: session.targetId,
+      method: request.method,
+      epoch: session.refs.currentEpoch,
+      url: session.url,
+      navigated: false,
+      result: capped.payload,
+      truncated: capped.truncated,
+    }
+  }
+
+  /**
+   * P3：按 ref 现算元素的视口坐标盒（方案 4.3 / 4.4）。
+   *
+   * 定位链路照 `[V36]` 实测：`refs.resolve(ref)`（纪元校验沿用既有路径，从不绕开）→
+   * `backendNodeId` → `DOM.resolveNode`（无需 `DOM.enable`）→ `Runtime.callFunctionOn`
+   * 现算 rect。**不用 nodeId**（`[V19]` 实测重复 `getDocument` 后重新分配），**不引
+   * selector**（重构后可能静默命中另一个元素；backendNodeId 是「指向」语义，失败可检出）。
+   *
+   * ## 三道失效守卫（方案 4.4 + `[V36]`，缺一不可）
+   *
+   * 1. `DOM.resolveNode` 抛错 / 拿不到 objectId → `BROWSER_STALE_REF`（节点彻底没了）；
+   * 2. resolve 成功但 `this.isConnected === false` → `BROWSER_STALE_REF` —— **`[V36]` 实测
+   *    `replaceWith` 换掉元素后 resolveNode 仍然成功**，只查 resolveNode 会漏这一档；
+   * 3. rect 宽高为 0 → `BROWSER_PROTOCOL_ERROR`。理由：节点还在文档里、只是没布局
+   *    （`display:none` / 未渲染），ref 并没有失效，所以不报 `BROWSER_STALE_REF`；沿用
+   *    click 路径对「元素没有可用布局盒」的既有错误码，并绝不拿 0 坐标假装成功。
+   *
+   * **每次调用都现算 rect，绝不缓存 snapshot 时的几何**（方案 4.4 的硬要求）：snapshot
+   * 之后的几何大概率已变，「现算」是 isConnected 之外唯一的兜底，缓存等于把兜底拆掉。
+   * 已知的剩余漏报区间：节点还在且 connected，但被页面复用显示另一条数据 —— 没有廉价
+   * 检测手段，坐标对不对要由调用方按业务语义判断（注释别写成「兜底完备」）。
+   */
+  async locate(request: BrowserLocateRequest, signal?: AbortSignal): Promise<BrowserLocateResult> {
+    const session = this.require(request.sessionId)
+    // 纪元校验走既有 resolve 路径：从未观察 → BROWSER_SNAPSHOT_REQUIRED，旧纪元 → BROWSER_STALE_REF。
+    const target = session.refs.resolve(request.ref)
+    const options = { signal, timeoutMs: this.config.commandTimeoutMs }
+    let objectId: string | undefined
+    try {
+      objectId = await this.resolveNodeObjectId(session, target.backendNodeId, signal)
+    } catch (error: unknown) {
+      // detach（[V16]）与连接丢失是会话级状态，不是 ref 失效 —— 保持既有错误码原样上抛。
+      if (error instanceof BrowserError
+        && (error.code === 'BROWSER_DEBUGGER_DETACHED' || error.code === 'BROWSER_CONNECTION_LOST')) throw error
+      throw new BrowserError(
+        `the element for ref "${request.ref}" is gone from the document; run browser_snapshot again`,
+        'BROWSER_STALE_REF',
+        { cause: error },
+      )
+    }
+    if (objectId === undefined) {
+      throw new BrowserError(
+        `the element for ref "${request.ref}" is no longer attached to the document; run browser_snapshot again`,
+        'BROWSER_STALE_REF',
+      )
+    }
+    try {
+      // 守卫 2（[V36]）：resolveNode 成功 ≠ 节点还连在文档上，量 rect 之前先查 isConnected。
+      const connected = await session.connection.send<EvaluateResult>(
+        'Runtime.callFunctionOn',
+        { objectId, functionDeclaration: 'function () { return this.isConnected; }', returnByValue: true },
+        options,
+      )
+      if (connected.result?.value !== true) {
+        throw new BrowserError(
+          `the element for ref "${request.ref}" was removed from the document (the page may have `
+          + 're-rendered); run browser_snapshot again',
+          'BROWSER_STALE_REF',
+        )
+      }
+      const scroll = request.scroll ?? true
+      // 守卫 3 落在 elementViewportBox 的零尺寸校验里（见上，选 BROWSER_PROTOCOL_ERROR 的理由）。
+      const box = await this.elementViewportBox(session, objectId, signal, scroll)
+      if (request.highlight === true) await this.paintHighlight(session, objectId, signal)
+      else if (session.highlightPainted) await this.clearHighlight(session, signal)
+      return {
+        kind: 'locate',
+        sessionId: session.targetId,
+        epoch: session.refs.currentEpoch,
+        ref: request.ref,
+        x: box.x,
+        y: box.y,
+        width: box.width,
+        height: box.height,
+        centered: scroll,
+      }
+    } finally {
+      this.releaseObject(session, objectId, signal)
+    }
+  }
+
   /** @inheritdoc */
   async dispose(): Promise<void> {
     const sessions = [...this.sessions.values()]
     this.sessions.clear()
     const results = await Promise.allSettled(sessions.map(async (session) => {
+      session.consoleCollector.dispose()
+      session.networkCollector.dispose()
       session.connection.close()
       await this.transport.closeTarget(session.targetId)
     }))
@@ -399,6 +668,21 @@ export class CdpBrowserProvider implements BrowserProvider {
   /** 当前存活会话数（测试与诊断用）。 */
   get sessionCount(): number {
     return this.sessions.size
+  }
+
+  /**
+   * 设置某个会话的人工接管状态位（P3，方案 4.1.1）。
+   *
+   * 由 `browser-electron` 的 takeover 通道驱动；直连外部 Chrome 的 provider 没有这条通道，
+   * 状态位恒为 `false`。**是幂等状态位，不是计数器** —— agent 自己 toggle DevTools 时同样
+   * 会收到通知，不需要去重。会话不存在时静默忽略（通知可能晚于会话关闭）。
+   *
+   * @param sessionId - 会话 id（即 target id）。
+   * @param active - 人工是否正在操作（DevTools 开 / 关）。
+   */
+  protected setTakeover(sessionId: string, active: boolean): void {
+    const session = this.sessions.get(sessionId)
+    if (session !== undefined) session.takeover = active
   }
 
   /** 后台刷新一次端点探测结果。 */
@@ -462,6 +746,8 @@ export class CdpBrowserProvider implements BrowserProvider {
       outline: renderOutline(outline, publication.refs),
       refs: session.refs.list(),
       truncated: publication.truncated,
+      // 人工接管只加提示，**不动 epoch** —— 开合 DevTools 不该作废模型的 ref（[V31]）。
+      ...session.takeover ? { takeover: true } : {},
     }
   }
 
@@ -546,6 +832,25 @@ export class CdpBrowserProvider implements BrowserProvider {
   // ---------------------------------------------------------------------------
 
   /**
+   * `DOM.resolveNode({ backendNodeId })` → 远端对象句柄（`[V36]`：无需 `DOM.enable`）。
+   *
+   * 节点已销毁时 Chrome 回 CDP 错误（原样上抛，由调用方决定映射）；返回体里缺
+   * `objectId` 时返回 `undefined` —— 两种「拿不到句柄」的形态要分开处理。
+   */
+  private async resolveNodeObjectId(
+    session: SessionState,
+    backendNodeId: number,
+    signal?: AbortSignal,
+  ): Promise<string | undefined> {
+    const resolved = await session.connection.send<ResolveNodeResult>(
+      'DOM.resolveNode',
+      { backendNodeId },
+      { signal, timeoutMs: this.config.commandTimeoutMs },
+    )
+    return resolved.object?.objectId
+  }
+
+  /**
    * 把 ref 解析成远端对象句柄。
    *
    * **第一步**就是查纪元表：ref 失效（或从未 snapshot）时这里直接抛
@@ -554,12 +859,7 @@ export class CdpBrowserProvider implements BrowserProvider {
    */
   private async resolveObjectId(session: SessionState, ref: string, signal?: AbortSignal): Promise<string> {
     const target = session.refs.resolve(ref)
-    const resolved = await session.connection.send<ResolveNodeResult>(
-      'DOM.resolveNode',
-      { backendNodeId: target.backendNodeId },
-      { signal, timeoutMs: this.config.commandTimeoutMs },
-    )
-    const objectId = resolved.object?.objectId
+    const objectId = await this.resolveNodeObjectId(session, target.backendNodeId, signal)
     if (objectId === undefined) {
       throw new BrowserError(
         'the observed element is no longer attached to the document; run browser_snapshot again',
@@ -577,25 +877,32 @@ export class CdpBrowserProvider implements BrowserProvider {
   }
 
   /**
-   * 取元素的视口坐标盒（先滚动到视口中央再量）。
+   * 取元素的视口坐标盒（默认先滚动到视口中央再量）。
    *
    * 用 `Runtime.callFunctionOn` + `getBoundingClientRect` 而不是 `DOM.getBoxModel`：
    * 后者给的是文档坐标，而 `Input.dispatchMouseEvent` 吃的是视口坐标；
    * 元素在视口外时文档坐标直接把事件点到看不见的地方去。
+   *
+   * `scroll=false` 跳过 `scrollIntoView`（`browser_locate` 的 `scroll: false` 用）：
+   * 只读坐标、不动视口。零尺寸在此统一拒绝 —— click 的落点与 locate 的「不可见」判定
+   * 都不能建立在 0 宽高的盒子上。
    */
   private async elementViewportBox(
     session: SessionState,
     objectId: string,
     signal?: AbortSignal,
+    scroll = true,
   ): Promise<{ x: number; y: number; width: number; height: number }> {
     const evaluated = await session.connection.send<EvaluateResult>(
       'Runtime.callFunctionOn',
       {
         objectId,
-        functionDeclaration:
-          'function () { this.scrollIntoView({ block: "center", inline: "center" });'
-          + ' const rect = this.getBoundingClientRect();'
-          + ' return { x: rect.x, y: rect.y, width: rect.width, height: rect.height }; }',
+        functionDeclaration: scroll
+          ? 'function () { this.scrollIntoView({ block: "center", inline: "center" });'
+            + ' const rect = this.getBoundingClientRect();'
+            + ' return { x: rect.x, y: rect.y, width: rect.width, height: rect.height }; }'
+          : 'function () { const rect = this.getBoundingClientRect();'
+            + ' return { x: rect.x, y: rect.y, width: rect.width, height: rect.height }; }',
         returnByValue: true,
       },
       { signal, timeoutMs: this.config.commandTimeoutMs },
@@ -617,6 +924,46 @@ export class CdpBrowserProvider implements BrowserProvider {
       throw new BrowserError('the element has no usable layout box to interact with', 'BROWSER_PROTOCOL_ERROR')
     }
     return { x, y, width, height }
+  }
+
+  /**
+   * 在元素上画一层高亮（方案 4.3，`browser_locate` 的 `highlight: true`）。
+   *
+   * 两道门缺一不可（`[V15][V20]`）：本 session 必须先 `DOM.enable` 才能成功
+   * `Overlay.enable`，必须先 `Overlay.enable` 才能调 `Overlay.highlightNode`。
+   * **每次都补发这两条 enable**：re-attach 后 domain enable 状态不保证还在
+   * （与 console / network 采集读取前补发 enable 同一条理由）。
+   *
+   * 只用 `highlightNode` + `highlightConfig`（contentColor 填色 + borderColor 边框），
+   * **绝不用 `Overlay.highlightRect`** —— `[V32]` 实测后者会把传入 rect 之外的整个视口
+   * 染色。高亮是本 client 自己的一层，与人工 DevTools / 其它 client 的高亮互不取消
+   * （`[V31]`），无需协商；它会保持到 `Overlay.hideHighlight` 或页面导航。
+   */
+  private async paintHighlight(session: SessionState, objectId: string, signal?: AbortSignal): Promise<void> {
+    const options = { signal, timeoutMs: this.config.commandTimeoutMs }
+    await session.connection.send('DOM.enable', {}, options)
+    await session.connection.send('Overlay.enable', {}, options)
+    await session.connection.send('Overlay.highlightNode', {
+      objectId,
+      highlightConfig: {
+        contentColor: { r: 250, g: 200, b: 60, a: 0.5 },
+        borderColor: { r: 220, g: 120, b: 0, a: 1 },
+      },
+    }, options)
+    session.highlightPainted = true
+  }
+
+  /**
+   * 弹掉本 client 画的那层高亮（`browser_locate` 的 `highlight: false` 且此前画过时调用）。
+   * `hideHighlight` 只弹自己那层（`[V31]`）；enable 门与 paint 相同，防止 re-attach 后
+   * Overlay 未 enable 时 hide 直接失败。
+   */
+  private async clearHighlight(session: SessionState, signal?: AbortSignal): Promise<void> {
+    const options = { signal, timeoutMs: this.config.commandTimeoutMs }
+    await session.connection.send('DOM.enable', {}, options)
+    await session.connection.send('Overlay.enable', {}, options)
+    await session.connection.send('Overlay.hideHighlight', {}, options)
+    session.highlightPainted = false
   }
 
   /** 点击：解析 ref → 滚到可视区 → 在元素中心派发真实的鼠标按下/抬起。 */
@@ -834,6 +1181,33 @@ export class CdpBrowserProvider implements BrowserProvider {
     awaitNavigation: boolean,
     signal?: AbortSignal,
   ): Promise<BrowserMutationResult> {
+    const navigated = await this.detectNavigation(session, beforeUrl, awaitNavigation, signal)
+    return {
+      kind: 'mutation',
+      sessionId: session.targetId,
+      action,
+      epoch: session.refs.currentEpoch,
+      url: session.url,
+      title: session.title,
+      navigated,
+    }
+  }
+
+  /**
+   * 探测地址是否变了；变了就作废既有 ref 并更新会话元信息。
+   *
+   * 判据是**地址变化**（`meta.url !== beforeUrl`）而不是 `readyState`：软导航 / 异步提交
+   * 都可能让 readyState 先于地址稳定。`awaitNavigation` 为真时给一个短轮询窗口
+   * （`MUTATION_NAVIGATION_POLL_MS`），否则只读一次。
+   *
+   * @returns 是否检测到导航（地址变化）。
+   */
+  private async detectNavigation(
+    session: SessionState,
+    beforeUrl: string,
+    awaitNavigation: boolean,
+    signal?: AbortSignal,
+  ): Promise<boolean> {
     let navigated = false
     const deadline = awaitNavigation ? Date.now() + MUTATION_NAVIGATION_POLL_MS : 0
     for (;;) {
@@ -850,15 +1224,7 @@ export class CdpBrowserProvider implements BrowserProvider {
       if (navigated || Date.now() >= deadline) break
       await delay(WAIT_POLL_INTERVAL_MS, signal)
     }
-    return {
-      kind: 'mutation',
-      sessionId: session.targetId,
-      action,
-      epoch: session.refs.currentEpoch,
-      url: session.url,
-      title: session.title,
-      navigated,
-    }
+    return navigated
   }
 
   /** 标签页清单：只含受控会话；transport 能回答「谁在前台」时补上 active。 */
@@ -1052,8 +1418,38 @@ function describeKey(key: string): { key: string; code: string; virtualKeyCode: 
   )
 }
 
-/** 把 `navigationSettled` 的探测结果从 `unknown` 收窄成结构化状态。 */
-function readNavigationState(value: unknown): { ready: boolean; href: string } | undefined {
+/** 收窄 `limit`：缺省 / 非法落到默认值，过大压到 500。 */
+function normalizeLimit(limit: number | undefined): number {
+  if (limit === undefined || !Number.isFinite(limit) || limit <= 0) return DEFAULT_P2_LIMIT
+  return Math.min(Math.floor(limit), 500)
+}
+
+/**
+ * 把过大的结果压成一段截断字符串。
+ *
+ * 逃生舱可能返回极大的对象（`DOM.getDocument{depth:-1}`、完整 AX 树），直接塞进工具结果会
+ * 撑爆模型上下文。这里统一设一个上限：超了就退化成「JSON 文本 + 截断说明」，并在回执里标
+ * `truncated`。注意退化后 `value` / `result` 的类型从对象变成字符串 —— schema 声明的是
+ * 任意 JSON，两者都合法。
+ */
+function capResult(value: unknown): { payload: unknown; truncated: boolean } {
+  let serialized: string | undefined
+  try {
+    serialized = JSON.stringify(value)
+  } catch {
+    serialized = undefined
+  }
+  if (serialized === undefined || serialized.length <= EXECUTE_MAX_RESULT_CHARS) {
+    return { payload: value, truncated: false }
+  }
+  const overflow = serialized.length - EXECUTE_MAX_RESULT_CHARS
+  return {
+    payload: `${serialized.slice(0, EXECUTE_MAX_RESULT_CHARS)}\n...[truncated ${overflow} chars]`,
+    truncated: true,
+  }
+}
+
+/** 把 `navigationSettled` 的探测结果从 `unknown` 收窄成结构化状态。 */function readNavigationState(value: unknown): { ready: boolean; href: string } | undefined {
   if (typeof value !== 'string') return undefined
   let parsed: unknown
   try {

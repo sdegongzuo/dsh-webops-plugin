@@ -18,13 +18,27 @@ export {
   CdpBrowserProvider,
   CDP_PROVIDER_ID,
   DEFAULT_CDP_ENDPOINT,
+  DEFAULT_P2_LIMIT,
+  EXECUTE_MAX_RESULT_CHARS,
   validateProviderConfig,
 } from './provider.ts'
 export type { CdpProviderConfig } from './provider.ts'
+export { ConsoleCollector, CONSOLE_RING_CAPACITY, CONSOLE_TEXT_MAX_CHARS } from './console.ts'
+export type { ConsoleEntry, ConsoleReadOptions, ConsoleReadResult } from './console.ts'
+export { NetworkCollector, NETWORK_MAX_BODY_CHARS, NETWORK_TABLE_CAPACITY } from './network.ts'
+export type { NetworkBodyResult, NetworkEntry } from './network.ts'
+export {
+  assertExecuteAllowed,
+  BROWSER_EXECUTE_ALLOWED,
+  extractEvaluateValue,
+  translateEvaluateError,
+} from './execute.ts'
 export { CdpConnection, HttpCdpTransport } from './protocol.ts'
 export type { CdpSocket, CdpSocketFactory, CdpTarget, CdpTransport, CdpVersion } from './protocol.ts'
 export { RefRegistry } from './refs.ts'
 export type { RefPublication, RefTarget } from './refs.ts'
+export { TargetStateRegistry } from './state.ts'
+export type { StateClaim, StateClaimOptions, StateOwner, StateRecord } from './state.ts'
 export { buildOutline, DEFAULT_SNAPSHOT_LIMITS, renderOutline } from './snapshot.ts'
 export type { AxNode, OutlineLine, SnapshotLimits, SnapshotOutline } from './snapshot.ts'
 export { BROWSER_MAX_URL_LENGTH, validateEndpoint, validateTargetUrl } from './url-policy.ts'

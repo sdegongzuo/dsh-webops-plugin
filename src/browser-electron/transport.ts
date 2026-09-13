@@ -18,7 +18,8 @@
  */
 
 import { CdpConnection, type CdpTarget, type CdpTransport, type CdpVersion } from '../browser-cdp/protocol.ts'
-import { ElectronWindowBridge, type BridgeOptions, type BridgeTabBar, type TabHostChannel } from './bridge.ts'
+import { ElectronWindowBridge, type BridgeDevTools, type BridgeOptions, type BridgeTabBar, type TabHostChannel } from './bridge.ts'
+import type { TakeoverListener } from './bridge.ts'
 import { DEFAULT_BRIDGE_COMMAND_TIMEOUT_MS } from './bridge.ts'
 import { WindowCdpSocket } from './socket.ts'
 
@@ -124,6 +125,33 @@ export class ElectronWindowTransport implements CdpTransport {
   async activateTarget(targetId: string): Promise<void> {
     const bridge = await this.requireBridge()
     await bridge.activate(targetId)
+  }
+
+  /**
+   * 切换活动标签的开发者工具，等宿主把状态落定后返回。
+   *
+   * 宿主只在打开那一瞬让位、随后立刻把调试器接回，所以这里返回之后 agent 的 CDP
+   * 通道应当仍然可用（见 `host.cjs` 的 `toggleDevTools`）。
+   * @returns 这次是开还是关，以及宿主的真实打开状态。
+   */
+  async toggleDevTools(): Promise<BridgeDevTools> {
+    const bridge = await this.requireBridge()
+    return bridge.toggleDevTools()
+  }
+
+  /**
+   * 订阅人工接管通知（方案 4.1.1）。
+   *
+   * 与其它动作一样是**按需启动**宿主的：订阅意味着「我要用这个窗口」，没必要单独造一条
+   * 不需要宿主的路。`active` 是幂等状态位，`devtools-opened` / `devtools-closed` 各来一条 —
+   * 人工走菜单 / 快捷键、agent 走 `toggleDevTools()`，两种来源都走这条通道。
+   *
+   * @param listener - 每次接管状态变化调用一次 `(tabId, active)`。
+   * @returns 退订函数。
+   */
+  async onTakeover(listener: TakeoverListener): Promise<() => void> {
+    const bridge = await this.requireBridge()
+    return bridge.onTakeover(listener)
   }
 
   /**
