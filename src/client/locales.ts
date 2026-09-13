@@ -9,12 +9,12 @@ export const BROWSER_NS = 'browser-plugin'
 
 /** 中文文案（也是 key 的唯一来源）。 */
 export const zh = {
-  title: '浏览器',
-  // 状态词与 title 拼在一起显示（「浏览器 · 已就绪」），所以这里不要重复「浏览器」。
+  title: '网页操作',
+  // 状态词与 title 拼在一起显示（「网页操作 · 已就绪」），所以这里不要重复「网页操作」。
   active: '操作中',
   idle: '已就绪',
   failed: '有调用失败',
-  idleHint: 'agent 可用 browser_* 工具打开、观察与操作页面',
+  idleHint: 'agent 可打开、观察与操作网页',
   url: '地址',
   snapshot: '快照',
   screenshot: '截图',
@@ -24,11 +24,11 @@ export const zh = {
 
 /** 英文文案；键集与 {@link zh} 一致。 */
 export const en: Record<BrowserKey, string> = {
-  title: 'Browser',
+  title: 'Web ops',
   active: 'busy',
   idle: 'ready',
   failed: 'call failed',
-  idleHint: 'The agent can open, inspect, and drive pages via browser_* tools',
+  idleHint: 'The agent can open, inspect, and drive web pages',
   url: 'URL',
   snapshot: 'snapshots',
   screenshot: 'screenshots',

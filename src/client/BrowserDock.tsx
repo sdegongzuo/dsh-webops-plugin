@@ -3,7 +3,7 @@
  *
  * 为什么无活动也要占位：这个插件要「装完在界面里看得见」。只在模型真的调用过
  * `browser_*` 之后才出现的话，用户装完插件打开会话什么也看不到，等于没有证据表明
- * 客户端半边活了。所以无活动时显示一行「浏览器 · 已就绪 / agent 可用 browser_* 工具打开、观察与操作页面」。
+ * 客户端半边活了。所以无活动时显示一行「网页操作 · 已就绪 / agent 可打开、观察与操作网页」。
  * 这一行同时也是 `scripts/check-desktop.mjs` 的第四项硬证据。
  *
  * 数据全部派生自对话快照（`ui-chat` 的 `ChatSnapshot`），**不新增任何 RPC**：
@@ -67,7 +67,7 @@ export function BrowserDock(props: BrowserDockProps) {
     >
       <span style={{ fontWeight: 600 }}>{t('title')}</span>
       <span style={{ opacity: 0.75 }}>{stateText}</span>
-      {/* 无活动时给一句说明，否则这行就只剩「浏览器 · 已就绪」，看不出在等什么。 */}
+      {/* 无活动时给一句说明，否则这行就只剩「网页操作 · 已就绪」，看不出在等什么。 */}
       {idle ? (
         <span data-dsh-browser-hint style={{ opacity: 0.6 }}>{t('idleHint')}</span>
       ) : (
