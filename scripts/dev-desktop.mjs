@@ -167,6 +167,9 @@ async function main() {
   // 窗口宿主需要真的 Electron 二进制；这里就用跑桌面端的这一个。
   environment.DSH_BROWSER_ELECTRON_PATH ??= electron
   // 万一有人把 provider 切回 `cdp`，端点也别指向桌面端自己。
+  // 注意：默认的 `electron` provider **完全用不到**这个端点 —— 桌面模式下不起任何
+  // Chrome；只有显式把 provider 换成 `cdp`（或跑 headless 无头验证链路）才需要
+  // 一个真 Chrome 实例监听 9333。
   environment.DSH_BROWSER_CDP_ENDPOINT ??= 'http://127.0.0.1:9333'
 
   console.log(`dev-desktop: DSH_HOME=${environment.DSH_HOME}`)
