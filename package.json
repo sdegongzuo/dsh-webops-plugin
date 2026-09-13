@@ -62,6 +62,7 @@
     "shot:desktop": "node scripts/shot-desktop.mjs",
     "smoke:dispatch": "tsx scripts/smoke-dispatch.ts",
     "smoke:devtools": "tsx scripts/smoke-devtools.ts",
+    "smoke:p2p3": "tsx scripts/smoke-p2p3.ts",
     "smoke:window": "tsx scripts/smoke-window.ts",
     "window:desktop": "node scripts/window-in-host.mjs",
     "package:portable": "node scripts/package-portable.mjs"
