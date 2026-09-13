@@ -1,8 +1,8 @@
-# dsh-browser-plugin
+# dsh-webops-plugin
 
-给 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) 增加**浏览器调试与操作**能力的插件。
-能力形态对齐 [Minke](https://github.com/lencx/minke) 的 Agent Browser：模型可以打开页面、读取页面大纲、
-按 ref 定位并操作元素、采集控制台与网络活动，并支持人工接管。
+给 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) 增加**客户端网页操作与调试**能力的插件：
+多会话、新窗口、多标签页地调试和操作网页。能力形态对齐 [Minke](https://github.com/lencx/minke) 的 Agent Browser：
+模型可以打开页面、读取页面大纲、按 ref 定位并操作元素、采集控制台与网络活动，并支持人工接管。
 
 这是一个 **out-of-tree bundle**：不修改 deepseek-harness 仓库的任何文件，靠自己的 `cordis.patch.yml`
 把插件行插进目标 profile。
