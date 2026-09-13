@@ -611,6 +611,24 @@ agent 的 snapshot / 截图 / evaluate 全部照常返回。
 回归以 `pnpm test` 的输出为准（238 passed / 3 skipped，3 个 live 用例在端点非真 Chrome 时整组跳过）。
 P2/P3 的设计依据见 `docs/P2-P3-开发方案.md` 与 `docs/P2-P3-状态归属与接入规范.md`。
 
+## 发版
+
+推 `v*` tag 触发 `.github/workflows/release.yml`：windows-latest 上取 deepseek-harness 源码
+（13 个 `link:` 依赖指向它）→ `pnpm install` → `pnpm build` → 打 zip → 建 Release。
+也支持 Actions 手动补发（`workflow_dispatch`，可覆盖 `harness_ref`）。
+
+产物 `dsh-webops-plugin-v<ver>-win-x64-portable.zip` 是**免构建**的插件目录：解压后
+`dsh plugin add <目录>` 直接加载，用户端不需要 Node 工具链，也不需要 harness checkout
+（发布版 `package.json` 已剔除 `devDependencies` 里的 `link:`）。包内 `INSTALL.md` 有完整步骤。
+
+```bash
+pnpm run package:portable            # 本地也能打，产出 dist/*.zip
+git tag v0.1.0 && git push origin v0.1.0
+```
+
+> 便携版的「win-x64」体现在**命名与验证环境**上：产物本身是平台无关的 JS + 一个
+> Electron 窗口宿主 `lib/browser-electron/host.cjs`（运行时由桌面端提供 electron.exe）。
+
 ## License
 
 MIT
