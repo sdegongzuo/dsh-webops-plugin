@@ -371,7 +371,7 @@ describe('CdpBrowserProvider', () => {
     await provider.observe({ kind: 'screenshot', sessionId: session.id, fullPage: true })
 
     const capture = chrome.calls.filter(call => call.method === 'Page.captureScreenshot').at(-1)
-    expect(capture?.params).toEqual({ format: 'png', captureBeyondViewport: true })
+    expect(capture?.params).toEqual({ format: 'png', captureBeyondViewport: true, fromSurface: false })
   })
 
   it('clips an element screenshot to the ref box and releases the remote handle', async () => {

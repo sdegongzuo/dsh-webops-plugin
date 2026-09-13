@@ -764,7 +764,11 @@ export class CdpBrowserProvider implements BrowserProvider {
       const target: RefTarget = session.refs.resolve(ref)
       clip = await this.elementClip(session, target.backendNodeId, signal)
     }
-    const params: Record<string, unknown> = { format: 'png' }
+    // `fromSurface: false` 从渲染器取帧而不是合成器表面：默认的表面路径在
+    // 「看不见的页面」上不出帧会**永久挂起** —— [V33] 的 show:false 窗口、以及
+    // 多标签场景里 setVisible(false) 的后台标签（2026-09-13 多会话演示实测，
+    // 30s 超时前不返回）。渲染器路径对前台/后台标签都强制出一帧，没有这个坑。
+    const params: Record<string, unknown> = { format: 'png', fromSurface: false }
     if (clip !== undefined) {
       params['clip'] = clip
       params['captureBeyondViewport'] = true
