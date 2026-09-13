@@ -3,7 +3,7 @@
  *
  * 所有贡献都走 `ctx.effect()` —— 插件卸载时 provider 一并释放它持有的连接与标签页。
  *
- * @module dsh-browser-plugin/browser-cdp
+ * @module dsh-webops-plugin/browser-cdp
  */
 
 import type { Context } from '@deepseek-ai/cordis'

@@ -13,7 +13,7 @@
 import { defineConfig } from 'tsdown'
 
 /** 插件 id：既写进 `__ModuleLoader__.load` 的握手，也是 client 入口的构建名。 */
-const PLUGIN_ID = 'dsh-browser-plugin'
+const PLUGIN_ID = 'dsh-webops-plugin'
 
 /**
  * 浏览器模块表里**本来就有的**共享模块（源自 `packages/client/web/src/platform.ts`

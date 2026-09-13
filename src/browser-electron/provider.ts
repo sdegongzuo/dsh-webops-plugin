@@ -8,7 +8,7 @@
  * provider id 是 `electron`，与 `cdp` 并列注册；两者是否可用由
  * {@link ElectronBrowserProvider.available} 与 `browser` 服务的配置决定。
  *
- * @module dsh-browser-plugin/browser-electron/provider
+ * @module dsh-webops-plugin/browser-electron/provider
  */
 
 import { CdpBrowserProvider } from '../browser-cdp/provider.ts'

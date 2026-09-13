@@ -5,7 +5,7 @@
  * 所以这里做的事就是双向搬运：socket 的 `send` 拆成一次桥命令，
  * 桥回来的结果与事件重新拼成 `{ data }` 事件派发出去。
  *
- * @module dsh-browser-plugin/browser-electron/socket
+ * @module dsh-webops-plugin/browser-electron/socket
  */
 
 import type { CdpSocket } from '../browser-cdp/protocol.ts'

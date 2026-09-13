@@ -7,7 +7,7 @@
  * 传输层与业务层之间隔了 {@link CdpTransport} 这层接口，测试可以整段替换掉，
  * 不必真的起浏览器。
  *
- * @module dsh-browser-plugin/browser-cdp/protocol
+ * @module dsh-webops-plugin/browser-cdp/protocol
  */
 
 import { BrowserError } from '../browser/types.ts'

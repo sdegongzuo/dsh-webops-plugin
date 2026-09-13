@@ -4,7 +4,7 @@
  * 刻意**不开 nodeIntegration**：这个页面只是 UI，不需要 Node；`sandbox: true` 下
  * `contextBridge` 依然可用，所以走它。
  *
- * @module dsh-browser-plugin/browser-electron/tabbar-preload
+ * @module dsh-webops-plugin/browser-electron/tabbar-preload
  */
 
 const { contextBridge, ipcRenderer } = require('electron')

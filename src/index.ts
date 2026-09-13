@@ -10,13 +10,13 @@
  * 原因在 `packages/client/modules/src/index.ts` 的 `locatePkgJson()`：客户端模块表
  * 判断「某个 Loader 行是不是客户端包」时，先调
  * `exactPackageSpecifier(name)` 取包名，而该函数对**非 scoped 且带 `/`** 的
- * specifier（本插件的三个 host 行 `dsh-browser-plugin/browser` 等）直接返回
+ * specifier（本插件的三个 host 行 `dsh-webops-plugin/browser` 等）直接返回
  * `undefined`，于是整行被判为「永久不是客户端行」。只有**裸包名**行
- * （`dsh-browser-plugin`）才会继续解析 `dsh.client` 与 `exports["./client"]`。
+ * （`dsh-webops-plugin`）才会继续解析 `dsh.client` 与 `exports["./client"]`。
  *
  * 所以：三个 host 行负责能力，这一行（裸包名）只负责让浏览器那半边被发现和加载。
  *
- * @module dsh-browser-plugin
+ * @module dsh-webops-plugin
  */
 
 import { noteLoaded } from './debug.ts'

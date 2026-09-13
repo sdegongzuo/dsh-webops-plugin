@@ -13,7 +13,7 @@
  * - 本模块是**纯函数**，不碰 CDP、不碰网络；ref 名由 `RefRegistry` 分配，所以这里只产出
  *   「行 + 该行是否绑定一个可操作元素」，由调用方在 publish 之后拼上真实 ref。
  *
- * @module dsh-browser-plugin/browser-cdp/snapshot
+ * @module dsh-webops-plugin/browser-cdp/snapshot
  */
 
 import type { RefTarget } from './refs.ts'

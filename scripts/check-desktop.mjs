@@ -16,7 +16,7 @@
  * 第 4 条之所以是硬条件：dock 常驻渲染（无活动时显示「已就绪」），所以它**缺席即失败**——
  * 这正好让「装完在界面里看得见」这件事有了自动化证据，不必先骗模型去调一次浏览器工具。
  *
- * 5. `data-dsh-browser-plugin-dock` / `-tool-views` → slot **注册成功**（不只是 bundle 跑过）。
+ * 5. `data-dsh-webops-plugin-dock` / `-tool-views` → slot **注册成功**（不只是 bundle 跑过）。
  *    `ctx.slots.inject` 的 cb 要等 slot 被声明才执行，所以这两个标记才能证明
  *    `conversation.input.dock` 与 `tool.call.toolview` 真的被声明并且我们注册进去了。
  *
@@ -27,7 +27,7 @@
 
 const PORT = Number(process.env.RENDERER_PORT ?? 9222)
 const DEADLINE_MS = Number(process.env.CHECK_DEADLINE_MS ?? 60_000)
-const PLUGIN_ID = 'dsh-browser-plugin'
+const PLUGIN_ID = 'dsh-webops-plugin'
 /** 客户端应注册的工具卡片数：browser_open / navigate / snapshot / screenshot。 */
 const EXPECTED_TOOL_VIEWS = 4
 

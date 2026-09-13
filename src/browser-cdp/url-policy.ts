@@ -8,7 +8,7 @@
  * 落点；对浏览器来说真正的边界是「模型能不能让浏览器去任意地址」，而那由**用户自己开着的
  * Chrome 的登录态**兜底：这是调试形态，不是匿名抓取形态。
  *
- * @module dsh-browser-plugin/browser-cdp/url-policy
+ * @module dsh-webops-plugin/browser-cdp/url-policy
  */
 
 import { BrowserError } from '../browser/types.ts'

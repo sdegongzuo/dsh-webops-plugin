@@ -6,7 +6,7 @@
  *
  * 状态：P0 骨架。缝隙本身已可用（注册 / 选择 / 转发），页面能力在 provider 侧。
  *
- * @module dsh-browser-plugin/browser
+ * @module dsh-webops-plugin/browser
  */
 
 import { Service } from '@deepseek-ai/cordis'

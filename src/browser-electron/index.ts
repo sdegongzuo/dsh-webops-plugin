@@ -24,7 +24,7 @@
  *
  * 也可以在 profile 里写 `config:`（`enabled` / `electronPath`）。
  *
- * @module dsh-browser-plugin/browser-electron
+ * @module dsh-webops-plugin/browser-electron
  */
 
 import { fileURLToPath } from 'node:url'

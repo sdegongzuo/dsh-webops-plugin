@@ -23,7 +23,7 @@
  * - **截图落盘**：`ctx.attachments.saveImage` → `ImageAttachmentRef`，消息里只留引用，
  *   绝不把 base64 塞进工具结果。
  *
- * @module dsh-browser-plugin/tool-browser
+ * @module dsh-webops-plugin/tool-browser
  */
 
 import type { Context } from '@deepseek-ai/cordis'

@@ -17,7 +17,7 @@
  * 它验证的是「provider + 真实浏览器」这一段；attachment 落盘用真实的 LocalAttachmentStore，
  * 所以「截图能不能被会话接受」这件事也有实证，而不是只有桩。
  *
- * @module dsh-browser-plugin/browser-cdp/live
+ * @module dsh-webops-plugin/browser-cdp/live
  */
 
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'

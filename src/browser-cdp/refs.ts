@@ -14,7 +14,7 @@
  * 于是旧 ref 只会落到「表里没有」，报 `BROWSER_STALE_REF`（有过 snapshot）或
  * `BROWSER_SNAPSHOT_REQUIRED`（从来没 snapshot 过），两者都是模型应当用「重新观察」来恢复的。
  *
- * @module dsh-browser-plugin/browser-cdp/refs
+ * @module dsh-webops-plugin/browser-cdp/refs
  */
 
 import { BrowserError } from '../browser/types.ts'

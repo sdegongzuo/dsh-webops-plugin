@@ -39,7 +39,7 @@ const REPO_ROOT = resolve(PLUGIN_ROOT, '..', 'deepseek-harness')
 const APP_ROOT = join(REPO_ROOT, 'apps', 'desktop')
 const DEVELOPMENT_ROOT = join(APP_ROOT, '.desktop-build', 'development')
 const PROJECT_DIR = join(DEVELOPMENT_ROOT, 'project')
-const PLUGIN_NAME = 'dsh-browser-plugin'
+const PLUGIN_NAME = 'dsh-webops-plugin'
 
 /** 装进 profile 的包内容；`src/` 不进去，桌面端只吃构建产物。 */
 const SHIPPED = ['lib', 'package.json', 'cordis.patch.yml', 'README.md', 'LICENSE']

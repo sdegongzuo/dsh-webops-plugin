@@ -1,4 +1,4 @@
-# dsh-browser-plugin 的 bundle patch。
+# dsh-webops-plugin 的 bundle patch。
 #
 # 三行全部落在 HOST 平面：能力服务、它的 CDP provider、以及模型可见的工具。
 #
@@ -19,24 +19,24 @@
 
 - insert:
     - id: browser
-      name: 'dsh-browser-plugin/browser'
+      name: 'dsh-webops-plugin/browser'
 
     - id: browser-cdp
-      name: 'dsh-browser-plugin/browser-cdp'
+      name: 'dsh-webops-plugin/browser-cdp'
 
     # 桌面端用的 provider：开一个真的 Electron 窗口，用 webContents.debugger 驱动。
     # 它**默认不参与 provider 选择**（`available()` 要求显式启用），所以插在这儿
     # 不会影响 CLI 场景 —— 那边只有 browser-cdp 可用，仍然自动选中它。
     - id: browser-electron
-      name: 'dsh-browser-plugin/browser-electron'
+      name: 'dsh-webops-plugin/browser-electron'
 
     - id: tool-browser
-      name: 'dsh-browser-plugin/tool-browser'
+      name: 'dsh-webops-plugin/tool-browser'
 
     # keyless 验证驱动：把 llm/stream 拦下来按脚本回放（第一轮发起 browser_open，
     # 工具真的执行；第二轮文本收尾）。只在验证场景使用；不需要时删掉这一行即可。
     - id: fake-llm
-      name: 'dsh-browser-plugin/fake-llm'
+      name: 'dsh-webops-plugin/fake-llm'
 
     - id: browser-plugin
-      name: 'dsh-browser-plugin'
+      name: 'dsh-webops-plugin'

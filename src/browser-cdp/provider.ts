@@ -14,7 +14,7 @@
  * 一个会话 = 一个标签页 + 一条 WebSocket + 一个 {@link RefRegistry}。
  * 标签页由本 provider 创建，因此也由它负责关闭；用户自己的标签页一概不碰。
  *
- * @module dsh-browser-plugin/browser-cdp
+ * @module dsh-webops-plugin/browser-cdp
  */
 
 import { BrowserError } from '../browser/types.ts'

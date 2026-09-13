@@ -8,7 +8,7 @@
  * 宿主是**一个窗口、多个标签页**：`open` 开的是标签（复用同一个壳窗口），
  * `activate` 决定哪个标签在前台，用户点标签条上的叉会自己关（`closed` 事件没有 `id`）。
  *
- * @module dsh-browser-plugin/browser-electron/bridge
+ * @module dsh-webops-plugin/browser-electron/bridge
  */
 
 import { spawn, type ChildProcess } from 'node:child_process'

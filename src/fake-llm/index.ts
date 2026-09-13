@@ -8,7 +8,7 @@
  * `@deepseek-ai/dsh-llm-replay` 的事；这个插件刻意极简，脚本写死、全局队列按序消费，
  * 脚本耗尽后的额外调用（比如标题生成）一律回一句兜底文本，绝不炸会话。
  *
- * @module dsh-browser-plugin/fake-llm
+ * @module dsh-webops-plugin/fake-llm
  */
 
 import { ToolCallId, type StreamChunk } from '@deepseek-ai/dsh-llm'

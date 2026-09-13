@@ -27,12 +27,12 @@ const URL_TO_OPEN = process.env.SMOKE_URL ?? 'https://www.baidu.com'
 const EXPRESSION = `(async () => {
   const { createRequire } = process.getBuiltinModule('module')
   const req = createRequire(${JSON.stringify(join(PROJECT, 'package.json'))})
-  const mod = req('dsh-browser-plugin/browser-electron')
+  const mod = req('dsh-webops-plugin/browser-electron')
   const provider = new mod.ElectronBrowserProvider(
     {},
     new mod.ElectronWindowTransport({
       electronPath: process.env.DSH_BROWSER_ELECTRON_PATH,
-      hostScript: req.resolve('dsh-browser-plugin/browser-electron').replace(/index\\.js$/u, 'host.cjs'),
+      hostScript: req.resolve('dsh-webops-plugin/browser-electron').replace(/index\\.js$/u, 'host.cjs'),
     }),
     true,
   )

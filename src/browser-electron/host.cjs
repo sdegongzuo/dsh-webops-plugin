@@ -59,7 +59,7 @@
  * - `{ type: 'event', tabId, method, params }`
  * - `{ type: 'error', id?, message }`
  *
- * @module dsh-browser-plugin/browser-electron/host
+ * @module dsh-webops-plugin/browser-electron/host
  */
 
 const { app, BrowserWindow, WebContentsView, ipcMain } = require('electron')

@@ -11,7 +11,7 @@
  *
  * 默认关闭：正常运行时插件不该往 stdout/stderr 写东西。
  *
- * @module dsh-browser-plugin/debug
+ * @module dsh-webops-plugin/debug
  */
 
 /** 打开诊断输出的环境变量名。 */
@@ -24,5 +24,5 @@ export const DEBUG_ENV = 'DSH_BROWSER_PLUGIN_DEBUG'
  */
 export function noteLoaded(face: string, detail: string): void {
   if (process.env[DEBUG_ENV] !== '1') return
-  process.stdout.write(`[dsh-browser-plugin] ${face}: ${detail}\n`)
+  process.stdout.write(`[dsh-webops-plugin] ${face}: ${detail}\n`)
 }

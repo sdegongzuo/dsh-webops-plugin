@@ -14,7 +14,7 @@
  * `target.webSocketDebuggerUrl` 用自定义 scheme `electron-tab://<id>`：
  * 它不是网页，也不需要端口，但它得是个稳定的「句柄」，上层拿它去 `connect()`。
  *
- * @module dsh-browser-plugin/browser-electron/transport
+ * @module dsh-webops-plugin/browser-electron/transport
  */
 
 import { CdpConnection, type CdpTarget, type CdpTransport, type CdpVersion } from '../browser-cdp/protocol.ts'

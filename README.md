@@ -139,21 +139,21 @@ scripts/shot-desktop.mjs  截一张真实桌面端的 PNG
 
 ```bash
 cd /d/dev/cli/deepseek-harness
-pnpm dsh plugin --profile browserp0 add D:/dev/cli/dsh-browser-plugin
+pnpm dsh plugin --profile browserp0 add D:/dev/cli/dsh-webops-plugin
 ```
 
-它初始化 profile（不存在时）、pnpm link 本目录、并把 `dsh-browser-plugin` 追加进 profile 的
+它初始化 profile（不存在时）、pnpm link 本目录、并把 `dsh-webops-plugin` 追加进 profile 的
 `dsh.profile.bundles`。实测 5 秒完成：
 
 ```
 dsh: initialized profile browserp0 at C:\Users\yemaf\.dsh\profiles\browserp0
-+ dsh-browser-plugin link:D:/dev/cli/dsh-browser-plugin
++ dsh-webops-plugin link:D:/dev/cli/dsh-webops-plugin
 ```
 
-验证层序（应出现 `# == dsh-browser-plugin` 层与五行）：
+验证层序（应出现 `# == dsh-webops-plugin` 层与五行）：
 
 ```bash
-pnpm dsh --profile browserp0 --dump-config | grep -A4 "== dsh-browser-plugin"
+pnpm dsh --profile browserp0 --dump-config | grep -A4 "== dsh-webops-plugin"
 ```
 
 **不需要 junction，也不需要改 dsh 的 `pnpm-workspace.yaml`**——`dsh plugin add` 自己完成了包名解析
@@ -165,12 +165,12 @@ pnpm dsh --profile browserp0 --dump-config | grep -A4 "== dsh-browser-plugin"
 ### 生产期
 
 ```sh
-dsh plugin --profile <name> add D:\dev\cli\dsh-browser-plugin   # 本地目录
-dsh plugin --profile <name> add github:sdegongzuo/dsh-browser-plugin#<sha>  # git（需 prepare + allowBuilds）
+dsh plugin --profile <name> add D:\dev\cli\dsh-webops-plugin   # 本地目录
+dsh plugin --profile <name> add github:sdegongzuo/dsh-webops-plugin#<sha>  # git（需 prepare + allowBuilds）
 ```
 
 > git 安装需要本仓提供 self-contained 的 `prepare` 脚本，且用户要在 profile 的 `pnpm-workspace.yaml`
-> 里 `allowBuilds: { dsh-browser-plugin: true }`。详见官方 `publish.md`。**待 P0 期间实测**。
+> 里 `allowBuilds: { dsh-webops-plugin: true }`。详见官方 `publish.md`。**待 P0 期间实测**。
 
 ### 桌面端另有硬约束（重要，别把两件事混在一起做）
 
@@ -180,7 +180,7 @@ profile 里的插件做四类断言，**每一条都与开发期的 `link:` 路�
 | 断言（源码位置） | 含义 | 对本仓的影响 |
 |---|---|---|
 | `linked private package` | profile 的 `node_modules` 下出现 symlink 即拒 | `dsh plugin add` 产生的正是 symlink → **桌面端不吃这条路** |
-| `package resolves outside profile` | 依赖闭包必须物理位于 profile 目录内 | 本仓在 `D:\dev\cli\dsh-browser-plugin` → 必须 vendor 一份副本进去 |
+| `package resolves outside profile` | 依赖闭包必须物理位于 profile 目录内 | 本仓在 `D:\dev\cli\dsh-webops-plugin` → 必须 vendor 一份副本进去 |
 | `must declare <host 包> as a peer dependency` | dsh 的共享包只能出现在 `peerDependencies`，出现在 `dependencies` 直接报错 | 本仓现在把 dsh 包放在 `devDependencies` + `link:` → 桌面端会拒 |
 | `requires <name>@<range>, found <version>` | peer 版本必须满足范围 | 要跟桌面端 runtime 里的版本对齐 |
 
@@ -206,7 +206,7 @@ application`，且 `plugin-add` 只收 npm registry 形态的 spec），而且 `
 
 #### 这里踩到的坑：客户端行必须是**裸包名**
 
-四个 patch 行里，前三个（`dsh-browser-plugin/browser` 等）负责能力，第四个是**裸包名** `dsh-browser-plugin`，
+四个 patch 行里，前三个（`dsh-webops-plugin/browser` 等）负责能力，第四个是**裸包名** `dsh-webops-plugin`，
 它的 host 半边是空实现（`src/index.ts`）。原因在 dsh 的
 `packages/client/modules/src/index.ts#locatePkgJson()`：它先调 `exactPackageSpecifier(name)` 取包名，而该函数对
 **非 scoped 且带 `/`** 的 specifier 直接返回 `undefined`，于是整行被判为「永久不是客户端行」，永远不会去读
@@ -223,10 +223,10 @@ Electron 的 stdout。所以 `src/debug.ts` 的加载诊断**必须写 stdout**�
 `DSH_BROWSER_PLUGIN_DEBUG=1`（`dev-desktop.mjs` 默认打开）时能看到：
 
 ```
-[dsh-browser-plugin] root: client row registered
-[dsh-browser-plugin] browser-cdp: endpoint=http://127.0.0.1:9333
-[dsh-browser-plugin] browser-electron: enabled=true electron=…/electron/dist/electron.exe
-[dsh-browser-plugin] tool-browser: registered open, navigate, snapshot, screenshot
+[dsh-webops-plugin] root: client row registered
+[dsh-webops-plugin] browser-cdp: endpoint=http://127.0.0.1:9333
+[dsh-webops-plugin] browser-electron: enabled=true electron=…/electron/dist/electron.exe
+[dsh-webops-plugin] tool-browser: registered open, navigate, snapshot, screenshot
 ```
 
 ---
@@ -330,7 +330,7 @@ Chrome，从不启动进程，所以「进程树回收」这一条在 P0 里没�
 | `browser-cdp` | provider（外部 Chrome），注册进 `ctx.browser` |
 | `browser-electron` | provider（桌面端自己的 Electron 窗口），默认不参与选择 |
 | `tool-browser` | 模型可见的工具 |
-| `dsh-browser-plugin`（裸包名） | host 半边是空实现，只为让浏览器那半边被客户端模块表发现；见「桌面端接入」里的坑 |
+| `dsh-webops-plugin`（裸包名） | host 半边是空实现，只为让浏览器那半边被客户端模块表发现；见「桌面端接入」里的坑 |
 
 依据：host 平面的行在**所有** surface（TUI / headless / web / 桌面端）都会生效，除非该 surface 的 overlay
 显式 `disabled: true`——这正是 `dsh-web-app` 必须写下 `disabled: true` 才能压掉 `tool-web` 的原因。
@@ -404,7 +404,7 @@ host 平面那份就会与 preset 那份一起进入 agent 的工具视图。
 
 | # | 验收项 | 状态 | 怎么验 |
 |---|---|---|---|
-| 1 | `--dump-config` 五行在、层序对 | ✅ | `pnpm dsh --profile browserp0 --dump-config \| grep -A5 "== dsh-browser-plugin"` |
+| 1 | `--dump-config` 五行在、层序对 | ✅ | `pnpm dsh --profile browserp0 --dump-config \| grep -A5 "== dsh-webops-plugin"` |
 | 2 | 真 Chrome 上跑通 open → snapshot → screenshot | ✅ | live 测试（下） |
 | 3 | 截图以 attachment 引用出现 | ⚠️ 见下 | live 测试用真实 `LocalAttachmentStore` 存盘；工具层的「图片块」由单测覆盖 |
 | 4 | 导航后用旧 ref 拿到 `stale_ref` | ✅ | live 测试 + `provider.test.ts`（并断言**没有**发出截图命令） |
@@ -429,12 +429,12 @@ CDP 产出的 PNG 也确实能被真实的 `LocalAttachmentStore` 接受并原�
 
 # 1) 对着这个 Chrome 跑全套测试
 #    这组只在端点是「真 Chrome」时才跑：9222 上那个 Electron 会被认出来并带原因跳过
-cd D:/dev/cli/dsh-browser-plugin
+cd D:/dev/cli/dsh-webops-plugin
 DSH_CDP_ENDPOINT=http://127.0.0.1:9333 pnpm test
 
 # 2) 层序
 cd /d/dev/cli/deepseek-harness
-pnpm dsh --profile browserp0 --dump-config | grep -A4 "== dsh-browser-plugin"
+pnpm dsh --profile browserp0 --dump-config | grep -A4 "== dsh-webops-plugin"
 
 # 3) 真实会话（需要一个 API key；见下）
 #    在容器根建 .env 写入 DEEPSEEK_API_KEY=...（绝不提交），然后：
