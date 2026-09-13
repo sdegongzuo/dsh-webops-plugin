@@ -6,9 +6,17 @@
  *
  * 用法：
  *   node scripts/package-desktop-portable.mjs --app <win-unpacked 目录> [--version 0.1.0]
+ *   node scripts/package-desktop-portable.mjs [--version 0.1.0]        # 复用缓存的 base
+ *   node scripts/package-desktop-portable.mjs --app <dir> --cache-base # 构建后顺便缓存 base
  *
  * 产出：
  *   dist/dsh-webops-desktop-v<ver>-win-x64-portable.zip
+ *
+ * 两层拆分（避免每次发版都重编译 dsh）：
+ *   第 1 层 base = dsh 桌面端本体（app/，~300MB，只在升级 dsh 时重建）；
+ *   第 2 层 overlay = home/profiles/desktop/ 里的插件（几十 KB，每次发版都换）。
+ *   `--cache-base` 把本次的 app/ 存到 `.desktop-base/app`，之后不带 `--app` 跑就直接复用，
+ *   只重新生成 overlay 并重新压缩。
  *
  * 为什么 profile 是我们自己写而不是调桌面端去装：
  * 打包态桌面端装插件只能走 UI 插件管理器（IPC pluginsAdd → pnpm add），CLI 碰不到这个
@@ -27,6 +35,8 @@ import { fileURLToPath } from 'node:url'
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const DIST = join(ROOT, 'dist')
 const STAGE = join(ROOT, '.desktop-stage')
+/** 第 1 层 base 的本地缓存：dsh 本体不常变，缓存后插件发版无需重编译。 */
+const BASE_CACHE = join(ROOT, '.desktop-base', 'app')
 
 /** 官方常量，抄自 `apps/desktop/src/project-manager.ts`（改错任何一个桌面端直接抛错）。 */
 const PROJECT_NAME = '@deepseek-ai/dsh-desktop-runtime'
@@ -39,19 +49,26 @@ const readArg = (name) => {
   return at === -1 ? undefined : args[at + 1]
 }
 
-/** @type {string | undefined} */
-const appDir = readArg('app')
+const cacheBase = args.includes('--cache-base')
+let appDir = readArg('app')
 const pkg = JSON.parse(readFileSync(join(ROOT, 'package.json'), 'utf8'))
 const version = readArg('version') ?? pkg.version
 const pluginName = pkg.name
 
-if (appDir === undefined) {
+if (appDir === undefined && existsSync(BASE_CACHE)) {
+  appDir = BASE_CACHE
+  console.log(`复用缓存的 dsh 本体: ${BASE_CACHE}`)
+}
+if (appDir === undefined || !existsSync(appDir)) {
   console.error('用法: node scripts/package-desktop-portable.mjs --app <win-unpacked 目录> [--version x.y.z]')
+  console.error('      node scripts/package-desktop-portable.mjs [--version x.y.z]   # 复用 .desktop-base/app')
   process.exit(1)
 }
-if (!existsSync(appDir)) {
-  console.error(`package-desktop-portable: 应用目录不存在: ${appDir}`)
-  process.exit(1)
+if (cacheBase) {
+  rmSync(BASE_CACHE, { recursive: true, force: true })
+  mkdirSync(dirname(BASE_CACHE), { recursive: true })
+  cpSync(appDir, BASE_CACHE, { recursive: true })
+  console.log(`已缓存 dsh 本体到 ${BASE_CACHE}（下次发版可省略 --app）`)
 }
 if (!existsSync(join(ROOT, 'lib'))) {
   console.error('package-desktop-portable: 缺少 lib/，先跑 pnpm build')

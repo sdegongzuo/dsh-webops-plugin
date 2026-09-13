@@ -2,16 +2,23 @@ name: release-desktop
 
 # 发版「包含 dsh-webops-plugin 的整个 dsh 桌面端」Windows x64 便携版。
 #
-# 为什么必须放 CI 跑：本机流程走到 `prepare:dsh` 会失败，缺的不是磁盘也不是网络，
-# 而是一个**必须就地编译的原生模块 fs-ext** —— 它没有任何预编译二进制
-# （require 时报 `Cannot find module './build/Release/fs_ext.node'`），必须 node-gyp 现场编译，
-# 因此需要 Visual C++ 构建工具。**GitHub 的 windows-latest runner 自带 Visual Studio + MSVC**，
-# 正好缺什么有什么，不用在主机上装几个 G 的 VS。
+# 本机也能跑通（已实测产出 v0.1.0），但 harness 的 `prepare:dsh` 有三个坑必须在
+# clone 之后打补丁才能过，补丁都在本仓里：
 #
-# 另一道门槛：harness 的 `pnpm-workspace.yaml` 的 `allowBuilds` 白名单**不含 fs-ext**
-# （策略是「未列出 = hard install error」，默认拒绝）。而 `prepare-dsh.ts:83` 会清洗所有
-# `npm_*` / `pnpm_*` 环境变量、并用空 npmrc，所以环境变量与全局 npmrc 都注入不进去。
-# 唯一可行的注入点是**改那份 yaml** —— 在 CI 里 clone 之后改，不污染本地 checkout。
+#   1. `docs/harness-desktop-build.patch`
+#      - `prepare-dsh.ts` 把 `NPM_CONFIG_REGISTRY` 硬编码成 npmjs.org，
+#        而 `--config.registry` 压不住 env（要用 pnpm 原生 `--registry=`）→ 直连慢到挂死。
+#      - `install --prod --frozen-lockfile --trust-lockfile` 这组标志会让 pnpm 拒绝联网取
+#        registry 依赖，卡在 `added 241/507`、`download` 恒为 0。去掉后 21.5 秒装完。
+#      - `runtime-payload-smoke.mjs` 校验 `fs-ext`，但 fs-ext **不在 0.1.5-rc.2 的依赖树里**
+#        （产物 node_modules 里搜不到，518 个 tarball 也没有）→ 跳过该项。
+#   2. `scripts/patch-electron-builder.mjs`
+#      electron-builder 解包完立即 rename，Windows 上因句柄未释放报 EPERM。加个重试。
+#
+# 注：**不需要 Visual C++ 构建工具**。node-pty 用的是预编译的 conpty.dll，
+# koffi / sharp 同理，实测一遍都没编译过原生模块。
+#
+# 补丁只改 CI 里的临时 checkout，不污染本地 harness。
 #
 # 触发：
 #   推 `desktop-v*` tag（与插件便携版的 `v*` tag 区分开），或 Actions 手动补发。
@@ -70,24 +77,14 @@ jobs:
           git fetch --depth 1 origin $env:HARNESS_REF
           git checkout --quiet FETCH_HEAD
 
-      - name: 补 fs-ext 进 allowBuilds 白名单
-        # 只改 CI 里这份临时 checkout。fs-ext 是 dsh 生产依赖树里唯一「无预编译、
-        # 必须 node-gyp 就地编译」的包；不批准它的 build script，prepare:dsh 的
-        # native payload smoke 会以 `Cannot find module 'fs-ext'` 失败。
+      - name: 应用 harness 构建补丁
+        # 修 prepare:dsh 的 registry 硬编码 / install 标志 / fs-ext 冒烟校验，见文件头说明。
         shell: pwsh
         run: |
           Set-Location (Join-Path (Split-Path $PWD) 'deepseek-harness')
-          $path = 'pnpm-workspace.yaml'
-          $text = Get-Content $path -Raw
-          if ($text -match '(?m)^\s+fs-ext:') {
-            Write-Host 'fs-ext 已在白名单里，跳过'
-          } else {
-            $patched = [regex]::Replace($text, '(?m)^allowBuilds:[ \t]*$', "allowBuilds:`n  fs-ext: true", 1)
-            if ($patched -eq $text) { throw 'allowBuilds 块没找到，白名单 patch 失败' }
-            Set-Content -Path $path -Value $patched -NoNewline
-            Write-Host '已插入 fs-ext: true'
-          }
-          Get-Content $path | Select-String -Pattern 'allowBuilds' -Context 0,2
+          git apply --ignore-whitespace "$env:GITHUB_WORKSPACE/docs/harness-desktop-build.patch"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git --no-pager diff --stat
 
       - name: 装 harness 依赖
         shell: pwsh
@@ -95,6 +92,13 @@ jobs:
         run: |
           Set-Location (Join-Path (Split-Path $PWD) 'deepseek-harness')
           pnpm install --no-frozen-lockfile
+
+      - name: 修 electron-builder 解包 rename 的 EPERM
+        # 必须在 pnpm install 之后（改的是 node_modules 里的 app-builder-lib）。
+        shell: pwsh
+        run: |
+          node "$env:GITHUB_WORKSPACE/scripts/patch-electron-builder.mjs" (Join-Path (Split-Path $PWD) 'deepseek-harness')
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: 判断 tar 是否需要 --force-local
         # Git Bash 的 GNU tar 会把 Windows 盘符路径当成远程主机（`Cannot connect to D:`），

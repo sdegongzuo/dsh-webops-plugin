@@ -2,6 +2,8 @@ node_modules/
 lib/
 dist/
 .portable-stage/
+# dsh 桌面端本体缓存（611MB，只作本地构建加速，不入库）
+.desktop-base/
 coverage/
 *.tsbuildinfo
 *.log
