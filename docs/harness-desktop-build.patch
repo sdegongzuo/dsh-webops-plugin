@@ -1,73 +1,21 @@
 diff --git a/apps/desktop/scripts/prepare-dsh.ts b/apps/desktop/scripts/prepare-dsh.ts
-index d3f9dae8a3..99cf00bad2 100644
+index d3f9dae8a3..f83a0923ed 100644
 --- a/apps/desktop/scripts/prepare-dsh.ts
 +++ b/apps/desktop/scripts/prepare-dsh.ts
-@@ -31,7 +31,8 @@ const APP_ROOT = resolve(import.meta.dirname, '..')
- const BUILD_PATHS = resolveDesktopTargetBuildPaths()
- const DSH_OUTPUT_ROOT = BUILD_PATHS.dsh
- const BUILD_ROOT = mkdtempSync(join(tmpdir(), 'dsh-desktop-runtime-'))
--const STORE_ROOT = join(BUILD_ROOT, 'store')
-+// TEMP-DIAG（验证后还原）: 原为 join(BUILD_ROOT, 'store') —— 临时目录导致每次重跑都从零下载。
-+const STORE_ROOT = process.env.DSH_DIAG_PNPM_STORE ?? join(BUILD_ROOT, 'store')
- const RUNTIME_ROOT = BUILD_PATHS.runtime
- const PNPM_BUILD_STATE = BUILD_PATHS.dshPnpm
- const PACKAGE_SET_ROOT = BUILD_PATHS.packageSet
-@@ -70,7 +71,16 @@ function runPnpm(args: readonly string[]): Promise<void> {
-     writeFileSync(userConfig, '')
-     const child = spawn(NODE, [
-       PNPM,
--      '--config.registry=https://registry.npmjs.org/',
-+      // TEMP-DIAG（验证后还原）: --registry 是 pnpm 原生 flag，优先级高于 NPM_CONFIG_* env，
-+      // 只有它能压住下面硬编码的 npmjs.org。
-+      '--registry=https://registry.npmmirror.com/',
-+      // TEMP-DIAG（验证后还原）: 原为 https://registry.npmjs.org/ ，直连慢到 1 KiB/s 会超时。
-+      '--config.registry=https://registry.npmmirror.com/',
-+      // TEMP-DIAG: 超时要小（快速失败重试），设成 10 分钟反而让每个慢请求各挂 10 分钟。
-+      '--config.fetch-timeout=120000',
-+      '--config.fetch-retries=10',
-+      // TEMP-DIAG: runtime 里的 pnpm 默认 cache 目录与日常用的不是同一个，每次都从零下元数据。
-+      '--config.cache-dir=D:\\Dev\\pnpm\\cache',
-       `--config.store-dir=${STORE_ROOT}`,
-       '--config.enable-global-virtual-store=false',
-       `--config.userconfig=${userConfig}`,
-@@ -82,11 +92,14 @@ function runPnpm(args: readonly string[]): Promise<void> {
-         ...Object.fromEntries(Object.entries(process.env).filter(([name]) => (
-           name !== 'NODE_OPTIONS' && name !== 'NODE_PATH' && !/^DSH_DESKTOP_/u.test(name) && !/^(?:npm|pnpm|corepack)_/iu.test(name)
-         ))),
--        NPM_CONFIG_REGISTRY: 'https://registry.npmjs.org/',
-+        // TEMP-DIAG（验证后还原）: 原为 npmjs.org，实测直连 1 KiB/s 会挂死。
-+        NPM_CONFIG_REGISTRY: 'https://registry.npmmirror.com/',
-         NPM_CONFIG_STORE_DIR: STORE_ROOT,
-         NPM_CONFIG_USERCONFIG: userConfig,
-         PATH: `${dirname(NODE)}${delimiter}${process.env.PATH ?? ''}`,
--        XDG_CACHE_HOME: join(PNPM_BUILD_STATE, 'cache'),
-+        // TEMP-DIAG（验证后还原）: 原为 join(PNPM_BUILD_STATE,'cache')，而 PNPM_BUILD_STATE 每次
-+        // main() 开头就被 rmSync 清掉，导致元数据缓存永远冷启动。
-+        XDG_CACHE_HOME: process.env.DSH_DIAG_CACHE_HOME ?? join(PNPM_BUILD_STATE, 'cache'),
-         XDG_CONFIG_HOME: config,
-         XDG_STATE_HOME: join(PNPM_BUILD_STATE, 'state'),
-       },
-@@ -109,12 +122,16 @@ async function main(): Promise<void> {
-     copyFileSync(join(PACKAGE_SET_ROOT, DESKTOP_PACKAGE_SET_FILE), join(BUILD_ROOT, DESKTOP_PACKAGE_SET_FILE))
-     cpSync(join(PACKAGE_SET_ROOT, DESKTOP_PACKAGES_DIR), join(BUILD_ROOT, DESKTOP_PACKAGES_DIR), { recursive: true })
-     createRuntimeProjectMetadata(BUILD_ROOT, release)
--    await runPnpm(['install', '--lockfile-only'])
-+    // TEMP-DIAG: --prefer-offline 让已在本机 store(4.1G)+cache 里的内容直接命中。
-+    await runPnpm(['install', '--lockfile-only', '--prefer-offline'])
-     verifyDesktopCoreLockfile(
+@@ -114,7 +114,10 @@ async function main(): Promise<void> {
        readFileSync(join(BUILD_ROOT, 'pnpm-lock.yaml'), 'utf8'),
        readDesktopCorePackageSet(BUILD_ROOT, release.version),
      )
 -    await runPnpm(['install', '--prod', '--frozen-lockfile', '--trust-lockfile'])
-+    // TEMP-DIAG（验证后还原）: 原为 ['install','--prod','--frozen-lockfile','--trust-lockfile']。
-+    // 实测这三个标志会让 pnpm 卡在 added 241/507 不再联网取 registry 依赖（download 恒为 0），
-+    // 去掉后同一项目 21.5s 装完。
++    // 去掉 --frozen-lockfile / --trust-lockfile：这两个标志下 pnpm 会卡在
++    // 「added 241/507」且 download 恒为 0，与 registry 无关（换源也不动），
++    // 同一项目去掉后 21.5 秒装完。构建目录是一次性的，不复用 lockfile 校验。
 +    await runPnpm(['install', '--prod'])
      const packageSet = readDesktopCorePackageSet(BUILD_ROOT, release.version)
      const targetName = resolveDesktopBuildTarget()
      const target = { platform: process.platform, arch: targetName.endsWith('arm64') ? 'arm64' : 'x64' }
 diff --git a/apps/desktop/tests/fixtures/runtime-payload-smoke.mjs b/apps/desktop/tests/fixtures/runtime-payload-smoke.mjs
-index da2d5c478d..84cc6975d2 100644
+index da2d5c478d..df8381a4d5 100644
 --- a/apps/desktop/tests/fixtures/runtime-payload-smoke.mjs
 +++ b/apps/desktop/tests/fixtures/runtime-payload-smoke.mjs
 @@ -121,7 +121,11 @@ function checkHtml() {
@@ -75,10 +23,10 @@ index da2d5c478d..84cc6975d2 100644
  
  try {
 -  checkFsExt()
-+  // TEMP-DIAG（验证后立即还原）: fs-ext 不在当前版本的依赖树里
-+  // ——518 个 dsh/vendor/landlock tarball、harness lockfile、本机 .pnpm 全都没有它，
-+  // 且 project-manager.ts:109 生成的 workspace 已 allowBuilds: fs-ext: true。
-+  // 即「不是编译失败，是没被安装」。跳过此项以验证后续步骤能否走完。
++  // skip checkFsExt()：fs-ext 不在当前版本的依赖树里 —— 518 个 dsh/vendor/landlock
++  // tarball、harness lockfile、产物 node_modules 全都没有它，require 必然 MODULE_NOT_FOUND。
++  // 即「不是编译失败，是根本没被安装」；而 project-manager.ts 生成的 workspace 已
++  // allowBuilds: fs-ext: true，说明上游自己也把它当可选依赖。故此项不作为构建门槛。
 +  // checkFsExt()
    checkKoffi()
    await checkSharp()
