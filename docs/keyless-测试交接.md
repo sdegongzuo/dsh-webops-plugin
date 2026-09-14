@@ -89,5 +89,5 @@ verify-card: PASS —— ...
 - **未提交**：无（adoptSession 收编链、client 15 视图、fake-llm 热搜流+动态收尾、find 空白归一化、verify-card 加固均已提交）。
 - 单测基线：280 passed / 3 skipped（2026-09-14，含新增的 `src/bundle-patch.test.ts` 出货 patch 守卫与 fake-llm 闸门用例）。
 - **发版前必过**：`pnpm run verify:portable -- --dir <解压后的便携版目录>`（可加 `--browser <chrome>`）。它先用 harness 真代码（`apps/desktop/src/{runtime-tree,profile-packages}.ts`，`--harness` 可指路径）走一遍桌面端启动准备 —— 全量 sha256 完整性、`state.runtimeId` / `nodeVersion` / `platform` / `arch` 逐项对齐、建 241 条宿主链接 + `validateDesktopPluginGraph` —— 再真起宿主读 boot graph、可选验浏览器信标。约 40 项断言，任一转红即 exit 1。
-  - 2026-09-14 实测：**必须先确认解压产物没坏**。v0.2.1 首次自检时报 `Cannot find package '@deepseek-ai/dsh-client-ui-workflow-run'`，真因是解压产出 5160 个 NUL 文件（zip 的 11954 条 CRC 全绿，是我这边的解压方式坏了），一度被误读成「包有问题」。现在这条由 sha256 断言兜住。
+  - 2026-09-14 实测：**必须先确认解压产物没坏**。便携版真包首次自检时报 `Cannot find package '@deepseek-ai/dsh-client-ui-workflow-run'`，真因是解压产出 5160 个 NUL 文件（zip 的 11954 条 CRC 全绿，是我这边的解压方式坏了），一度被误读成「包有问题」。现在这条由 sha256 断言兜住。
   - 出厂态 `home/profiles/desktop/node_modules` 只有 `dsh-webops-plugin` 一个是**正常**的；241 条 `@deepseek-ai/*` 链接由桌面端首次启动建，不在 zip 里。

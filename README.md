@@ -659,7 +659,7 @@ git tag v0.1.0 && git push origin v0.1.0
 约 226 MB，CI 要 1–3 小时（job timeout 180 分钟）。
 
 ```bash
-git tag desktop-v0.2.1 && git push origin desktop-v0.2.1
+git tag desktop-v0.2.0 && git push origin desktop-v0.2.0
 ```
 
 **harness 侧必须打补丁才能过，补丁在本仓 `docs/harness-desktop-build.patch`**，
@@ -768,7 +768,7 @@ pnpm run verify:portable -- --dir /path/to/解压后的目录 \
 
 ##### 自检本身踩过的坑：解压产物损坏会被误读成「包坏了」
 
-2026-09-14 对 v0.2.1 真包自检时，`runDesktopHost` 报
+2026-09-14 对便携版真包做自检时，`runDesktopHost` 报
 `Cannot find package '@deepseek-ai/dsh-client-ui-workflow-run'`，看着像包不完整 —— 其实是
 **解压那一步坏了**：`D:/tmp/dsh-v021-run` 的 14071 个文件里 **5160 个是 NUL 填充**
 （大小对、内容全 `\x00`；`使用说明.txt`、`dsh-desktop-host/lib/index.js` 全中招），
