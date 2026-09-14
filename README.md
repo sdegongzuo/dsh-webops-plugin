@@ -693,8 +693,11 @@ electron-builder 解包完立即 rename，Windows 上因句柄未释放报 EPERM
 | 字段 | 约束 | 踩错的后果 |
 |---|---|---|
 | `nodeVersion` / `platform` / `arch` | 必须与 `app/resources/dsh/desktop-runtime.json` 完全一致 | 不一致 → `reconcileProfile` 判定 `rebuild=true` → **删掉整个 `node_modules`** 再跑 `pnpm install --frozen-lockfile`（插件不在 registry，必挂） |
-| `runtimeId` | `sha256(JSON.stringify(descriptor))`，键序照抄 `runtime-tree.ts:150` 的构造 | 只是让第二次启动走不到快速返回分支，无害 |
+| `runtimeId` | `sha256(JSON.stringify(descriptor))`，键序照抄 `runtime-tree.ts:150` 的构造 | 不一致 → **起宿主之前** `assertProfileRuntime`（`main.ts:204`）就抛 `profile does not match this application runtime`，用户看到的是启动错误页（**不是无害的**，2026-09-14 实测纠正了先前「只是走不到快速返回分支」的误记） |
 | `links` | 给 `[]` | 真实 junction 的 target 是**用户机器上的绝对路径**，打包时无从得知；给空数组让桌面端自己建链并回写 |
+
+校验这三条不靠肉眼：`pnpm run verify:portable` 会用 harness 真代码（`readDesktopRuntime` +
+`desktopRuntimeId`）重算一遍并逐项对照。
 
 > 这个坑 v0.1.0 和 v0.2.0 都有 —— 两个包发出去后插件都没加载过，因为从来没人真的双击起过它。
 
@@ -729,26 +732,55 @@ ctx.on('llm/stream', (options, _next) => { /* 直接 return 自己的流，从�
 
 ```bash
 # 1) 解压便携版（zip 解开，或 CI 产出的目录）
-# 2) 自检（生产路径：真起 dsh 桌面端宿主，读 boot graph）
+# 2) 自检（先用 harness 真代码走桌面端启动准备，再真起宿主读 boot graph）
 pnpm run verify:portable -- --dir /path/to/解压后的目录
 # 3) 想在真浏览器里再确认客户端注册，就多给一个 Chrome：
 pnpm run verify:portable -- --dir /path/to/解压后的目录 \
     --browser "C:/Program Files/Google/Chrome/Application/chrome.exe"
 ```
 
-它复刻 Electron 壳对宿主做的前两件事（给 fd3/fd4 管道、转发 `dsh-app://app/*` 请求），
-所以拿到的 `/index.html` 与真启动同源，验证的是**产物本身**：
+`--harness` 指向 deepseek-harness 源码（默认 `$DSH_HARNESS` 或 `D:/dev/cli/deepseek-harness`），
+前几条断言靠它的 `apps/desktop/src/*.ts` 真代码 —— 不是脚本自己复刻的逻辑。
 
-- 出货 patch 里没有 `llm/stream` 劫持行、profile 里没有越权 overlay；
-- `desktop-runtime-state.json` 在位（少了它插件登记会被静默抹掉）；
-- `__DSH_BOOT__` 里有插件的客户端行，且它的 bundle 能 200 拉下来、内容是合法客户端模块；
-- 给了 `--browser` 时，再验客户端半边真的注册成功（`<html>` 上 `dshBrowserPluginDock≥1`、
-  `dshBrowserPluginToolViews≥15`）。
+它分两段：**先把桌面端的启动准备走一遍**（`readDesktopRuntime` → `desktopRuntimeId` →
+`verifyDesktopRuntime` → `linkDesktopHostPackages` → `validateDesktopPluginGraph`，
+即 Electron 里 `applyRelease()` 串起来的那几步）；**再复刻 Electron 壳对宿主做的前两件事**
+（给 fd3/fd4 管道、转发 `dsh-app://app/*` 请求）。拿到的 `/index.html` 与真启动同源，
+验证的是**产物本身**：
+
+| 断言 | 挡住的失败 |
+|---|---|
+| `app/resources/dsh` 全量 sha256 对齐 `desktop-runtime.json#files` | 解压损坏 / 打包截断 |
+| `state.runtimeId` 与本包 runtime 一致 | 起宿主前被 `assertProfileRuntime` 拦到错误页 |
+| `state.nodeVersion` / `platform` / `arch` 与 runtime 一致 | `reconcileProfile` 走 `rebuild` → `pnpm install --frozen-lockfile` → 插件不在 registry，必挂 |
+| 能建出 241 条宿主链接，且 `validateDesktopPluginGraph` 通过 | 插件依赖没本地化 / 共享宿主实例被顶替 / peer 版本不满足 |
+| 出货 patch 里没有 `llm/stream` 劫持行、profile 里没有越权 overlay | `fake-llm` 这类夹具随包出货 |
+| `desktop-runtime-state.json` 在位、无遗留 `desktop-packages-pending` | 插件登记被 `createPluginProfile` 静默抹掉 |
+| `__DSH_BOOT__` 里有插件的客户端行，bundle 能 200 拉取且是合法客户端模块 | 客户端半边没被发现 |
+| 给了 `--browser` 时 `<html>` 信标 `dshBrowserPluginDock≥1`、`dshBrowserPluginToolViews≥15` | bundle 拉到了但注册失败 |
+
+脚本在 profile 的**工作副本**上建链，不动 `--dir` 里那份，所以可以反复跑（每次都从出厂态验）。
 
 > 它**不断言状态条出现在 DOM 里**：状态条挂在会话面的 `conversation.input.dock` 上，而
 > `ui-conversation` 只在会话存在时才渲染那个 slot（`const zone = session === undefined ? undefined : {…}`）——
 > 空 home 会停在「选择工作区」页，那一面根本没挂载。这是**预期行为**，不是插件没加载
 > （2026-09-14 就是在这里误会过一次：用户还没选工作区，以为插件没装上）。
+
+##### 自检本身踩过的坑：解压产物损坏会被误读成「包坏了」
+
+2026-09-14 对 v0.2.1 真包自检时，`runDesktopHost` 报
+`Cannot find package '@deepseek-ai/dsh-client-ui-workflow-run'`，看着像包不完整 —— 其实是
+**解压那一步坏了**：`D:/tmp/dsh-v021-run` 的 14071 个文件里 **5160 个是 NUL 填充**
+（大小对、内容全 `\x00`；`使用说明.txt`、`dsh-desktop-host/lib/index.js` 全中招），
+而 zip 自己的 CRC 校验 **11954 个条目全绿**。
+
+所以第一条断言就是全量 sha256 —— 它把「包到底好不好」变成证据，而不是靠「起不来 → 包坏了」猜。
+再遇到同类报错，先验 zip（`python -c "import zipfile;print(zipfile.ZipFile(p).testzip())"`），
+再验解压产物；**换一种解压方式**即可（Python 的 `zipfile.read()` 逐条写盘是好的）。
+
+另：**出厂态 `profile/node_modules` 只有 `dsh-webops-plugin` 一个条目**是正常的 ——
+241 条 `@deepseek-ai/*` 链接由桌面端首次启动时 `linkDesktopHostPackages` 建立，
+zip 里没有它们、`state.links` 是空数组，**这是设计如此**（链接目标在用户机器上无从预知）。
 
 ## License
 

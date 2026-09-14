@@ -5,14 +5,17 @@
  * ## 为什么需要它
  *
  * v0.1.0 与 v0.2.0 两个包发出去之后，插件**从来没有在打包形态下被起过一次**。
- * 两次都因此踩到「只有真启动才会暴露」的问题：
+ * 三次都因此踩到「只有真启动才会暴露」的问题：
  *
  * - v0.1.0 / v0.2.0：profile 少了 `desktop-runtime-state.json`，登记的插件被
  *   `createPluginProfile()` 静默抹掉 —— 界面正常、插件没有，不报错。
  * - v0.2.0：出货 patch 里带着 keyless 验证用的 `fake-llm`，它接管 `llm/stream`，
  *   任何真实对话都会被换成脚本回放。
+ * - v0.2.1 自检首轮：**解压产物损坏**（14071 个文件里 5160 个是 NUL 填充，
+ *   连 `使用说明.txt` 和 `dsh-desktop-host/lib/index.js` 都中招）被误读成
+ *   「包坏了」。zip 的 CRC 全绿，真正坏的是解压那一步。此后完整性校验成为硬断言。
  *
- * 这两件事**都不会**被 `pnpm typecheck` / `pnpm test` / CI 构建拦住：那一行是合法配置，
+ * 这三件事**都不会**被 `pnpm typecheck` / `pnpm test` / CI 构建拦住：那一行是合法配置，
  * 插件也是合法加载。只有「真起一次 + 读真图」才能发现。
  *
  * ## 它到底做了什么
@@ -22,14 +25,27 @@
  * 把 `dsh-app://app/*` 的请求转过去、把渲染进程开起来。本脚本只复刻前两件，
  * 拿到的 `/index.html` 与真启动**同源**（同一个 `assetHandler`、同一个 `clientModules`）。
  *
+ * 真启动前还会用 **harness 的真代码**（不是本脚本的复刻）走一遍桌面端的准备阶段：
+ * `readDesktopRuntime` → `desktopRuntimeId` → `verifyDesktopRuntime` →
+ * `linkDesktopHostPackages` → `validateDesktopPluginGraph`。这几步在 Electron 里
+ * 由 `applyRelease()` 串起来，跳过任何一步都可能漏掉真实的启动失败。
+ *
  * 断言（任一不过即退出码 1）：
- *   1. 插件目录的出货 patch 里没有 `llm/stream` 劫持行；profile 里没有越权的 overlay；
+ *   1. `app/resources/dsh` 全量 sha256 与 `desktop-runtime.json` 的 `files` 清单一致
+ *      （挡住解压损坏 / 打包截断，这是「包到底好不好」的唯一硬证据）；
+ *   2. `desktop-runtime-state.json` 的 `runtimeId` 与本包 runtime 一致
+ *      （不一致会被 `assertProfileRuntime` 在起宿主之前拦下），且
+ *      `nodeVersion` / `platform` / `arch` 一致（不一致会触发
+ *      `pnpm install --frozen-lockfile` 重建 node_modules，而插件不在 registry → 必然失败）；
+ *   3. 在 profile 的工作副本上复刻 `prepareProfile`：能建出全部宿主链接、且
+ *      `validateDesktopPluginGraph` 通过（插件依赖本地化 + 共享宿主实例 + peer 版本满足）；
+ *   4. 出货 patch 里没有 `llm/stream` 劫持行；profile 里没有越权的 overlay；
  *      `desktop-runtime-state.json` 在位（少了它插件会被静默抹掉）；
- *   2. `__DSH_BOOT__` 里存在插件的客户端行，且它的 bundle 能 200 拉下来、内容是合法模块；
- *   3. `--browser` 给了 Chrome 时，再验客户端半边真的在浏览器里注册成功
+ *   5. `__DSH_BOOT__` 里存在插件的客户端行，且它的 bundle 能 200 拉下来、内容是合法模块；
+ *   6. `--browser` 给了 Chrome 时，再验客户端半边真的在浏览器里注册成功
  *      （`<html>` 上的信标：`dshBrowserPlugin` / `Dock` / `ToolViews`）。
  *
- * 第 3 条**不断言状态条出现在 DOM 里**：状态条挂在会话面的 `conversation.input.dock` 上，
+ * 第 6 条**不断言状态条出现在 DOM 里**：状态条挂在会话面的 `conversation.input.dock` 上，
  * 而 `ui-conversation` 只在会话存在时才渲染那个 slot（空 home 会停在「选择工作区」页）。
  * 信标证明的是「bundle 被拉取、`apply` 跑过、slot 注册成功」—— 这正是打包回归会破坏的部分；
  * DOM 可见性依赖会话状态，不适合当发布闸门。
@@ -45,11 +61,14 @@
  * ```
  *
  * `--dir` 里 `home/` 的设置与凭据会被复制到一次性 home（`--home` 可指定，`--keep-home` 保留），
- * **不会**动包里那份；因此可以反复跑。
+ * **不会**动包里那份；profile 的建链也在工作副本上做，所以可以反复跑。
+ *
+ * `--harness` 指向 deepseek-harness 源码（默认 `$DSH_HARNESS` 或 `D:/dev/cli/deepseek-harness`）。
+ * 前 3 条断言依赖它的 `apps/desktop/src/*.ts`，缺了就没法验真启动路径，脚本会直接报错退出。
  */
 import { spawn } from 'node:child_process'
 import { createServer } from 'node:http'
-import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
@@ -57,7 +76,7 @@ import { pathToFileURL } from 'node:url'
 
 /* ---------- 参数 ---------- */
 
-const FLAGS = new Set(['--dir', '--profile', '--browser', '--home', '--port', '--cdp-port'])
+const FLAGS = new Set(['--dir', '--profile', '--browser', '--home', '--port', '--cdp-port', '--harness'])
 
 function parseArgs(argv) {
   const options = { profile: 'desktop', port: 19333, cdpPort: 19222 }
@@ -72,6 +91,7 @@ function parseArgs(argv) {
     else if (flag === '--profile') options.profile = value
     else if (flag === '--browser') options.browser = value
     else if (flag === '--home') options.home = value
+    else if (flag === '--harness') options.harness = value
     else if (flag === '--port') options.port = Number(value)
     else options.cdpPort = Number(value)
   }
@@ -89,6 +109,13 @@ for (const path of [join(packageRoot, 'app'), runtimeDir]) {
   if (!existsSync(path)) throw new Error(`verify-portable: ${path} 不存在 —— --dir 要指到解压后的便携版根目录（里面有 app/）`)
 }
 
+const harnessDesktopSrc = join(resolve(options.harness ?? process.env.DSH_HARNESS ?? 'D:/dev/cli/deepseek-harness'), 'apps', 'desktop', 'src')
+for (const file of ['runtime-tree.ts', 'profile-packages.ts']) {
+  if (!existsSync(join(harnessDesktopSrc, file))) {
+    throw new Error(`verify-portable: 找不到 ${join(harnessDesktopSrc, file)} —— 用 --harness 指向 deepseek-harness 源码根目录`)
+  }
+}
+
 const failures = []
 const notes = []
 
@@ -98,9 +125,84 @@ function check(ok, message) {
   return ok
 }
 
-/* ---------- 1. 插件目录的静态检查 ---------- */
+/* ---------- 0. 加载桌面端真代码 ---------- */
 
-console.log(`\n[1/3] 便携版内容（profile=${options.profile}）`)
+const { tsImport } = await import('tsx/esm/api')
+const runtimeTree = await tsImport(pathToFileURL(join(harnessDesktopSrc, 'runtime-tree.ts')).href, import.meta.url)
+const profilePackages = await tsImport(pathToFileURL(join(harnessDesktopSrc, 'profile-packages.ts')).href, import.meta.url)
+
+/* ---------- 1. 产物完整性 + runtime 身份 ---------- */
+
+console.log(`\n[1/5] 产物完整性 + runtime 身份（桌面端真代码，harness=${harnessDesktopSrc})`)
+
+const runtime = runtimeTree.readDesktopRuntime(runtimeDir)
+const runtimeId = runtimeTree.desktopRuntimeId(runtime)
+console.log(`      runtime ${runtime.release.version} / node ${runtime.release.nodeVersion} / ${runtime.platform}/${runtime.arch}` +
+  ` / ${String(runtime.sharedPackages.length)} 个共享包 / ${String(runtime.files.length)} 个受校验文件`)
+
+// 把「解压是否完整」从臆测变成证据：逐文件 sha256 对齐打包时记录的清单。
+try {
+  await runtimeTree.verifyDesktopRuntime(runtimeDir, runtime.release.version)
+  check(true, `app/resources/dsh 完整性：${String(runtime.files.length)} 个文件 sha256 全部匹配`)
+} catch (error) {
+  check(false, `app/resources/dsh 完整性校验失败（解压损坏？）：${error.message}`)
+}
+
+const statePath = join(profileDir, 'desktop-runtime-state.json')
+if (check(existsSync(statePath), 'desktop-runtime-state.json 在位（缺了它插件登记会被静默抹掉）')) {
+  const state = profilePackages.readDesktopProfileState(profileDir)
+  check(state.runtimeId === runtimeId, 'state.runtimeId 与本包 runtime 一致（assertProfileRuntime 会放行）')
+  // reconcileProfile 的 rebuild 触发器：任一不一致就删 node_modules 跑
+  // `pnpm install --frozen-lockfile --ignore-scripts`，而插件不在 registry 里 → 用户机器上必然失败。
+  check(state.nodeVersion === runtime.release.nodeVersion,
+    `state.nodeVersion=${state.nodeVersion} 与 runtime 一致（否则触发 pnpm install 重建）`)
+  check(state.platform === runtime.platform, `state.platform=${state.platform} 与 runtime 一致`)
+  check(state.arch === runtime.arch, `state.arch=${state.arch} 与 runtime 一致`)
+  check(!existsSync(join(profileDir, 'desktop-packages-pending')), '没有遗留 desktop-packages-pending（否则启动即报「准备未完成」）')
+}
+
+/* ---------- 2. 复刻桌面端 prepareProfile ---------- */
+
+console.log('\n[2/5] 复刻桌面端 prepareProfile（建链 + 依赖图校验）')
+
+const BUILTIN_BUNDLES = ['@deepseek-ai/dsh-base', '@deepseek-ai/dsh-web-app']
+const scratchBase = mkdtempSync(join(tmpdir(), 'dsh-verify-profile-'))
+const workProfileDir = join(scratchBase, options.profile)
+
+let activePlugins = []
+if (existsSync(profileDir)) {
+  // 在副本上做：`linkDesktopHostPackages` 会往 node_modules 写 241 条 junction 并重写 state，
+  // 不该污染 `--dir` 里那份。副本也从「出厂态」开始，正好验证首次启动那条路径。
+  cpSync(profileDir, workProfileDir, { recursive: true })
+
+  const manifest = JSON.parse(readFileSync(join(workProfileDir, 'package.json'), 'utf8'))
+  const bundles = manifest.dsh?.profile?.bundles ?? []
+  check(BUILTIN_BUNDLES.every((bundle, index) => bundles[index] === bundle),
+    'profile 的 bundles 以两个内置 bundle 正确开头（profilePluginNames 的前置校验）')
+  check(new Set(bundles).size === bundles.length, 'profile bundles 无重复')
+  activePlugins = bundles.slice(BUILTIN_BUNDLES.length)
+  check(activePlugins.includes('dsh-webops-plugin'), `本插件在 activePlugins 里：${JSON.stringify(activePlugins)}`)
+
+  const nmDir = join(profileDir, 'node_modules')
+  const shipped = existsSync(nmDir) ? readdirSync(nmDir) : []
+  notes.push(`出厂态 profile/node_modules 只有 ${String(shipped.length)} 个条目（${shipped.join(', ')}）——` +
+    `${String(runtime.sharedPackages.length)} 条宿主链接由桌面端首次启动时建立，不在 zip 里，这是设计如此`)
+
+  try {
+    profilePackages.linkDesktopHostPackages(workProfileDir, runtimeDir, runtime)
+    const linked = profilePackages.readDesktopProfileState(workProfileDir)
+    check(linked.links.length === runtime.sharedPackages.length,
+      `建链 ${String(linked.links.length)}/${String(runtime.sharedPackages.length)} 条宿主包链接`)
+    profilePackages.validateDesktopPluginGraph(workProfileDir, runtimeDir, runtime, activePlugins)
+    check(true, '依赖图校验通过（插件依赖本地化 + 共享宿主实例 + peer 版本满足）')
+  } catch (error) {
+    check(false, `prepareProfile 失败：${error.message}`)
+  }
+}
+
+/* ---------- 3. 插件目录的静态检查 ---------- */
+
+console.log(`\n[3/5] 便携版内容（profile=${options.profile}）`)
 
 const shippedPluginDir = join(profileDir, 'node_modules', 'dsh-webops-plugin')
 check(existsSync(shippedPluginDir), '插件已物化到 profile 的 node_modules')
@@ -119,14 +221,12 @@ if (existsSync(shippedPluginDir)) {
   check(existsSync(join(shippedPluginDir, 'lib', 'tool-browser', 'index.js')), '工具产物 lib/tool-browser/index.js 在包里')
 }
 
-check(existsSync(join(profileDir, 'desktop-runtime-state.json')),
-  'desktop-runtime-state.json 在位（缺了它插件登记会被静默抹掉）')
 check(!existsSync(join(profileDir, 'cordis.patch.yml')),
   'profile 里没有越权 overlay（出货包不该带 profile 级 patch）')
 
-/* ---------- 2. 真起宿主，读 boot graph ---------- */
+/* ---------- 4. 真起宿主，读 boot graph ---------- */
 
-console.log('\n[2/3] 生产路径启动宿主并读取 __DSH_BOOT__')
+console.log('\n[4/5] 生产路径启动宿主并读取 __DSH_BOOT__')
 
 const scratchHome = options.home === undefined
   ? mkdtempSync(join(tmpdir(), 'dsh-verify-home-'))
@@ -183,7 +283,7 @@ function feedResponsePipe(chunk) {
   }
 }
 
-const host = await runDesktopHost(runtimeDir, profileDir, async (frame) => feedResponsePipe(frame), {
+const host = await runDesktopHost(runtimeDir, workProfileDir, async (frame) => feedResponsePipe(frame), {
   allowLinkedPackages: true,
 })
 
@@ -238,12 +338,12 @@ if (pluginEntry !== undefined) {
   check(text.includes('tool.call.toolview'), 'bundle 含工具卡片注册目标')
 }
 
-/* ---------- 3. 可选：真浏览器里确认客户端注册 ---------- */
+/* ---------- 5. 可选：真浏览器里确认客户端注册 ---------- */
 
 if (options.browser === undefined) {
-  console.log('\n[3/3] 跳过浏览器验证（没给 --browser，客户端注册那一步未验）')
+  console.log('\n[5/5] 跳过浏览器验证（没给 --browser，客户端注册那一步未验）')
 } else {
-  console.log('\n[3/3] 真浏览器里确认客户端半边注册')
+  console.log('\n[5/5] 真浏览器里确认客户端半边注册')
 
   const hopByHop = new Set(['content-encoding', 'transfer-encoding', 'content-length', 'connection'])
   const proxy = createServer((req, res) => {
@@ -337,6 +437,10 @@ if (options.browser === undefined) {
 /* ---------- 收尾 ---------- */
 
 await host.dispose()
+// workProfileDir 是 profile 的工作副本（含脚本建出的 241 条 junction），连同它的父目录一起清掉。
+try {
+  rmSync(scratchBase, { recursive: true, force: true })
+} catch { /* 临时目录，删不掉不影响结论 */ }
 if (!options.keepHome) {
   try {
     rmSync(scratchHome, { recursive: true, force: true })
