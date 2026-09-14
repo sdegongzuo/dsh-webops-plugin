@@ -10,7 +10,7 @@ import { describe, expect, it, vi } from 'vitest'
 import Module from 'node:module'
 import { createRequire } from 'node:module'
 import { CdpConnection } from '../browser-cdp/protocol.ts'
-import type { BridgeDevTools, BridgeTab, BridgeTabBar, EventListener, TabHostChannel, TakeoverListener } from './bridge.ts'
+import type { BridgeDevTools, BridgeTab, BridgeTabBar, EventListener, TabHostChannel, TakeoverListener, TabOpenedListener } from './bridge.ts'
 import { ElectronBrowserProvider } from './provider.ts'
 import { WindowCdpSocket } from './socket.ts'
 import { ElectronWindowTransport, tabHandle, tabIdFromHandle } from './transport.ts'
@@ -49,9 +49,10 @@ class FakeHost implements TabHostChannel {
   disposed = false
   isClosed = false
   /** 命令的固定结果；设成 Error 表示这条命令失败。 */
-  respond: (method: string, params: Record<string, unknown>) => unknown = () => ({})
+  respond: (tabId: string, method: string, params: Record<string, unknown>) => unknown = () => ({})
   private readonly eventListeners = new Map<string, Set<EventListener>>()
   private readonly takeoverListeners = new Set<TakeoverListener>()
+  private readonly tabOpenedListeners = new Set<TabOpenedListener>()
   private readonly closeListeners = new Set<() => void>()
 
   open(url: string): Promise<BridgeTab> {
@@ -72,7 +73,7 @@ class FakeHost implements TabHostChannel {
 
   command(tabId: string, method: string, params: Record<string, unknown>): Promise<unknown> {
     this.commands.push({ tabId, method, params })
-    const result = this.respond(method, params)
+    const result = this.respond(tabId, method, params)
     return result instanceof Error ? Promise.reject(result) : Promise.resolve(result)
   }
 
@@ -131,6 +132,11 @@ class FakeHost implements TabHostChannel {
     return () => { this.takeoverListeners.delete(listener) }
   }
 
+  onTabOpened(listener: TabOpenedListener): () => void {
+    this.tabOpenedListeners.add(listener)
+    return () => { this.tabOpenedListeners.delete(listener) }
+  }
+
   onClose(listener: () => void): () => void {
     this.closeListeners.add(listener)
     return () => { this.closeListeners.delete(listener) }
@@ -144,6 +150,11 @@ class FakeHost implements TabHostChannel {
   /** 推一条人工接管通知（宿主发的是 `{ type: 'takeover', tabId, active }`）。 */
   emitTakeover(tabId: string, active: boolean): void {
     for (const listener of [...this.takeoverListeners]) listener(tabId, active)
+  }
+
+  /** 推一条「宿主自己开的新标签」通报（宿主发的是无 command id 的 `{ type: 'opened' }`）。 */
+  emitTabOpened(tabId: string, url: string, title = ''): void {
+    for (const listener of [...this.tabOpenedListeners]) listener(tabId, url, title)
   }
 
   /** 模拟整条通道断开。 */
@@ -162,14 +173,15 @@ function transportFor(host: FakeHost): ElectronWindowTransport {
 }
 
 /** 让假宿主的 CDP 命令够 `provider.open` + `observe` 跑完：空白页 + 空 AX 树。 */
-function wireFakePage(host: FakeHost): void {
-  host.respond = (method, params) => {
+/** 编程假页面的 CDP 应答：readyState 恒 complete；每个标签的元信息按 tabId 自定义。 */
+function wireFakePage(host: FakeHost, metaByTab: Record<string, { readonly url: string; readonly title: string }> = {}): void {
+  host.respond = (tabId, method, params) => {
     if (method === 'Accessibility.getFullAXTree') return { nodes: [] }
     if (method === 'Runtime.evaluate') {
       const expression = String(params['expression'] ?? '')
-      return expression.includes('readyState')
-        ? { result: { value: true } }
-        : { result: { value: { url: 'about:blank', title: '' } } }
+      if (expression.includes('readyState')) return { result: { value: true } }
+      const meta = metaByTab[tabId] ?? { url: 'about:blank', title: '' }
+      return { result: { value: { url: meta.url, title: meta.title } } }
     }
     return {}
   }
@@ -387,10 +399,67 @@ describe('人工接管（takeover）通知通道', () => {
   })
 })
 
+describe('弹窗标签收编（tab opened 通报）', () => {
+  it('transport 把宿主的 opened 通报分发给订阅者，退订后不再收到', async () => {
+    const host = new FakeHost()
+    const transport = transportFor(host)
+    const seen: { tabId: string; url: string; title: string }[] = []
+    const unsubscribe = await transport.onTabOpened((tabId, url, title) => { seen.push({ tabId, url, title }) })
+
+    host.emitTabOpened('t2', 'https://news.ycombinator.com/', 'Hacker News')
+    unsubscribe()
+    host.emitTabOpened('t3', 'https://example.com/', '')
+
+    expect(seen).toEqual([{ tabId: 't2', url: 'https://news.ycombinator.com/', title: 'Hacker News' }])
+  })
+
+  it('provider 收编通报的新标签：tabs(list) 能列出它，url 用页面真实值', async () => {
+    const host = new FakeHost()
+    wireFakePage(host, { t9: { url: 'https://news.ycombinator.com/', title: 'Hacker News' } })
+    const provider = new ElectronBrowserProvider({}, transportFor(host), true)
+    await provider.open({})
+    // 订阅是异步挂上的（transport → bridge）；等一轮宏任务，别让测试靠时序侥幸。
+    await new Promise(resolve => setTimeout(resolve, 0))
+
+    host.emitTabOpened('t9', 'https://news.ycombinator.com/', 'Hacker News')
+    // 收编是异步的（连接 → enable → 等加载 → 读元信息）；轮询到出现为止。
+    let listed: { sessionId: string; url: string }[] = []
+    for (let i = 0; i < 50; i++) {
+      const result = await provider.tabs({ kind: 'list' })
+      listed = result.tabs.map(t => ({ sessionId: t.sessionId, url: t.url }))
+      if (listed.some(t => t.sessionId === 't9')) break
+      await new Promise(resolve => setTimeout(resolve, 20))
+    }
+    expect(listed).toEqual([
+      { sessionId: 't1', url: 'about:blank' },
+      { sessionId: 't9', url: 'https://news.ycombinator.com/' },
+    ])
+  })
+
+  it('收编的会话可以直接执行工具（execute 走真实 CDP 命令）', async () => {
+    const host = new FakeHost()
+    wireFakePage(host)
+    const provider = new ElectronBrowserProvider({}, transportFor(host), true)
+    await provider.open({})
+    await new Promise(resolve => setTimeout(resolve, 0))
+
+    host.emitTabOpened('t9', 'https://news.ycombinator.com/', 'Hacker News')
+    for (let i = 0; i < 50; i++) {
+      const result = await provider.tabs({ kind: 'list' })
+      if (result.tabs.some(t => t.sessionId === 't9')) break
+      await new Promise(resolve => setTimeout(resolve, 20))
+    }
+    // 收编后 execute 不应报「会话不存在」；命令应转发到 t9 的标签。
+    const before = host.commands.filter(c => c.tabId === 't9').length
+    await provider.execute({ sessionId: 't9', method: 'Runtime.evaluate', params: { expression: '1 + 1', returnByValue: true } })
+    expect(host.commands.filter(c => c.tabId === 't9').length).toBe(before + 1)
+  })
+})
+
 describe('WindowCdpSocket', () => {
   it('把 CDP 命令经桥发出去，并把结果拼成 message 事件', async () => {
     const host = new FakeHost()
-    host.respond = method => ({ echo: method })
+    host.respond = (_tabId, method) => ({ echo: method })
     const socket = new WindowCdpSocket(host, 't1')
     const messages: string[] = []
     socket.addEventListener('message', event => { messages.push((event as { data: string }).data) })
@@ -476,7 +545,7 @@ describe('WindowCdpSocket', () => {
 
   it('能被 CdpConnection 直接使用（这才是它存在的理由）', async () => {
     const host = new FakeHost()
-    host.respond = method => (method === 'Browser.getVersion' ? { product: 'Electron/44' } : {})
+    host.respond = (_tabId, method) => (method === 'Browser.getVersion' ? { product: 'Electron/44' } : {})
     const connection = new CdpConnection(new WindowCdpSocket(host, 't1'), 5_000)
 
     await expect(connection.send('Browser.getVersion')).resolves.toEqual({ product: 'Electron/44' })

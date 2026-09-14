@@ -19,7 +19,7 @@
 
 import { CdpConnection, type CdpTarget, type CdpTransport, type CdpVersion } from '../browser-cdp/protocol.ts'
 import { ElectronWindowBridge, type BridgeDevTools, type BridgeOptions, type BridgeTabBar, type TabHostChannel } from './bridge.ts'
-import type { TakeoverListener } from './bridge.ts'
+import type { TakeoverListener, TabOpenedListener } from './bridge.ts'
 import { DEFAULT_BRIDGE_COMMAND_TIMEOUT_MS } from './bridge.ts'
 import { WindowCdpSocket } from './socket.ts'
 
@@ -152,6 +152,21 @@ export class ElectronWindowTransport implements CdpTransport {
   async onTakeover(listener: TakeoverListener): Promise<() => void> {
     const bridge = await this.requireBridge()
     return bridge.onTakeover(listener)
+  }
+
+  /**
+   * 订阅「宿主自己开的新标签」通报（页面弹窗 / 标签条「+」）。
+   *
+   * 这些标签不走 `newTab()`（没有 open 命令应答），上层会话注册表天然看不见它们；
+   * 上层收到通报后收编会话，`browser_tabs(list)` 才能列出弹窗标签。
+   * 与 `onTakeover` 一样按需启动宿主。
+   *
+   * @param listener - 每个新标签在 dom-ready 后调用一次 `(tabId, url, title)`。
+   * @returns 退订函数。
+   */
+  async onTabOpened(listener: TabOpenedListener): Promise<() => void> {
+    const bridge = await this.requireBridge()
+    return bridge.onTabOpened(listener)
   }
 
   /**

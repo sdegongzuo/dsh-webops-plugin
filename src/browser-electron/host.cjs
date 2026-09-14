@@ -251,9 +251,12 @@ function ensureShell(size) {
  * 开一个标签页。
  * @param url - 初始地址；空值按 `about:blank` 处理。
  * @param size - 首次开窗的尺寸。
+ * @param options - `announce: true` 时在 dom-ready 后向父进程通报 `{ type: 'opened' }`。
+ *   **只有非命令创建的标签需要通报**（页面弹窗、标签条「+」）：父进程的会话注册表
+ *   只认识 `open` 命令的应答，不通报的话这些标签对 `provider.tabs(list)` 永远不可见。
  * @returns 描述这个标签的记录。
  */
-function openTab(url, size) {
+function openTab(url, size, options) {
   const window = ensureShell(size)
   const id = `t${++sequence}`
   const view = new WebContentsView({
@@ -290,7 +293,7 @@ function openTab(url, size) {
   view.webContents.setWindowOpenHandler(({ url }) => {
     if (!/^https?:/i.test(url ?? '')) return { action: 'deny' }
     try {
-      openTab(url)
+      openTab(url, undefined, { announce: true })
     } catch {
       // 开不出来就只拒绝：页面侧表现为 window.open 返回 null，与弹窗拦截一致。
     }
@@ -329,6 +332,18 @@ function openTab(url, size) {
 
   // 必须显式加载：不加载就没有导航，`dom-ready` 不会来，`entry.ready` 永远挂起。
   void view.webContents.loadURL(url === undefined || url === '' ? 'about:blank' : url)
+  if (options?.announce === true) {
+    // 通报放在 dom-ready 之后：此刻调试器已接上（dom-ready 处理器先 attach 再 resolve），
+    // 父进程立刻收编会话时 CDP 通道就是可用的；url/title 也已是真实值而非 about:blank。
+    entry.ready.then(() => {
+      send({
+        type: 'opened',
+        tabId: id,
+        url: view.webContents.getURL(),
+        title: view.webContents.getTitle(),
+      })
+    }).catch(() => undefined)
+  }
   return entry
 }
 
@@ -605,7 +620,7 @@ app.on('window-all-closed', () => {
 app.whenReady().then(() => {
   ipcMain.on('dsh-tab-select', (_event, id) => { activateTab(id) })
   ipcMain.on('dsh-tab-close', (_event, id) => { closeTab(id) })
-  ipcMain.on('dsh-tab-create', () => { void openTab('about:blank') })
+  ipcMain.on('dsh-tab-create', () => { void openTab('about:blank', undefined, { announce: true }) })
   ipcMain.on('dsh-nav', (_event, payload) => {
     const { action, url } = payload ?? {}
     handleNav(action, url)

@@ -16,7 +16,8 @@ import type { CdpProviderConfig } from '../browser-cdp/provider.ts'
 import type { CdpTransport } from '../browser-cdp/protocol.ts'
 import { BrowserError } from '../browser/types.ts'
 import type { BrowserOpenRequest, BrowserSession } from '../browser/types.ts'
-import { ElectronWindowTransport } from './transport.ts'
+import { noteLoaded } from '../debug.ts'
+import { ElectronWindowTransport, tabHandle } from './transport.ts'
 
 /** 本 provider 的 id，用于 `browser` 服务的 `provider` 配置。 */
 export const ELECTRON_PROVIDER_ID = 'electron'
@@ -37,6 +38,8 @@ export class ElectronBrowserProvider extends CdpBrowserProvider {
   private readonly windowTransport: ElectronWindowTransport | undefined
   /** 人工接管通道的订阅（只挂一次；同一个宿主进程里所有标签共用一条）。 */
   private takeoverChannel: Promise<void> | undefined
+  /** 「宿主自己开的新标签」通报的订阅（只挂一次，与接管通道同模式）。 */
+  private tabOpenedChannel: Promise<void> | undefined
 
   /**
    * @param config - 超时与快照上限（端点无关，保留给基类）。
@@ -64,7 +67,30 @@ export class ElectronBrowserProvider extends CdpBrowserProvider {
   override async open(request: BrowserOpenRequest, signal?: AbortSignal): Promise<BrowserSession> {
     const session = await super.open(request, signal)
     this.ensureTakeoverChannel()
+    this.ensureTabOpenedChannel()
     return session
+  }
+
+  /**
+   * 订阅「宿主自己开的新标签」通报（只挂一次）。
+   *
+   * 页面弹窗转的新标签、标签条「+」开的标签都没走 `open()` —— 不订阅通报的话，
+   * 它们对 `browser_tabs(list)` 和一切工具永远不可见（2026-09-13 实测：窗口上明明
+   * 有两个标签，`tabs(list)` 只报一个）。收到通报就调用基类 `adoptSession` 收编；
+   * 收编失败静默放过 —— 通报链路本身不能成为工具失败源。
+   */
+  private ensureTabOpenedChannel(): void {
+    const transport = this.windowTransport
+    if (transport === undefined) return
+    this.tabOpenedChannel ??= transport.onTabOpened((tabId, url, title) => {
+      // open 命令自己开的标签不会发通报（宿主侧只对非命令创建的标签 announce），
+      // 所以这里不存在「把 open 的会话再收编一遍」的去重问题。
+      noteLoaded('browser-electron', `provider: adopting opened tab ${tabId} url=${url}`)
+      void this.adoptSession({ id: tabId, type: 'page', url, title, webSocketDebuggerUrl: tabHandle(tabId) }).then(
+        (session) => noteLoaded('browser-electron', `provider: adopted ${session.id} url=${session.url}`),
+        (error: unknown) => noteLoaded('browser-electron', `provider: adopt failed for ${tabId}: ${error instanceof Error ? error.message : String(error)}`),
+      )
+    }).then(() => undefined, () => undefined)
   }
 
   /**

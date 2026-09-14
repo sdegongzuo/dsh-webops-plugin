@@ -14,6 +14,7 @@
 import { spawn, type ChildProcess } from 'node:child_process'
 import { existsSync } from 'node:fs'
 import { connect, type Socket } from 'node:net'
+import { noteLoaded } from '../debug.ts'
 
 /** 一个标签页的摘要。 */
 export interface BridgeTab {
@@ -112,6 +113,13 @@ export type EventListener = (method: string, params: unknown) => void
 export type TakeoverListener = (tabId: string, active: boolean) => void
 
 /**
+ * 「宿主自己开了个新标签」的通报监听：页面弹窗（setWindowOpenHandler）与标签条
+ * 「+」按钮开的标签不走 `open` 命令，父进程的会话注册表看不见它们 —— 宿主在
+ * dom-ready 后补发 `{ type: 'opened' }`（无 command id），从这里通知上层收编。
+ */
+export type TabOpenedListener = (tabId: string, url: string, title: string) => void
+
+/**
  * 窗口宿主通道的公共面。
  *
  * 抽出这个接口是为了让上层（socket / transport）**不依赖一个活着的 Electron 进程**：
@@ -156,6 +164,8 @@ export interface TabHostChannel {
    * 不是 CDP 方法；混进去会让「这哪来的 CDP 事件」变成下一个人要查的问题。
    */
   onTakeover: (listener: TakeoverListener) => () => void
+  /** 订阅「宿主自己开的新标签」通报（页面弹窗 / 标签条「+」）。 */
+  onTabOpened: (listener: TabOpenedListener) => () => void
   /** 订阅通道断开。 */
   onClose: (listener: () => void) => () => void
 }
@@ -174,6 +184,7 @@ export class ElectronWindowBridge implements TabHostChannel {
   private readonly pending = new Map<number, Pending>()
   private readonly listeners = new Map<string, Set<EventListener>>()
   private readonly takeoverListeners = new Set<TakeoverListener>()
+  private readonly tabOpenedListeners = new Set<TabOpenedListener>()
   private readonly closeListeners = new Set<() => void>()
   private readonly windowSize: { readonly width: number; readonly height: number } | undefined
   private readonly keepAlive: boolean
@@ -299,6 +310,12 @@ export class ElectronWindowBridge implements TabHostChannel {
   onTakeover(listener: TakeoverListener): () => void {
     this.takeoverListeners.add(listener)
     return () => this.takeoverListeners.delete(listener)
+  }
+
+  /** @inheritdoc */
+  onTabOpened(listener: TabOpenedListener): () => void {
+    this.tabOpenedListeners.add(listener)
+    return () => this.tabOpenedListeners.delete(listener)
   }
 
   /**
@@ -476,6 +493,17 @@ export class ElectronWindowBridge implements TabHostChannel {
       return
     }
 
+    if (type === 'opened' && typeof id !== 'number') {
+      // 宿主自己开的标签（页面弹窗 / 标签条「+」）在 dom-ready 后的通报。
+      // 带 command id 的 'opened' 是 open 命令的应答，走下面的 pending 关联，别截胡。
+      const tabId = String(message['tabId'])
+      const url = typeof message['url'] === 'string' ? message['url'] : ''
+      const title = typeof message['title'] === 'string' ? message['title'] : ''
+      noteLoaded('browser-electron', `bridge: opened announcement tabId=${tabId} url=${url}`)
+      for (const listener of [...this.tabOpenedListeners]) listener(tabId, url, title)
+      return
+    }
+
     if (type === 'closed' && typeof id !== 'number') {
       // 用户自己在标签条上点了叉：当成一条 CDP 断连事件，让上层摘掉会话。
       const tabId = String(message['tabId'])
@@ -513,6 +541,7 @@ export class ElectronWindowBridge implements TabHostChannel {
     this.closeListeners.clear()
     this.listeners.clear()
     this.takeoverListeners.clear()
+    this.tabOpenedListeners.clear()
     try {
       this.socket.destroy()
     } catch {
