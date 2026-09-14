@@ -387,6 +387,34 @@ describe('人工接管（takeover）通知通道', () => {
     expect(after.epoch).toBe(3)
   })
 
+  it('连开/关 DevTools 5 次，ref 纪元一次都没有被额外推进（防回归）', async () => {
+    const host = new FakeHost()
+    wireFakePage(host)
+    const provider = new ElectronBrowserProvider({}, transportFor(host), true)
+    const session = await provider.open({})
+    await new Promise(resolve => setTimeout(resolve, 0))
+
+    const epochs: number[] = []
+    for (let round = 1; round <= 5; round += 1) {
+      host.emitTakeover(session.id, true)
+      const opened = await provider.observe({ kind: 'snapshot', sessionId: session.id })
+      if (opened.kind !== 'snapshot') throw new Error('expected a snapshot')
+      expect(opened.takeover).toBe(true)
+      epochs.push(opened.epoch)
+
+      host.emitTakeover(session.id, false)
+      const closed = await provider.observe({ kind: 'snapshot', sessionId: session.id })
+      if (closed.kind !== 'snapshot') throw new Error('expected a snapshot')
+      expect(closed.takeover).toBeUndefined()
+      epochs.push(closed.epoch)
+    }
+
+    // 10 次 snapshot → 纪元就是 1..10：人工开/关 DevTools 一次都没让它多跳。
+    // 这条现在必然通过（refs.invalidate() 只由地址变化触发，与 detach 无关），
+    // 它拦的是 P3 接入「观察失效」时顺手拿 Inspector.detached 推纪元的改法。
+    expect(epochs).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10])
+  })
+
   it('takeover 通知不进 CDP 事件流（不会被 WindowCdpSocket 当成事件收下）', async () => {
     const host = new FakeHost()
     const socket = new WindowCdpSocket(host, 't1')

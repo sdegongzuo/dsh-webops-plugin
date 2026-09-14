@@ -155,6 +155,37 @@ describe('ConsoleCollector', () => {
     expect(texts.filter(text => text.includes('log entries are not shown'))).toHaveLength(1)
   })
 
+  it('survives a detach/re-enable round after 3000 log entries: no duplicates, notice kept, buckets apart', async () => {
+    const socket = new EventSocket()
+    const collector = new ConsoleCollector(new CdpConnection(socket))
+
+    // detach 前：3000 条 Log（同一个 source 桶）+ 一条 timestamp=0 的截断提示，
+    // 再掺一条 Runtime 条目（两域分桶，串了桶就会比错）。
+    for (let index = 1; index <= 3000; index += 1) {
+      socket.emit('Log.entryAdded', logParams(index * 10, `log-${index}`))
+    }
+    socket.emit('Log.entryAdded', logParams(0, '2990 log entries are not shown.', 'other', 'info'))
+    socket.emit('Runtime.consoleAPICalled', rtParams(30_000_000, 'from-runtime'))
+    const before = collector.buffered
+
+    // re-attach → refresh 重放：CDP 只回最新的那些，外加那条提示。
+    await enableAndReplay(socket, collector, () => {
+      for (let index = 2001; index <= 3000; index += 1) {
+        socket.emit('Log.entryAdded', logParams(index * 10, `log-${index}`))
+      }
+      socket.emit('Log.entryAdded', logParams(0, '2990 log entries are not shown.', 'other', 'info'))
+    })
+
+    const result = collector.read({ limit: CONSOLE_RING_CAPACITY + 50 })
+    // ① 上限截断没有变成重复：重放全被高水位吃掉，条数一涨都没涨。
+    expect(result.buffered).toBe(before)
+    expect(new Set(result.entries.map(entry => entry.text)).size).toBe(result.entries.length)
+    // ② timestamp=0 的截断提示没有被高水位吃掉，也没因为重复投递变成两条。
+    expect(result.entries.filter(entry => entry.text.includes('log entries are not shown'))).toHaveLength(1)
+    // ③ Runtime 与 Log 各按自己的桶去重：Runtime 那条没被 Log 的高水位带走。
+    expect(result.entries.some(entry => entry.text === 'from-runtime')).toBe(true)
+  })
+
   it('keeps per-domain buckets independent: identical timestamps in different domains both survive', () => {
     const socket = new EventSocket()
     const collector = new ConsoleCollector(new CdpConnection(socket))

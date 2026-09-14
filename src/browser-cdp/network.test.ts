@@ -12,6 +12,12 @@ class EventSocket implements CdpSocket {
   readonly sent: { method: string; params: Record<string, unknown> }[] = []
   private readonly handlers = new Map<string, ((event: unknown) => void)[]>()
 
+  /**
+   * detach 模拟：置 true 后 `emit` 的事件**不会**送达采集器。
+   * CDP 会话不在线时就是这个效果 —— 事件不是迟到，是永久不到。
+   */
+  muted = false
+
   constructor(private readonly body = 'pong') {}
 
   send(data: string): void {
@@ -38,6 +44,7 @@ class EventSocket implements CdpSocket {
 
   /** 注入一条 CDP 事件。 */
   emit(method: string, params: unknown): void {
+    if (this.muted) return
     this.dispatch('message', { data: JSON.stringify({ method, params }) })
   }
 
@@ -127,6 +134,42 @@ describe('NetworkCollector', () => {
     })
     expect(entries[1]?.method).toBeUndefined()
     expect(entries[0]).toMatchObject({ partial: true, reason: 'request-headers-missing', errorText: 'net::ERR_ABORTED' })
+  })
+
+  it('completes an entry whose response only arrives after re-attach (request started before detach)', () => {
+    const socket = new EventSocket()
+    const collector = new NetworkCollector(new CdpConnection(socket))
+
+    socket.emit('Network.requestWillBeSent', requestEvent('r1', 'GET', 'https://api.example.com/slow'))
+    // detach：这段窗口里什么都没发生（请求是在 detach **之前**发起的）。
+    socket.muted = true
+    socket.muted = false
+    // re-attach 之后才完成：收尾链完整，不该被标成半截记录。
+    socket.emit('Network.responseReceived', responseEvent('r1', 'https://api.example.com/slow', 200, 'text/html'))
+
+    const entry = collector.get('r1')
+    expect(entry).toMatchObject({ method: 'GET', status: 200, mimeType: 'text/html' })
+    expect(entry?.partial).toBeUndefined()
+    expect(entry?.reason).toBeUndefined()
+  })
+
+  it('loses a request that both started and finished during detach — permanently ([V38])', () => {
+    const socket = new EventSocket()
+    const collector = new NetworkCollector(new CdpConnection(socket))
+
+    socket.emit('Network.requestWillBeSent', requestEvent('kept', 'GET', 'https://api.example.com/kept'))
+    // detach：这期间发生的一切事件一条都到不了采集器（不是迟到，是永久不到）。
+    socket.muted = true
+    socket.emit('Network.requestWillBeSent', requestEvent('lost', 'GET', 'https://api.example.com/lost'))
+    socket.emit('Network.responseReceived', responseEvent('lost', 'https://api.example.com/lost', 200, 'text/html'))
+    socket.muted = false
+    socket.emit('Network.requestWillBeSent', requestEvent('kept-2', 'GET', 'https://api.example.com/kept-2'))
+
+    const { requests } = collector.list(50)
+    expect(requests.map(entry => entry.requestId)).toEqual(['kept-2', 'kept'])
+    // 这条断言的是「它确实没来」——[V38] 是已知且接受的能力边界，将来谁想加
+    // 「detach 期间的事件回填」，得先证明 CDP 真有这个能力，而不是把这条删掉。
+    expect(collector.get('lost')).toBeUndefined()
   })
 
   it('updates an existing entry without marking it partial', () => {
