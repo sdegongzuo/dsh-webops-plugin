@@ -165,6 +165,20 @@ jobs:
           Add-Content -Path $env:GITHUB_ENV -Value "ZIP_SHA256=$((Get-FileHash $zip.FullName -Algorithm SHA256).Hash.ToLower())"
           Add-Content -Path $env:GITHUB_ENV -Value "ZIP_MB=$([math]::Round($zip.Length / 1MB, 1))"
 
+      - name: 发版前自检（生产路径）
+        # 前面各步只保证「能构建出来」，不保证「构建出来的东西能起来」：
+        # v0.1.0 / v0.2.0 两次发版都因此翻车（插件登记被 createPluginProfile 静默抹掉、
+        # 出货 patch 误带 fake-llm 接管 llm/stream）。这两件事 typecheck / test / 构建都拦不住。
+        # verify-portable 用 harness 真代码走一遍桌面端启动准备（全量 sha256 完整性 +
+        # runtimeId / nodeVersion / platform / arch 对齐 + 建 241 条宿主链接 + 依赖图校验），
+        # 再真起一次宿主读 __DSH_BOOT__。不过就不发 Release。
+        # 验的是 .desktop-stage（zip 的内容源，所以不需要先解压 zip）；
+        # 唯一的例外是浏览器信标那步（--browser，要真实 Chromium）在 CI 上跳过。
+        shell: pwsh
+        run: |
+          node "$env:GITHUB_WORKSPACE/scripts/verify-portable.mjs" --dir "$env:GITHUB_WORKSPACE/.desktop-stage" --harness (Join-Path (Split-Path $PWD) 'deepseek-harness')
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
       - name: 写 release 说明
         shell: pwsh
         run: |

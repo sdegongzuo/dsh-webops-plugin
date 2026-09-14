@@ -761,6 +761,10 @@ pnpm run verify:portable -- --dir /path/to/解压后的目录 \
 
 脚本在 profile 的**工作副本**上建链，不动 `--dir` 里那份，所以可以反复跑（每次都从出厂态验）。
 
+`release-desktop.yml` 里也内置了这一步（「发版前自检」），跑在「打好 zip」之后、「发布 Release」之前，
+直接验 `.desktop-stage`（zip 的内容源，不必先解压）——**不过就不发 Release**。
+所以以后坏包不会再出现在 Release 上，不必靠把 237 MB 拖回本地才验得动。
+
 > 它**不断言状态条出现在 DOM 里**：状态条挂在会话面的 `conversation.input.dock` 上，而
 > `ui-conversation` 只在会话存在时才渲染那个 slot（`const zone = session === undefined ? undefined : {…}`）——
 > 空 home 会停在「选择工作区」页，那一面根本没挂载。这是**预期行为**，不是插件没加载
