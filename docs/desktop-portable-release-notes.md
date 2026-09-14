@@ -1,8 +1,51 @@
-# dsh 桌面端便携版 v0.1.0（Windows x64）
+# dsh 桌面端便携版 —— 发版存档
 
-> **本文是 v0.1.0 那次手动发版的历史存档**（当时的 zip 是本机打的）。
-> 自 `desktop-v0.2.0` 起，Release 说明由 `.github/workflows/release-desktop.yml`
-> 在 CI 里内联生成（含当场算出的 SHA-256 与体积），不再维护这份文档。
+> **v0.1.0 的 zip 是本机手打的**；自 `desktop-v0.2.0` 起 Release 说明由
+> `.github/workflows/release-desktop.yml` 在 CI 里内联生成（含当场算出的 SHA-256 与体积）。
+> 下面 v0.1.0 一节是历史存档，**v0.2.0 一节是重发后的验证结论**，留作后续发版的对照基线。
+
+---
+
+## v0.2.0（2026-09-14 重发，CI 构建 run `34857849891`）
+
+v0.2.0 第一次发出去是坏的：打包时漏写 `home\profiles\desktop\desktop-runtime-state.json`，
+桌面端 `applyRelease()` 在 `previous === undefined` 时会调 `createPluginProfile()` 把
+profile 的 `package.json` 重写成空插件列表 —— **插件登记被静默抹掉，不报错也不提示**。
+修复后决定**原地覆盖 v0.2.0**（`package.json` 的 version 从 0.2.1 回退到 0.2.0 与 tag 对齐）。
+
+### 资产
+
+| 项 | 值 |
+|---|---|
+| 文件 | `dsh-webops-desktop-v0.2.0-win-x64-portable.zip` |
+| 大小 | 237,431,549 字节 |
+| SHA-256 | `1b9b3868b6787586b72ad408f17711e4f8822629dd5712a3d1c5386c9e429607` |
+
+⚠️ **不要用字节数判断包的好坏**：这次的资产 237,431,549、坏掉的旧资产 237,429,790、
+本地构建 237,414,706 —— 三个都不同，CI 构建与本地构建本就有差异。只认内容断言。
+
+### 验证结论（`pnpm run verify:portable`，33 项全绿）
+
+| 段 | 结论 |
+|---|---|
+| ① zip 完整性 | 11,887 条 CRC 全绿；逐条 `read()` 写盘 11,762 个文件；无一命中 NUL 填充 |
+| ② 产物完整性 + runtime 身份 | 11,218 个受校验文件 sha256 全部匹配；`state.runtimeId` / `nodeVersion` / `platform` / `arch` 四项与包内 runtime 一致 |
+| ③ 复刻启动准备 | 241/241 条宿主包链接建成；`validateDesktopPluginGraph` 通过；`activePlugins=["dsh-webops-plugin"]` |
+| ④ 生产路径起宿主 | `/index.html` 200、`__DSH_BOOT__` 已注入、boot graph 52 行且含 `dsh-webops-plugin`、客户端 bundle 可拉取且合法 |
+| ⑤ 真浏览器信标 | `dshBrowserPlugin=1`、dock 已注册、15 个工具视图全部注册 |
+| ⑥ 出货 patch 守卫 | 不含 `fake-llm` / `llm-replay` / `mock-llm`（v0.2.0 事故点），含 browser-cdp / browser-electron / tool-browser 与裸包名行 |
+
+关键修复点在包里已经能直接看到：`home\profiles\desktop\package.json` 的
+`dsh.profile.bundles` 含 `dsh-webops-plugin`，`desktop-runtime-state.json` 的
+`runtimeId` 非空、`links` 为 `[]`。
+
+**唯一机器验不了的环节**：双击 `启动.cmd` 后输入框上方是否出现「网页操作」状态条。
+本环境起不了 Electron GUI（宿主能在纯 node 里驱动，真实窗口渲染只能人眼确认），
+需要使用者确认。
+
+---
+
+## v0.1.0（历史存档，本机手打）
 
 **已内置 `dsh-webops-plugin@0.1.0`**，解压即用：不需要 Node、不需要 pnpm、不需要联网装插件、不需要签名证书。
 

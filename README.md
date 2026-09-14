@@ -656,11 +656,45 @@ git tag v0.1.0 && git push origin v0.1.0
 
 `.github/workflows/release-desktop.yml`：取 harness → **打补丁** → 装依赖 → 修 electron-builder
 的 EPERM → `package:win:x64:dir --unsigned` → 物化插件 profile → 打 zip → 建 Release。
-约 226 MB，CI 要 1–3 小时（job timeout 180 分钟）。
+产物约 226 MB。**首次构建约 17 分钟**（不是先前以为的 1–3 小时；job timeout 180 分钟只是保险）。
 
 ```bash
 git tag desktop-v0.2.0 && git push origin desktop-v0.2.0
 ```
+
+**耗时构成**（run `34818902102`，总 17m12s）：
+
+| 步骤 | 耗时 | 占比 |
+|---|---|---|
+| 构建桌面端应用目录（`package:win:x64:dir --unsigned`） | 631s | 61% |
+| 物化 profile + 打 zip | 294s | 29% |
+| 装 harness 依赖 | 38s | 4% |
+| 其余 11 步合计 | 69s | 6% |
+
+不是编译慢 —— **不需要 MSVC**，node-pty 用预编译的 conpty.dll，koffi / sharp 同理。
+631s 花在 electron-builder 把 226MB / 14071 个文件解包组装成 app 目录（纯 IO），
+294s 花在压缩。所以提速做了两件事：
+
+| 改动 | 做法 | 收益 |
+|---|---|---|
+| 缓存 dsh 本体 | `actions/cache` 缓存整个 `win-unpacked`，key 含 `HARNESS_REF` + 两处补丁的 hash；命中则**跳过构建步骤**，未命中构建完搬到缓存目录由 cache 的 post 存起来 | 插件自己迭代时省掉 631s |
+| 压缩级别 `Optimal` → `Fastest` | `scripts/package-desktop-portable.mjs` 第 6 步 | app 里绝大多数是已压过的二进制（Electron 运行时、asar、.node、图片），Optimal 的体积收益是个位数 MB，代价是几分钟 CPU |
+
+**提速前后对照**（三次实测）：
+
+| 步骤 | 改动前 run `34818902102` | 首次（缓存 miss）run `34865536100` | 缓存命中 run `34867323186` |
+|---|---|---|---|
+| 恢复缓存 | —（没有这一步） | 1s | 7s |
+| 构建桌面端应用目录 | 631s | 596s | **0s（跳过）** |
+| 物化 profile + 打 zip | 294s | 235s | 248s |
+| 发版前自检 | — | 29s | 30s |
+| **总计** | **17m12s** | **16m03s** | **6m28s** |
+
+`Fastest` 单独省下约 55s（294s → 235~248s，压缩的是已压过的二进制，收益符合预期）；
+大头还是缓存 —— 命中后构建步骤直接不跑。
+
+> 公开仓的 Actions **完全免费**（`billable.WINDOWS.total_ms = 0`，实测 run `34818902102`），
+> 所以省的是等待时间，不是额度。
 
 **harness 侧必须打补丁才能过，补丁在本仓 `docs/harness-desktop-build.patch`**，
 `git apply --ignore-whitespace` 干净应用（已在 pin 的 `c291e79` 上验证过）：
