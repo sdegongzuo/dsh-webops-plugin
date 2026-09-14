@@ -175,8 +175,13 @@ jobs:
         # 验的是 .desktop-stage（zip 的内容源，所以不需要先解压 zip）；
         # 唯一的例外是浏览器信标那步（--browser，要真实 Chromium）在 CI 上跳过。
         shell: pwsh
+        env:
+          # harness 是插件仓的兄弟目录（同「取 deepseek-harness 源码」step 的 Split-Path 结果）。
+          # 用 GitHub 表达式拼路径而不是 pwsh 的 Join-Path/Split-Path —— 少一层本机验不了的语法风险
+          # （这个环境里 psh 工具输出恒为空，pwsh 表达式没法本地试跑）。
+          HARNESS_ROOT: ${{ github.workspace }}/../deepseek-harness
         run: |
-          node "$env:GITHUB_WORKSPACE/scripts/verify-portable.mjs" --dir "$env:GITHUB_WORKSPACE/.desktop-stage" --harness (Join-Path (Split-Path $PWD) 'deepseek-harness')
+          node "$env:GITHUB_WORKSPACE/scripts/verify-portable.mjs" --dir "$env:GITHUB_WORKSPACE/.desktop-stage" --harness "$env:HARNESS_ROOT"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: 写 release 说明
