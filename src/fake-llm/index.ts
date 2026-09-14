@@ -7,7 +7,7 @@
  *   3. `browser_execute`（Runtime.evaluate）     → 读热搜榜，返回 `{ fifth, list }`
  *   4. `browser_find { query: 第五条标题 }`      → 在大纲里确定性拿到热搜链接的 ref
  *   5. `browser_click { session_id, ref }`       → 真实点击（target=_blank → 弹窗转新标签页）
- *   6. `browser_tabs { action: 'list' }`         → 弹窗标签必须已收编且在前台（[foreground]）
+ *   6. `browser_wait`(1.5s) + `browser_tabs`      → 弹窗标签必须已收编且在前台（[foreground]）
  *   7. `browser_execute`（在前台新标签上）       → 读详情页正文
  *   8. 纯文本收尾（finish: stop）
  *
@@ -172,30 +172,73 @@ function foregroundSessionId(history: string): string | undefined {
   return [...history.matchAll(/- session_id=([A-Za-z0-9._-]+) \[foreground\]/gu)].at(-1)?.[1]
 }
 
+/** 抽出的「测试效果证据」。 */
+export interface DetailDigest {
+  /** 热搜榜第五条标题。 */
+  fifth: string
+  /** 详情页 URL。 */
+  url: string
+  /** 详情页正文摘录。 */
+  excerpt: string
+}
+
+/**
+ * 抽取结果：成功带证据，失败带**定位用**的理由。
+ *
+ * 失败理由里附带上百字的尾部快照 —— 2026-09-14 的降级排查踩过：只知道「抽不到」
+ * 完全没法定位，得看到历史里那段到底长什么样（是被截断、还是格式变了）。
+ */
+export type DetailDigestResult = { ok: true; digest: DetailDigest } | { ok: false; reason: string }
+
+/** 失败理由里带的尾部快照长度。 */
+const TAIL_SNIPPET = 240
+
 /**
  * 从历史里抽「测试效果证据」：第五条标题 + 详情页 URL + 正文摘录。
  *
  * 详情正文取自最后一轮 execute（在弹窗标签上）的渲染结果——`Runtime.evaluate on
  * session_id=… (at <URL>, ref epoch N) <正文>`，正文到工具结果的 UNTRUSTED 提示为止。
  */
-function detailDigest(history: string): { fifth: string; url: string; excerpt: string } | undefined {
+export function detailDigest(history: string): DetailDigestResult {
   const fifth = fifthHotSearch(history)
-  if (fifth === undefined) return undefined
+  if (fifth === undefined) {
+    return { ok: false, reason: `fifth: 历史里没有 "fifth":"…" 段（热搜榜 execute 结果没进历史或被截断）` }
+  }
   const marker = 'Runtime.evaluate on session_id='
   const lastIdx = history.lastIndexOf(marker)
-  if (lastIdx < 0) return undefined
+  if (lastIdx < 0) {
+    return { ok: false, reason: `marker: 历史里没有 "${marker}"（详情页 execute 结果没进历史）` }
+  }
   const atIdx = history.indexOf('(at ', lastIdx)
-  if (atIdx < 0) return undefined
-  const afterParen = history.indexOf(') ', atIdx)
-  if (afterParen < 0) return undefined
-  const url = history.slice(atIdx + 4, afterParen)
-  let excerpt = history.slice(afterParen + 2)
+  if (atIdx < 0) {
+    return { ok: false, reason: `at: marker 之后没有 "(at "，尾部=${JSON.stringify(history.slice(lastIdx, lastIdx + TAIL_SNIPPET))}` }
+  }
+  // URL 取 `(at ` 之后到第一个空白或逗号为止（`,` 是 URL 与 `, ref epoch N)` 的分隔，
+  // 紧跟没有空格，必须排除）。**不要求它后面还有 `, ref epoch N) `**：详情页 URL 动辄
+  // 两三百字，而工具结果进入 llm 请求历史时会被截断——2026-09-14 的降级真因就是整条
+  // 结果断在 URL 中间，锚点死等 `) ` 从而整段判死。
+  const url = /[^\s,]+/u.exec(history.slice(atIdx + 4))?.[0] ?? ''
+  if (url === '') {
+    return { ok: false, reason: `url: "(at " 之后取不到 URL，尾部=${JSON.stringify(history.slice(atIdx, atIdx + TAIL_SNIPPET))}` }
+  }
+  const rest = history.slice(atIdx + 4 + url.length)
+  const head = /^,\s*ref epoch \d+\)\s*/u.exec(rest)
+  if (head === null) {
+    return {
+      ok: false,
+      // URL 已经抽到了，这里单独报「正文段不在」——定位时看得到 URL 就好判断是不是截断。
+      reason: `body: URL 之后不是 ", ref epoch N) "（结果被截断则整段正文不在历史里），URL=${JSON.stringify(url)}，其后=${JSON.stringify(rest.slice(0, TAIL_SNIPPET))}`,
+    }
+  }
+  let excerpt = rest.slice(head[0].length)
   const notice = excerpt.indexOf('Everything the page reports')
   if (notice > 0) excerpt = excerpt.slice(0, notice)
   excerpt = excerpt.trim()
   if (excerpt.length > 600) excerpt = `${excerpt.slice(0, 600)}…`
-  if (excerpt === '') return undefined
-  return { fifth, url, excerpt }
+  if (excerpt === '') {
+    return { ok: false, reason: `excerpt: 正文段为空，URL=${JSON.stringify(url)}` }
+  }
+  return { ok: true, digest: { fifth, url, excerpt } }
 }
 
 /** 读热搜榜：返回 JSON（`fifth` = 序号 5 的标题，`list` = 全部标题）。 */
@@ -203,8 +246,14 @@ function detailDigest(history: string): { fifth: string; url: string; excerpt: s
 // 再 `items[4]` 回退就会点到第二条。与 pickFifthTitle 同语义：只认序号 5。
 const HOTSEARCH_EXPRESSION = "JSON.stringify((() => { const lis = [...document.querySelectorAll('#hotsearch-content-wrapper > li, .s-hotsearch-content li, #hotsearch li')]; const items = lis.map(li => { const idxEl = li.querySelector('.title-content-index'); const titleEl = li.querySelector('.title-content-title'); const link = li.querySelector('a'); const raw = ((idxEl && idxEl.innerText) || '').replace(/\\s+/g, ''); const rank = (raw.match(/^\\d+/) || [''])[0]; let title = ((titleEl && titleEl.innerText) || (link && link.innerText) || li.innerText || '').trim(); if (!titleEl) title = title.replace(/^\\d+\\s*/, ''); return { rank, title }; }).filter(i => i.title.length > 1); const hit = items.find(i => i.rank === '5'); return { fifth: (hit && hit.title) || '', list: items.map(i => (i.rank || '-') + ' ' + i.title) }; })())"
 
-/** 读弹窗标签（热搜详情页）的正文文本。 */
-const CONTENT_EXPRESSION = "document.body ? document.body.innerText.replace(/\\s+/g, ' ').slice(0, 4000) : ''"
+/**
+ * 读弹窗标签（热搜详情页）的正文文本。
+ *
+ * 只取前 1200 字：收尾回复里摘录最多展示 600 字（`detailDigest` 会再截一次），
+ * 取更多纯属浪费——而且工具结果进 llm 请求历史时会被截断，正文越长越容易把
+ * `(at <URL>, ref epoch N) ` 这一整段连同 URL 尾部一起砍掉（2026-09-14 的降级真因）。
+ */
+const CONTENT_EXPRESSION = "document.body ? document.body.innerText.replace(/\\s+/g, ' ').slice(0, 1200) : ''"
 
 /**
  * 安装脚本化模型回放。
@@ -264,7 +313,17 @@ export function apply(ctx: import('@deepseek-ai/cordis').Context, config: FakeLl
       if (sessionId === undefined || ref === undefined) return undefined
       return toolCallTurn([{ id: 'c5', name: 'browser_click', args: { session_id: sessionId, ref } }])
     },
-    () => toolCallTurn([{ id: 'c6', name: 'browser_tabs', args: { action: 'list' } }]),
+    (request) => {
+      const sessionId = firstSessionId(historyText(request))
+      if (sessionId === undefined) return undefined
+      // 先睡一拍再列标签：弹窗是**异步**转标签的（宿主发 opened 通报 → provider
+      // adoptSession 登记），click 返回时它可能还没进注册表。不睡会偶发「tabs 里只有
+      // t1」（2026-09-14 实测：同一份代码两次跑，一次收编一次没收编）。
+      return toolCallTurn([
+        { id: 'c6a', name: 'browser_wait', args: { session_id: sessionId, time_ms: 1500 } },
+        { id: 'c6', name: 'browser_tabs', args: { action: 'list' } },
+      ])
+    },
     (request) => {
       const detailSession = foregroundSessionId(historyText(request))
       if (detailSession === undefined) return undefined
@@ -277,11 +336,13 @@ export function apply(ctx: import('@deepseek-ai/cordis').Context, config: FakeLl
     (request) => {
       // 收尾不是写死文本：从轨迹历史里抽出「测试效果证据」（第五条标题 / 详情页 URL /
       // 正文摘录）拼成可见回复 —— 否则聊天里只有一句干巴巴的「走完了」，效果看不见。
-      const digest = detailDigest(historyText(request))
-      if (digest === undefined) {
-        debugNote('digest', `动态证据抽取失败，降级静态文本；历史长度=${historyText(request).length}`)
+      const history = historyText(request)
+      const result = detailDigest(history)
+      if (!result.ok) {
+        debugNote('digest', `动态证据抽取失败，降级静态文本；原因=${result.reason}；历史长度=${history.length}`)
         return textChunks(text)
       }
+      const digest = result.digest
       return textChunks([
         '✅ 已完成「打开百度 → 点击热搜第五条 → 读详情」全链路（7 次工具调用）：',
         '',

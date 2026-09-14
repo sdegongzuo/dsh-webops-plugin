@@ -30,34 +30,30 @@ const call = (method, params = {}) => new Promise((resolve, reject) => {
   socket.send(JSON.stringify({ id, method, params }))
 })
 
-const expr = `(() => {
-  const sel = '[data-dsh-browser-row], [class*="markdown"], [class*="message"], [class*="chat"]'
-  const texts = Array.from(document.querySelectorAll('body *'))
-    .filter(el => el.children.length === 0 && el.textContent && el.textContent.trim().length > 10)
-    .map(el => el.textContent.trim())
-  const joined = texts.join('\\n===\\n')
-  return joined
-})()`
+// 用 innerText 全文，不要只收「无子节点的叶子」：markdown 会把「详情页：<url>」拆成
+// 文本节点 + <a>，叶子过滤会把证据行整行漏掉（2026-09-14 假阴性的真因）。
+const expr = `(() => document.body.innerText)()`
 
 const { result } = await call('Runtime.evaluate', { expression: expr, returnByValue: true })
 const text = String(result?.value ?? '')
 writeFileSync('scripts/.last-chat-dom.txt', text)
 console.log('DOM 全文长度:', text.length)
 
-const FIFTH = '烧烤店被检查15次'
-const hasFifth = text.includes(FIFTH)
-const hasDetailUrl = text.includes('baidu.com/s?wd=') || text.includes('wd=%E7%83%A7%E7%83%')
+// 热搜榜是实时数据，标题不能写死（写死必然 false）——从回复里现抽那一行。
+const fifthLine = /热搜第五条：([^\n]+)/u.exec(text)?.[1]?.trim() ?? ''
+const hasFifth = fifthLine.length > 0
+const hasDetailUrl = /baidu\.com\/s\?wd=/u.test(text)
 const hasExcerptMarker = text.includes('正文摘录')
 const hasEvidenceHeader = text.includes('已完成「打开百度')
 console.log('证据检查：')
-console.log('  第五条标题出现:', hasFifth)
+console.log('  第五条标题出现:', hasFifth, hasFifth ? `（${fifthLine}）` : '（回复里没有「热搜第五条：」行）')
 console.log('  详情页 URL 出现:', hasDetailUrl)
 console.log('  「正文摘录」标记出现:', hasExcerptMarker)
 console.log('  证据收尾开头出现:', hasEvidenceHeader)
 
 // 把含证据的片段打出来
 if (hasFifth || hasExcerptMarker) {
-  const idx = Math.max(text.lastIndexOf(FIFTH), text.lastIndexOf('正文摘录'))
+  const idx = Math.max(text.lastIndexOf('热搜第五条'), text.lastIndexOf('正文摘录'))
   console.log('\n--- 证据片段（前后各 600 字）---')
   console.log(text.slice(Math.max(0, idx - 600), idx + 600))
 } else {
