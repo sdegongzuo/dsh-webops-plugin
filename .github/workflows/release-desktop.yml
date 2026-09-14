@@ -93,6 +93,19 @@ jobs:
           Set-Location (Join-Path (Split-Path $PWD) 'deepseek-harness')
           pnpm install --no-frozen-lockfile
 
+      - name: 装本仓依赖
+        # 这两步原 workflow 漏了，desktop-v0.2.0 第一次跑就栽在
+        # 「package-desktop-portable: 缺少 lib/，先跑 pnpm build」——
+        # package-desktop-portable.mjs:73 硬要求 lib/（插件构建产物），
+        # 而「生成桌面端」这条链路并不产出它（那是 release.yml 的事）。
+        # devDependencies 里 13 个 dsh 包是 `link:../deepseek-harness/...`，故必须在取
+        # harness 之后。放这里而不是打包前，是为了插件构建失败能早失败，
+        # 不必等 120 分钟的 dsh 打包跑完才报。
+        run: pnpm install --no-frozen-lockfile
+
+      - name: 构建插件
+        run: pnpm build
+
       - name: 修 electron-builder 解包 rename 的 EPERM
         # 必须在 pnpm install 之后（改的是 node_modules 里的 app-builder-lib）。
         shell: pwsh
