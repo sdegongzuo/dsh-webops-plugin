@@ -32,6 +32,19 @@
  * 抛 `Object reference chain is too long`；`Symbol('s')` 抛 `Object couldn't be returned by value`。
  * 所以**不能只判 `result.value === undefined`**，要同时看 `result.type` / `result.subtype`。
  *
+ * ## Promise：等它落定，再判能不能跨边界（2026-09-14 修）
+ *
+ * 报告 S5 实测：`fetch('/get').then(r => r.status)` 报 `BROWSER_EXECUTE_RESULT_UNSERIALIZABLE`，
+ * 但 network 里那条 `GET /get` 明明已经 200 —— 表达式**已经跑完并产生了副作用**，只是返回值是个
+ * `Promise`（`subtype: 'promise'`，没有 `value`），于是被当成「不可序列化」拒掉。现在两条一起改：
+ *
+ * 1. provider 给 `Runtime.evaluate` 强制带上 `awaitPromise: true`，Promise 落定后返回**它兑现的值**；
+ * 2. 仍然拿到 `promise` / `error` 这类没有 `value` 的对象时，错误消息**如实说明表达式已执行**，
+ *    不再让调用方以为是「没跑」。
+ *
+ * 另外 `exceptionDetails`（表达式抛异常、或者被 await 的 Promise reject）不再被压成
+ * 「不可序列化」，而是由 {@link extractEvaluateException} 取出真实异常文本。
+ *
  * @module dsh-webops-plugin/browser-cdp/execute
  */
 
@@ -124,11 +137,39 @@ interface RemoteObject {
   readonly type?: unknown
   readonly subtype?: unknown
   readonly value?: unknown
+  readonly description?: unknown
 }
 
 /** 一个值是不是「没有任何自身可枚举键的普通对象」。 */
 function isEmptyObject(value: unknown): boolean {
   return typeof value === 'object' && value !== null && !Array.isArray(value) && Object.keys(value).length === 0
+}
+
+/** `Runtime.evaluate` 结果里的 `exceptionDetails`（表达式抛错 / 被 await 的 Promise reject）。 */
+interface ExceptionDetails {
+  readonly text?: unknown
+  readonly exception?: { readonly description?: unknown; readonly value?: unknown; readonly preview?: unknown }
+}
+
+/**
+ * 从 `Runtime.evaluate` 的返回体里取出异常文本。
+ *
+ * 为什么必须单独处理：被 `await` 的 Promise **reject** 时，CDP 把错误放在 `exceptionDetails`
+ * 而不是抛协议错误 —— 只按返回值三态判会把它当成「不可序列化」，模型看到的是
+ * `BROWSER_EXECUTE_RESULT_UNSERIALIZABLE`，而真实原因是页面上那句表达式抛了。
+ *
+ * @param result - CDP 返回的 `{ result, exceptionDetails }`。
+ * @returns 异常文本；没有异常时 `undefined`。
+ */
+export function extractEvaluateException(result: unknown): string | undefined {
+  const details = (result as { exceptionDetails?: ExceptionDetails } | null | undefined)?.exceptionDetails
+  if (details === undefined || details === null) return undefined
+  const description = details.exception?.description
+  if (typeof description === 'string' && description.length > 0) return description
+  const value = details.exception?.value
+  if (typeof value === 'string' && value.length > 0) return value
+  const text = details.text
+  return typeof text === 'string' && text.length > 0 ? text : 'the evaluated expression threw an unknown error'
 }
 
 /**
@@ -137,7 +178,7 @@ function isEmptyObject(value: unknown): boolean {
  * @param result - CDP 返回的 `{ result: RemoteObject }`。
  * @returns 可序列化的值。
  * @throws `BROWSER_EXECUTE_RESULT_UNSERIALIZABLE`：`document.body` 那种静默 `{}`、DOM 节点、
- * 函数 / Symbol 等无法跨 CDP 边界返回的值。
+ * 函数 / Symbol / Promise 等无法跨 CDP 边界返回的值。
  */
 export function extractEvaluateValue(result: unknown): unknown {
   const remote = (result as { result?: RemoteObject } | null | undefined)?.result
@@ -149,6 +190,14 @@ export function extractEvaluateValue(result: unknown): unknown {
   const value = remote.value
   if (type === 'object') {
     // `document.body` 会静默变成 `{}`（看着有值其实是垃圾），DOM 节点 subtype 是 `node`。
+    if (subtype === 'promise') {
+      // 走到这里说明 awaitPromise 没生效（老版本 / 被调用方显式关掉）。表达式**已经跑了**，
+      // 必须说清楚，否则调用方会以为「什么都没发生」而重复执行一次带副作用的表达式。
+      throw unserializable(
+        'the expression returned a Promise and it was not awaited, so there is no value to return '
+        + '(the expression itself has already run and may have had side effects)',
+      )
+    }
     if (subtype === 'node' || value === undefined || isEmptyObject(value)) {
       throw unserializable('the expression returned a DOM node or an object that serialized to an empty value')
     }
@@ -177,8 +226,9 @@ export function translateEvaluateError(error: unknown): unknown {
 function unserializable(detail: string): BrowserError {
   return new BrowserError(
     `the expression's value could not be serialized by CDP: ${detail}. `
+    + 'The expression itself has already run in the page, so any side effect it had is NOT rolled back. '
     + 'Return a primitive value or a JSON string (for example JSON.stringify(...)) instead of a DOM node, '
-    + 'a cyclic object, a function, or a Symbol.',
+    + 'a cyclic object, a function, a Symbol, or an unawaited Promise.',
     'BROWSER_EXECUTE_RESULT_UNSERIALIZABLE',
   )
 }

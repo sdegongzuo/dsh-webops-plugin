@@ -23,13 +23,14 @@ export {
   validateProviderConfig,
 } from './provider.ts'
 export type { CdpProviderConfig } from './provider.ts'
-export { ConsoleCollector, CONSOLE_RING_CAPACITY, CONSOLE_TEXT_MAX_CHARS } from './console.ts'
+export { ConsoleCollector, CONSOLE_RING_CAPACITY, CONSOLE_TEXT_MAX_CHARS, normalizeTimestamp } from './console.ts'
 export type { ConsoleEntry, ConsoleReadOptions, ConsoleReadResult } from './console.ts'
 export { NetworkCollector, NETWORK_MAX_BODY_CHARS, NETWORK_TABLE_CAPACITY } from './network.ts'
-export type { NetworkBodyResult, NetworkEntry } from './network.ts'
+export type { NetworkBodyResult, NetworkEntry, NetworkListResult } from './network.ts'
 export {
   assertExecuteAllowed,
   BROWSER_EXECUTE_ALLOWED,
+  extractEvaluateException,
   extractEvaluateValue,
   translateEvaluateError,
 } from './execute.ts'
@@ -39,7 +40,7 @@ export { RefRegistry } from './refs.ts'
 export type { RefPublication, RefTarget } from './refs.ts'
 export { TargetStateRegistry } from './state.ts'
 export type { StateClaim, StateClaimOptions, StateOwner, StateRecord } from './state.ts'
-export { buildOutline, DEFAULT_SNAPSHOT_LIMITS, renderOutline } from './snapshot.ts'
+export { buildOutline, DEFAULT_SNAPSHOT_LIMITS, MAX_SNAPSHOT_LINES, renderOutline, resolveSnapshotLimits } from './snapshot.ts'
 export type { AxNode, OutlineLine, SnapshotLimits, SnapshotOutline } from './snapshot.ts'
 export { BROWSER_MAX_URL_LENGTH, validateEndpoint, validateTargetUrl } from './url-policy.ts'
 

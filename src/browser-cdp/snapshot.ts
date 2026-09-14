@@ -64,6 +64,38 @@ export const DEFAULT_SNAPSHOT_LIMITS: SnapshotLimits = {
   maxOutlineChars: 40_000,
 }
 
+/**
+ * `maxLines` 的硬上限（`browser_snapshot` 的 `max_lines` 参数封顶）。
+ *
+ * 为什么封顶而不是无限：大纲直接进上下文预算，5000 行已经是一屏长文页全量（≈250KB 文本），
+ * 再大就不是「紧凑大纲」了。超限按上限夹住，不报错 —— 模型要的只是「多给点」。
+ */
+export const MAX_SNAPSHOT_LINES = 5_000
+
+/** 单行平均字符数（缩进 + 角色 + 名称）的估计值，用来按行数缩放字符预算。 */
+const OUTLINE_CHARS_PER_LINE = 60
+
+/**
+ * 按调用方给的 `maxLines` 调整一份限额。
+ *
+ * 关键点：**行数预算和字符预算必须一起动**。只抬 `maxLines` 而不抬 `maxOutlineChars`，
+ * 字符预算会先耗尽，模型会看到「我把 max_lines 调大了，大纲还是截断」（2026-09-14 报告
+ * 里长文页截断的修法）。所以字符预算取 `max(原值, 行数 × 60)`。
+ *
+ * @param base - provider 配置里的默认限额。
+ * @param maxLines - 调用方要求的行数上限；非法值按默认处理。
+ * @returns 调整后的限额。
+ */
+export function resolveSnapshotLimits(base: SnapshotLimits, maxLines?: number | undefined): SnapshotLimits {
+  if (maxLines === undefined || !Number.isFinite(maxLines)) return base
+  const clamped = Math.max(1, Math.min(Math.floor(maxLines), MAX_SNAPSHOT_LINES))
+  return {
+    ...base,
+    maxLines: clamped,
+    maxOutlineChars: Math.max(base.maxOutlineChars, clamped * OUTLINE_CHARS_PER_LINE),
+  }
+}
+
 /** 纯布局层：只下钻，不占行。 */
 const TRANSPARENT_ROLES = new Set([
   'rootwebarea',
@@ -170,6 +202,13 @@ export interface SnapshotOutline {
   /** 可操作元素，按出现顺序；ref 名由 `RefRegistry.publish` 分配。 */
   readonly rows: readonly Omit<RefTarget, 'ref'>[]
   readonly truncated: boolean
+  /**
+   * 因预算耗尽而**没有**输出的节点数（含因 `maxDepth` 被砍掉的子树根）。
+   *
+   * 存在的意义是让截断「可解释」：只说 `truncated: true` 时模型不知道是差几行还是差几千行，
+   * 也就无从决定「抬预算」还是「换招」（`browser_find` / `browser_scroll`）。
+   */
+  readonly droppedElements: number
 }
 
 /** 折叠空白并裁剪到 `maxLength`，避免一个 `aria-label` 撑爆一行。 */
@@ -244,7 +283,7 @@ function renderLine(
  *
  * @param nodes - `Accessibility.getFullAXTree` 的原始节点数组（平面）。
  * @param limits - 规模上限，默认 {@link DEFAULT_SNAPSHOT_LIMITS}。
- * @returns 大纲行、可操作元素候选行，以及是否被截断。
+ * @returns 大纲行、可操作元素候选行，以及截断情况（是否截断 + 少输出了多少元素）。
  */
 export function buildOutline(
   nodes: readonly AxNode[],
@@ -266,6 +305,7 @@ export function buildOutline(
   const rows: Omit<RefTarget, 'ref'>[] = []
   const visited = new Set<string>()
   let truncated = false
+  let droppedElements = 0
   let chars = 0
 
   const visit = (node: AxNode, depth: number): void => {
@@ -280,6 +320,7 @@ export function buildOutline(
     // 预算耗尽后整棵子树都不再输出，并在结果里标记截断（调用方据此提示模型先缩小范围）。
     if (lines.length >= limits.maxLines || chars >= limits.maxOutlineChars) {
       truncated = true
+      droppedElements += 1
       return
     }
 
@@ -299,7 +340,10 @@ export function buildOutline(
     }
 
     if (depth >= limits.maxDepth) {
-      if ((node.childIds ?? []).length > 0) truncated = true
+      if ((node.childIds ?? []).length > 0) {
+        truncated = true
+        droppedElements += 1
+      }
       return
     }
     for (const childId of node.childIds ?? []) {
@@ -311,7 +355,7 @@ export function buildOutline(
 
   for (const root of roots) visit(root, 0)
 
-  return { lines, rows, truncated }
+  return { lines, rows, truncated, droppedElements }
 }
 
 /**

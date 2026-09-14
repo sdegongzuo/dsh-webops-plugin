@@ -144,6 +144,10 @@ export interface BrowserSnapshot {
   readonly refs: readonly BrowserRef[]
   /** 大纲是否因规模上限被截断（截断后 ref 只覆盖已输出的部分）。 */
   readonly truncated: boolean
+  /** 被截断时：本次实际输出的大纲行数（`truncated=false` 时等于总行数）。 */
+  readonly outlineLines: number
+  /** 被截断时：因规模预算没被输出的元素个数（差几行还是差几千行，模型据此决定要不要抬预算）。 */
+  readonly droppedElements?: number
   /**
    * P3 人工接管状态位：`true` 表示有人正开着 DevTools 操作这个页面，**本结果可能随时失效**，
    * 模型应当把它当作「需要重新观察」的信号。
@@ -171,7 +175,15 @@ export interface BrowserScreenshot {
 
 /** P0 的观察类请求。P1 会加入 click / fill / press 等 mutation 类型。 */
 export type BrowserObserveRequest =
-  | { readonly kind: 'snapshot'; readonly sessionId: string }
+  | {
+    readonly kind: 'snapshot'
+    readonly sessionId: string
+    /**
+     * 大纲的行数上限（1-{@link MAX_SNAPSHOT_LINES}）。省略 = provider 默认（800）。
+     * 长文页默认会被截断，调大它可以多看几屏 —— 代价是上下文预算。
+     */
+    readonly maxLines?: number
+  }
   | {
     readonly kind: 'screenshot'
     readonly sessionId: string
@@ -195,7 +207,11 @@ export type BrowserMutationRequest =
   | {
     readonly kind: 'scroll'
     readonly sessionId: string
-    readonly ref: string
+    /**
+     * 滚轮事件的落点元素。**可以省略** —— 省略时落在视口中心（整页滚动），
+     * 这样在「只有标题、没有任何可操作元素」的页面上也能滚，且不需要先 snapshot。
+     */
+    readonly ref?: string
     /** 横向滚动量（正 = 向右）；与 `deltaY` 至少给一个。 */
     readonly deltaX?: number
     /** 纵向滚动量（正 = 向下）；与 `deltaX` 至少给一个。 */
@@ -262,6 +278,8 @@ export interface BrowserConsoleRequest {
   readonly level?: string
   /** 只保留文本包含该子串的条目（大小写不敏感）。 */
   readonly text?: string
+  /** 连更早文档（导航前那几页）的条目一起读。默认 false：只给当前文档的。 */
+  readonly allDocuments?: boolean
 }
 
 /** 一条归一化后的 console 条目。 */
@@ -269,7 +287,10 @@ export interface BrowserConsoleEntry {
   /** `Runtime` 用事件 type；`Log` 用 `entry.level`。 */
   readonly level: string
   readonly text: string
-  /** 毫秒时间戳（Runtime 的微秒已折算成毫秒）。 */
+  /**
+   * 毫秒时间戳。两域口径不同且随版本漂移，采集时按量级归一（见
+   * `browser-cdp/console.ts` 的 `normalizeTimestamp`），所以两域可比。
+   */
   readonly timestamp: number
   /** 来源域：`runtime` = `Runtime.consoleAPICalled`，`log` = `Log.entryAdded`。 */
   readonly source: 'runtime' | 'log'
@@ -280,7 +301,7 @@ export interface BrowserConsoleResult {
   readonly kind: 'console'
   readonly sessionId: string
   readonly entries: readonly BrowserConsoleEntry[]
-  /** 过滤前缓冲里的条目总数。 */
+  /** 过滤前缓冲里的条目总数（含更早文档的）。 */
   readonly buffered: number
   /** 匹配的条目多于 `limit`。 */
   readonly truncated: boolean
@@ -289,6 +310,10 @@ export interface BrowserConsoleResult {
    * 说明有 console 内容永久缺失，模型应据此判断窗口是否完整。
    */
   readonly replayTruncated: boolean
+  /** 当前文档序号（0 起；本会话观察到几次导航就加几）。 */
+  readonly document: number
+  /** 属于更早文档、**没被返回**的条目数（`allDocuments: true` 时恒为 0 —— 都被返回了）。 */
+  readonly earlierDocuments: number
 }
 
 /** P2：网络采集的两种动作。 */
@@ -300,6 +325,8 @@ export type BrowserNetworkRequest =
     readonly limit?: number
     /** 只保留 URL 包含该子串的条目（大小写不敏感）。 */
     readonly url?: string
+    /** 连更早文档（导航前那几页）的请求一起列。默认 false：只给当前文档的。 */
+    readonly allDocuments?: boolean
   }
   | { readonly kind: 'body'; readonly sessionId: string; readonly requestId: string }
 
@@ -332,6 +359,10 @@ export interface BrowserNetworkResult {
   readonly body?: string
   readonly base64Encoded?: boolean
   readonly truncated?: boolean
+  /** list 动作才有：当前文档序号（0 起）。 */
+  readonly document?: number
+  /** list 动作才有：属于更早文档、**没被列出**的请求数（`allDocuments: true` 时恒为 0）。 */
+  readonly earlierDocuments?: number
 }
 
 /** P2：`browser_execute` —— 唯一能直接发任意 CDP 命令的逃生舱。 */
@@ -367,7 +398,11 @@ export interface BrowserLocateRequest {
   readonly ref: string
   /** 在元素上画一层高亮（`Overlay.highlightNode`；保持到 hideHighlight / 导航）。 */
   readonly highlight?: boolean
-  /** 先 `scrollIntoView` 居中再量（默认 true）。 */
+  /**
+   * 量之前先 `scrollIntoView` 把元素滚到视口中央。**默认 false**（只读、不动视口）：
+   * 默认滚动会让 locate 无法用来验证「刚才那次 scroll 到底滚没滚」，也会悄悄改掉
+   * 用户看到的画面；要看元素在视口里的**当前位置**就别开它。
+   */
   readonly scroll?: boolean
 }
 
@@ -384,6 +419,11 @@ export interface BrowserLocateResult {
   readonly height: number
   /** `scroll=true` 时元素先被滚到视口中央再量，为 true。 */
   readonly centered: boolean
+  /**
+   * 量到的那一刻，元素是否与视口有交集（`scroll=false` 时直接回答「它在不在屏幕上」）。
+   * 视口尺寸读不到时为 `undefined`。
+   */
+  readonly inViewport?: boolean
 }
 
 /**

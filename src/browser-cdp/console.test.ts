@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { CONSOLE_RING_CAPACITY, ConsoleCollector } from './console.ts'
+import { CONSOLE_RING_CAPACITY, ConsoleCollector, normalizeTimestamp } from './console.ts'
 import { CdpConnection } from './protocol.ts'
 import type { CdpSocket } from './protocol.ts'
 
@@ -40,7 +40,7 @@ class EventSocket implements CdpSocket {
   }
 }
 
-/** 造一条 `Runtime.consoleAPICalled` 参数。timestamp 按协议是**微秒**。 */
+/** 造一条 `Runtime.consoleAPICalled` 参数。timestamp 按量级归一，测试里给哪种口径都行。 */
 function rtParams(timestampMicros: number, text: string, type = 'log', contextId = 1): Record<string, unknown> {
   return {
     type,
@@ -50,7 +50,7 @@ function rtParams(timestampMicros: number, text: string, type = 'log', contextId
   }
 }
 
-/** 造一条 `Log.entryAdded` 参数。timestamp 是毫秒（截断提示恒为 0）。 */
+/** 造一条 `Log.entryAdded` 参数。timestamp 按量级归一（截断提示恒为 0）。 */
 function logParams(timestamp: number, text: string, source = 'javascript', level = 'error'): Record<string, unknown> {
   return { entry: { source, level, text, timestamp } }
 }
@@ -159,13 +159,14 @@ describe('ConsoleCollector', () => {
     const socket = new EventSocket()
     const collector = new ConsoleCollector(new CdpConnection(socket))
 
-    // 两域时间戳口径不同（[V37]），跨域比大小本来就是错的；同值也不能互相挤掉。
+    // 两域即使给了不同单位的同一瞬间（Runtime 微秒、Log 毫秒），也要各自存活且落到同一把尺子上。
     socket.emit('Runtime.consoleAPICalled', rtParams(1789289442861_960, 'from-runtime'))
     socket.emit('Log.entryAdded', logParams(1789289442861.96, 'from-log'))
 
     const entries = collector.read({ limit: 50 }).entries
     expect(entries.map(entry => entry.text).sort()).toEqual(['from-log', 'from-runtime'])
     expect(entries.map(entry => entry.source).sort()).toEqual(['log', 'runtime'])
+    expect(Math.abs((entries[0]?.timestamp ?? 0) - (entries[1]?.timestamp ?? 0))).toBeLessThan(1)
   })
 
   it('drops the second of two same-bucket entries with an identical timestamp (documented side effect)', () => {
@@ -204,5 +205,73 @@ describe('ConsoleCollector', () => {
     expect(socket.methods.filter(method => method === 'Runtime.enable')).toHaveLength(2)
     expect(socket.methods.filter(method => method === 'Log.enable')).toHaveLength(2)
     expect(socket.methods.some(method => method.includes('disable'))).toBe(false)
+  })
+
+  it('hides earlier-document entries by default and reports how many are hidden (2026-09-14)', () => {
+    const socket = new EventSocket()
+    const collector = new ConsoleCollector(new CdpConnection(socket))
+
+    socket.emit('Runtime.consoleAPICalled', rtParams(1000_500, 'from-wikipedia'))
+    socket.emit('Log.entryAdded', logParams(1000_900, 'also-wikipedia'))
+    collector.noteNavigation()
+    socket.emit('Runtime.consoleAPICalled', rtParams(2000_500, 'from-httpbin'))
+
+    const current = collector.read({ limit: 50 })
+    expect(current.document).toBe(1)
+    expect(current.entries.map(entry => entry.text)).toEqual(['from-httpbin'])
+    expect(current.earlierDocuments).toBe(2)
+    // 缓冲没有被清空：allDocuments 读得回来（这是「过滤」不是「丢弃」）。
+    expect(current.buffered).toBe(3)
+    expect(collector.read({ limit: 50, allDocuments: true }).entries.map(entry => entry.text))
+      .toEqual(['from-httpbin', 'also-wikipedia', 'from-wikipedia'])
+  })
+
+  it('lets the [V39] truncation notice through once per document, not once per session', () => {
+    const socket = new EventSocket()
+    const collector = new ConsoleCollector(new CdpConnection(socket))
+
+    socket.emit('Log.entryAdded', logParams(0, '2010 log entries are not shown.', 'other', 'info'))
+    socket.emit('Log.entryAdded', logParams(0, '2010 log entries are not shown.', 'other', 'info'))
+    expect(collector.read({ limit: 50 }).entries).toHaveLength(1)
+
+    // 换文档后必须再报一次：新文档的缺失是**新的**缺失，被上一份的去重键吃掉就是不报。
+    collector.noteNavigation()
+    socket.emit('Log.entryAdded', logParams(0, '2010 log entries are not shown.', 'other', 'info'))
+    expect(collector.read({ limit: 50 }).entries).toHaveLength(1)
+    expect(collector.read({ limit: 50, allDocuments: true }).entries).toHaveLength(2)
+  })
+})
+
+describe('normalizeTimestamp', () => {
+  it('puts the Runtime and Log domains on the same millisecond scale whatever unit they use', () => {
+    // 同一个瞬间，三种口径：秒（Log 的旧口径）、毫秒（两域当前口径）、微秒（Runtime 的旧口径）。
+    const epochMs = 1_789_316_204_273
+    for (const raw of [epochMs / 1000, epochMs, epochMs * 1000]) {
+      expect(normalizeTimestamp(raw)).toBeCloseTo(epochMs, 0)
+    }
+  })
+
+  it('leaves the [V39] notice sentinel (0) and non-positive values untouched', () => {
+    expect(normalizeTimestamp(0)).toBe(0)
+    expect(normalizeTimestamp(-1)).toBe(-1)
+  })
+
+  it('keeps two domains comparable inside one read (the bug the report found)', () => {
+    const socket = new EventSocket()
+    const collector = new ConsoleCollector(new CdpConnection(socket))
+
+    // 报告 S5 的原样数据：Runtime 给毫秒、Log 给毫秒。旧实现把 Runtime 又除以 1000，
+    // 于是同一瞬间的两条差 1000 倍。
+    socket.emit('Runtime.consoleAPICalled', rtParams(1_789_316_252_000, 'dsh-probe-s5'))
+    socket.emit('Log.entryAdded', logParams(1_789_316_204_273, 'dsh-probe-warn'))
+
+    const [log, runtime] = collector.read({ limit: 50 }).entries
+    expect(runtime?.source).toBe('runtime')
+    expect(runtime?.timestamp).toBe(1_789_316_252_000)
+    expect(log?.source).toBe('log')
+    expect(log?.timestamp).toBe(1_789_316_204_273)
+    // 旧实现里 Runtime 被多除了一次 1000，两条会差 1000 倍（约 10^9 ms ≈ 12 天）。
+    const gapMs = Math.abs((runtime?.timestamp ?? 0) - (log?.timestamp ?? 0))
+    expect(gapMs).toBeLessThan(120_000)
   })
 })

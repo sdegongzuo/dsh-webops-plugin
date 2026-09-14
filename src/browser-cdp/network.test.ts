@@ -68,7 +68,7 @@ describe('NetworkCollector', () => {
     socket.emit('Network.requestWillBeSent', requestEvent('3', 'GET', 'https://static.example.com/logo.png'))
     socket.emit('Network.responseReceived', responseEvent('3', 'https://static.example.com/logo.png', 200, 'image/png', true))
 
-    const entries = collector.list(50)
+    const { requests: entries } = collector.list(50)
     expect(entries.map(entry => entry.requestId)).toEqual(['3', '2', '1'])
     expect(entries[0]).toMatchObject({ method: 'GET', mimeType: 'image/png', fromDiskCache: true })
     expect(entries[1]).toMatchObject({ method: 'POST', errorText: 'net::ERR_FAILED' })
@@ -105,7 +105,7 @@ describe('NetworkCollector', () => {
     socket.emit('Network.requestWillBeSent', requestEvent('1', 'GET', 'https://api.example.com/users'))
     socket.emit('Network.requestWillBeSent', requestEvent('2', 'GET', 'https://static.example.com/app.js'))
 
-    const matched = collector.list(50, 'API.Example')
+    const { requests: matched } = collector.list(50, 'API.Example')
     expect(matched.map(entry => entry.requestId)).toEqual(['1'])
   })
 
@@ -117,7 +117,7 @@ describe('NetworkCollector', () => {
     socket.emit('Network.responseReceived', responseEvent('orph-1', 'https://api.example.com/late', 200, 'text/html'))
     socket.emit('Network.loadingFailed', { requestId: 'orph-2', errorText: 'net::ERR_ABORTED' })
 
-    const entries = collector.list(50)
+    const { requests: entries } = collector.list(50)
     expect(entries.map(entry => entry.requestId)).toEqual(['orph-2', 'orph-1'])
     expect(entries[1]).toMatchObject({
       url: 'https://api.example.com/late',
@@ -154,5 +154,41 @@ describe('NetworkCollector', () => {
     expect(collector.get('r-1')).toBeUndefined()
     expect(collector.get('r-6')).toBeDefined()
     expect(collector.get(`r-${NETWORK_TABLE_CAPACITY + 5}`)).toBeDefined()
+  })
+
+  it('hides earlier-document requests by default and reports how many are hidden (2026-09-14)', () => {
+    const socket = new EventSocket()
+    const collector = new NetworkCollector(new CdpConnection(socket))
+
+    // 第一个文档：两次请求。
+    socket.emit('Network.requestWillBeSent', requestEvent('a-1', 'GET', 'https://wikipedia.org/'))
+    socket.emit('Network.requestWillBeSent', requestEvent('a-2', 'GET', 'https://wikipedia.org/logo.png'))
+    collector.noteNavigation()
+    // 第二个文档（导航之后）：一次请求。
+    socket.emit('Network.requestWillBeSent', requestEvent('b-1', 'GET', 'https://httpbin.org/html'))
+
+    const current = collector.list(50)
+    expect(current.document).toBe(1)
+    expect(current.requests.map(entry => entry.requestId)).toEqual(['b-1'])
+    expect(current.earlierDocuments).toBe(2)
+
+    // 不是丢弃：allDocuments 能读回来，body 也照样按 requestId 取。
+    const all = collector.list(50, undefined, true)
+    expect(all.requests.map(entry => entry.requestId)).toEqual(['b-1', 'a-2', 'a-1'])
+    expect(collector.get('a-1')).toBeDefined()
+  })
+
+  it('keeps a request in the document it started in, even if it is updated after a navigation', () => {
+    const socket = new EventSocket()
+    const collector = new NetworkCollector(new CdpConnection(socket))
+
+    socket.emit('Network.requestWillBeSent', requestEvent('slow', 'GET', 'https://example.com/slow'))
+    collector.noteNavigation()
+    // 导航后迟到的响应：这条请求属于**上一个**文档。
+    socket.emit('Network.responseReceived', responseEvent('slow', 'https://example.com/slow', 200, 'text/html'))
+
+    expect(collector.get('slow')).toMatchObject({ document: 0, status: 200 })
+    expect(collector.list(50).requests).toEqual([])
+    expect(collector.list(50).earlierDocuments).toBe(1)
   })
 })

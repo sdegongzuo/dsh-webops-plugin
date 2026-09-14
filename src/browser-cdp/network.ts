@@ -28,6 +28,13 @@
  * 子资源很正常）；不设上限的长会话会无界增长。500 条足够覆盖「最近一次交互产生的请求」，
  * 更早的请求体绝大多数也已经拿不到了（`Network.getResponseBody` 对已回收的资源会报错）。
  *
+ * ## 跨导航的请求
+ *
+ * 标签页导航后，上位文档的请求对新页面是噪音（报告 2026-09-14 S5：console/network 跨
+ * Wikipedia → the-internet → httpbin 一路累积）。所以每条记录带上文档序号，`list` 默认只返回
+ * **当前文档**的请求，被遮掉多少条如实报告（`earlierDocuments`），`allDocuments` 可读全部；
+ * `body` 按 `requestId` 取，不受影响（旧 requestId 仍取得到就取）。
+ *
  * @module dsh-webops-plugin/browser-cdp/network
  */
 
@@ -57,6 +64,8 @@ export interface NetworkEntry {
   readonly reason?: string
   /** `loadingFailed` 的错误文本。 */
   readonly errorText?: string
+  /** 采集到这条时该标签页处于第几个文档（0 起；导航一次 +1）。 */
+  readonly document: number
 }
 
 /** 读取响应体的结果。 */
@@ -84,6 +93,17 @@ interface MutableEntry {
   partial?: boolean
   reason?: string
   errorText?: string
+  /** 缺省时由 {@link NetworkCollector} 填成「当前文档」。 */
+  document?: number
+}
+
+/** {@link NetworkCollector.list} 的结果。 */
+export interface NetworkListResult {
+  readonly requests: readonly NetworkEntry[]
+  /** 当前文档序号（0 起）。 */
+  readonly document: number
+  /** 表里属于更早文档、**没被列出**的条目数（`allDocuments: true` 时恒为 0 —— 都列出来了）。 */
+  readonly earlierDocuments: number
 }
 
 /** 读一个对象字段里的字符串。 */
@@ -99,6 +119,8 @@ function readString(source: Record<string, unknown>, key: string): string | unde
   /** 按到达顺序保存；`Map` 保留插入序，所以最早插入的就是最旧的。 */
   private readonly requests = new Map<string, NetworkEntry>()
   private readonly unsubscribes: (() => void)[] = []
+  /** 当前文档序号（0 起）；provider 每次观察到导航就 +1。 */
+  private document = 0
 
   /**
    * @param connection - 该会话的 CDP 连接；构造时立即订阅三个事件。
@@ -123,23 +145,46 @@ function readString(source: Record<string, unknown>, key: string): string | unde
     await this.connection.send('Network.enable', {}, options)
   }
 
+  /** 当前文档序号（0 起）。 */
+  get currentDocument(): number {
+    return this.document
+  }
+
+  /**
+   * 通报「标签页换文档了」：此后到达的事件归入新文档，`list` 默认不再返回旧文档的请求。
+   *
+   * 记录**不**删除（`allDocuments` 仍可列、`body` 仍可按 requestId 取），只是默认过滤。
+   * 已经在表里的记录保留各自原有的文档序号 —— 请求属于它发起时所在的那个文档。
+   */
+  noteNavigation(): void {
+    this.document += 1
+  }
+
   /**
    * 列出请求（从最新往回，最多 `limit` 条）。
+   *
    * @param limit - 数量上限。
    * @param urlFilter - 只保留 URL 包含该子串的条目（大小写不敏感）。
+   * @param allDocuments - 连更早文档的请求一起返回。默认 false：只给当前文档的。
    */
-  list(limit: number, urlFilter?: string | undefined): readonly NetworkEntry[] {
+  list(limit: number, urlFilter?: string | undefined, allDocuments = false): NetworkListResult {
     const needle = urlFilter?.toLowerCase()
-    const matched: NetworkEntry[] = []
+    const requests: NetworkEntry[] = []
+    let earlierDocuments = 0
     const values = [...this.requests.values()]
     for (let index = values.length - 1; index >= 0; index -= 1) {
       const entry = values[index]
       if (entry === undefined) continue
+      if (entry.document !== this.document && !allDocuments) {
+        // 只在真的被遮住时计数：`allDocuments` 时它们会被列出来，报「隐藏了 N 条」是假话。
+        earlierDocuments += 1
+        continue
+      }
       if (needle !== undefined && !entry.url.toLowerCase().includes(needle)) continue
-      matched.push(entry)
-      if (matched.length >= limit) break
+      requests.push(entry)
+      if (requests.length >= limit) break
     }
-    return matched
+    return { requests, document: this.document, earlierDocuments }
   }
 
   /** 取一条记录（诊断用）。 */
@@ -176,7 +221,8 @@ function readString(source: Record<string, unknown>, key: string): string | unde
 
   /** 写一条记录并维持 500 条的环形上界（最旧的先出）。 */
   private put(entry: MutableEntry): void {
-    this.requests.set(entry.requestId, { ...entry })
+    // 没带文档序号的是「新到达」的事件（带序号的是更新已有记录），归入当前文档。
+    this.requests.set(entry.requestId, { ...entry, document: entry.document ?? this.document })
     if (this.requests.size > NETWORK_TABLE_CAPACITY) {
       const oldest = this.requests.keys().next().value
       if (oldest !== undefined) this.requests.delete(oldest)

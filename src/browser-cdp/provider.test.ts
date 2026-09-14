@@ -35,6 +35,13 @@ class FakeChrome {
   boxModel: readonly number[] | undefined = [10, 20, 110, 20, 110, 60, 10, 60]
   /** P1：点击是否引发导航（模拟链接点击）。 */
   navigateOnClick = false
+  /** P1：回车是否引发导航（模拟表单提交，报告 S1 的维基搜索）。 */
+  navigateOnEnter = false
+  /**
+   * 前 N 次读页面元信息时把 `title` 报成空串 —— 模拟「文档已提交、`<title>` 还没解析」
+   * （报告 S1：press 返回的 title 是空串，调用方据此误判「页没就绪」）。
+   */
+  titleEmptyReads = 0
   /** P1：wait-hidden 里元素是否还连在文档上。 */
   elementConnected = true
   /** P1：wait-text 里页面文本是否包含目标串。 */
@@ -48,8 +55,12 @@ class FakeChrome {
   responseBody = 'pong'
   /** P3：`getBoundingClientRect` 的返回值（locate / click 共用）。 */
   elementRect = { x: 10, y: 20, width: 100, height: 40 }
+  /** P3：视口尺寸（locate 的 `in_viewport` 与「不带 ref 的 scroll」都要它）。 */
+  viewport = { width: 1280, height: 720 }
   /** P3：设置后 `DOM.resolveNode` 抛这条消息（模拟节点已被销毁）。 */
   resolveNodeError: string | undefined
+  /** P2：设置后，含 `throw` 的表达式返回 `exceptionDetails`（异常文本）。 */
+  evaluateThrows: string | undefined
 
   /** 记录一条命令并给出它的结果。 */
   handle(socket: FakeSocket, method: string, params: Record<string, unknown>): unknown {
@@ -63,6 +74,13 @@ class FakeChrome {
         return {}
       case 'Runtime.evaluate': {
         const expression = String(params['expression'])
+        // 表达式抛错 / 被 await 的 Promise reject：CDP 走 `exceptionDetails`，不是协议错误。
+        if (this.evaluateThrows !== undefined && expression.includes('throw')) {
+          return {
+            result: { type: 'object', subtype: 'error' },
+            exceptionDetails: { text: 'Uncaught (in promise)', exception: { description: this.evaluateThrows } },
+          }
+        }
         // 导航判据里带 `ready:`；`readPageMeta` 也读 location.href，但没有这个键。
         if (expression.includes('ready:')) {
           return {
@@ -77,14 +95,23 @@ class FakeChrome {
         if (expression === '1 + 1') {
           return { result: { value: 2 } }
         }
-        return expression.includes('readyState')
-          ? { result: { value: this.readyStateComplete } }
-          : { result: { value: { url: this.page.url, title: this.page.title } } }
+        if (expression.includes('innerWidth')) {
+          return { result: { value: { ...this.viewport } } }
+        }
+        if (expression.includes('readyState')) {
+          return { result: { value: this.readyStateComplete } }
+        }
+        // 读页面元信息：先按 `titleEmptyReads` 把标题报成空串，再给真实值。
+        if (this.titleEmptyReads > 0) {
+          this.titleEmptyReads -= 1
+          return { result: { value: { url: this.page.url, title: '' } } }
+        }
+        return { result: { value: { url: this.page.url, title: this.page.title } } }
       }
       case 'Runtime.callFunctionOn': {
         const fn = String(params['functionDeclaration'])
         if (fn.includes('getBoundingClientRect')) {
-          return { result: { value: { ...this.elementRect } } }
+          return { result: { value: { ...this.elementRect, viewportWidth: this.viewport.width, viewportHeight: this.viewport.height } } }
         }
         if (fn.includes('!this.isConnected')) {
           // wait-hidden 的判据：true = 元素已从文档移除。
@@ -132,6 +159,10 @@ class FakeChrome {
         }
         return {}
       case 'Input.dispatchKeyEvent':
+        if (this.navigateOnEnter && params['type'] === 'keyUp' && params['key'] === 'Enter') {
+          this.href = 'https://zh.wikipedia.org/w/index.php?search=Electron'
+          this.page = { url: this.href, title: 'Electron (software) - 维基百科，自由的百科全书' }
+        }
         return {}
       default:
         throw new Error(`unscripted method ${method}`)
@@ -683,6 +714,44 @@ describe('CdpBrowserProvider.mutate (P1)', () => {
       .rejects.toThrow(expect.objectContaining({ code: 'BROWSER_PROTOCOL_ERROR' }))
   })
 
+  it('scrolls at the viewport centre when no ref is given, without requiring a snapshot', async () => {
+    await provider.open({})
+    const before = chrome.calls.length
+
+    const result = await provider.mutate({ kind: 'scroll', sessionId: 'tab-1', deltaY: 800 })
+    expect(result).toEqual({
+      kind: 'mutation',
+      sessionId: 'tab-1',
+      action: 'scroll',
+      epoch: 0,
+      url: 'https://example.com/',
+      title: 'Example',
+      navigated: false,
+    })
+
+    const wheel = chrome.calls.slice(before).find(call => call.method === 'Input.dispatchMouseEvent')
+    // 视口 1280×720 ⇒ 落点是正中央。
+    expect(wheel?.params).toMatchObject({ type: 'mouseWheel', x: 640, y: 360, deltaY: 800 })
+    // 没有任何 ref 参与：既不该 resolveNode，也不该因为「没 snapshot 过」而拒绝 ——
+    // 这正是「只有标题的页面」与长文页上唯一能用的滚动方式（报告 S3/S5）。
+    expect(chrome.calls.slice(before).some(call => call.method === 'DOM.resolveNode')).toBe(false)
+  })
+
+  it('waits for the new document title after a navigating press (report S1)', async () => {
+    const ref = await firstRef()
+    chrome.navigateOnEnter = true
+    // 第一次读元信息时地址已变、标题还没解析出来；此时文档也还没 complete。
+    chrome.titleEmptyReads = 1
+    chrome.readyStateComplete = false
+
+    const result = await provider.mutate({ kind: 'press', sessionId: 'tab-1', ref, key: 'Enter' })
+
+    expect(result.navigated).toBe(true)
+    expect(result.url).toBe('https://zh.wikipedia.org/w/index.php?search=Electron')
+    // 关键断言：返回的 title 不再是空串（旧实现会给 ''，调用方据此误判「页没就绪」）。
+    expect(result.title).toBe('Electron (software) - 维基百科，自由的百科全书')
+  })
+
   it('waits for a duration, for text to appear, or for an element to disappear', async () => {
     await provider.open({})
     const snapshot = await provider.observe({ kind: 'snapshot', sessionId: 'tab-1' })
@@ -749,6 +818,36 @@ describe('P2: console / network / execute', () => {
     const call = chrome.calls.filter(entry => entry.method === 'Runtime.evaluate')
       .find(entry => entry.params['expression'] === '1 + 1')
     expect(call?.params['returnByValue']).toBe(true)
+    // 2026-09-14：Promise 必须被 await —— 否则 `fetch(...).then(...)` 只会回一个没有 value
+    // 的 Promise，被当成「不可序列化」拒掉（报告 S5，而副作用其实已经发生）。
+    expect(call?.params['awaitPromise']).toBe(true)
+  })
+
+  it('overrides a caller that tries to turn awaitPromise off', async () => {
+    await provider.open({})
+    await provider.execute({
+      sessionId: 'tab-1',
+      method: 'Runtime.evaluate',
+      params: { expression: '1 + 1', awaitPromise: false },
+    })
+
+    const call = chrome.calls.filter(entry => entry.method === 'Runtime.evaluate')
+      .find(entry => entry.params['expression'] === '1 + 1')
+    expect(call?.params['awaitPromise']).toBe(true)
+  })
+
+  it('surfaces the real exception text instead of "unserializable" when the expression throws', async () => {
+    await provider.open({})
+    chrome.evaluateThrows = 'TypeError: Cannot read properties of null (reading "x")'
+
+    await expect(provider.execute({
+      sessionId: 'tab-1',
+      method: 'Runtime.evaluate',
+      params: { expression: 'throw new Error("boom")' },
+    })).rejects.toThrow(expect.objectContaining({
+      code: 'BROWSER_PROTOCOL_ERROR',
+      message: expect.stringContaining('TypeError: Cannot read properties of null') as unknown as string,
+    }))
   })
 
   it('refuses a non-allow-listed command before anything is sent', async () => {
@@ -815,6 +914,45 @@ describe('P2: console / network / execute', () => {
     expect(chrome.calls.filter(call => call.method === 'Log.enable').length).toBeGreaterThan(0)
   })
 
+  it('scopes console / network to the current document and reports what it hid (report S5)', async () => {
+    await provider.open({})
+    const socket = chrome.sockets[0]
+    if (socket === undefined) throw new Error('no connection was opened')
+
+    // 第一个文档（维基）：一条 console + 一次请求。
+    emitCdp(socket, 'Runtime.consoleAPICalled', {
+      type: 'log', timestamp: 1000_500, executionContextId: 1, args: [{ type: 'string', value: 'from-wikipedia' }],
+    })
+    emitCdp(socket, 'Network.requestWillBeSent', {
+      requestId: 'wiki-1', request: { method: 'GET', url: 'https://wikipedia.org/' },
+    })
+
+    // 导航到别的站（走 provider.navigate，它会推进文档序号）。
+    await provider.navigate({ sessionId: 'tab-1', url: 'https://httpbin.org/html' })
+    emitCdp(socket, 'Runtime.consoleAPICalled', {
+      type: 'log', timestamp: 2000_500, executionContextId: 2, args: [{ type: 'string', value: 'from-httpbin' }],
+    })
+    emitCdp(socket, 'Network.requestWillBeSent', {
+      requestId: 'http-1', request: { method: 'GET', url: 'https://httpbin.org/html' },
+    })
+
+    const console = await provider.console({ sessionId: 'tab-1', limit: 50 })
+    expect(console.entries.map(entry => entry.text)).toEqual(['from-httpbin'])
+    expect(console.document).toBe(1)
+    expect(console.earlierDocuments).toBe(1)
+
+    const network = await provider.network({ kind: 'list', sessionId: 'tab-1' })
+    expect(network.requests.map(entry => entry.requestId)).toEqual(['http-1'])
+    expect(network.document).toBe(1)
+    expect(network.earlierDocuments).toBe(1)
+
+    // 显式要看全部时能读回来（过滤不等于丢数据）。
+    const all = await provider.console({ sessionId: 'tab-1', limit: 50, allDocuments: true })
+    expect(all.entries.map(entry => entry.text)).toEqual(['from-httpbin', 'from-wikipedia'])
+    const allRequests = await provider.network({ kind: 'list', sessionId: 'tab-1', allDocuments: true })
+    expect(allRequests.requests.map(entry => entry.requestId)).toEqual(['http-1', 'wiki-1'])
+  })
+
   it('lists collected requests and fetches a body by the id from the events', async () => {
     await provider.open({})
     const socket = chrome.sockets[0]
@@ -879,7 +1017,8 @@ describe('P3: locate', () => {
       y: 20,
       width: 100,
       height: 40,
-      centered: true,
+      centered: false,
+      inViewport: true,
     })
 
     // 链路顺序（[V36]）：resolveNode → isConnected 守卫 → callFunctionOn 现算 rect。
@@ -889,23 +1028,32 @@ describe('P3: locate', () => {
     expect(trace[0]).toBe('DOM.resolveNode')
     expect(trace[1]).toContain('isConnected')
     expect(trace[2]).toContain('getBoundingClientRect')
-    // 居中语义与 click 落点一致：量之前先 scrollIntoView。
-    expect(trace[2]).toContain('scrollIntoView')
+    // 2026-09-14 改：默认**不**滚动视口 —— 否则 locate 验证不了上一次 scroll 到底生效没有。
+    expect(trace[2]).not.toContain('scrollIntoView')
     // 远端对象句柄用完即还，且没有 DOM.enable / Overlay 之类的多余命令。
     expect(trace).toContain('DOM.releaseObject')
     expect(trace).not.toContain('Overlay.highlightNode')
   })
 
-  it('skips scrollIntoView when scroll=false and reports centered=false', async () => {
+  it('scrolls the element to the centre only when scroll=true, and then reports centered=true', async () => {
     const { ref } = await firstRef()
 
-    const result = await provider.locate({ sessionId: 'tab-1', ref, scroll: false })
-    expect(result.centered).toBe(false)
+    const result = await provider.locate({ sessionId: 'tab-1', ref, scroll: true })
+    expect(result.centered).toBe(true)
 
     const rectCall = chrome.calls.filter(call =>
       call.method === 'Runtime.callFunctionOn'
       && String(call.params['functionDeclaration']).includes('getBoundingClientRect')).at(-1)
-    expect(String(rectCall?.params['functionDeclaration'])).not.toContain('scrollIntoView')
+    expect(String(rectCall?.params['functionDeclaration'])).toContain('scrollIntoView')
+  })
+
+  it('reports in_viewport=false when the element sits outside the current viewport', async () => {
+    const { ref } = await firstRef()
+    // 视口高 720，元素在 y=900（文档下方、当前没滚到）：不滚视口就应当如实说「不在视口里」。
+    chrome.elementRect = { x: 10, y: 900, width: 100, height: 40 }
+
+    const result = await provider.locate({ sessionId: 'tab-1', ref })
+    expect(result).toMatchObject({ centered: false, inViewport: false, y: 900 })
   })
 
   it('reports BROWSER_STALE_REF when resolveNode says the node is gone', async () => {

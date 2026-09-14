@@ -42,6 +42,7 @@ const SNAPSHOT: BrowserSnapshot = {
   outline: '- button "Submit" [ref=e1]',
   refs: [{ ref: 'e1', role: 'button', name: 'Submit' }],
   truncated: false,
+  outlineLines: 1,
 }
 
 const SCREENSHOT = {
@@ -153,7 +154,8 @@ function mount(): Harness {
           y: 20,
           width: 100,
           height: 40,
-          centered: args.scroll ?? true,
+          centered: args.scroll ?? false,
+          inViewport: true,
         })
       },
       // P2 三工具的桩：返回最小合法结果，让转发与 schema 校验有东西可断言。
@@ -169,6 +171,8 @@ function mount(): Harness {
           buffered: 2,
           truncated: false,
           replayTruncated: true,
+          document: 1,
+          earlierDocuments: 3,
         })
       },
       network: (args: { kind: string; requestId?: string }) => {
@@ -185,6 +189,8 @@ function mount(): Harness {
               status: 200,
               mimeType: 'application/json',
             }],
+            document: 1,
+            earlierDocuments: 2,
           })
           : Promise.resolve({
             kind: 'network',
@@ -646,6 +652,28 @@ describe('browser_find / browser_locate (P3)', () => {
     expect(value.matches[1]).toEqual({ ref: '', role: '', name: '', line: '- text "needle in a plain line"' })
   })
 
+  it('finds the rank-5 hot-search link without matching rank 2 or a title that merely contains 5', async () => {
+    harness.snapshotResponse = {
+      ...SNAPSHOT,
+      outline: [
+        '- link "2 渔民落水11天后事都办了 人回来了" [ref=e22]',
+        '- link "5 亚朵店长叫“现长”店助叫“政委”" [ref=e35]',
+        '- text "烧烤店被检查15次：系1人投诉116次"',
+        '- link "15 其他" [ref=e40]',
+      ].join('\n'),
+      refs: [
+        { ref: 'e22', role: 'link', name: '2 渔民落水11天后事都办了 人回来了' },
+        { ref: 'e35', role: 'link', name: '5 亚朵店长叫“现长”店助叫“政委”' },
+        { ref: 'e40', role: 'link', name: '15 其他' },
+      ],
+    }
+    await tool(harness, 'browser_snapshot').execute({ session_id: 's1' }, exec())
+    const value = await tool(harness, 'browser_find')
+      .execute({ session_id: 's1', query: 'link "5 ' }, exec()) as FindResultView
+    expect(value.matches).toHaveLength(1)
+    expect(value.matches[0]).toMatchObject({ ref: 'e35', role: 'link' })
+  })
+
   it('drops the cached outline on navigate so stale refs cannot be searched', async () => {
     await tool(harness, 'browser_snapshot').execute({ session_id: 's1' }, exec())
     await tool(harness, 'browser_navigate').execute({ session_id: 's1', url: 'https://example.com/next' }, exec())
@@ -680,7 +708,8 @@ describe('browser_find / browser_locate (P3)', () => {
       y: 20,
       width: 100,
       height: 40,
-      centered: true,
+      centered: false,
+      in_viewport: true,
     })
     expect(validateJsonSchemaValue(definition.output.schema, value)).toEqual([])
   })
@@ -710,5 +739,122 @@ describe('browser_find / browser_locate (P3)', () => {
     const text = String((blocks[0] as { text: string }).text)
     expect(text).toContain('100x40')
     expect(text).toContain('measured fresh')
+  })
+})
+
+describe('2026-09-14 五个场景报告的逐条修复', () => {
+  let harness: Harness
+
+  beforeEach(() => {
+    harness = mount()
+  })
+
+  it('#2 long-page truncation is explainable and the budget can be raised', async () => {
+    const definition = tool(harness, 'browser_snapshot')
+    const value = await definition.execute({ session_id: 's1', max_lines: 2_000 }, exec())
+
+    expect(harness.browserCalls).toEqual([
+      { method: 'observe', args: { kind: 'snapshot', sessionId: 's1', maxLines: 2_000 } },
+    ])
+    expect(value).toMatchObject({ outline_lines: 1, truncated: false })
+    expect(validateJsonSchemaValue(definition.output.schema, value)).toEqual([])
+
+    const blocks = definition.output.render({}, {
+      session_id: 's1',
+      url: SESSION.url,
+      title: SESSION.title,
+      epoch: 4,
+      outline: ['- button "A" [ref=e1]', '- button "B" [ref=e2]'].join('\n'),
+      truncated: true,
+      outline_lines: 800,
+      dropped_elements: 412,
+      refs: [{ ref: 'e1', role: 'button', name: 'A' }],
+    } as never)
+    const text = String((blocks[0] as { text: string }).text)
+    expect(text).toContain('after 800 lines')
+    expect(text).toContain('412 further element(s)')
+    expect(text).toContain('max_lines')
+  })
+
+  it('#5/#9 a snapshot with zero refs says there is nothing actionable', () => {
+    const blocks = tool(harness, 'browser_snapshot').output.render({ session_id: 's1' }, {
+      session_id: 's1',
+      url: 'https://the-internet.herokuapp.com/windows/new',
+      title: 'New Window',
+      epoch: 7,
+      outline: '- heading "New Window"',
+      truncated: false,
+      outline_lines: 1,
+      refs: [],
+    } as never)
+
+    const text = String((blocks[0] as { text: string }).text)
+    expect(text).toContain('NO actionable elements')
+    expect(text).toContain('scroll without a ref')
+  })
+
+  it('#9 an empty title is spelled out instead of silently omitted', () => {
+    const session = tool(harness, 'browser_navigate').output.render(
+      { session_id: 's1' },
+      { session_id: 's1', url: 'https://httpbin.org/html', title: '', epoch: 2 } as never,
+    )
+    expect(String((session[0] as { text: string }).text)).toContain('title: (empty')
+
+    const snapshot = tool(harness, 'browser_snapshot').output.render({ session_id: 's1' }, {
+      session_id: 's1', url: 'https://httpbin.org/html', title: '', epoch: 2,
+      outline: '- text "hi"', truncated: false, outline_lines: 1, refs: [],
+    } as never)
+    expect(String((snapshot[0] as { text: string }).text)).toContain('title: (empty')
+  })
+
+  it('#4 browser_scroll no longer needs a ref: it can scroll at the viewport centre', async () => {
+    const definition = tool(harness, 'browser_scroll')
+    const value = await definition.execute({ session_id: 's1', delta_y: 300 }, exec())
+
+    expect(harness.browserCalls).toEqual([
+      { method: 'mutate', args: { kind: 'scroll', sessionId: 's1', deltaY: 300 } },
+    ])
+    expect(validateJsonSchemaValue(definition.output.schema, value)).toEqual([])
+
+    // 带 ref 时行为不变。
+    harness.browserCalls.length = 0
+    await definition.execute({ session_id: 's1', ref: 'e1', delta_y: 300 }, exec())
+    expect(harness.browserCalls).toEqual([
+      { method: 'mutate', args: { kind: 'scroll', sessionId: 's1', ref: 'e1', deltaY: 300 } },
+    ])
+  })
+
+  it('#3 locate does not scroll the viewport by default and reports in_viewport', async () => {
+    const definition = tool(harness, 'browser_locate')
+    const value = await definition.execute({ session_id: 's1', ref: 'e1' }, exec())
+
+    expect(harness.browserCalls).toEqual([{ method: 'locate', args: { sessionId: 's1', ref: 'e1' } }])
+    expect(value).toMatchObject({ centered: false, in_viewport: true })
+    expect(validateJsonSchemaValue(definition.output.schema, value)).toEqual([])
+
+    const text = String((definition.output.render({}, value as never)[0] as { text: string }).text)
+    expect(text).toContain('WITHOUT scrolling the viewport')
+    expect(text).toContain('inside the viewport')
+  })
+
+  it('#8 console / network default to the current document and say how much they hid', async () => {
+    const consoleValue = await tool(harness, 'browser_console')
+      .execute({ session_id: 's1', all_documents: true }, exec())
+    expect(harness.browserCalls[0]).toEqual({
+      method: 'console',
+      args: { sessionId: 's1', allDocuments: true },
+    })
+    expect(consoleValue).toMatchObject({ document: 1, earlier_documents: 3 })
+
+    const consoleText = String((tool(harness, 'browser_console').output.render({}, consoleValue as never)[0] as { text: string }).text)
+    expect(consoleText).toContain('earlier document')
+    expect(consoleText).toContain('all_documents=true')
+
+    const networkValue = await tool(harness, 'browser_network')
+      .execute({ session_id: 's1', action: 'list' }, exec())
+    expect(networkValue).toMatchObject({ document: 1, earlier_documents: 2 })
+    const networkText = String((tool(harness, 'browser_network').output.render({}, networkValue as never)[0] as { text: string }).text)
+    expect(networkText).toContain('earlier document')
+    expect(networkText).toContain('all_documents=true')
   })
 })

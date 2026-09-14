@@ -3,6 +3,7 @@ import { BrowserError } from '../browser/types.ts'
 import {
   assertExecuteAllowed,
   BROWSER_EXECUTE_ALLOWED,
+  extractEvaluateException,
   extractEvaluateValue,
   translateEvaluateError,
 } from './execute.ts'
@@ -89,6 +90,39 @@ describe('extractEvaluateValue', () => {
       .toThrow(expect.objectContaining({ code: 'BROWSER_EXECUTE_RESULT_UNSERIALIZABLE' }))
     expect(() => extractEvaluateValue({}))
       .toThrow(expect.objectContaining({ code: 'BROWSER_EXECUTE_RESULT_UNSERIALIZABLE' }))
+  })
+
+  it('an unawaited Promise says the expression already ran instead of pretending nothing happened ([V22]/S5)', () => {
+    // 报告 S5：`fetch('/get').then(r => r.status)` 报了「不可序列化」，可副作用已经发生。
+    try {
+      extractEvaluateValue({ result: { type: 'object', subtype: 'promise', description: 'Promise' } })
+      throw new Error('expected an unserializable rejection')
+    } catch (error: unknown) {
+      if (!(error instanceof BrowserError)) throw error
+      expect(error.code).toBe('BROWSER_EXECUTE_RESULT_UNSERIALIZABLE')
+      expect(error.message).toContain('Promise')
+      expect(error.message).toContain('already run')
+      expect(error.message).toContain('NOT rolled back')
+    }
+  })
+})
+
+describe('extractEvaluateException', () => {
+  it('surfaces the real exception when the expression throws or an awaited promise rejects', () => {
+    expect(extractEvaluateException({
+      result: { type: 'object', subtype: 'error' },
+      exceptionDetails: {
+        text: 'Uncaught (in promise)',
+        exception: { description: 'Error: ENOENT\n    at <anonymous>:1:1' },
+      },
+    })).toBe('Error: ENOENT\n    at <anonymous>:1:1')
+
+    // 没有 exceptionDetails 就不是异常 —— 千万别把正常返回当成抛错。
+    expect(extractEvaluateException({ result: { type: 'number', value: 1 } })).toBeUndefined()
+    expect(extractEvaluateException(undefined)).toBeUndefined()
+    // exception 没有 description / value 时退到 text，再退到一句兜底。
+    expect(extractEvaluateException({ exceptionDetails: { text: 'Uncaught' } })).toBe('Uncaught')
+    expect(extractEvaluateException({ exceptionDetails: {} })).toContain('unknown error')
   })
 })
 

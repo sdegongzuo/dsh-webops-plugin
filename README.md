@@ -582,11 +582,11 @@ agent 的 snapshot / 截图 / evaluate 全部照常返回。
 
 | 工具 | 能力级 | 一句话 |
 |---|---|---|
-| `browser_console` | read | 读会话的 console 环形缓冲（Runtime + Log 两域合流，按 message 高水位去重，最新在前） |
-| `browser_network` | read | 列网络请求 / 按 requestId 取响应体（Network 事件从不重放，断开窗口期的请求按「会丢」处理） |
-| `browser_execute` | **mutate** | 白名单制的高危逃生舱：一次发一条允许列表内的 CDP 命令（`Runtime.evaluate` 会执行任意表达式） |
+| `browser_console` | read | 读会话的 console 环形缓冲（Runtime + Log 两域合流，按 message 高水位去重，最新在前；**默认只给当前文档**） |
+| `browser_network` | read | 列网络请求 / 按 requestId 取响应体（Network 事件从不重放，断开窗口期的请求按「会丢」处理；**默认只给当前文档**） |
+| `browser_execute` | **mutate** | 白名单制的高危逃生舱：一次发一条允许列表内的 CDP 命令（`Runtime.evaluate` 会执行任意表达式，Promise 会被 await） |
 | `browser_find` | read | 在最近一次 snapshot 的大纲上做零状态文本检索，不发任何 CDP 命令 |
-| `browser_locate` | read | 按 ref 现算视口坐标盒（backendNodeId 路线），可选 `Overlay.highlightNode` 高亮 + 滚动居中 |
+| `browser_locate` | read | 按 ref 现算视口坐标盒（backendNodeId 路线）+ `in_viewport`；**默认不动视口**，可选 `Overlay.highlightNode` 高亮 / `scroll=true` 居中 |
 
 ### 通用层
 
@@ -608,8 +608,25 @@ agent 的 snapshot / 截图 / evaluate 全部照常返回。
 
 ### 验证与设计依据
 
-回归以 `pnpm test` 的输出为准（238 passed / 3 skipped，3 个 live 用例在端点非真 Chrome 时整组跳过）。
+回归以 `pnpm test` 的输出为准（273 passed / 3 skipped，3 个 live 用例在端点非真 Chrome 时整组跳过）。
 P2/P3 的设计依据见 `docs/P2-P3-开发方案.md` 与 `docs/P2-P3-状态归属与接入规范.md`。
+
+## 五个典型场景实测的修复（2026-09-14）
+
+来源：`docs/browser-tools-five-scenarios.md`（真 Electron 窗口、无 fake-llm、无 API key 的实测报告）。
+9 条问题逐条修完，每条都有对应的回归测试。
+
+| # | 修法 | 落点 |
+|---|---|---|
+| 1 | 检测到导航后再等新文档可用（标题出现 / `readyState=complete`，上限 5s），`press` 不再返回空 title | `provider.detectNavigation` → `settleDocument` |
+| 2 | `browser_snapshot` 支持 `max_lines`（≤5000，字符预算按行数同步放大）；截断时如实报「截到第几行 + 少给多少元素」 | `snapshot.resolveSnapshotLimits`、`formatSnapshotOutput` |
+| 3 | `browser_locate` **默认不滚视口**（`scroll` 默认 false），并回 `in_viewport` —— 于是 locate 能用来验证 scroll 是否生效 | `provider.locate`、`tool-browser` |
+| 4 | `browser_scroll` 的 `ref` 变可选：不给就落在视口中心（整页滚动），不再要求先 snapshot | `provider.scroll` → `viewportCenter` |
+| 5 | 零 ref 的页面在 snapshot 结果里显式说明「没有可操作元素」并给出替代动作 | `formatSnapshotOutput` |
+| 6 | 时间戳不再写死单位，按量级归一（秒/毫秒/微秒 → 毫秒）；修掉 Runtime 比 Log 小 1000 倍 | `console.normalizeTimestamp` |
+| 7 | `Runtime.evaluate` 强制 `awaitPromise`；`exceptionDetails` 取真实异常文本；不可序列化消息说明「表达式已执行、副作用不回滚」 | `provider.execute`、`execute.ts` |
+| 8 | console / network 记录带文档序号，读/列默认只给当前文档并如实报 `earlier_documents`；`all_documents=true` 可读全部（过滤不等于丢弃） | `console.ts` / `network.ts` / `provider.noteDocumentChange` |
+| 9 | 空标题、零 ref 都有明确提示（不再是空白或沉默） | `formatSessionOutput` / `formatSnapshotOutput` |
 
 ## 发版
 

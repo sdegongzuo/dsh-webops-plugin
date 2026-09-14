@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { buildOutline, DEFAULT_SNAPSHOT_LIMITS, renderOutline } from './snapshot.ts'
+import { buildOutline, DEFAULT_SNAPSHOT_LIMITS, MAX_SNAPSHOT_LINES, renderOutline, resolveSnapshotLimits } from './snapshot.ts'
 import type { AxNode } from './snapshot.ts'
 import { RefRegistry } from './refs.ts'
 
@@ -102,6 +102,8 @@ describe('buildOutline', () => {
 
     expect(outline.lines).toHaveLength(3)
     expect(outline.truncated).toBe(true)
+    // 截断要可解释：模型据此知道是差 17 行还是差 17000 行。
+    expect(outline.droppedElements).toBe(17)
   })
 
   it('stops descending at maxDepth and flags the truncation', () => {
@@ -154,7 +156,32 @@ describe('buildOutline', () => {
   })
 
   it('produces nothing for an empty tree', () => {
-    expect(buildOutline([])).toEqual({ lines: [], rows: [], truncated: false })
+    expect(buildOutline([])).toEqual({ lines: [], rows: [], truncated: false, droppedElements: 0 })
+  })
+
+  it('resolveSnapshotLimits: raises the character budget with the line budget, and clamps', () => {
+    // 只抬行数不抬字符数 = 字符预算先耗尽，「我调大了 max_lines 还是截断」。
+    const raised = resolveSnapshotLimits(DEFAULT_SNAPSHOT_LIMITS, 2_000)
+    expect(raised.maxLines).toBe(2_000)
+    expect(raised.maxOutlineChars).toBeGreaterThanOrEqual(2_000 * 60)
+    expect(raised.maxTextLength).toBe(DEFAULT_SNAPSHOT_LIMITS.maxTextLength)
+
+    // 上限封顶，不会因为模型要 10 万行就去渲染 10 万行。
+    expect(resolveSnapshotLimits(DEFAULT_SNAPSHOT_LIMITS, 1e9).maxLines).toBe(MAX_SNAPSHOT_LINES)
+    expect(resolveSnapshotLimits(DEFAULT_SNAPSHOT_LIMITS, 0).maxLines).toBe(1)
+    // 非法值原样落回默认限额（对象都不换）。
+    expect(resolveSnapshotLimits(DEFAULT_SNAPSHOT_LIMITS, Number.NaN)).toBe(DEFAULT_SNAPSHOT_LIMITS)
+    expect(resolveSnapshotLimits(DEFAULT_SNAPSHOT_LIMITS, undefined)).toBe(DEFAULT_SNAPSHOT_LIMITS)
+  })
+
+  it('resolveSnapshotLimits: 2000 lines of a long page really do come out', () => {
+    const nodes: AxNode[] = Array.from({ length: 1_500 }, (_unused, index) =>
+      node({ nodeId: String(index), role: { value: 'link' }, name: { value: `l${index}` }, backendDOMNodeId: index }))
+
+    expect(buildOutline(nodes, DEFAULT_SNAPSHOT_LIMITS).truncated).toBe(true)
+    const raised = buildOutline(nodes, resolveSnapshotLimits(DEFAULT_SNAPSHOT_LIMITS, 2_000))
+    expect(raised.truncated).toBe(false)
+    expect(raised.lines).toHaveLength(1_500)
   })
 })
 

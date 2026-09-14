@@ -32,6 +32,7 @@ function makeProvider(id: string, available: boolean): BrowserProvider {
       outline: '',
       refs: [],
       truncated: false,
+      outlineLines: 0,
     }),
     tabs: (request: BrowserTabsRequest) => Promise.resolve({ action: request.kind, tabs: [] }),
     mutate: (request: BrowserMutationRequest) => Promise.resolve({
@@ -51,6 +52,8 @@ function makeProvider(id: string, available: boolean): BrowserProvider {
       buffered: 0,
       truncated: false,
       replayTruncated: false,
+      document: 0,
+      earlierDocuments: 0,
     }),
     network: (request: BrowserNetworkRequest) => Promise.resolve({
       kind: 'network',
@@ -76,7 +79,8 @@ function makeProvider(id: string, available: boolean): BrowserProvider {
       y: 20,
       width: 100,
       height: 40,
-      centered: request.scroll ?? true,
+      centered: request.scroll ?? false,
+      inViewport: true,
     }),
   }
 }
@@ -186,7 +190,7 @@ describe('BrowserRuntime forwarding', () => {
     browser.registerProvider(makeProvider('cdp', true))
 
     await expect(browser.locate({ sessionId: 's1', ref: 'e1' }))
-      .resolves.toMatchObject({ kind: 'locate', sessionId: 's1', ref: 'e1', centered: true })
+      .resolves.toMatchObject({ kind: 'locate', sessionId: 's1', ref: 'e1', centered: false })
   })
 
   it('ignores providers without a dispose hook and reports the ones that fail', async () => {

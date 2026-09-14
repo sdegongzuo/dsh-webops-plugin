@@ -43,13 +43,13 @@ import type {
 } from '../browser/types.ts'
 import { RefRegistry } from './refs.ts'
 import type { RefTarget } from './refs.ts'
-import { buildOutline, DEFAULT_SNAPSHOT_LIMITS, renderOutline } from './snapshot.ts'
+import { buildOutline, DEFAULT_SNAPSHOT_LIMITS, renderOutline, resolveSnapshotLimits } from './snapshot.ts'
 import type { AxNode, SnapshotLimits } from './snapshot.ts'
 import { HttpCdpTransport } from './protocol.ts'
 import type { CdpConnection, CdpTarget, CdpTransport } from './protocol.ts'
 import { ConsoleCollector, CONSOLE_RING_CAPACITY } from './console.ts'
 import { NetworkCollector, NETWORK_TABLE_CAPACITY } from './network.ts'
-import { assertExecuteAllowed, extractEvaluateValue, translateEvaluateError } from './execute.ts'
+import { assertExecuteAllowed, extractEvaluateException, extractEvaluateValue, translateEvaluateError } from './execute.ts'
 import { validateEndpoint, validateTargetUrl } from './url-policy.ts'
 
 /** provider 的 id，也是 `ctx.browser` 配置里 `provider` 字段要填的值。 */
@@ -102,6 +102,16 @@ export const MAX_WAIT_TIME_MS = 30_000
 
 /** click / press 落地后探测「地址是否变了」的窗口（毫秒）。 */
 export const MUTATION_NAVIGATION_POLL_MS = 800
+
+/**
+ * 探测到导航之后再等新文档「能用」的上限（毫秒）。
+ *
+ * 为什么需要：地址变了不等于新文档已解析完 —— 报告 S1 实测 `browser_press` 回车跳维基搜索页时
+ * 返回的 `title` 是**空串**（文档已提交，`<title>` 还没解析出来），调用方据此会误判「页没就绪」。
+ * 所以检测到导航后额外等一小段：`readyState === 'complete'` 或标题出现即返回，超时也返回
+ * （页面是慢，不是错，别把 `press` 拖成失败）。窗口远小于工具超时（60s）。
+ */
+export const MUTATION_NAVIGATION_SETTLE_MS = 5_000
 
 /** `wait` 轮询 text / hidden 条件的间隔（毫秒）。 */
 const WAIT_POLL_INTERVAL_MS = 100
@@ -313,6 +323,59 @@ export class CdpBrowserProvider implements BrowserProvider {
   }
 
   /**
+   * 收编一个**已经存在**的标签页为受控会话（不导航、不新建）。
+   *
+   * 场景：窗口宿主里页面弹窗转的新标签、标签条「+」开的标签 —— 它们没走 `open()`
+   * （没有 `newTab` 应答），会话注册表天然看不见；宿主在 dom-ready 后通报
+   * `{ type: 'opened' }`，provider 据此调用这里把它们收编进来，`browser_tabs(list)`
+   * 与后续工具才可操作。通知到达时调试器已接上、文档已提交，所以：
+   *
+   * - `Page.enable` 等全部**尽力而为**：收编失败不该炸掉通报链路（标签顶多继续不可见，
+   *   与修复前一致）；
+   * - 等 `readyState === 'complete'` 用 `waitForDocument`（通报时文档已提交，不存在
+   *   open() 里「空白页提前 complete」的坑），超时**不**抛错 —— 会话照样登记，
+   *   页面慢就交给模型自己再 snapshot。
+   *
+   * @param target - 已存在目标的摘要（id / url / title / 句柄）。
+   * @param signal - 取消信号。
+   * @returns 收编好的会话。
+   */
+  protected async adoptSession(target: CdpTarget, signal?: AbortSignal): Promise<BrowserSession> {
+    const connection = await this.transport.connect(target.webSocketDebuggerUrl, signal)
+    const session: SessionState = {
+      targetId: target.id,
+      connection,
+      refs: new RefRegistry(),
+      // 与 open() 同序：采集器在构造时订阅事件，必须赶在 enable 之前建好。
+      consoleCollector: new ConsoleCollector(connection),
+      networkCollector: new NetworkCollector(connection),
+      url: target.url,
+      title: target.title,
+      takeover: false,
+      highlightPainted: false,
+    }
+    await connection.send('Page.enable', {}, { signal, timeoutMs: this.config.commandTimeoutMs })
+      .catch(() => undefined)
+    for (const domain of ['Runtime.enable', 'Log.enable', 'Network.enable']) {
+      await connection.send(domain, {}, { signal, timeoutMs: this.config.commandTimeoutMs }).catch(() => undefined)
+    }
+    // **先登记、后等加载**：通报链路存在的意义就是「让 tabs(list) 尽早看见弹窗标签」；
+    // 若等加载完成才登记，`click` 后立刻 `tabs(list)` 会重新引入竞态（2026-09-13 keyless
+    // 实测）。url/title 先用通报值顶着，页面加载完再刷成页面真实值。
+    this.sessions.set(session.targetId, session)
+    connection.onClose(() => {
+      if (this.sessions.get(session.targetId) === session) this.sessions.delete(session.targetId)
+    })
+    await this.waitForDocument(connection, signal, this.config.navigationTimeoutMs)
+    const meta = await this.readPageMeta(connection, signal)
+    if (meta !== undefined && meta.url !== '') {
+      session.url = meta.url
+      session.title = meta.title
+    }
+    return this.toSession(session)
+  }
+
+  /**
    * 新建一个标签页。**只新建，绝不接管既有标签页。**
    *
    * 为什么不退回「拿 `/json/list` 的第一个页面顶上」：那里的页面可能是用户的邮箱、后台或 IDE，
@@ -355,12 +418,19 @@ export class CdpBrowserProvider implements BrowserProvider {
     } else {
       session.url = url
     }
+    // 只有真的换过文档才推进采集器的文档序号：等加载超时（`loaded=false`）且地址也没变时
+    // 文档可能根本没换，那时把 console / network 的旧记录遮掉反而是错的。
+    if (loaded || (meta !== undefined && meta.url !== '' && meta.url !== previousUrl)) {
+      this.noteDocumentChange(session)
+    }
     if (!loaded) {
       throw new BrowserError(
         `navigation to ${url} did not finish loading within ${this.config.navigationTimeoutMs} ms; the page may still be loading`,
         'BROWSER_NAVIGATION_FAILED',
       )
     }
+    // 加载完成即算「新文档能用」：读到空标题说明这页面本来就没有 <title>，不必再等。
+    if (session.title.length === 0) await this.settleDocument(session, signal)
     return this.toSession(session)
   }
 
@@ -368,7 +438,7 @@ export class CdpBrowserProvider implements BrowserProvider {
   async observe(request: BrowserObserveRequest, signal?: AbortSignal): Promise<BrowserObservation> {
     const session = this.require(request.sessionId)
     return request.kind === 'snapshot'
-      ? this.snapshot(session, signal)
+      ? this.snapshot(session, signal, request.maxLines)
       : this.screenshot(session, request.ref, request.fullPage ?? false, signal)
   }
 
@@ -447,7 +517,12 @@ export class CdpBrowserProvider implements BrowserProvider {
     const options = { signal, timeoutMs: this.config.commandTimeoutMs }
     await session.consoleCollector.refresh(options)
     const limit = normalizeLimit(request.limit)
-    const result = session.consoleCollector.read({ limit, level: request.level, text: request.text })
+    const result = session.consoleCollector.read({
+      limit,
+      level: request.level,
+      text: request.text,
+      allDocuments: request.allDocuments === true,
+    })
     return {
       kind: 'console',
       sessionId: session.targetId,
@@ -455,6 +530,8 @@ export class CdpBrowserProvider implements BrowserProvider {
       buffered: result.buffered,
       truncated: result.truncated,
       replayTruncated: session.consoleCollector.truncatedReplay,
+      document: result.document,
+      earlierDocuments: result.earlierDocuments,
     }
   }
 
@@ -484,11 +561,18 @@ export class CdpBrowserProvider implements BrowserProvider {
         truncated: body.truncated,
       }
     }
+    const listed = session.networkCollector.list(
+      normalizeLimit(request.limit),
+      request.url,
+      request.allDocuments === true,
+    )
     return {
       kind: 'network',
       sessionId: session.targetId,
       action: 'list',
-      requests: session.networkCollector.list(normalizeLimit(request.limit), request.url),
+      requests: listed.requests,
+      document: listed.document,
+      earlierDocuments: listed.earlierDocuments,
     }
   }
 
@@ -510,6 +594,11 @@ export class CdpBrowserProvider implements BrowserProvider {
     if (request.method === 'Runtime.evaluate') {
       // 强制按值返回（`[V22]`）：返回引用的话拿到的 objectId 会随会话泄漏。
       params['returnByValue'] = true
+      // 强制 await Promise（2026-09-14 修）：不 await 时 `fetch(...).then(r => r.status)` 这种
+      // 表达式只会回一个没有 value 的 Promise 对象，被当成「不可序列化」拒掉 —— 可它其实
+      // **已经跑完并产生了副作用**（报告 S5：network 里那条 GET 明明已经 200）。等它落定，
+      // 返回兑现值才是调用方要的东西。
+      params['awaitPromise'] = true
     }
     let raw: unknown
     try {
@@ -524,7 +613,11 @@ export class CdpBrowserProvider implements BrowserProvider {
     if (NAVIGATION_COMMANDS.has(request.method)) {
       // 显式导航：地址变了 detectNavigation 会作废；地址没变（reload）这里再作废一次。
       const changed = await this.detectNavigation(session, beforeUrl, true, signal)
-      if (!changed) session.refs.invalidate()
+      if (!changed) {
+        session.refs.invalidate()
+        // reload 的地址不变但文档确实换了，采集器的文档序号必须跟着走（否则旧日志会混进来）。
+        this.noteDocumentChange(session)
+      }
       const capped = capResult(raw)
       return {
         kind: 'execute',
@@ -538,6 +631,16 @@ export class CdpBrowserProvider implements BrowserProvider {
       }
     }
     if (request.method === 'Runtime.evaluate') {
+      // 表达式抛错 / 被 await 的 Promise reject：`exceptionDetails` 里才有真话，
+      // 直接说「表达式抛了」比「返回值不可序列化」有用得多（后者会把调用方引向改写法）。
+      const exception = extractEvaluateException(raw)
+      if (exception !== undefined) {
+        throw new BrowserError(
+          `the evaluated expression threw in the page: ${exception}. The expression has already run, `
+          + 'so any side effect it had is NOT rolled back.',
+          'BROWSER_PROTOCOL_ERROR',
+        )
+      }
       const value = extractEvaluateValue(raw)
       const capped = capResult(value)
       return {
@@ -585,6 +688,10 @@ export class CdpBrowserProvider implements BrowserProvider {
    * 之后的几何大概率已变，「现算」是 isConnected 之外唯一的兜底，缓存等于把兜底拆掉。
    * 已知的剩余漏报区间：节点还在且 connected，但被页面复用显示另一条数据 —— 没有廉价
    * 检测手段，坐标对不对要由调用方按业务语义判断（注释别写成「兜底完备」）。
+   *
+   * **不滚动视口**（`scroll` 默认 false，2026-09-14 改）：默认 `scrollIntoView` 会让 locate
+   * 既验证不了「刚才那次 scroll 生效没有」，又悄悄改掉用户看到的画面。要看元素当下的位置就
+   * 保持默认；确实需要把它挪到视口中央再量时才传 `scroll: true`。
    */
   async locate(request: BrowserLocateRequest, signal?: AbortSignal): Promise<BrowserLocateResult> {
     const session = this.require(request.sessionId)
@@ -624,11 +731,15 @@ export class CdpBrowserProvider implements BrowserProvider {
           'BROWSER_STALE_REF',
         )
       }
-      const scroll = request.scroll ?? true
+      const scroll = request.scroll ?? false
       // 守卫 3 落在 elementViewportBox 的零尺寸校验里（见上，选 BROWSER_PROTOCOL_ERROR 的理由）。
       const box = await this.elementViewportBox(session, objectId, signal, scroll)
       if (request.highlight === true) await this.paintHighlight(session, objectId, signal)
       else if (session.highlightPainted) await this.clearHighlight(session, signal)
+      const inViewport = box.viewportWidth === undefined || box.viewportHeight === undefined
+        ? undefined
+        : box.x + box.width > 0 && box.y + box.height > 0
+          && box.x < box.viewportWidth && box.y < box.viewportHeight
       return {
         kind: 'locate',
         sessionId: session.targetId,
@@ -639,6 +750,7 @@ export class CdpBrowserProvider implements BrowserProvider {
         width: box.width,
         height: box.height,
         centered: scroll,
+        ...inViewport !== undefined ? { inViewport } : {},
       }
     } finally {
       this.releaseObject(session, objectId, signal)
@@ -722,14 +834,20 @@ export class CdpBrowserProvider implements BrowserProvider {
     }
   }
 
-  /** 观察：可访问性树 → 大纲 → 分配 ref（推进纪元）。 */
-  private async snapshot(session: SessionState, signal?: AbortSignal): Promise<BrowserSnapshot> {
+  /**
+   * 观察：可访问性树 → 大纲 → 分配 ref（推进纪元）。
+   *
+   * `maxLines` 只有调用方显式给时才改限额（见 {@link resolveSnapshotLimits}：行数预算和字符
+   * 预算一起抬，否则只抬一半会「我调大了还是截断」。长文页默认 800 行必截，这是报告 S3 的
+   * 原始问题 —— 现在模型可以自己要求多看几屏）。
+   */
+  private async snapshot(session: SessionState, signal?: AbortSignal, maxLines?: number): Promise<BrowserSnapshot> {
     const tree = await session.connection.send<AxTreeResult>(
       'Accessibility.getFullAXTree',
       {},
       { signal, timeoutMs: this.config.commandTimeoutMs },
     )
-    const outline = buildOutline(tree.nodes ?? [], this.config.snapshotLimits)
+    const outline = buildOutline(tree.nodes ?? [], resolveSnapshotLimits(this.config.snapshotLimits, maxLines))
     // publish 会把纪元推进一格：上一次 snapshot 的 ref 从此作废。
     const publication = session.refs.publish(outline.rows, outline.truncated)
     const meta = await this.readPageMeta(session.connection, signal)
@@ -746,6 +864,8 @@ export class CdpBrowserProvider implements BrowserProvider {
       outline: renderOutline(outline, publication.refs),
       refs: session.refs.list(),
       truncated: publication.truncated,
+      outlineLines: outline.lines.length,
+      ...outline.truncated ? { droppedElements: outline.droppedElements } : {},
       // 人工接管只加提示，**不动 epoch** —— 开合 DevTools 不该作废模型的 ref（[V31]）。
       ...session.takeover ? { takeover: true } : {},
     }
@@ -881,32 +1001,34 @@ export class CdpBrowserProvider implements BrowserProvider {
   }
 
   /**
-   * 取元素的视口坐标盒（默认先滚动到视口中央再量）。
+   * 取元素的视口坐标盒（`scroll=true` 时先滚动到视口中央再量）。
    *
    * 用 `Runtime.callFunctionOn` + `getBoundingClientRect` 而不是 `DOM.getBoxModel`：
    * 后者给的是文档坐标，而 `Input.dispatchMouseEvent` 吃的是视口坐标；
    * 元素在视口外时文档坐标直接把事件点到看不见的地方去。
    *
-   * `scroll=false` 跳过 `scrollIntoView`（`browser_locate` 的 `scroll: false` 用）：
-   * 只读坐标、不动视口。零尺寸在此统一拒绝 —— click 的落点与 locate 的「不可见」判定
-   * 都不能建立在 0 宽高的盒子上。
+   * `scroll=false` 跳过 `scrollIntoView`（`browser_locate` 的默认路径）：只读坐标、不动视口。
+   * 零尺寸在此统一拒绝 —— click 的落点与 locate 的「不可见」判定都不能建立在 0 宽高的盒子上。
+   *
+   * 同一次调用顺带把视口尺寸带回来（`browser_locate` 判 `in_viewport` 用，省一次往返）；
+   * 老实现没有这两个字段，所以按可选读，读不到就是 `undefined`。
    */
   private async elementViewportBox(
     session: SessionState,
     objectId: string,
     signal?: AbortSignal,
     scroll = true,
-  ): Promise<{ x: number; y: number; width: number; height: number }> {
+  ): Promise<{ x: number; y: number; width: number; height: number; viewportWidth?: number; viewportHeight?: number }> {
+    const measure = ' const rect = this.getBoundingClientRect();'
+      + ' return { x: rect.x, y: rect.y, width: rect.width, height: rect.height,'
+      + ' viewportWidth: window.innerWidth, viewportHeight: window.innerHeight }; }'
     const evaluated = await session.connection.send<EvaluateResult>(
       'Runtime.callFunctionOn',
       {
         objectId,
         functionDeclaration: scroll
-          ? 'function () { this.scrollIntoView({ block: "center", inline: "center" });'
-            + ' const rect = this.getBoundingClientRect();'
-            + ' return { x: rect.x, y: rect.y, width: rect.width, height: rect.height }; }'
-          : 'function () { const rect = this.getBoundingClientRect();'
-            + ' return { x: rect.x, y: rect.y, width: rect.width, height: rect.height }; }',
+          ? `function () { this.scrollIntoView({ block: "center", inline: "center" });${measure}`
+          : `function () {${measure}`,
         returnByValue: true,
       },
       { signal, timeoutMs: this.config.commandTimeoutMs },
@@ -927,7 +1049,38 @@ export class CdpBrowserProvider implements BrowserProvider {
     ) {
       throw new BrowserError('the element has no usable layout box to interact with', 'BROWSER_PROTOCOL_ERROR')
     }
-    return { x, y, width, height }
+    const viewportWidth = box['viewportWidth']
+    const viewportHeight = box['viewportHeight']
+    return {
+      x,
+      y,
+      width,
+      height,
+      ...typeof viewportWidth === 'number' ? { viewportWidth } : {},
+      ...typeof viewportHeight === 'number' ? { viewportHeight } : {},
+    }
+  }
+
+  /**
+   * 读一次视口尺寸（CSS 像素）。`browser_scroll` 不带 ref 时用它算落点（视口中心）。
+   * 读不到时退到 400×300 —— 滚轮事件落在视口内的任意一点都行，只有「落在视口外」才无效。
+   */
+  private async viewportSize(session: SessionState, signal?: AbortSignal): Promise<{ width: number; height: number }> {
+    const evaluated = await session.connection.send<EvaluateResult>(
+      'Runtime.evaluate',
+      { expression: '({ width: window.innerWidth, height: window.innerHeight })', returnByValue: true },
+      { signal, timeoutMs: this.config.commandTimeoutMs },
+    ).catch(() => undefined)
+    const value = evaluated?.result?.value
+    if (typeof value === 'object' && value !== null) {
+      const size = value as Record<string, unknown>
+      const width = size['width']
+      const height = size['height']
+      if (typeof width === 'number' && width > 0 && typeof height === 'number' && height > 0) {
+        return { width, height }
+      }
+    }
+    return { width: 400, height: 300 }
   }
 
   /**
@@ -1064,10 +1217,16 @@ export class CdpBrowserProvider implements BrowserProvider {
     return this.settleMutation(session, 'press', beforeUrl, true, signal)
   }
 
-  /** 滚动：在元素中心派发真实的滚轮事件（滚的是元素所在的可滚动容器）。 */
+  /**
+   * 滚动：在元素中心派发真实的滚轮事件（滚的是元素所在的可滚动容器）。
+   *
+   * `ref` 省略时落在**视口中心**（等价于整页滚动）—— 报告 S3/S5 的能力边界就在这：
+   * 长文页与「只有标题、零可操作元素」的页面上根本没有 ref 可给，要求必须带 ref 等于
+   * 让 scroll 在那些页面上不可用。不带 ref 的路径不查 ref 纪元（没有任何 ref 参与）。
+   */
   private async scroll(
     session: SessionState,
-    ref: string,
+    ref: string | undefined,
     deltaX: number | undefined,
     deltaY: number | undefined,
     signal?: AbortSignal,
@@ -1078,20 +1237,31 @@ export class CdpBrowserProvider implements BrowserProvider {
       throw new BrowserError('browser_scroll needs a non-zero deltaX or deltaY', 'BROWSER_PROTOCOL_ERROR')
     }
     const beforeUrl = session.url
-    const objectId = await this.resolveObjectId(session, ref, signal)
-    try {
-      const box = await this.elementViewportBox(session, objectId, signal)
-      await session.connection.send('Input.dispatchMouseEvent', {
-        type: 'mouseWheel',
-        x: box.x + box.width / 2,
-        y: box.y + box.height / 2,
-        deltaX: dx,
-        deltaY: dy,
-      }, { signal, timeoutMs: this.config.commandTimeoutMs })
-    } finally {
-      this.releaseObject(session, objectId, signal)
-    }
+    const point = ref === undefined
+      ? await this.viewportCenter(session, signal)
+      : await (async (): Promise<{ x: number; y: number }> => {
+        const objectId = await this.resolveObjectId(session, ref, signal)
+        try {
+          const box = await this.elementViewportBox(session, objectId, signal)
+          return { x: box.x + box.width / 2, y: box.y + box.height / 2 }
+        } finally {
+          this.releaseObject(session, objectId, signal)
+        }
+      })()
+    await session.connection.send('Input.dispatchMouseEvent', {
+      type: 'mouseWheel',
+      x: point.x,
+      y: point.y,
+      deltaX: dx,
+      deltaY: dy,
+    }, { signal, timeoutMs: this.config.commandTimeoutMs })
     return this.settleMutation(session, 'scroll', beforeUrl, false, signal)
+  }
+
+  /** 视口中心（CSS 像素）：不带 ref 的 scroll 的落点。 */
+  private async viewportCenter(session: SessionState, signal?: AbortSignal): Promise<{ x: number; y: number }> {
+    const size = await this.viewportSize(session, signal)
+    return { x: Math.round(size.width / 2), y: Math.round(size.height / 2) }
   }
 
   /** 等待：timeMs（纯等待）/ text（页面出现某文本）/ ref（元素从文档里消失）三选一。 */
@@ -1198,11 +1368,14 @@ export class CdpBrowserProvider implements BrowserProvider {
   }
 
   /**
-   * 探测地址是否变了；变了就作废既有 ref 并更新会话元信息。
+   * 探测地址是否变了；变了就作废既有 ref、换文档、更新会话元信息。
    *
    * 判据是**地址变化**（`meta.url !== beforeUrl`）而不是 `readyState`：软导航 / 异步提交
    * 都可能让 readyState 先于地址稳定。`awaitNavigation` 为真时给一个短轮询窗口
    * （`MUTATION_NAVIGATION_POLL_MS`），否则只读一次。
+   *
+   * 一旦判定导航（且 `awaitNavigation`），再等新文档「能用」（见 {@link settleDocument}）：
+   * 地址变了但 `<title>` 还没解析时返回空标题，会被当成「页没就绪」（报告 S1）。
    *
    * @returns 是否检测到导航（地址变化）。
    */
@@ -1221,6 +1394,7 @@ export class CdpBrowserProvider implements BrowserProvider {
           // 页面换掉了：旧 ref 全部作废，绝不许旧 ref 静默命中新页面上的元素。
           session.refs.invalidate()
           navigated = true
+          this.noteDocumentChange(session)
         }
         session.url = meta.url
         session.title = meta.title
@@ -1228,7 +1402,44 @@ export class CdpBrowserProvider implements BrowserProvider {
       if (navigated || Date.now() >= deadline) break
       await delay(WAIT_POLL_INTERVAL_MS, signal)
     }
+    if (navigated && awaitNavigation) await this.settleDocument(session, signal)
     return navigated
+  }
+
+  /**
+   * 等新文档「真的能用」：读到非空标题，或文档已 `complete`（那说明它本来就没有 `<title>`），
+   * 或窗口耗尽。
+   *
+   * 报告 S1 的成因很具体：`browser_press` 回车跳维基搜索页，`Page.navigate` 已提交（地址变了），
+   * 但 `<title>` 还在解析中，于是工具立刻返回 `title: ''`，调用方据此误判「页还没就绪」。
+   * 这里只补这一小段等待，**超时不算失败**（页面是慢，不是错），也绝不把 `press` 拖成超时。
+   */
+  private async settleDocument(session: SessionState, signal?: AbortSignal): Promise<void> {
+    const deadline = Date.now() + MUTATION_NAVIGATION_SETTLE_MS
+    for (;;) {
+      const meta = await this.readPageMeta(session.connection, signal)
+      if (meta !== undefined) {
+        session.url = meta.url
+        session.title = meta.title
+        if (meta.title.length > 0) return
+      }
+      // 加载完还读不到标题 ⇒ 这个页面本来就没有 `<title>`，没必要等满窗口。
+      if (await this.documentComplete(session.connection, signal)) return
+      if (Date.now() >= deadline) return
+      await delay(WAIT_POLL_INTERVAL_MS, signal)
+    }
+  }
+
+  /**
+   * 通报两个采集器「这个会话换文档了」。
+   *
+   * console / network 的缓冲都是按会话累积的，不区分文档时会把上一个页面的日志与请求
+   * 一股脑端给模型（报告 S5）。换文档只推进文档序号、不丢数据：`read` / `list` 默认只给
+   * 当前文档的，被遮掉多少条如实报告。
+   */
+  private noteDocumentChange(session: SessionState): void {
+    session.consoleCollector.noteNavigation()
+    session.networkCollector.noteNavigation()
   }
 
   /** 标签页清单：只含受控会话；transport 能回答「谁在前台」时补上 active。 */
