@@ -16,3 +16,6 @@ coverage/
 .probe-*
 .verify-card*.png
 .workbuddy/
+# 真窗口调试脚本的临时输出（一次性的证据快照，不入库）
+scripts/.last-*
+scripts/.kill-ports.txt
