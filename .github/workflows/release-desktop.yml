@@ -172,8 +172,10 @@ jobs:
         # verify-portable 用 harness 真代码走一遍桌面端启动准备（全量 sha256 完整性 +
         # runtimeId / nodeVersion / platform / arch 对齐 + 建 241 条宿主链接 + 依赖图校验），
         # 再真起一次宿主读 __DSH_BOOT__。不过就不发 Release。
-        # 验的是 .desktop-stage（zip 的内容源，所以不需要先解压 zip）；
-        # 唯一的例外是浏览器信标那步（--browser，要真实 Chromium）在 CI 上跳过。
+        #
+        # 验的是**解压后的 zip**：打包脚本收尾会 rmSync 掉 .desktop-stage
+        # （package-desktop-portable.mjs:259），所以那个中间目录在这里已经没了。
+        # 验解压产物反而更忠实 —— 那正是用户拿到的东西，顺带证明 zip 本身没坏。
         shell: pwsh
         env:
           # harness 是插件仓的兄弟目录（同「取 deepseek-harness 源码」step 的 Split-Path 结果）。
@@ -181,7 +183,11 @@ jobs:
           # （这个环境里 psh 工具输出恒为空，pwsh 表达式没法本地试跑）。
           HARNESS_ROOT: ${{ github.workspace }}/../deepseek-harness
         run: |
-          node "$env:GITHUB_WORKSPACE/scripts/verify-portable.mjs" --dir "$env:GITHUB_WORKSPACE/.desktop-stage" --harness "$env:HARNESS_ROOT"
+          $zip = Join-Path "$env:GITHUB_WORKSPACE\dist" "$env:ZIP_NAME"
+          $dest = Join-Path "$env:GITHUB_WORKSPACE" ".desktop-verify"
+          Write-Host "解压后再自检: $zip -> $dest"
+          Expand-Archive -LiteralPath $zip -DestinationPath $dest -Force
+          node "$env:GITHUB_WORKSPACE/scripts/verify-portable.mjs" --dir "$dest" --harness "$env:HARNESS_ROOT"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: 写 release 说明
