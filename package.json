@@ -1,6 +1,6 @@
 {
   "name": "dsh-webops-plugin",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "private": true,
   "description": "为 DeepSeek Harness 提供浏览器调试与操作能力：ctx.browser 能力服务 + CDP provider + browser_* 工具 + 客户端观察面板。",
   "type": "module",
@@ -59,6 +59,7 @@
     "dev:desktop": "tsx scripts/dev-desktop.mjs",
     "check:desktop": "node scripts/check-desktop.mjs",
     "verify:card": "node scripts/verify-card.mjs",
+    "verify:portable": "node scripts/verify-portable.mjs",
     "shot:desktop": "node scripts/shot-desktop.mjs",
     "smoke:dispatch": "tsx scripts/smoke-dispatch.ts",
     "smoke:devtools": "tsx scripts/smoke-devtools.ts",

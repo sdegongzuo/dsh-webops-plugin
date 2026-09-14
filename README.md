@@ -449,7 +449,7 @@ pnpm dsh --profile browserp0
 ```bash
 pnpm install       # 工具链 + link 本地 dsh 包；不查 registry
 pnpm typecheck     # tsc --noEmit
-pnpm test          # vitest；174 个用例通过（另有 3 个 live，端点不是真 Chrome 时整组跳过）
+pnpm test          # vitest；280 个用例通过（另有 3 个 live，端点不是真 Chrome 时整组跳过）
 pnpm build         # tsdown 加 copy-assets；产出 lib/（host 四面 + 包根 + 客户端 bundle + host.cjs）
 ```
 
@@ -465,6 +465,8 @@ pnpm build         # tsdown 加 copy-assets；产出 lib/（host 四面 + 包根
 | `browser-cdp/url-policy.test.ts` | 地址策略与端点回环约束 |
 | `tool-browser/index.test.ts` | 四个工具的 schema 编译、参数校验、输出过 schema、图片块 |
 | `browser-cdp/live.test.ts` | 真实 Chrome 上的 open → snapshot → screenshot → navigate → stale_ref → close + 真实 attachment 存储（端点非真 Chrome 时整组带原因跳过） |
+| `bundle-patch.test.ts` | **出货 patch 守卫**：`cordis.patch.yml` 里不得出现 `llm/stream` 劫持行、必须在开发 overlay 里保留夹具 |
+| `fake-llm/index.test.ts` | 闸门（`DSH_FAKE_LLM` 未开则绝不注册监听器）+ 热搜第五条/ref 抽取的确定性 |
 
 `pnpm-workspace.yaml` 里的 `allowBuilds: { esbuild: true }` 是必需的：pnpm 默认挂起依赖的构建脚本，
 vitest 启动前的 deps-status 检查会因此直接失败（`ERR_PNPM_IGNORED_BUILDS`）。
@@ -657,7 +659,7 @@ git tag v0.1.0 && git push origin v0.1.0
 约 226 MB，CI 要 1–3 小时（job timeout 180 分钟）。
 
 ```bash
-git tag desktop-v0.2.0 && git push origin desktop-v0.2.0
+git tag desktop-v0.2.1 && git push origin desktop-v0.2.1
 ```
 
 **harness 侧必须打补丁才能过，补丁在本仓 `docs/harness-desktop-build.patch`**，
@@ -695,6 +697,58 @@ electron-builder 解包完立即 rename，Windows 上因句柄未释放报 EPERM
 | `links` | 给 `[]` | 真实 junction 的 target 是**用户机器上的绝对路径**，打包时无从得知；给空数组让桌面端自己建链并回写 |
 
 > 这个坑 v0.1.0 和 v0.2.0 都有 —— 两个包发出去后插件都没加载过，因为从来没人真的双击起过它。
+
+#### 坑：keyless 验证夹具 `fake-llm` 曾经随包发出去
+
+v0.2.0 的 `cordis.patch.yml` 里带着 `fake-llm` 行。它**不是**一个无害的调试开关：
+
+```js
+ctx.on('llm/stream', (options, _next) => { /* 直接 return 自己的流，从不调 _next() */ })
+```
+
+`llm/stream` 在 dsh 里是 **waterfall**（`dsh-llm/lib/index.js`：`ctx.waterfall(this, 'llm/stream', options, () => this.adapterStream(...))`），
+监听器只要不调 `next()` 就短路掉真实模型。所以装了 v0.2.0 的用户，**任何真实对话都会被换成
+「打开百度 → 读热搜第五条」的脚本回放**。（对照官方写法的正确姿势：`dsh-llm/lib/invariant.js:63`
+的 `(_options, next) => validateStream(next(), fail)` —— 它调了 `next()`。）
+
+现在这三道防线同时存在：
+
+| 防线 | 位置 |
+|---|---|
+| 那一行不在出货 patch 里 | `cordis.patch.yml`（随 `package.json#files` 进便携版） |
+| 开发/验证专用 overlay 单独一个文件，且不在出货白名单 | `cordis.fake-llm.patch.yml`（由 `dev-desktop.mjs` 拼接写进开发态 profile） |
+| `apply` 有闸门，默认哑 | `src/fake-llm/index.ts` 的 `GATE_ENV = 'DSH_FAKE_LLM'`，只有 `=1` 才注册监听器 |
+
+`src/bundle-patch.test.ts` 会把前两条钉死在 `pnpm test` 里（它按 YAML 有效行断言，注释里
+解释「为什么不在」不会误伤自己）。
+
+#### 发版前必做：`pnpm run verify:portable`
+
+上面两个坑**都不会**被 `pnpm typecheck` / `pnpm test` / CI 构建拦住 —— 那一行是合法配置，
+插件也是合法加载。所以发便携版之前必须真的把**打包产物**起一次：
+
+```bash
+# 1) 解压便携版（zip 解开，或 CI 产出的目录）
+# 2) 自检（生产路径：真起 dsh 桌面端宿主，读 boot graph）
+pnpm run verify:portable -- --dir /path/to/解压后的目录
+# 3) 想在真浏览器里再确认客户端注册，就多给一个 Chrome：
+pnpm run verify:portable -- --dir /path/to/解压后的目录 \
+    --browser "C:/Program Files/Google/Chrome/Application/chrome.exe"
+```
+
+它复刻 Electron 壳对宿主做的前两件事（给 fd3/fd4 管道、转发 `dsh-app://app/*` 请求），
+所以拿到的 `/index.html` 与真启动同源，验证的是**产物本身**：
+
+- 出货 patch 里没有 `llm/stream` 劫持行、profile 里没有越权 overlay；
+- `desktop-runtime-state.json` 在位（少了它插件登记会被静默抹掉）；
+- `__DSH_BOOT__` 里有插件的客户端行，且它的 bundle 能 200 拉下来、内容是合法客户端模块；
+- 给了 `--browser` 时，再验客户端半边真的注册成功（`<html>` 上 `dshBrowserPluginDock≥1`、
+  `dshBrowserPluginToolViews≥15`）。
+
+> 它**不断言状态条出现在 DOM 里**：状态条挂在会话面的 `conversation.input.dock` 上，而
+> `ui-conversation` 只在会话存在时才渲染那个 slot（`const zone = session === undefined ? undefined : {…}`）——
+> 空 home 会停在「选择工作区」页，那一面根本没挂载。这是**预期行为**，不是插件没加载
+> （2026-09-14 就是在这里误会过一次：用户还没选工作区，以为插件没装上）。
 
 ## License
 

@@ -43,6 +43,17 @@ export interface FakeLlmConfig {
   fallbackText?: string
 }
 
+/**
+ * 接管 `llm/stream` 的闸门环境变量。
+ *
+ * `llm/stream` 在 dsh 里是 **waterfall**（`dsh-llm`：`ctx.waterfall(this, 'llm/stream', …)`），
+ * 监听器只要不调 `next()` 就直接短路掉真实模型。所以这个插件**默认必须是哑的**：
+ * 出货包里它根本不该被挂载（见仓库根的 `cordis.patch.yml` 与 `cordis.fake-llm.patch.yml`），
+ * 而这道闸是第二层保险 —— 万一那行被误加回出货 patch，用户看到的是「插件没反应」，
+ * 而不是「我的对话被换成了假回放」。
+ */
+export const GATE_ENV = 'DSH_FAKE_LLM'
+
 const DEFAULT_URL = 'https://www.baidu.com/'
 const DEFAULT_TEXT = '已走完「打开百度 → 热搜第五条 → 点击 → 读详情」工具链，热搜详情页的正文在轨迹里，工具卡片应当已在本会话渲染。'
 const DEFAULT_FALLBACK_TEXT = '（fake-llm：脚本已耗尽，这是兜底回复。）'
@@ -201,6 +212,12 @@ const CONTENT_EXPRESSION = "document.body ? document.body.innerText.replace(/\\s
  * @param config - 地址与文本。
  */
 export function apply(ctx: import('@deepseek-ai/cordis').Context, config: FakeLlmConfig = {}): void {
+  // 闸门：没显式开启就什么都不做（`apply` 仍然会被调用，只是不注册监听器）。
+  if (process.env[GATE_ENV] !== '1') {
+    debugNote('gate', `${GATE_ENV} 未置 1（当前=${process.env[GATE_ENV] ?? '未设'}），不接管 llm/stream`)
+    return
+  }
+
   const url = config.url ?? DEFAULT_URL
   const text = config.text ?? DEFAULT_TEXT
   const fallbackText = config.fallbackText ?? DEFAULT_FALLBACK_TEXT

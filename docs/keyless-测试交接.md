@@ -64,13 +64,17 @@ verify-card: PASS —— ...
 5. **热搜榜是实时数据**，别对具体标题写死断言；第五条以榜单序号「5」为准（不是 DOM 第 5 个——置顶/推荐项会占住前排，2026-09-13 实测把第五条点成了第二条）。
 6. **detailDigest 失败会降级成静态文本**「已走完…」。若聊天里只出现静态文本，看实例日志里的 `fake-llm: digest: 动态证据抽取失败` 打点（需 DSH_BROWSER_PLUGIN_DEBUG=1）定位哪一段没抽到。
 7. verify:card **注入前会先点「新会话」**（已内建）——恢复的旧会话 DOM 里残留旧轮次卡片（t1/example.com），不切新会话轮询断言会被污染成假失败/假通过。
+8. **fake-llm 只在开发态挂上，而且需要 `DSH_FAKE_LLM=1`。** 它的 patch 行**不在出货的 `cordis.patch.yml` 里** —— 那一行随包发出去，会把每个用户的真实对话都换成脚本回放（2026-09-14 的 v0.2.0 事故，见 README「发版」段）。它现在待在开发专用 overlay `cordis.fake-llm.patch.yml` 里，由 `pnpm run dev:desktop` 拼接写进开发态 profile **并同时置 `DSH_FAKE_LLM=1`**。所以：
+   - 验证链路**必须走 `dev:desktop`**；手工装配 profile 时要自己把 overlay 拼进去、并置那个环境变量。
+   - 症状对照：插件在图上、`llm/stream` 却没人接管（回复来自真模型或报缺 key）→ 先查 `DSH_FAKE_LLM` 与 overlay 在不在。
+   - 排查时看实例日志的 `fake-llm: gate:` 打点（需 `DSH_BROWSER_PLUGIN_DEBUG=1`）：它会明确说闸门没开。
 
 ## 5. 相关文件
 
 | 文件 | 作用 |
 |---|---|
 | `scripts/verify-card.mjs` | 端到端验证脚本（新会话→注入→轮询卡片→t2 断言→截图） |
-| `src/fake-llm/index.ts` | 脚本化模型回放：8 轮真实任务流 + detailDigest 动态收尾 + digest 失败打点 |
+| `src/fake-llm/index.ts` | 脚本化模型回放：8 轮真实任务流 + detailDigest 动态收尾 + digest 失败打点。**`apply` 有 `DSH_FAKE_LLM=1` 闸门，默认哑**；patch 行在开发专用 `cordis.fake-llm.patch.yml` |
 | `src/browser-electron/host.cjs` | 弹窗 `openTab(url, undefined, { announce: true })` → opened 通报 |
 | `src/browser-electron/bridge.ts` | `onTabOpened` 通报分发（无 command id 的 `{type:'opened'}` 分支） |
 | `src/browser-electron/provider.ts` | `adoptSession` 收编（先登记后等加载，防 click→tabs 竞态） |
@@ -82,5 +86,6 @@ verify-card: PASS —— ...
 
 - **已验证 PASS**（2026-09-13 23:33 一轮）：6 张卡片全 ok、open=baidu、t2 [foreground] 收编断言通过。仅截图步骤曾超时（已改为失败只警告不失败）。
 - **已知问题（待交接方排查）**：`detailDigest` 动态证据回复**确认在降级**——实例日志打点 `fake-llm: digest: 动态证据抽取失败，降级静态文本；历史长度=13945`。历史不短（13945 字），`fifth` 段大概率能抽到，嫌疑集中在 marker 段定位（`'Runtime.evaluate on session_id='` → `'(at '` → `') '`）：c7 结果文本在 llm 请求历史里可能被截断（tool-result 有长度上限，4000 字正文 + 长 URL 恰好把 `(at …) ` 截掉）。排查法：在 `detailDigest` 各 return undefined 分支分别加 `debugNote` 打点，重启桌面端跑一轮即可定位是哪段缺失。
-- **未提交**（用户习惯：明确说「提交 push」才提交）：adoptSession 收编链、client 15 视图、fake-llm 热搜流+动态收尾、find 空白归一化、verify-card 加固。
-- 单测基线：243 passed / 3 skipped。
+- **未提交**：无（adoptSession 收编链、client 15 视图、fake-llm 热搜流+动态收尾、find 空白归一化、verify-card 加固均已提交）。
+- 单测基线：280 passed / 3 skipped（2026-09-14，含新增的 `src/bundle-patch.test.ts` 出货 patch 守卫与 fake-llm 闸门用例）。
+- **发版前必过**：`pnpm run verify:portable -- --dir <解压后的便携版目录>` —— 生产路径真起宿主、读 boot graph、验客户端注册。见 README「发版」段。

@@ -1,0 +1,23 @@
+# **仅开发/验证用**的 overlay：把 keyless 验证驱动 `fake-llm` 插进 cordis 图。
+#
+# 为什么单独一个文件：`fake-llm` 会接管 `llm/stream` 并按脚本回放，装上它之后**任何真实
+# 对话都会得到假回复**。它是验证台上的夹具，不是产品能力，所以不能出现在随包出货的
+# `cordis.patch.yml` 里（那个文件被 `package.json#files` 白名单带进便携版）。
+#
+# 生效方式：`scripts/dev-desktop.mjs` 会把 `cordis.patch.yml` 与本文件**拼接**后写进
+# 开发态 profile 的 `cordis.patch.yml`（profile overlay 在 bundle 层之后应用）。
+# 本文件不在 `package.json#files` 白名单里，出货包拿不到它。
+#
+# 另有一道保险：`src/fake-llm/index.ts` 的 `apply` 只有在 `DSH_FAKE_LLM=1` 时才注册
+# `llm/stream` 监听器。即使某天这一行被误加回出货 patch，也只会是「加载了但不接管」。
+#
+# 收尾的 `text` / `fallbackText` 可以用行内 config 覆盖，例如：
+#     - id: fake-llm
+#       name: 'dsh-webops-plugin/fake-llm'
+#       config:
+#         url: 'https://example.com/'
+#         fallbackText: '（脚本走完，这是兜底回复。）'
+
+- insert:
+    - id: fake-llm
+      name: 'dsh-webops-plugin/fake-llm'

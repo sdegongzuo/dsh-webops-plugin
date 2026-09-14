@@ -1,6 +1,7 @@
-# dsh-webops-plugin 的 bundle patch。
+# dsh-webops-plugin 的 bundle patch（**出货版**）。
 #
-# 三行全部落在 HOST 平面：能力服务、它的 CDP provider、以及模型可见的工具。
+# 五行全部落在 HOST 平面：能力服务、它的 CDP provider、桌面端 provider、模型可见的工具，
+# 以及承载客户端半边的裸包名行。
 #
 # 为什么工具也放 host 平面：host 平面的行在**所有** surface（TUI / headless / web / 桌面端）
 # 都会生效，除非某个 surface 的 overlay 显式把它 disabled —— 这正是 `dsh-web-app` 必须写下
@@ -9,11 +10,17 @@
 #
 # 注意：patch 命中某一行时是**整块替换 config**（不是深合并），将来若要覆盖其中一行的 config，
 # 必须把这行拥有的所有键重述一遍。
+#
+# ⚠️ 这个文件是**随包出货**的。往里加行等于给每个用户装上那个插件 —— 加之前先问自己
+# 「用户装了这个，他的真实对话会不会被改变行为」。keyless 验证用的 `fake-llm`（会把
+# `llm/stream` 整条接管并按脚本回放）**故意不在这里**，它在开发/验证专用的
+# `cordis.fake-llm.patch.yml` 里，由 `scripts/dev-desktop.mjs` 写进开发态 profile。
+# 2026-09-14：v0.2.0 的出货包曾把那一行带出去，任何真实对话都会被换成假回放。
 
-# 第四行是**裸包名**，host 侧是空实现，唯一作用是让浏览器那半边被发现：
+# 最后一行是**裸包名**，host 侧是空实现，唯一作用是让浏览器那半边被发现：
 # `packages/client/modules/src/index.ts` 的 `locatePkgJson()` 用
 # `exactPackageSpecifier()` 取包名，它对「非 scoped 且带 `/`」的 specifier 直接返回
-# undefined —— 也就是说下面三条 host 行永远不会被当成客户端包，只有裸包名行才会去解析
+# undefined —— 也就是说上面三条 host 行永远不会被当成客户端包，只有裸包名行才会去解析
 # `dsh.client` 与 `exports["./client"]`。dsh 自己的纯客户端包
 # （如 `dsh-client-ui-brand-official`）也是这个「空 host 行 + ./client」形态。
 
@@ -32,11 +39,6 @@
 
     - id: tool-browser
       name: 'dsh-webops-plugin/tool-browser'
-
-    # keyless 验证驱动：把 llm/stream 拦下来按脚本回放（第一轮发起 browser_open，
-    # 工具真的执行；第二轮文本收尾）。只在验证场景使用；不需要时删掉这一行即可。
-    - id: fake-llm
-      name: 'dsh-webops-plugin/fake-llm'
 
     - id: browser-plugin
       name: 'dsh-webops-plugin'

@@ -44,6 +44,16 @@ const PLUGIN_NAME = 'dsh-webops-plugin'
 /** 装进 profile 的包内容；`src/` 不进去，桌面端只吃构建产物。 */
 const SHIPPED = ['lib', 'package.json', 'cordis.patch.yml', 'README.md', 'LICENSE']
 
+/**
+ * 仅开发态拼接的 overlay 文件名。
+ *
+ * `cordis.patch.yml` 是**出货版**的 patch（随 `package.json#files` 进便携版），里面的行
+ * 每个用户都会装上；`fake-llm` 会接管 `llm/stream`，只能待在开发态，所以它单独一个文件，
+ * 由本脚本拼在出货 patch 之后写进 profile overlay。
+ * 2026-09-14：v0.2.0 曾把那一行随包带出去，真实对话会被换成假回放。
+ */
+const DEV_OVERLAY = 'cordis.fake-llm.patch.yml'
+
 /** 桌面端在开发态固定使用的三个调试端口，与 dsh 的 dev.ts 一致。 */
 const PORTS = { main: 9229, renderer: 9222, host: 9230 }
 
@@ -87,10 +97,19 @@ function installIntoProfile() {
     if (existsSync(from)) cpSync(from, join(destination, entry), { recursive: true })
   }
   // profile 自己的 overlay：`loadProfileDirectory` 在 bundle 层之后读它。
+  //
+  // 开发态里本插件**不是**注册的 bundle（`prepareDevelopmentProject` 不写 bundles 列表），
+  // 所以这个 overlay 必须承载全部行 —— 出货 patch + 开发专用的 fake-llm 行。
+  const shippedPatch = readFileSync(join(PLUGIN_ROOT, 'cordis.patch.yml'), 'utf8')
+  const devOverlayPath = join(PLUGIN_ROOT, DEV_OVERLAY)
+  const devOverlay = existsSync(devOverlayPath) ? readFileSync(devOverlayPath, 'utf8') : ''
   writeFileSync(
     join(PROJECT_DIR, 'cordis.patch.yml'),
-    readFileSync(join(PLUGIN_ROOT, 'cordis.patch.yml'), 'utf8'),
+    devOverlay === '' ? shippedPatch : `${shippedPatch}\n\n${devOverlay}`,
   )
+  if (devOverlay === '') {
+    console.warn(`dev-desktop: 缺 ${DEV_OVERLAY} —— fake-llm 不会挂上，keyless 验证链路跑不了`)
+  }
   console.log(`dev-desktop: 已装配 ${PLUGIN_NAME}@${manifestVersion(source, '插件')} → ${destination}`)
 }
 
@@ -160,6 +179,9 @@ async function main() {
   environment.ELECTRON_ENABLE_LOGGING ??= '1'
   // 打开本插件的加载诊断，便于确认 host 半边是否真的挂上。
   environment.DSH_BROWSER_PLUGIN_DEBUG ??= '1'
+  // 开发态显式开闸：`fake-llm` 的 `llm/stream` 接管是**默认关闭**的（见 src/fake-llm/index.ts
+  // 的 GATE_ENV），keyless 验证需要它，所以这里置 1。出货包里两者都不存在。
+  environment.DSH_FAKE_LLM ??= '1'
   // 桌面端的浏览器 provider 用 `electron`：它开的是**桌面端自己的 BrowserWindow**。
   // 不用 `cdp` 是因为桌面端那个调试端口（9222）就是它自己的渲染进程，嵌入式 Chromium
   // 不实现 `PUT /json/new` —— 连它做 browser_open 只会得到「Could not create new page」。
