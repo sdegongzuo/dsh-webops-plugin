@@ -244,14 +244,19 @@ writeFileSync(
   { encoding: 'utf8' },
 )
 
-// 6) 打包（与 package-portable.mjs 一致，走 Compress-Archive）
+// 6) 打包
+//
+// 压缩级别用 Fastest：app/ 里绝大多数是已经压过的二进制（Electron 运行时、asar、
+// .node、图片），Optimal 换来的体积收益是个位数 MB，代价却是几分钟的 CPU ——
+// 实测这一整步（物化 profile + 打 zip）在 CI 上要 294s，压缩占了绝大部分。
+// 产物仍是标准 zip（Compress-Archive 只换 deflate 级别），不影响用户侧解压。
 execFileSync(
   'powershell',
   [
     '-NoProfile',
     '-NonInteractive',
     '-Command',
-    `Compress-Archive -Path '${join(STAGE, '*')}' -DestinationPath '${zipPath}' -CompressionLevel Optimal -Force`,
+    `Compress-Archive -Path '${join(STAGE, '*')}' -DestinationPath '${zipPath}' -CompressionLevel Fastest -Force`,
   ],
   { stdio: 'pipe' },
 )

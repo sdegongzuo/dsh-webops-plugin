@@ -127,7 +127,19 @@ jobs:
             Write-Host "tar=$tar 非 GNU，不设 TAR_OPTIONS"
           }
 
+      - name: 恢复 dsh 桌面端本体缓存（win-unpacked）
+        # 这一步原本是全 workflow 最贵的一步（实测 631s，占 61%）：electron-builder 要把
+        # 226MB / 14071 个文件解包组装成 app 目录，不是编译，纯粹是 IO。
+        # dsh 本体只在 harness ref 变化时才需要重建，所以按 HARNESS_REF + 两处补丁内容做
+        # key 缓存整个目录 —— 插件自己迭代时直接命中，跳过这一步。
+        id: base-cache
+        uses: actions/cache@v4
+        with:
+          path: .desktop-base/app
+          key: dsh-win-unpacked-${{ runner.os }}-${{ env.HARNESS_REF }}-${{ hashFiles('docs/harness-desktop-build.patch', 'scripts/patch-electron-builder.mjs') }}
+
       - name: 构建桌面端应用目录
+        if: steps.base-cache.outputs.cache-hit != 'true'
         # `package:win:x64:dir` = electron-builder --dir，产出可直接运行的 win-unpacked 目录。
         # 必须带 --unsigned：本机/CI 都没有 SafeNet USB 签名令牌，而
         # `electron-builder.config.mjs:108` 是 forceCodeSigning: !unsigned。
@@ -145,12 +157,23 @@ jobs:
         id: locate
         shell: pwsh
         run: |
+          $cache = Join-Path $env:GITHUB_WORKSPACE '.desktop-base/app'
+          # 命中缓存时直接用它；顺带验一下不是个空壳（缓存恢复出过空目录的情况）。
+          if ('${{ steps.base-cache.outputs.cache-hit }}' -eq 'true' -and (Test-Path (Join-Path $cache '*.exe'))) {
+            Write-Host "缓存命中，跳过构建：$cache"
+            Add-Content -Path $env:GITHUB_ENV -Value "WIN_UNPACKED=$cache"
+            exit 0
+          }
           $base = Join-Path (Split-Path $PWD) 'deepseek-harness\apps\desktop\.desktop-build\targets\win-x64'
           $app = Get-ChildItem -Path $base -Recurse -Directory -Filter 'win-unpacked' -ErrorAction SilentlyContinue |
                  Select-Object -First 1
           if ($null -eq $app) { throw "没找到 win-unpacked（搜过 $base）" }
           Write-Host "win-unpacked: $($app.FullName)"
-          Add-Content -Path $env:GITHUB_ENV -Value "WIN_UNPACKED=$($app.FullName)"
+          # 搬到缓存目录：job 成功结束后 actions/cache 会把它存起来供下次复用。
+          # 同盘 Move-Item 是瞬时的，不额外花拷贝时间。
+          New-Item -ItemType Directory -Path $cache -Force | Out-Null
+          Move-Item -Path (Join-Path $app.FullName '*') -Destination $cache -Force
+          Add-Content -Path $env:GITHUB_ENV -Value "WIN_UNPACKED=$cache"
 
       - name: 物化插件 profile 并打便携版 zip
         # 把插件按官方模板写进 profile，随 zip 分发；启动器用 DSH_HOME 把配置锁在包内。
