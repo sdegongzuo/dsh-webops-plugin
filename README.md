@@ -673,6 +673,29 @@ electron-builder 解包完立即 rename，Windows 上因句柄未释放报 EPERM
 
 > **不需要 Visual C++ 构建工具**：node-pty 用预编译的 conpty.dll，koffi / sharp 同理，实测没有编译过原生模块。
 
+#### 坑：profile 光写 `package.json` 不够，插件会被静默抹掉
+
+`scripts/package-desktop-portable.mjs` 手工物化 `home/profiles/desktop/`。但只写
+`package.json`（登记 `dependencies` + `dsh.profile.bundles`）**不能生效**：
+
+`DesktopProjectManager.applyRelease()`（`apps/desktop/src/project-manager.ts:306`）第一步是
+`previous = readDesktopProfileState(profile)`，读的是 profile 下的 `desktop-runtime-state.json`；
+`previous === undefined`（文件不存在）时它会调 `createPluginProfile()`，而那个函数
+（同文件 `:604`）把 `package.json` **整个重写**成 `dependencies: {}` +
+`bundles: [@deepseek-ai/dsh-base, @deepseek-ai/dsh-web-app]` —— 登记的插件被冲掉，
+接着 `prepareProfile()` 拿空的 activePlugins 校验，直接返回，**不报错、不提示**。
+表现就是：双击启动、界面正常、什么插件都没有。
+
+所以打包脚本会额外写一份 `desktop-runtime-state.json`，三个取值有硬约束：
+
+| 字段 | 约束 | 踩错的后果 |
+|---|---|---|
+| `nodeVersion` / `platform` / `arch` | 必须与 `app/resources/dsh/desktop-runtime.json` 完全一致 | 不一致 → `reconcileProfile` 判定 `rebuild=true` → **删掉整个 `node_modules`** 再跑 `pnpm install --frozen-lockfile`（插件不在 registry，必挂） |
+| `runtimeId` | `sha256(JSON.stringify(descriptor))`，键序照抄 `runtime-tree.ts:150` 的构造 | 只是让第二次启动走不到快速返回分支，无害 |
+| `links` | 给 `[]` | 真实 junction 的 target 是**用户机器上的绝对路径**，打包时无从得知；给空数组让桌面端自己建链并回写 |
+
+> 这个坑 v0.1.0 和 v0.2.0 都有 —— 两个包发出去后插件都没加载过，因为从来没人真的双击起过它。
+
 ## License
 
 MIT

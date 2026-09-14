@@ -24,6 +24,11 @@
  * `project-manager.ts:604 createPluginProfile` 的模板手工物化一份，让桌面端启动时
  * 认为「这个插件本来就是装好的」（`applyRelease()` 状态自洽时不会重装，见
  * `project-manager.ts:306-322`）。
+ *
+ * **但光写 package.json 不够**：`applyRelease()` 在 `previous === undefined` 时会调
+ * `createPluginProfile()` 把 package.json 重写成空插件列表 —— 登记的插件被静默冲掉。
+ * 所以还必须写 `desktop-runtime-state.json`（见下面 2.5 节的详细理由）。
+ * 这个坑 2026-09-14 才被发现：v0.1.0 和 v0.2.0 的包都因此启动后没有任何插件。
  */
 
 import { execFileSync } from 'node:child_process'
@@ -116,6 +121,57 @@ writeFileSync(
 )
 writeFileSync(join(profileDir, 'pnpm-workspace.yaml'), WORKSPACE_SETTINGS)
 console.log('  + home/profiles/desktop/package.json')
+
+// 2.5) 桌面端认可的 profile 状态文件。**少了它，上面登记的插件会被静默抹掉。**
+//
+// `DesktopProjectManager.applyRelease()`（project-manager.ts:306）的流程是：
+//   previous = readDesktopProfileState(profile)          // 读 desktop-runtime-state.json
+//   if (previous === undefined) createPluginProfile()    // ← 这里
+// 而 `createPluginProfile()`（project-manager.ts:604）会把 package.json **整个重写**成
+// `dependencies: {}` + `bundles: [dsh-base, dsh-web-app]` —— 我们刚写进去的
+// `dsh-webops-plugin` 被冲掉，随后 `prepareProfile` 拿空的 activePlugins 去校验，
+// 直接 `return`，**不报错、不提示**，启动后什么插件都没有。
+//
+// 所以必须让 previous !== undefined。三个字段的取值有硬约束：
+//   · nodeVersion / platform / arch 必须与 app 内 runtime 完全一致 —— 不一致会让
+//     `reconcileProfile` 判定 rebuild=true，**删掉整个 node_modules** 再跑
+//     `pnpm install --frozen-lockfile`（我们的插件不在 registry，必挂）。
+//   · runtimeId 是 `sha256(JSON.stringify(descriptor))`（runtime-tree.ts:220），
+//     descriptor 由 `readDesktopRuntime`（runtime-tree.ts:150）按固定键序重建；
+//     这里照抄那个键序算出同值，好让第二次启动能走 applyRelease 的快速返回分支。
+//   · links 给空数组：真实 junction 的 target 是**用户机器上的绝对路径**，打包时
+//     不可能知道；给空数组让 host 那步重新建链并回写正确值。代价只是首次启动多跑
+//     一次 prepareProfile（幂等）。
+//   · lockHash 必须等于 `desktopPluginLockHash()` 在「没有 pnpm-lock.yaml」时的值，
+//     即空串的 sha256。
+const descriptorPath = join(appDir, 'resources', 'dsh', 'desktop-runtime.json')
+if (!existsSync(descriptorPath)) {
+  console.error(`package-desktop-portable: 缺 ${descriptorPath}（app 目录不完整？）`)
+  process.exit(1)
+}
+const runtime = JSON.parse(readFileSync(descriptorPath, 'utf8'))
+const descriptor = {
+  schemaVersion: runtime.schemaVersion,
+  release: runtime.release,
+  platform: runtime.platform,
+  arch: runtime.arch,
+  sharedPackages: runtime.sharedPackages,
+  files: runtime.files,
+}
+writeFileSync(
+  join(profileDir, 'desktop-runtime-state.json'),
+  `${JSON.stringify({
+    schemaVersion: 1,
+    runtimeId: createHash('sha256').update(JSON.stringify(descriptor)).digest('hex'),
+    version: runtime.release.version,
+    nodeVersion: runtime.release.nodeVersion,
+    platform: runtime.platform,
+    arch: runtime.arch,
+    lockHash: createHash('sha256').update('').digest('hex'),
+    links: [],
+  }, undefined, 2)}\n`,
+)
+console.log(`  + home/profiles/desktop/desktop-runtime-state.json (node ${runtime.release.nodeVersion}, ${runtime.platform}/${runtime.arch})`)
 
 // 3) 插件真身。必须是**真实文件**：validateDesktopPluginGraph 见 symlink 就拒。
 //    发布版 package.json 剔除 devDependencies 里指向本机 harness 的 link:。
