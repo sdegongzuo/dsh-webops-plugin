@@ -1,5 +1,9 @@
 # dsh 桌面端便携版 v0.1.0（Windows x64）
 
+> **本文是 v0.1.0 那次手动发版的历史存档**（当时的 zip 是本机打的）。
+> 自 `desktop-v0.2.0` 起，Release 说明由 `.github/workflows/release-desktop.yml`
+> 在 CI 里内联生成（含当场算出的 SHA-256 与体积），不再维护这份文档。
+
 **已内置 `dsh-webops-plugin@0.1.0`**，解压即用：不需要 Node、不需要 pnpm、不需要联网装插件、不需要签名证书。
 
 ## 怎么用

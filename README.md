@@ -630,7 +630,11 @@ P2/P3 的设计依据见 `docs/P2-P3-开发方案.md` 与 `docs/P2-P3-状态归�
 
 ## 发版
 
-推 `v*` tag 触发 `.github/workflows/release.yml`：windows-latest 上取 deepseek-harness 源码
+两条链路各自吃一种 tag，互不干扰：
+
+### 插件便携版 —— `v*` tag
+
+`.github/workflows/release.yml`：windows-latest 上取 deepseek-harness 源码
 （13 个 `link:` 依赖指向它）→ `pnpm install` → `pnpm build` → 打 zip → 建 Release。
 也支持 Actions 手动补发（`workflow_dispatch`，可覆盖 `harness_ref`）。
 
@@ -645,6 +649,29 @@ git tag v0.1.0 && git push origin v0.1.0
 
 > 便携版的「win-x64」体现在**命名与验证环境**上：产物本身是平台无关的 JS + 一个
 > Electron 窗口宿主 `lib/browser-electron/host.cjs`（运行时由桌面端提供 electron.exe）。
+
+### 桌面端便携版（含插件的整个 dsh）—— `desktop-v*` tag
+
+`.github/workflows/release-desktop.yml`：取 harness → **打补丁** → 装依赖 → 修 electron-builder
+的 EPERM → `package:win:x64:dir --unsigned` → 物化插件 profile → 打 zip → 建 Release。
+约 226 MB，CI 要 1–3 小时（job timeout 180 分钟）。
+
+```bash
+git tag desktop-v0.2.0 && git push origin desktop-v0.2.0
+```
+
+**harness 侧必须打补丁才能过，补丁在本仓 `docs/harness-desktop-build.patch`**，
+`git apply --ignore-whitespace` 干净应用（已在 pin 的 `c291e79` 上验证过）：
+
+| 补丁点 | 为什么 |
+|---|---|
+| 去掉 `install --prod --frozen-lockfile --trust-lockfile` 的 `--frozen-lockfile` / `--trust-lockfile` | 这组标志下 pnpm 卡在 `added 241/507` 且 `download` 恒为 0（换 registry 也不动），去掉后同一项目 21.5 秒装完 |
+| 跳过 `runtime-payload-smoke.mjs` 的 `checkFsExt()` | `fs-ext` **不在**当前版本依赖树里（多个 tarball、lockfile、产物 `node_modules` 全都没有），`require` 必然 `MODULE_NOT_FOUND` —— 不是编译失败，是没被安装 |
+
+补丁只改 CI 里的临时 checkout，不污染本地 harness。另一个坑在 `scripts/patch-electron-builder.mjs`：
+electron-builder 解包完立即 rename，Windows 上因句柄未释放报 EPERM，加了个重试。
+
+> **不需要 Visual C++ 构建工具**：node-pty 用预编译的 conpty.dll，koffi / sharp 同理，实测没有编译过原生模块。
 
 ## License
 
