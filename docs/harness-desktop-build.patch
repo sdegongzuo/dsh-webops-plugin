@@ -152,3 +152,19 @@ index da2d5c478d..df8381a4d5 100644
    checkKoffi()
    await checkSharp()
    checkHtml()
+diff --git a/apps/desktop/electron-builder.config.mjs b/apps/desktop/electron-builder.config.mjs
+index 752a3c4134..42f1a9821e 100644
+--- a/apps/desktop/electron-builder.config.mjs
++++ b/apps/desktop/electron-builder.config.mjs
+@@ -63,9 +63,9 @@ export function createElectronBuilderConfig(
+       'lib/*.cjs',
+       'renderer/**/*',
+       'package.json',
+-      { from: buildPaths.dsh, to: 'dsh', filter: ['**/*'] },
++      { from: buildPaths.dsh, to: 'dsh', filter: ['**/*', '**/.*', '**/.*/**/*'] },
+       // electron-builder excludes a source directory's root node_modules.
+-      { from: join(buildPaths.dsh, 'node_modules'), to: 'dsh/node_modules', filter: ['**/*'] },
++      { from: join(buildPaths.dsh, 'node_modules'), to: 'dsh/node_modules', filter: ['**/*', '**/.*', '**/.*/**/*'] },
+     ],
+     asarUnpack: [
+       '**/*.{node,dylib,dll,so,exe}',

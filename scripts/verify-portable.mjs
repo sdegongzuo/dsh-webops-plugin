@@ -179,6 +179,24 @@ try {
   check(true, `${runtimeLabel} 完整性：${String(runtime.files.length)} 个文件 sha256 全部匹配`)
 } catch (error) {
   check(false, `${runtimeLabel} 完整性校验失败（解压损坏？）：${error.message}`)
+  // 官方只丢一句 `integrity verification failed`，不说是哪个文件 —— 定位全靠猜。
+  // 这里自己再比一遍，把「缺了谁 / 多了谁 / 谁的字节变了」直接打出来。
+  try {
+    const expected = new Map(runtime.files.map(file => [file.path, file]))
+    const actual = new Map(runtimeTree.inventoryDesktopRuntime(runtimeDir).map(file => [file.path, file]))
+    const missing = [...expected.keys()].filter(path => !actual.has(path))
+    const extra = [...actual.keys()].filter(path => !expected.has(path))
+    const changed = [...expected.values()].filter(file => {
+      const found = actual.get(file.path)
+      return found !== undefined && (found.sha256 !== file.sha256 || found.bytes !== file.bytes)
+    })
+    const show = (label, list, format) => console.log(`      ${label} ${String(list.length)} 个${list.length > 0 ? `：${list.slice(0, 10).map(format).join('、')}${list.length > 10 ? ' …' : ''}` : ''}`)
+    show('清单有、盘上没有：', missing, path => path)
+    show('盘上有、清单没有：', extra, path => path)
+    show('字节/sha256 不符：', changed, file => `${file.path}(${String(file.bytes)}B→${String(actual.get(file.path).bytes)}B)`)
+  } catch (detailError) {
+    console.log(`      （差异明细没算出来：${detailError.message}）`)
+  }
 }
 
 const statePath = join(profileDir, 'desktop-runtime-state.json')
