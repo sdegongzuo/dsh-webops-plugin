@@ -47,7 +47,10 @@
  *   7. 便携 home 兜底成立：exe 与 `home/` 同级（打包脚本决定的布局），且 harness 的
  *      `resolvePortableDshHome` 在那个 exe 上真的命中它 —— 正反两向都验，这条保证
  *      「双击 `app\<exe>`」与「走 启动.cmd」等价。本地 harness 没打
- *      `docs/harness-desktop-build.patch` 时跳过（CI 是先打补丁再跑本脚本，必跑）。
+ *      `docs/harness-desktop-build.patch` 时跳过（CI 是先打补丁再跑本脚本，必跑）；
+ *   8. `app/resources/app.asar` 的主进程代码里真的含 harness 补丁注入的那几处
+ *      （主 exe 路径、便携 home 兜底、窗口宿主早期分支）—— 光验 profile 看不出这些，
+ *      而它们缺失时 profile 一样是干净的。
  *
  * 第 6 条**不断言状态条出现在 DOM 里**：状态条挂在会话面的 `conversation.input.dock` 上，
  * 而 `ui-conversation` 只在会话存在时才渲染那个 slot（空 home 会停在「选择工作区」页）。
@@ -247,6 +250,28 @@ if (existsSync(shippedPluginDir)) {
 
 check(!existsSync(join(profileDir, 'cordis.patch.yml')),
   'profile 里没有越权 overlay（出货包不该带 profile 级 patch）')
+
+/* ---------- 3.6 app.asar 里必须真含 harness 补丁注入的代码 ---------- */
+
+// 上面几条只看 profile —— 而「harness 补丁到底有没有进包」只有 app.asar 知道。这跟
+// 2026-09-15「browser-electron 行在、config 没了」是同一类失败：profile 一切正常，
+// Electron 主进程里却少一段代码，症状只会在真机上出现（窗口开不出来 / 双击 exe 找不到配置）。
+// 打包用的 main.js 会经 tsdown 重写（单引号规范成双引号），所以断言用**引号无关的正则**，
+// 不用字面量 —— 这几条正则是在已发布的 v0.2.2 包上逐条试出来的。
+const asarPath = join(resourcesRoot, 'app.asar')
+if (check(existsSync(asarPath), 'app/resources/app.asar 在包里')) {
+  const asarText = readFileSync(asarPath).toString('latin1')   // 标记全是 ASCII，按字节对齐
+  for (const [pattern, what] of [
+    [/process\.env\.DSH_APP_EXECUTABLE = process\.execPath/u, '主 exe 路径注入（app 模式的窗口宿主靠它）'],
+    [/resolvePortableDshHome\(process\.execPath\)/u, '便携 home 兜底（双击 exe 免启动脚本）'],
+    [/\(process\.env\.DSH_HOME \?\? ['"]{2}\)\.trim\(\) === ['"]{2}/u, '便携兜底只在 $DSH_HOME 为空时生效'],
+    [/process\.env\.DSH_BROWSER_ELECTRON_HOST/u, '窗口宿主的早期分支'],
+  ]) {
+    check(pattern.test(asarText), `app.asar 主进程含 ${what}`)
+  }
+  check(!/process\.env\.DSH_DESKTOP_APP_EXECUTABLE/u.test(asarText),
+    'app.asar 里没有 DSH_DESKTOP_ 前缀的变量名（host 子进程会把该前缀全过滤掉）')
+}
 
 /* ---------- 3.5 便携 home 兜底：双击 exe 与走 启动.cmd 等价 ---------- */
 
