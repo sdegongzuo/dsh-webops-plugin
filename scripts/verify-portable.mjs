@@ -31,7 +31,8 @@
  * 由 `applyRelease()` 串起来，跳过任何一步都可能漏掉真实的启动失败。
  *
  * 断言（任一不过即退出码 1）：
- *   1. `app/resources/dsh` 全量 sha256 与 `desktop-runtime.json` 的 `files` 清单一致
+ *   1. 运行时树（0.1.5 是 `app/resources/dsh`，0.1.6 起在 `app/resources/app.asar` 里）
+ *      全量 sha256 与 `desktop-runtime.json` 的 `files` 清单一致
  *      （挡住解压损坏 / 打包截断，这是「包到底好不好」的唯一硬证据）；
  *   2. `desktop-runtime-state.json` 的 `runtimeId` 与本包 runtime 一致
  *      （不一致会被 `assertProfileRuntime` 在起宿主之前拦下），且
@@ -86,6 +87,7 @@ import { createRequire } from 'node:module'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
+import { materializeRuntimeDir } from './desktop-runtime.mjs'
 
 /* ---------- 参数 ---------- */
 
@@ -117,13 +119,27 @@ function parseArgs(argv) {
 
 const options = parseArgs(process.argv.slice(2))
 const packageRoot = resolve(options.dir)
-const resourcesRoot = join(packageRoot, 'app', 'resources')
-const runtimeDir = join(resourcesRoot, 'dsh')
 const profileDir = join(packageRoot, 'home', 'profiles', options.profile)
 
-for (const path of [join(packageRoot, 'app'), runtimeDir]) {
-  if (!existsSync(path)) throw new Error(`verify-portable: ${path} 不存在 —— --dir 要指到解压后的便携版根目录（里面有 app/）`)
-}
+const appRoot = join(packageRoot, 'app')
+if (!existsSync(appRoot)) throw new Error(`verify-portable: ${appRoot} 不存在 —— --dir 要指到解压后的便携版根目录（里面有 app/）`)
+
+// dsh 0.1.6 起运行时被打进 app.asar，磁盘上不是真目录（见 desktop-runtime.mjs 文件头）。
+// 纯 Node 脚本读不了 asar，先物化成临时目录再验；0.1.5 的 `resources\dsh` 直接用。
+const materialized = materializeRuntimeDir(appRoot)
+const resourcesRoot = materialized.resources ?? join(appRoot, 'resources')
+const runtimeDir = materialized.runtimeDir
+/** 日志/失败信息里说清楚验的是哪棵树，免得看日志的人再去猜版本。 */
+const runtimeLabel = materialized.layout === 'asar'
+  ? 'app/resources/app.asar 内的 dsh 树（已解到临时目录）'
+  : 'app/resources/dsh'
+/**
+ * 桌面端用什么方式把宿主包给到插件，跟布局一一对应：
+ * `main.ts` 在打包态返回 `profileResolution: 'runtime'`，于是 `prepareProfile` 走
+ * `recordDesktopRuntimeProfile`（只记状态、不建链）；开发态/旧版走 `link`。
+ */
+const resolutionMode = materialized.layout === 'asar' ? 'runtime' : 'link'
+process.on('exit', () => materialized.cleanup())
 
 const harnessDesktopSrc = join(resolve(options.harness ?? process.env.DSH_HARNESS ?? 'D:/dev/cli/deepseek-harness'), 'apps', 'desktop', 'src')
 for (const file of ['runtime-tree.ts', 'profile-packages.ts', 'paths.ts']) {
@@ -160,9 +176,9 @@ console.log(`      runtime ${runtime.release.version} / node ${runtime.release.n
 // 把「解压是否完整」从臆测变成证据：逐文件 sha256 对齐打包时记录的清单。
 try {
   await runtimeTree.verifyDesktopRuntime(runtimeDir, runtime.release.version)
-  check(true, `app/resources/dsh 完整性：${String(runtime.files.length)} 个文件 sha256 全部匹配`)
+  check(true, `${runtimeLabel} 完整性：${String(runtime.files.length)} 个文件 sha256 全部匹配`)
 } catch (error) {
-  check(false, `app/resources/dsh 完整性校验失败（解压损坏？）：${error.message}`)
+  check(false, `${runtimeLabel} 完整性校验失败（解压损坏？）：${error.message}`)
 }
 
 const statePath = join(profileDir, 'desktop-runtime-state.json')
@@ -188,7 +204,7 @@ const workProfileDir = join(scratchBase, options.profile)
 
 let activePlugins = []
 if (existsSync(profileDir)) {
-  // 在副本上做：`linkDesktopHostPackages` 会往 node_modules 写 241 条 junction 并重写 state，
+  // 在副本上做：link 模式下 `linkDesktopHostPackages` 会往 node_modules 写几百条 junction 并重写 state，
   // 不该污染 `--dir` 里那份。副本也从「出厂态」开始，正好验证首次启动那条路径。
   cpSync(profileDir, workProfileDir, { recursive: true })
 
@@ -203,15 +219,33 @@ if (existsSync(profileDir)) {
   const nmDir = join(profileDir, 'node_modules')
   const shipped = existsSync(nmDir) ? readdirSync(nmDir) : []
   notes.push(`出厂态 profile/node_modules 只有 ${String(shipped.length)} 个条目（${shipped.join(', ')}）——` +
-    `${String(runtime.sharedPackages.length)} 条宿主链接由桌面端首次启动时建立，不在 zip 里，这是设计如此`)
+    resolutionMode === 'runtime'
+      ? `${String(runtime.sharedPackages.length)} 个宿主包由 app.asar 直接供给（runtime 模式不建链），这是设计如此`
+      : `${String(runtime.sharedPackages.length)} 条宿主链接由桌面端首次启动时建立，不在 zip 里，这是设计如此`)
 
   try {
-    profilePackages.linkDesktopHostPackages(workProfileDir, runtimeDir, runtime)
-    const linked = profilePackages.readDesktopProfileState(workProfileDir)
-    check(linked.links.length === runtime.sharedPackages.length,
-      `建链 ${String(linked.links.length)}/${String(runtime.sharedPackages.length)} 条宿主包链接`)
-    profilePackages.validateDesktopPluginGraph(workProfileDir, runtimeDir, runtime, activePlugins)
-    check(true, '依赖图校验通过（插件依赖本地化 + 共享宿主实例 + peer 版本满足）')
+    if (resolutionMode === 'runtime') {
+      // dsh 0.1.6 起打包态不再建 junction：宿主包由 `app.asar\dsh` 直接供给
+      // （宿主进程改成本 exe + ELECTRON_RUN_AS_NODE，能读 asar）。`prepareProfile`
+      // 因此只记状态，而 `applyRelease` 的快速返回分支也**不检查 links**。
+      // 这里照抄它，顺带断言「不建链」这件事本身 —— 若哪天上游改回 link 模式，
+      // 这一条会先转红，提示下面的分支该换回来了。
+      profilePackages.recordDesktopRuntimeProfile(workProfileDir, runtime)
+      const recorded = profilePackages.readDesktopProfileState(workProfileDir)
+      check(recorded.runtimeId === runtimeId,
+        'runtime 模式只记状态（recordDesktopRuntimeProfile 写回 runtimeId）')
+      check(recorded.links.length === 0,
+        `runtime 模式不建宿主链接（links=${String(recorded.links.length)}，宿主包在 app.asar 里）`)
+      profilePackages.validateDesktopPluginGraph(workProfileDir, runtimeDir, runtime, activePlugins, 'runtime')
+      check(true, `依赖图校验通过（runtime 模式：${String(runtime.sharedPackages.length)} 个宿主包由 asar 供给 + peer 版本满足）`)
+    } else {
+      profilePackages.linkDesktopHostPackages(workProfileDir, runtimeDir, runtime)
+      const linked = profilePackages.readDesktopProfileState(workProfileDir)
+      check(linked.links.length === runtime.sharedPackages.length,
+        `建链 ${String(linked.links.length)}/${String(runtime.sharedPackages.length)} 条宿主包链接`)
+      profilePackages.validateDesktopPluginGraph(workProfileDir, runtimeDir, runtime, activePlugins)
+      check(true, '依赖图校验通过（插件依赖本地化 + 共享宿主实例 + peer 版本满足）')
+    }
   } catch (error) {
     check(false, `prepareProfile 失败：${error.message}`)
   }

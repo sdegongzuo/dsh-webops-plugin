@@ -36,6 +36,7 @@ import { createHash } from 'node:crypto'
 import { cpSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { readRuntimeDescriptor } from './desktop-runtime.mjs'
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const DIST = join(ROOT, 'dist')
@@ -144,12 +145,17 @@ console.log('  + home/profiles/desktop/package.json')
 //     一次 prepareProfile（幂等）。
 //   · lockHash 必须等于 `desktopPluginLockHash()` 在「没有 pnpm-lock.yaml」时的值，
 //     即空串的 sha256。
-const descriptorPath = join(appDir, 'resources', 'dsh', 'desktop-runtime.json')
-if (!existsSync(descriptorPath)) {
-  console.error(`package-desktop-portable: 缺 ${descriptorPath}（app 目录不完整？）`)
+//
+// 清单在哪棵树里取决于 dsh 版本：0.1.5 及更早是 `resources\dsh\` 真目录，0.1.6 起
+// 打进了 `resources\app.asar`（详见 `desktop-runtime.mjs` 的文件头）。两种都认，
+// 换 harness 版本不至于把这一步搞挂。
+let runtime
+try {
+  runtime = readRuntimeDescriptor(appDir).descriptor
+} catch (error) {
+  console.error(`package-desktop-portable: ${error.message}`)
   process.exit(1)
 }
-const runtime = JSON.parse(readFileSync(descriptorPath, 'utf8'))
 const descriptor = {
   schemaVersion: runtime.schemaVersion,
   release: runtime.release,
