@@ -246,7 +246,7 @@ if (existsSync(profileDir)) {
   const shipped = existsSync(nmDir) ? readdirSync(nmDir) : []
   notes.push(`出厂态 profile/node_modules 只有 ${String(shipped.length)} 个条目（${shipped.join(', ')}）——` +
     resolutionMode === 'runtime'
-      ? `${String(runtime.sharedPackages.length)} 个宿主包由 app.asar 直接供给（runtime 模式不建链），这是设计如此`
+      ? `${String(runtime.sharedPackages.length)} 个宿主包由运行时目录直接供给（runtime 模式不建链），这是设计如此`
       : `${String(runtime.sharedPackages.length)} 条宿主链接由桌面端首次启动时建立，不在 zip 里，这是设计如此`)
 
   try {
@@ -261,9 +261,9 @@ if (existsSync(profileDir)) {
       check(recorded.runtimeId === runtimeId,
         'runtime 模式只记状态（recordDesktopRuntimeProfile 写回 runtimeId）')
       check(recorded.links.length === 0,
-        `runtime 模式不建宿主链接（links=${String(recorded.links.length)}，宿主包在 app.asar 里）`)
+        `runtime 模式不建宿主链接（links=${String(recorded.links.length)}），宿主包由 runtime 目录直接解析`)
       profilePackages.validateDesktopPluginGraph(workProfileDir, runtimeDir, runtime, activePlugins, 'runtime')
-      check(true, `依赖图校验通过（runtime 模式：${String(runtime.sharedPackages.length)} 个宿主包由 asar 供给 + peer 版本满足）`)
+      check(true, `依赖图校验通过（runtime 模式：${String(runtime.sharedPackages.length)} 个宿主包由 runtime 目录供给 + peer 版本满足）`)
     } else {
       profilePackages.linkDesktopHostPackages(workProfileDir, runtimeDir, runtime)
       const linked = profilePackages.readDesktopProfileState(workProfileDir)
