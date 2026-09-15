@@ -12,12 +12,13 @@ name: release-desktop
 #        registry 依赖，卡在 `added 241/507`、`download` 恒为 0。去掉后 21.5 秒装完。
 #      - `runtime-payload-smoke.mjs` 校验 `fs-ext`，但 fs-ext **不在 0.1.5-rc.2 的依赖树里**
 #        （产物 node_modules 里搜不到，518 个 tarball 也没有）→ 跳过该项。
-#      - `electron-builder.config.mjs` 把 dsh 打包进 asar 用的 filter 是 `['**/*']`，
-#        而 minimatch 默认 **不匹配点文件/点目录**，于是 dsh 树里 145 个
-#        `.github/logo.svg`、`.keep`、`.yarn/**`、`.idea/**` 之类的条目进不了 asar，
-#        `verifyDesktopRuntime` 的全量 sha256 校验必然失败（0.1.5 时 dsh 走
-#        extraResources 整目录复制，所以没这问题）。补 `**/.*` 与 `**/.*/**/*` 两个
-#        pattern 覆盖「点文件」和「点目录下的文件」两种形态。
+#      - 0.1.6 把 dsh 运行时从 extraResources 挪进了 `files`（于是被封进 app.asar）。
+#        这有两条后果，都让 `desktop-runtime.json` 的 `files` 清单对不上：
+#        filter `['**/*']` 按 minimatch 默认不放行点文件（145 个 `.keep` / `.yarn/**`）；
+#        更要命的是进了 app 目录就会被 electron-builder 当生产依赖剪裁，实测
+#        **239 个包的 package.json 字节被改小**。所以这里把 dsh 挪回
+#        extraResources，并让 `main.ts` 打包态的 dsh 指回 `resources\dsh`
+#        （0.1.5 及更早就是这条路径）。代价只是少享一点上游的 asar 收益。
 #   2. `scripts/patch-electron-builder.mjs`
 #      electron-builder 解包完立即 rename，Windows 上因句柄未释放报 EPERM。加个重试。
 #

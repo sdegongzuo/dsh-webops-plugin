@@ -1,3 +1,27 @@
+diff --git a/apps/desktop/electron-builder.config.mjs b/apps/desktop/electron-builder.config.mjs
+index 752a3c4134..b745e522cb 100644
+--- a/apps/desktop/electron-builder.config.mjs
++++ b/apps/desktop/electron-builder.config.mjs
+@@ -63,9 +63,6 @@ export function createElectronBuilderConfig(
+       'lib/*.cjs',
+       'renderer/**/*',
+       'package.json',
+-      { from: buildPaths.dsh, to: 'dsh', filter: ['**/*'] },
+-      // electron-builder excludes a source directory's root node_modules.
+-      { from: join(buildPaths.dsh, 'node_modules'), to: 'dsh/node_modules', filter: ['**/*'] },
+     ],
+     asarUnpack: [
+       '**/*.{node,dylib,dll,so,exe}',
+@@ -75,6 +72,9 @@ export function createElectronBuilderConfig(
+     ],
+     extraResources: [
+       { from: buildPaths.runtime, to: 'runtime' },
++      { from: buildPaths.dsh, to: 'dsh' },
++      // electron-builder excludes a source directory's root node_modules.
++      { from: join(buildPaths.dsh, 'node_modules'), to: 'dsh/node_modules' },
+     ],
+     mac: {
+       category: 'public.app-category.developer-tools',
 diff --git a/apps/desktop/scripts/prepare-dsh.ts b/apps/desktop/scripts/prepare-dsh.ts
 index d3f9dae8a3..f83a0923ed 100644
 --- a/apps/desktop/scripts/prepare-dsh.ts
@@ -15,7 +39,7 @@ index d3f9dae8a3..f83a0923ed 100644
      const targetName = resolveDesktopBuildTarget()
      const target = { platform: process.platform, arch: targetName.endsWith('arm64') ? 'arm64' : 'x64' }
 diff --git a/apps/desktop/src/main.ts b/apps/desktop/src/main.ts
-index a73a6223a5..81169987c5 100644
+index e63e21588a..d215a2a7ef 100644
 --- a/apps/desktop/src/main.ts
 +++ b/apps/desktop/src/main.ts
 @@ -1,6 +1,7 @@
@@ -57,7 +81,21 @@ index a73a6223a5..81169987c5 100644
  const SCHEME = 'dsh-app'
  let focusPrimaryWindow = (): void => {}
  type RecoveryAction = 'restart' | 'plugins' | 'reset'
-@@ -503,19 +519,31 @@ async function main(): Promise<void> {
+@@ -76,8 +92,11 @@ function runtimeResources(): RuntimeResources {
+     : process.execPath
+   const pnpm = (development ? process.env.DSH_DESKTOP_PNPM_ENTRY : undefined)
+     ?? join(process.resourcesPath, 'runtime', 'pnpm', 'bin', 'pnpm.mjs')
+-  const dsh = (development ? process.env.DSH_DESKTOP_DSH_DIR : undefined)
+-    ?? (development ? join(process.resourcesPath, 'dsh') : join(app.getAppPath(), 'dsh'))
++  // 便携版把 dsh 运行时留在 `resources\dsh` 真目录，不跟着上游塞进 app.asar：
++  // 进了 app 目录就会被 electron-builder 当生产依赖剪裁（实测 239 个包的
++  // package.json 字节被改小），`desktop-runtime.json` 的 files 清单随之对不上，
++  // 发版自检的完整性校验必然失败。0.1.5 及更早就是这条 extraResources 路径。
++  const dsh = (development ? process.env.DSH_DESKTOP_DSH_DIR : undefined) ?? join(process.resourcesPath, 'dsh')
+   return { node, pnpm, dsh, ...(development ? {} : { profileResolution: 'runtime' }) }
+ }
+ 
+@@ -507,19 +526,31 @@ async function main(): Promise<void> {
    setTimeout(() => { void checkAndPrompt(false) }, 10_000)
  }
  
@@ -152,19 +190,3 @@ index da2d5c478d..df8381a4d5 100644
    checkKoffi()
    await checkSharp()
    checkHtml()
-diff --git a/apps/desktop/electron-builder.config.mjs b/apps/desktop/electron-builder.config.mjs
-index 752a3c4134..42f1a9821e 100644
---- a/apps/desktop/electron-builder.config.mjs
-+++ b/apps/desktop/electron-builder.config.mjs
-@@ -63,9 +63,9 @@ export function createElectronBuilderConfig(
-       'lib/*.cjs',
-       'renderer/**/*',
-       'package.json',
--      { from: buildPaths.dsh, to: 'dsh', filter: ['**/*'] },
-+      { from: buildPaths.dsh, to: 'dsh', filter: ['**/*', '**/.*', '**/.*/**/*'] },
-       // electron-builder excludes a source directory's root node_modules.
--      { from: join(buildPaths.dsh, 'node_modules'), to: 'dsh/node_modules', filter: ['**/*'] },
-+      { from: join(buildPaths.dsh, 'node_modules'), to: 'dsh/node_modules', filter: ['**/*', '**/.*', '**/.*/**/*'] },
-     ],
-     asarUnpack: [
-       '**/*.{node,dylib,dll,so,exe}',

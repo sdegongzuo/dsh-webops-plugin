@@ -133,12 +133,6 @@ const runtimeDir = materialized.runtimeDir
 const runtimeLabel = materialized.layout === 'asar'
   ? 'app/resources/app.asar 内的 dsh 树（已解到临时目录）'
   : 'app/resources/dsh'
-/**
- * 桌面端用什么方式把宿主包给到插件，跟布局一一对应：
- * `main.ts` 在打包态返回 `profileResolution: 'runtime'`，于是 `prepareProfile` 走
- * `recordDesktopRuntimeProfile`（只记状态、不建链）；开发态/旧版走 `link`。
- */
-const resolutionMode = materialized.layout === 'asar' ? 'runtime' : 'link'
 process.on('exit', () => materialized.cleanup())
 
 const harnessDesktopSrc = join(resolve(options.harness ?? process.env.DSH_HARNESS ?? 'D:/dev/cli/deepseek-harness'), 'apps', 'desktop', 'src')
@@ -147,6 +141,20 @@ for (const file of ['runtime-tree.ts', 'profile-packages.ts', 'paths.ts']) {
     throw new Error(`verify-portable: 找不到 ${join(harnessDesktopSrc, file)} —— 用 --harness 指向 deepseek-harness 源码根目录`)
   }
 }
+
+/**
+ * 桌面端用什么方式把宿主包给到插件：**只能问 harness 源码，不能拿布局猜。**
+ *
+ * `main.ts` 在打包态返回 `profileResolution: 'runtime'`，于是 `prepareProfile` 走
+ * `recordDesktopRuntimeProfile`（只记状态、不建链）；0.1.5 及更早没有这个字段，走
+ * `linkDesktopHostPackages`（建几百条 junction）。
+ *
+ * 这两件事与「dsh 放在 `resources\dsh` 还是 app.asar 里」**彼此独立**：0.1.6 上游
+ * 把它们绑在一起改，但我们打补丁把 dsh 挪回了 extraResources，于是出现了
+ * 「布局是 flat、解析却是 runtime」的组合。按布局推断就会跑错分支。
+ */
+const resolutionMode = /profileResolution:\s*'runtime'/u.test(readFileSync(join(harnessDesktopSrc, 'main.ts'), 'utf8'))
+  ? 'runtime' : 'link'
 
 const failures = []
 const notes = []
