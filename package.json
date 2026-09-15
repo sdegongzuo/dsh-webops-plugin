@@ -1,6 +1,6 @@
 {
   "name": "dsh-webops-plugin",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "private": true,
   "description": "为 DeepSeek Harness 提供浏览器调试与操作能力：ctx.browser 能力服务 + CDP provider + browser_* 工具 + 客户端观察面板。",
   "type": "module",
