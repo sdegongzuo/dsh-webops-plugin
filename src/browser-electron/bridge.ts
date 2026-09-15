@@ -14,7 +14,19 @@
 import { spawn, type ChildProcess } from 'node:child_process'
 import { existsSync } from 'node:fs'
 import { connect, type Socket } from 'node:net'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { noteLoaded } from '../debug.ts'
+
+/**
+ * 宿主脚本路径的传递变量（打包应用模式专用）。
+ *
+ * 便携版没有独立的 `electron.exe`，只能用打包应用自己的主 exe 起第二个实例；
+ * 而「`Exe host.cjs`」在打包应用上不成立 —— app 路径固定在 asar 里，argv 里的脚本会被忽略。
+ * 所以走环境变量，由 shell 侧的早期分支接管（harness 侧的分支见
+ * `docs/harness-desktop-build.patch`）。**本常量与补丁里读的变量名必须一致。**
+ */
+export const APP_HOST_ENV = 'DSH_BROWSER_ELECTRON_HOST'
 
 /** 一个标签页的摘要。 */
 export interface BridgeTab {
@@ -27,10 +39,18 @@ export interface BridgeTab {
 
 /** 宿主启动参数。 */
 export interface BridgeOptions {
-  /** Electron 可执行文件路径。 */
+  /** Electron 可执行文件路径（打包应用模式下就是桌面端主 exe 自己）。 */
   readonly electronPath: string
   /** 窗口宿主脚本（`host.cjs`）的绝对路径。 */
   readonly hostScript: string
+  /**
+   * 以「打包应用主 exe」的方式起宿主，而不是「`electron.exe` + 脚本路径」。
+   *
+   * 两者的差别不只是传参：打包应用的 app 路径固定在 asar 里，**不接受**一个脚本路径参数，
+   * 所以要改成「环境变量告诉主进程去 require 哪个脚本」，并且必须给第二个实例一个
+   * **独立的 `--user-data-dir`** —— 否则它会和主应用抢同一份 userData。
+   */
+  readonly appMode?: boolean
   /** 首次开窗的尺寸。 */
   readonly windowSize?: { readonly width: number; readonly height: number }
   /** 单条命令的超时（毫秒）。默认 30000。 */
@@ -65,6 +85,43 @@ export const DEFAULT_BRIDGE_COMMAND_TIMEOUT_MS = 30_000
 
 /** 默认握手超时。 */
 export const DEFAULT_BRIDGE_HANDSHAKE_TIMEOUT_MS = 20_000
+
+/**
+ * 打包应用模式下第二个实例的 `--user-data-dir`。
+ *
+ * 必须和主应用**分开**：共享同一份 userData 会让第二个实例撞上 profile 锁（或污染主应用的
+ * 本地状态）。放系统临时目录、用固定名字即可 —— 宿主是惰性创建且单例的，
+ * 不需要按 pid 再细分。
+ */
+function hostUserDataDir(): string {
+  return join(tmpdir(), 'dsh-browser-electron-host')
+}
+
+/**
+ * 组装窗口宿主的 argv 与子进程环境。
+ *
+ * 抽成纯函数是为了可单测 —— 这两种模式的差别（argv 还是环境变量承载脚本路径）正是
+ * 便携版最容易搞错的地方，不该只靠真机试。
+ *
+ * @param options - 宿主启动参数。
+ * @returns 交给 `spawn` 的 `args` 与 `env`。
+ */
+export function resolveHostLaunch(options: BridgeOptions): {
+  args: string[]
+  environment: NodeJS.ProcessEnv
+} {
+  const environment: NodeJS.ProcessEnv = { ...process.env }
+  // 宿主必须是**真的 Electron 应用**：带这个变量它会退化成纯 Node，`app` 就不存在了。
+  delete environment['ELECTRON_RUN_AS_NODE']
+
+  if (options.appMode === true) {
+    // 打包应用的 app 路径固定在 asar 里，argv 里的脚本会被忽略 —— 只能靠环境变量
+    // 告诉 shell 去 require 哪个脚本；argv 留给 userData 开关。
+    environment[APP_HOST_ENV] = options.hostScript
+    return { args: [`--user-data-dir=${hostUserDataDir()}`], environment }
+  }
+  return { args: [options.hostScript], environment }
+}
 
 /** 一条在途命令。 */
 interface Pending {
@@ -228,11 +285,12 @@ export class ElectronWindowBridge implements TabHostChannel {
       throw new BridgeError(`window host script not found at ${options.hostScript}`, 'BRIDGE_HOST_MISSING')
     }
 
-    const environment: NodeJS.ProcessEnv = { ...process.env }
-    // 宿主必须是**真的 Electron 应用**：带这个变量它会退化成纯 Node，`app` 就不存在了。
-    delete environment['ELECTRON_RUN_AS_NODE']
+    const { args, environment } = resolveHostLaunch(options)
+    if (options.appMode === true) {
+      noteLoaded('browser-electron', `窗口宿主以打包应用模式启动：${options.electronPath}`)
+    }
 
-    const child = spawn(options.electronPath, [options.hostScript], {
+    const child = spawn(options.electronPath, args, {
       env: environment,
       stdio: ['ignore', 'pipe', 'pipe'],
       windowsHide: false,

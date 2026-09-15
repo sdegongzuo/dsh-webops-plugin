@@ -6,6 +6,8 @@ dist/
 .desktop-base/
 # 打包中间产物（app/ + profile/ 的临时拼装目录）
 .desktop-stage/
+# verify:portable 用的解压副本（几百 MB，一次性；本机 safe-delete 会拦大目录删除）
+.rel-verify/
 coverage/
 *.tsbuildinfo
 *.log

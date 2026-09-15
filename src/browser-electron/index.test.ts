@@ -11,6 +11,7 @@ import Module from 'node:module'
 import { createRequire } from 'node:module'
 import { CdpConnection } from '../browser-cdp/protocol.ts'
 import type { BridgeDevTools, BridgeTab, BridgeTabBar, EventListener, TabHostChannel, TakeoverListener, TabOpenedListener } from './bridge.ts'
+import { resolveHostLaunch } from './bridge.ts'
 import { ElectronBrowserProvider } from './provider.ts'
 import { WindowCdpSocket } from './socket.ts'
 import { ElectronWindowTransport, tabHandle, tabIdFromHandle } from './transport.ts'
@@ -649,6 +650,67 @@ describe('resolveConfig', () => {
 
   it('窗口尺寸有默认值', () => {
     expect(resolveConfig({}).windowSize).toEqual({ width: 1100, height: 820 })
+  })
+
+  it('打包态：没有 DSH_BROWSER_ELECTRON_PATH 时退到 shell 注入的 DSH_APP_EXECUTABLE', () => {
+    vi.stubEnv('DSH_BROWSER_ELECTRON_PATH', '')
+    vi.stubEnv('DSH_APP_EXECUTABLE', 'D:/pkg/app/DeepSeek Harness.exe')
+    try {
+      expect(resolveConfig({}).electronPath).toBe('D:/pkg/app/DeepSeek Harness.exe')
+    } finally {
+      vi.unstubAllEnvs()
+    }
+  })
+
+  it('开发态的 DSH_BROWSER_ELECTRON_PATH 优先于 DSH_APP_EXECUTABLE', () => {
+    vi.stubEnv('DSH_BROWSER_ELECTRON_PATH', '/dev/electron.exe')
+    vi.stubEnv('DSH_APP_EXECUTABLE', 'D:/pkg/app/DeepSeek Harness.exe')
+    try {
+      expect(resolveConfig({}).electronPath).toBe('/dev/electron.exe')
+    } finally {
+      vi.unstubAllEnvs()
+    }
+  })
+
+  it('appMode 默认关，可由 config 或环境变量打开，且 config 优先', () => {
+    expect(resolveConfig({}).appMode).toBe(false)
+    expect(resolveConfig({ appMode: true }).appMode).toBe(true)
+    vi.stubEnv('DSH_BROWSER_ELECTRON_APP_MODE', '1')
+    try {
+      expect(resolveConfig({}).appMode).toBe(true)
+      expect(resolveConfig({ appMode: false }).appMode).toBe(false)
+    } finally {
+      vi.unstubAllEnvs()
+    }
+  })
+})
+
+describe('resolveHostLaunch（宿主启动参数）', () => {
+  const base = { electronPath: '/electron.exe', hostScript: '/plugin/lib/browser-electron/host.cjs' }
+
+  it('脚本模式：argv 直接带脚本路径，不设宿主变量', () => {
+    const { args, environment } = resolveHostLaunch(base)
+
+    expect(args).toEqual(['/plugin/lib/browser-electron/host.cjs'])
+    expect(environment.DSH_BROWSER_ELECTRON_HOST).toBeUndefined()
+  })
+
+  it('打包应用模式：脚本路径改走环境变量，argv 只带独立 userData', () => {
+    const { args, environment } = resolveHostLaunch({ ...base, appMode: true })
+
+    expect(environment.DSH_BROWSER_ELECTRON_HOST).toBe('/plugin/lib/browser-electron/host.cjs')
+    expect(args).toHaveLength(1)
+    expect(args[0]).toMatch(/^--user-data-dir=/u)
+  })
+
+  it('两种模式都摘掉 ELECTRON_RUN_AS_NODE（否则宿主退化成纯 Node，开不了窗口）', () => {
+    vi.stubEnv('ELECTRON_RUN_AS_NODE', '1')
+    try {
+      expect(resolveHostLaunch(base).environment.ELECTRON_RUN_AS_NODE).toBeUndefined()
+      expect(resolveHostLaunch({ ...base, appMode: true }).environment.ELECTRON_RUN_AS_NODE).toBeUndefined()
+    } finally {
+      vi.unstubAllEnvs()
+    }
   })
 })
 

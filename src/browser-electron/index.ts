@@ -38,7 +38,7 @@ import { ElectronWindowTransport } from './transport.ts'
 import { noteLoaded } from '../debug.ts'
 
 export { ELECTRON_PROVIDER_ID, ElectronBrowserProvider } from './provider.ts'
-export { BridgeError, ElectronWindowBridge } from './bridge.ts'
+export { APP_HOST_ENV, BridgeError, ElectronWindowBridge } from './bridge.ts'
 export type { BridgeDevTools, BridgeOptions, BridgeTab, BridgeTabBar, TabHostChannel, TakeoverListener } from './bridge.ts'
 export { ELECTRON_TAB_SCHEME, ElectronWindowTransport, tabHandle, tabIdFromHandle } from './transport.ts'
 export { WindowCdpSocket } from './socket.ts'
@@ -55,6 +55,20 @@ export const PROVIDER_ENV = 'DSH_BROWSER_PROVIDER'
 /** Electron 可执行文件路径的环境变量。 */
 export const ELECTRON_PATH_ENV = 'DSH_BROWSER_ELECTRON_PATH'
 
+/**
+ * 桌面端主 exe 的路径（由 shell 在启动时写进 `process.env`，随 host 子进程传给插件）。
+ *
+ * 打包态它就是「窗口宿主的 Electron 二进制」—— 主 exe 自己。它是**用户机器上的
+ * 绝对路径**，打包时无从得知，所以只能运行时注入。
+ *
+ * **前缀有讲究**：不能叫 `DSH_DESKTOP_*`，`host-process.ts` 会把那个前缀的变量
+ * 全部过滤掉，插件根本收不到（见 `docs/harness-desktop-build.patch`）。
+ */
+export const APP_EXECUTABLE_ENV = 'DSH_APP_EXECUTABLE'
+
+/** 强制以「打包应用模式」启动宿主（`1` 表示启用；给开发态本地验证用）。 */
+export const APP_MODE_ENV = 'DSH_BROWSER_ELECTRON_APP_MODE'
+
 /** 本 provider 的 id（供外部引用）。 */
 export const PROVIDER_ID = 'electron'
 
@@ -65,8 +79,15 @@ export const DEFAULT_WINDOW_SIZE = { width: 1100, height: 820 } as const
 export interface Config {
   /** 是否启用；缺省时看 `DSH_BROWSER_PROVIDER`。 */
   enabled?: boolean
-  /** Electron 可执行文件路径；缺省时看 `DSH_BROWSER_ELECTRON_PATH`。 */
+  /** Electron 可执行文件路径；缺省时看 `DSH_BROWSER_ELECTRON_PATH`，再退到 `DSH_APP_EXECUTABLE`。 */
   electronPath?: string
+  /**
+   * 用「打包应用主 exe + 环境变量」起宿主，而不是「`electron.exe` + 脚本路径」。
+   *
+   * 便携版必须打开：那里没有独立的 `electron.exe`，只有打包应用的主 exe。
+   * 缺省时看 `DSH_BROWSER_ELECTRON_APP_MODE`。
+   */
+  appMode?: boolean
   /** 新建窗口的尺寸。 */
   windowSize?: { width?: number; height?: number }
   /** 单条命令超时（毫秒）。 */
@@ -78,6 +99,7 @@ export interface Config {
 export const Config: z<Config> = z.object({
   enabled: z.boolean(),
   electronPath: z.string(),
+  appMode: z.boolean(),
   windowSize: z.object({
     width: z.number().default(DEFAULT_WINDOW_SIZE.width),
     height: z.number().default(DEFAULT_WINDOW_SIZE.height),
@@ -104,6 +126,7 @@ export function apply(ctx: Context, config: Config = {}): void {
     new ElectronWindowTransport({
       electronPath: settings.electronPath ?? '',
       hostScript: resolveHostScript(),
+      appMode: settings.appMode,
       windowSize: settings.windowSize,
       ...settings.commandTimeoutMs === undefined ? {} : { commandTimeoutMs: settings.commandTimeoutMs },
       ...settings.handshakeTimeoutMs === undefined ? {} : { handshakeTimeoutMs: settings.handshakeTimeoutMs },
@@ -116,23 +139,34 @@ export function apply(ctx: Context, config: Config = {}): void {
       void provider.dispose().catch(() => undefined)
     }
   }, 'browser-electron.dispose()')
-  noteLoaded('browser-electron', `enabled=${String(settings.enabled)} electron=${settings.electronPath ?? '（未指定）'}`)
+  noteLoaded('browser-electron', `enabled=${String(settings.enabled)} electron=${settings.electronPath ?? '（未指定）'} appMode=${String(settings.appMode)}`)
+}
+
+/** 取第一个非空的环境变量值（空串按「没设」处理）。 */
+function firstNonEmpty(value: string | undefined): string | undefined {
+  return value !== undefined && value.length > 0 ? value : undefined
 }
 
 /** 解析配置：`config` 优先，环境变量兜底。 */
 export function resolveConfig(config: Config = {}): {
   enabled: boolean
   electronPath: string | undefined
+  appMode: boolean
   windowSize: { width: number; height: number }
   commandTimeoutMs: number | undefined
   handshakeTimeoutMs: number | undefined
 } {
   const enabled = config.enabled ?? process.env[PROVIDER_ENV] === PROVIDER_ID
-  const fromEnv = process.env[ELECTRON_PATH_ENV]
-  const electronPath = config.electronPath ?? (fromEnv !== undefined && fromEnv.length > 0 ? fromEnv : undefined)
+  // 打包态没有 `DSH_BROWSER_ELECTRON_PATH`（那是开发态 dev-desktop 设的），
+  // 只有 shell 注进来的 `DSH_APP_EXECUTABLE` —— 它就是窗口宿主要的 Electron 二进制。
+  const electronPath = config.electronPath
+    ?? firstNonEmpty(process.env[ELECTRON_PATH_ENV])
+    ?? firstNonEmpty(process.env[APP_EXECUTABLE_ENV])
+  const appMode = config.appMode ?? process.env[APP_MODE_ENV] === '1'
   return {
     enabled,
     electronPath,
+    appMode,
     windowSize: {
       width: config.windowSize?.width ?? DEFAULT_WINDOW_SIZE.width,
       height: config.windowSize?.height ?? DEFAULT_WINDOW_SIZE.height,

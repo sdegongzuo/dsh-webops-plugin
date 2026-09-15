@@ -34,8 +34,20 @@
     # 桌面端用的 provider：开一个真的 Electron 窗口，用 webContents.debugger 驱动。
     # 它**默认不参与 provider 选择**（`available()` 要求显式启用），所以插在这儿
     # 不会影响 CLI 场景 —— 那边只有 browser-cdp 可用，仍然自动选中它。
+    #
+    # 便携版必须把 config 写全，两个键缺一不可（2026-09-15 补）：
+    #   - `enabled: true`：不写的话 available() 恒为 false，`browser_open` 会落到
+    #     browser-cdp，而它在桌面端里是死路（内置 Chromium 不实现 `PUT /json/new`，
+    #     只会回 `Could not create new page`）—— 症状就是「没法打开新的窗口」。
+    #   - `appMode: true`：包里**没有**独立的 electron.exe，窗口宿主只能用桌面端主 exe
+    #     起第二个实例；这个模式下脚本路径走环境变量、argv 换成 `--user-data-dir`。
+    # `electronPath` 故意不写：它是用户机器上的绝对路径，打包时无从得知，
+    # 由 shell 注入的 `DSH_APP_EXECUTABLE` 兜底（见 harness 补丁）。
     - id: browser-electron
       name: 'dsh-webops-plugin/browser-electron'
+      config:
+        enabled: true
+        appMode: true
 
     - id: tool-browser
       name: 'dsh-webops-plugin/tool-browser'

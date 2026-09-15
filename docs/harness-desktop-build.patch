@@ -14,6 +14,77 @@ index d3f9dae8a3..f83a0923ed 100644
      const packageSet = readDesktopCorePackageSet(BUILD_ROOT, release.version)
      const targetName = resolveDesktopBuildTarget()
      const target = { platform: process.platform, arch: targetName.endsWith('arm64') ? 'arm64' : 'x64' }
+diff --git a/apps/desktop/src/main.ts b/apps/desktop/src/main.ts
+index a73a6223a5..8644d32bcf 100644
+--- a/apps/desktop/src/main.ts
++++ b/apps/desktop/src/main.ts
+@@ -1,6 +1,7 @@
+ /** Electron shell: desktop project ownership, custom protocol, windows, and lifecycle. */
+ 
+ import { readFile, writeFile } from 'node:fs/promises'
++import { createRequire } from 'node:module'
+ import { extname, join, normalize, resolve, sep } from 'node:path'
+ import { fileURLToPath } from 'node:url'
+ import {
+@@ -23,6 +24,11 @@ import { DesktopUpdateCoordinator } from './update-coordinator.ts'
+ import { desktopErrorState } from './startup-error.ts'
+ import { startupFailureDocument } from './startup-document.ts'
+ 
++// 让 host 子进程（以及跑在里面的插件）知道 shell 主 exe 在哪 —— 便携版没有独立的
++// electron.exe，browser-electron 的窗口宿主只能用这个 exe 起第二个实例。
++// 注意**不能**用 `DSH_DESKTOP_` 前缀：`host-process.ts` 会把那个前缀的变量全部过滤掉。
++process.env.DSH_APP_EXECUTABLE = process.execPath
++
+ const SCHEME = 'dsh-app'
+ let focusPrimaryWindow = (): void => {}
+ type RecoveryAction = 'restart' | 'plugins' | 'reset'
+@@ -503,19 +509,31 @@ async function main(): Promise<void> {
+   setTimeout(() => { void checkAndPrompt(false) }, 10_000)
+ }
+ 
+-const ownsDesktopInstance = claimDesktopSingleInstance(app, () => { focusPrimaryWindow() })
++// 窗口宿主模式：便携版里 browser-electron 用主 exe 起第二个实例来开浏览器窗口，
++// 靠 `DSH_BROWSER_ELECTRON_HOST` 把宿主脚本的绝对路径传进来
++// （「Exe host.cjs」在打包应用上不成立 —— app 路径固定在 asar 里，argv 里的脚本会被忽略）。
++//
++// 必须在 `claimDesktopSingleInstance` **之前**接管：先抢了单实例锁的话第二个实例会直接退出。
++// 宿主只管开窗口，不碰 profile、也不开主窗口。
++const browserHostScript = process.env.DSH_BROWSER_ELECTRON_HOST
+ 
+-if (ownsDesktopInstance) void app.whenReady().then(main).catch(async (error: unknown) => {
+-  const message = error instanceof Error ? error.message : String(error)
+-  console.error(error)
+-  const diagnosticFile = process.env.DSH_DESKTOP_DIAGNOSTIC_FILE
+-  if (diagnosticFile !== undefined) {
+-    await writeFile(diagnosticFile, `${error instanceof Error ? error.stack ?? message : message}\n`).catch(() => undefined)
+-  }
+-  const window = BrowserWindow.getAllWindows()[0] ?? createWindow(fileURLToPath(new URL('./preload-app.cjs', import.meta.url)), true)
+-  window.once('closed', () => { app.quit() })
+-  await showEmergencyDocument(window, message)
+-}).catch((error: unknown) => {
+-  console.error(error)
+-  app.exit(1)
+-})
++if (browserHostScript !== undefined && browserHostScript !== '') {
++  createRequire(import.meta.url)(browserHostScript)
++} else {
++  const ownsDesktopInstance = claimDesktopSingleInstance(app, () => { focusPrimaryWindow() })
++
++  if (ownsDesktopInstance) void app.whenReady().then(main).catch(async (error: unknown) => {
++    const message = error instanceof Error ? error.message : String(error)
++    console.error(error)
++    const diagnosticFile = process.env.DSH_DESKTOP_DIAGNOSTIC_FILE
++    if (diagnosticFile !== undefined) {
++      await writeFile(diagnosticFile, `${error instanceof Error ? error.stack ?? message : message}\n`).catch(() => undefined)
++    }
++    const window = BrowserWindow.getAllWindows()[0] ?? createWindow(fileURLToPath(new URL('./preload-app.cjs', import.meta.url)), true)
++    window.once('closed', () => { app.quit() })
++    await showEmergencyDocument(window, message)
++  }).catch((error: unknown) => {
++    console.error(error)
++    app.exit(1)
++  })
++}
 diff --git a/apps/desktop/tests/fixtures/runtime-payload-smoke.mjs b/apps/desktop/tests/fixtures/runtime-payload-smoke.mjs
 index da2d5c478d..df8381a4d5 100644
 --- a/apps/desktop/tests/fixtures/runtime-payload-smoke.mjs

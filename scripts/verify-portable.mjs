@@ -60,8 +60,14 @@
  *     --browser "C:/Program Files/Google/Chrome/Application/chrome.exe"
  * ```
  *
- * `--dir` 里 `home/` 的设置与凭据会被复制到一次性 home（`--home` 可指定，`--keep-home` 保留），
- * **不会**动包里那份；profile 的建链也在工作副本上做，所以可以反复跑。
+ * `--dir` 里 `home/` 的设置与凭据会被复制到一次性 home（`--home` 可指定、`--keep-home` 保留），
+ * **不会**动包里那份；profile 的建链也在工作副本上做。
+ *
+ * ⚠️ **`--dir` 必须是「刚解压、还没启动过」的目录**。启动过一次的便携版，它的 profile 里
+ * 已经躺着自己建好的 241 条链接，工作副本复制过去后建链会失败并报
+ * `refusing to replace unowned package @deepseek-ai/cordis`；紧接着还会连锁出
+ * `Cannot find package 'js-yaml'` / `plugin tree failed to load` 之类看起来吓人的错误 ——
+ * **都不是包坏了**，是这份目录不再是出厂态。要复验就重新解压一份。
  *
  * `--harness` 指向 deepseek-harness 源码（默认 `$DSH_HARNESS` 或 `D:/dev/cli/deepseek-harness`）。
  * 前 3 条断言依赖它的 `apps/desktop/src/*.ts`，缺了就没法验真启动路径，脚本会直接报错退出。
@@ -217,8 +223,18 @@ if (existsSync(shippedPluginDir)) {
   check(body.includes('dsh-webops-plugin/browser-electron'), '出货 patch 含 browser-electron 行')
   check(body.includes('dsh-webops-plugin/tool-browser'), '出货 patch 含 tool-browser 行')
   check(/name:\s*['"]?dsh-webops-plugin['"]?\s*$/mu.test(body), '出货 patch 含裸包名行（客户端半边靠它被发现）')
+  // 「行存在」不够 —— 2026-09-15 事故就是「行在、config 没了」：provider 于是从不参与
+  // 选择，browser_open 落到桌面端的死路上，症状是「没法打开新的窗口」，且不报任何错。
+  const electronAt = body.indexOf('browser-electron')
+  const nextRowAt = electronAt === -1 ? -1 : body.indexOf('- id:', electronAt + 1)
+  const electronRow = electronAt === -1 ? '' : body.slice(electronAt, nextRowAt === -1 ? undefined : nextRowAt)
+  check(/enabled:\s*true/u.test(electronRow),
+    'browser-electron 带 enabled: true（否则 available() 恒为 false）')
+  check(/appMode:\s*true/u.test(electronRow),
+    'browser-electron 带 appMode: true（便携版里没有独立的 electron.exe 可 spawn）')
   check(existsSync(join(shippedPluginDir, 'lib', 'client.js')), '客户端产物 lib/client.js 在包里')
   check(existsSync(join(shippedPluginDir, 'lib', 'tool-browser', 'index.js')), '工具产物 lib/tool-browser/index.js 在包里')
+  check(existsSync(join(shippedPluginDir, 'lib', 'browser-electron', 'host.cjs')), '窗口宿主脚本 lib/browser-electron/host.cjs 在包里')
 }
 
 check(!existsSync(join(profileDir, 'cordis.patch.yml')),
