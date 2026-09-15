@@ -109,6 +109,51 @@ describe('harness 补丁与插件之间的变量名约定', () => {
   })
 })
 
+describe('便携 home 兜底（双击 exe 也能自带配置）', () => {
+  const patch = readRepoFile('docs/harness-desktop-build.patch')
+
+  it('补丁在 main.ts 顶层把便携 home 认作 $DSH_HOME', () => {
+    // 没有这段：双击 app\<exe> 会落回 ~/.dsh，那里没有本插件 ——
+    // 症状是「打开了，但状态条不见了」，且不报任何错。
+    expect(patch, '补丁没接便携 home 兜底')
+      .toContain('resolvePortableDshHome(process.execPath)')
+  })
+
+  it('兜底只在 $DSH_HOME 为空时生效（显式设置永远优先）', () => {
+    // 反例：无条件赋值会覆盖 `启动.cmd` / dev-desktop / CI 显式指定的 home，
+    // 把「配置随包走」变成「配置永远在 exe 旁边」。
+    expect(patch, '兜底条件丢了，会覆盖用户显式设置的 $DSH_HOME')
+      .toContain("(process.env.DSH_HOME ?? '').trim() === ''")
+  })
+
+  it('判定逻辑实现于 harness 的 paths.ts，而不是在 main.ts 里手拼', () => {
+    // 抽成导出函数是为了能被真跑：verify:portable 直接 import 它在真解压目录上验。
+    expect(patch, 'paths.ts 里没有 resolvePortableDshHome 导出')
+      .toContain('export function resolvePortableDshHome(executablePath: string)')
+    expect(patch, '便携判定不再是「exe 上一级的 home」')
+      .toContain("resolve(dirname(executablePath), '..', 'home')")
+    expect(patch, 'main.ts 绕开了导出函数，自己拼路径')
+      .not.toContain("const portableHome = resolve(dirname(process.execPath), '..', 'home')")
+    expect(patch, 'main.ts 没从 paths.ts 引这个函数')
+      .toContain("import { resolveDesktopPaths, resolvePortableDshHome } from './paths.ts'")
+  })
+})
+
+describe('便携版使用说明（scripts/package-desktop-portable.mjs）', () => {
+  const script = readRepoFile('scripts/package-desktop-portable.mjs')
+
+  it('说明里不再要求「先起外接 Chrome」（v0.2.1 起 browser_open 用 dsh 自己的窗口）', () => {
+    // 旧文案让用户以为必须手起 Chrome，照着做反而误判功能坏了。
+    expect(script).not.toContain('这个 Chrome 先起来')
+    expect(script, '说明没告诉用户可以不外接 Chrome').toContain('不需要外接 Chrome')
+  })
+
+  it('说明里两种启动方式都写了（脚本 + 直接双击 exe）', () => {
+    expect(script).toContain('· 双击根目录的「启动.cmd」')
+    expect(script).toContain('· 直接双击 app 目录里的')
+  })
+})
+
 describe('开发专用 overlay（cordis.fake-llm.patch.yml）', () => {
   const overlay = readRepoFile('cordis.fake-llm.patch.yml')
 

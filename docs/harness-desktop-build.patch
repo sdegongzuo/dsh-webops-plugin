@@ -15,7 +15,7 @@ index d3f9dae8a3..f83a0923ed 100644
      const targetName = resolveDesktopBuildTarget()
      const target = { platform: process.platform, arch: targetName.endsWith('arm64') ? 'arm64' : 'x64' }
 diff --git a/apps/desktop/src/main.ts b/apps/desktop/src/main.ts
-index a73a6223a5..8644d32bcf 100644
+index a73a6223a5..81169987c5 100644
 --- a/apps/desktop/src/main.ts
 +++ b/apps/desktop/src/main.ts
 @@ -1,6 +1,7 @@
@@ -26,7 +26,16 @@ index a73a6223a5..8644d32bcf 100644
  import { extname, join, normalize, resolve, sep } from 'node:path'
  import { fileURLToPath } from 'node:url'
  import {
-@@ -23,6 +24,11 @@ import { DesktopUpdateCoordinator } from './update-coordinator.ts'
+@@ -12,7 +13,7 @@ import {
+   protocol,
+   type IpcMainInvokeEvent,
+ } from 'electron'
+-import { resolveDesktopPaths } from './paths.ts'
++import { resolveDesktopPaths, resolvePortableDshHome } from './paths.ts'
+ import { DesktopProjectManager, type DesktopProjectHooks } from './project-manager.ts'
+ import { DesktopHostProcess } from './host-process.ts'
+ import { DesktopBackendController, type DesktopBackendState } from './backend-controller.ts'
+@@ -23,6 +24,21 @@ import { DesktopUpdateCoordinator } from './update-coordinator.ts'
  import { desktopErrorState } from './startup-error.ts'
  import { startupFailureDocument } from './startup-document.ts'
  
@@ -35,10 +44,20 @@ index a73a6223a5..8644d32bcf 100644
 +// 注意**不能**用 `DSH_DESKTOP_` 前缀：`host-process.ts` 会把那个前缀的变量全部过滤掉。
 +process.env.DSH_APP_EXECUTABLE = process.execPath
 +
++// 便携模式：主 exe 的上一级如果存在 `home\`，就把这份安装当成便携版，把它认作 $DSH_HOME。
++// 便携版的布局是 `<root>\app\<exe>` + `<root>\home`，于是**双击 exe 本体**也能自带配置
++// 与插件，不必再走 `启动.cmd`。只在 `$DSH_HOME` 为空时兜底 —— 显式设置（`启动.cmd`、
++// `scripts/dev-desktop.mjs`、CI）永远优先，空值/纯空白与 `resolveDshHome()` 的口径一致。
++// 必须在任何 `resolveDesktopPaths()` 之前执行：全仓只在 `main()` 里调用它。
++if ((process.env.DSH_HOME ?? '').trim() === '') {
++  const portableHome = resolvePortableDshHome(process.execPath)
++  if (portableHome !== undefined) process.env.DSH_HOME = portableHome
++}
++
  const SCHEME = 'dsh-app'
  let focusPrimaryWindow = (): void => {}
  type RecoveryAction = 'restart' | 'plugins' | 'reset'
-@@ -503,19 +509,31 @@ async function main(): Promise<void> {
+@@ -503,19 +519,31 @@ async function main(): Promise<void> {
    setTimeout(() => { void checkAndPrompt(false) }, 10_000)
  }
  
@@ -84,6 +103,37 @@ index a73a6223a5..8644d32bcf 100644
 +    console.error(error)
 +    app.exit(1)
 +  })
++}
+diff --git a/apps/desktop/src/paths.ts b/apps/desktop/src/paths.ts
+index 5727e5c013..0f8bee120b 100644
+--- a/apps/desktop/src/paths.ts
++++ b/apps/desktop/src/paths.ts
+@@ -1,6 +1,7 @@
+ /** Filesystem ownership for the Electron-managed desktop installation. */
+ 
+-import { join } from 'node:path'
++import { existsSync } from 'node:fs'
++import { dirname, join, resolve } from 'node:path'
+ import { resolveDshHome } from '@deepseek-ai/dsh-home-paths'
+ 
+ /** Stable desktop installation paths under the shared Harness home. */
+@@ -40,3 +41,17 @@ export function resolveDesktopPaths(dshHome: string = resolveDshHome()): Desktop
+     },
+   }
+ }
++
++/**
++ * Resolve the harness home of a portable installation, when this is one.
++ *
++ * A portable bundle keeps its data beside the application: `<root>\app\<exe>` and
++ * `<root>\home`. Detecting that sibling lets a double-clicked executable carry its own
++ * configuration and plugins, exactly like launching through the bundle's `启动.cmd`.
++ * @param executablePath - absolute path of the desktop shell executable (`process.execPath`).
++ * @returns the portable home, or undefined when the executable has no sibling `home` directory.
++ */
++export function resolvePortableDshHome(executablePath: string): string | undefined {
++  const portableHome = resolve(dirname(executablePath), '..', 'home')
++  return existsSync(portableHome) ? portableHome : undefined
 +}
 diff --git a/apps/desktop/tests/fixtures/runtime-payload-smoke.mjs b/apps/desktop/tests/fixtures/runtime-payload-smoke.mjs
 index da2d5c478d..df8381a4d5 100644

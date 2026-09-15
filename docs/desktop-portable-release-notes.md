@@ -37,6 +37,35 @@
 
 > 这个坑 v0.1.0 和 v0.2.0 都有 —— 两个包发出去后插件都没加载过，因为从来没人真的双击起过它。
 
+#### 坑：「配置随包走」原本只能靠启动脚本（v0.2.2 补上）
+
+`resolveDshHome()`（`@deepseek-ai/dsh-home-paths/lib/index.js`）的取值优先级是
+**显式参数 → `$DSH_HOME` → `~/.dsh`**，**没有**「exe 旁边有 `home\` 就用它」这种便携兜底。
+于是 v0.1.0–v0.2.1 的包只有一条路能拿到包内配置：双击 `启动.cmd`（它 `set "DSH_HOME=%ROOT%home"`）。
+直接点 `app\<exe>` 会落回 `C:\Users\<你>\.dsh` —— 界面照常起来，**插件却不在生效的 profile 里**，
+症状是「状态条不见了」，不报任何错。
+
+v0.2.2 起 harness 补丁在 `main.ts` **顶层**（早于任何 `resolveDesktopPaths()`，全仓只在
+`main()` 里调用它）补了便携兜底：
+
+```ts
+if ((process.env.DSH_HOME ?? '').trim() === '') {
+  const portableHome = resolvePortableDshHome(process.execPath)   // <exe 上一级>\home
+  if (portableHome !== undefined) process.env.DSH_HOME = portableHome
+}
+```
+
+判定抽成 `paths.ts` 的 `resolvePortableDshHome(executablePath)` 导出 —— 不是为了好看，抽出来
+才能被 `verify:portable` 拿**真代码**在真解压目录上正反两向验证（命中 `<root>\home` / 没有兄弟
+`home\` 时必须返回 `undefined`）。两条断言各自都验过能转红（把 `home\` 改名即 ✗）。
+
+只兜底空值：`启动.cmd`、`scripts/dev-desktop.mjs`、CI 的显式 `$DSH_HOME` 永远优先。
+`启动.cmd` 继续保留 —— 它把这件事写死成显式动作，不依赖 exe 的摆放位置，两条路等价。
+
+> 已知边界：Electron 自己的 `userData`（渲染缓存、Local Storage）仍在 `%APPDATA%\<productName>`，
+> harness 不调 `app.setPath('userData')`，所以那部分不随包走 —— 不影响配置与插件，但「整个目录
+> 拷到 U 盘」的便携程度以 `home\` 为界。
+
 #### 坑：keyless 验证夹具 `fake-llm` 曾经随包发出去
 
 v0.2.0 的 `cordis.patch.yml` 里带着 `fake-llm` 行。它**不是**一个无害的调试开关：
@@ -173,6 +202,8 @@ profile 的 `package.json` 重写成空插件列表 —— **插件登记被静�
 
 > 一定走 `启动.cmd`，不要直接点 `app\` 里的 exe。
 > 直接点 exe 时 `$DSH_HOME` 会落回 `C:\Users\<你>\.dsh`，配置就不随包走了，预装的插件也不在生效的 profile 里。
+>
+> （这条只对 v0.1.0–v0.2.1 成立。v0.2.2 起两种启动方式等价，见上面「配置随包走」那节。）
 
 ## 目录结构
 

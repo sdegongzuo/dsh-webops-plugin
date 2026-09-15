@@ -43,7 +43,11 @@
  *      `desktop-runtime-state.json` 在位（少了它插件会被静默抹掉）；
  *   5. `__DSH_BOOT__` 里存在插件的客户端行，且它的 bundle 能 200 拉下来、内容是合法模块；
  *   6. `--browser` 给了 Chrome 时，再验客户端半边真的在浏览器里注册成功
- *      （`<html>` 上的信标：`dshBrowserPlugin` / `Dock` / `ToolViews`）。
+ *      （`<html>` 上的信标：`dshBrowserPlugin` / `Dock` / `ToolViews`）；
+ *   7. 便携 home 兜底成立：exe 与 `home/` 同级（打包脚本决定的布局），且 harness 的
+ *      `resolvePortableDshHome` 在那个 exe 上真的命中它 —— 正反两向都验，这条保证
+ *      「双击 `app\<exe>`」与「走 启动.cmd」等价。本地 harness 没打
+ *      `docs/harness-desktop-build.patch` 时跳过（CI 是先打补丁再跑本脚本，必跑）。
  *
  * 第 6 条**不断言状态条出现在 DOM 里**：状态条挂在会话面的 `conversation.input.dock` 上，
  * 而 `ui-conversation` 只在会话存在时才渲染那个 slot（空 home 会停在「选择工作区」页）。
@@ -88,6 +92,9 @@ function parseArgs(argv) {
   const options = { profile: 'desktop', port: 19333, cdpPort: 19222 }
   for (let i = 0; i < argv.length; i += 1) {
     const flag = argv[i]
+    // `pnpm run verify:portable -- --dir X` 在部分 pnpm 版本里会把 `--` 本身也透传进来，
+    // 于是文档里那条命令会直接报「未知参数 --」。这里吞掉它，两种写法都能用。
+    if (flag === '--') continue
     if (flag === '--keep-home') { options.keepHome = true; continue }
     if (!FLAGS.has(flag)) throw new Error(`verify-portable: 未知参数 ${JSON.stringify(flag)}`)
     const value = argv[i + 1]
@@ -116,7 +123,7 @@ for (const path of [join(packageRoot, 'app'), runtimeDir]) {
 }
 
 const harnessDesktopSrc = join(resolve(options.harness ?? process.env.DSH_HARNESS ?? 'D:/dev/cli/deepseek-harness'), 'apps', 'desktop', 'src')
-for (const file of ['runtime-tree.ts', 'profile-packages.ts']) {
+for (const file of ['runtime-tree.ts', 'profile-packages.ts', 'paths.ts']) {
   if (!existsSync(join(harnessDesktopSrc, file))) {
     throw new Error(`verify-portable: 找不到 ${join(harnessDesktopSrc, file)} —— 用 --harness 指向 deepseek-harness 源码根目录`)
   }
@@ -136,6 +143,7 @@ function check(ok, message) {
 const { tsImport } = await import('tsx/esm/api')
 const runtimeTree = await tsImport(pathToFileURL(join(harnessDesktopSrc, 'runtime-tree.ts')).href, import.meta.url)
 const profilePackages = await tsImport(pathToFileURL(join(harnessDesktopSrc, 'profile-packages.ts')).href, import.meta.url)
+const desktopPaths = await tsImport(pathToFileURL(join(harnessDesktopSrc, 'paths.ts')).href, import.meta.url)
 
 /* ---------- 1. 产物完整性 + runtime 身份 ---------- */
 
@@ -239,6 +247,35 @@ if (existsSync(shippedPluginDir)) {
 
 check(!existsSync(join(profileDir, 'cordis.patch.yml')),
   'profile 里没有越权 overlay（出货包不该带 profile 级 patch）')
+
+/* ---------- 3.5 便携 home 兜底：双击 exe 与走 启动.cmd 等价 ---------- */
+
+// 兜底要成立，两个前提一个都不能少：
+//   1) 布局确实是 `<root>\app\<exe>` + `<root>\home` —— 打包脚本决定的，这里拿真目录验；
+//   2) harness 的 `resolvePortableDshHome` 在那个 exe 上真的认出这个 home —— 用**真代码**跑。
+// 只验 1 是文本假设，只验 2 是「函数自己跟自己一致」；两个一起才是「双击能用」。
+const launcherExe = readdirSync(join(packageRoot, 'app'))
+  .find(name => name.endsWith('.exe') && !/uninstall|elevate/iu.test(name))
+check(launcherExe !== undefined, 'app/ 里有主 exe（便携 home 兜底与窗口宿主都指向它）')
+
+if (launcherExe !== undefined) {
+  const exePath = join(packageRoot, 'app', launcherExe)
+  const expectedHome = resolve(join(packageRoot, 'home'))
+  if (typeof desktopPaths.resolvePortableDshHome !== 'function') {
+    // 本地 harness 通常是「出厂态」（补丁现场生成完就还原），这条只能在 CI 里真跑。
+    notes.push('harness 源码未应用 docs/harness-desktop-build.patch → 便携 home 的行为验证跳过' +
+      '（CI 先打补丁再跑本脚本，那里会真验；本页其余断言不受影响）')
+  } else {
+    check(desktopPaths.resolvePortableDshHome(exePath) === expectedHome,
+      `resolvePortableDshHome(app/${launcherExe}) 命中 home/ —— 双击 exe 自带配置与插件`)
+    // 反向：不能把任意 exe 都判成便携版，否则配置会写到意想不到的地方。
+    const notPortable = mkdtempSync(join(tmpdir(), 'dsh-not-portable-'))
+    const verdict = desktopPaths.resolvePortableDshHome(join(notPortable, 'app', 'x.exe'))
+    check(verdict === undefined,
+      'resolvePortableDshHome 对「没有兄弟 home/ 的 exe」返回 undefined（反向验证，防止误判）')
+    rmSync(notPortable, { recursive: true, force: true })
+  }
+}
 
 /* ---------- 4. 真起宿主，读 boot graph ---------- */
 

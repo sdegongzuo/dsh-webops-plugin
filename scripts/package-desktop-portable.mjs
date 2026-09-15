@@ -187,6 +187,12 @@ console.log(`  + home/profiles/desktop/node_modules/${pluginName}/`)
 
 // 4) 启动器：把 DSH_HOME 指到包内，配置就随包走
 //    （apps/desktop/src/paths.ts:26 默认参数 resolveDshHome() 读 $DSH_HOME）
+//
+//    从 v0.2.2 起**这个脚本不再是唯一入口**：harness 补丁在 main.ts 顶层加了便携兜底 ——
+//    `$DSH_HOME` 为空时，若 `process.execPath` 的上一级存在 `home/`，就把它认作 $DSH_HOME。
+//    于是直接双击 `app\<exe>` 与走本脚本等价（判定逻辑见 harness 的 `resolvePortableDshHome`，
+//    由 `verify:portable` 在真解压目录上正反两向验证）。
+//    保留本脚本：它把「配置随包走」写死成显式动作，不依赖 exe 的摆放位置。
 writeFileSync(
   join(STAGE, '启动.cmd'),
   [
@@ -208,12 +214,19 @@ writeFileSync(
     `dsh 桌面端便携版 v${version}（Windows x64，已内置 ${pluginName} 插件）`,
     '',
     '【运行】',
-    '  双击「启动.cmd」。不要直接点 app 目录里的 exe —— 那样 $DSH_HOME 会落回用户目录，',
-    '  配置就不再随包走，插件也不在生效的 profile 里。',
+    '  二选一，效果相同：',
+    '    · 双击根目录的「启动.cmd」',
+    `    · 直接双击 app 目录里的 ${exe}`,
+    '',
+    '  后者能行是因为 dsh 认「exe 上一级的 home\\ 目录」为数据目录（便携模式）。',
+    '  只要 home\\ 与 app\\ 还保持同层，配置与插件就随包走。',
+    '  ⚠️ 唯一的例外：把 exe 单独挪出 app\\ 目录，就会落回用户目录 ~/.dsh，',
+    '     那里没有本插件，表现是「状态条不见了」。',
     '',
     '【数据在哪】',
     '  home\\  = dsh 的全部用户数据（会话、设置、凭据、已装插件）。',
     '  整个目录拷到 U 盘就能带走；删掉 home\\ 即恢复出厂。',
+    '  （Electron 自己的界面缓存仍在 %APPDATA%，不随包走；不影响配置与插件。）',
     '',
     '【插件】',
     `  ${pluginName} 已经预装在 home\\profiles\\desktop\\node_modules\\ 下，`,
@@ -226,13 +239,13 @@ writeFileSync(
     '  2) 会话打开后，输入框上方应能看到「网页操作」状态条；没有浏览器调用时',
     '     它显示「已就绪」，并提示 agent 可以打开、观察与操作网页。',
     '',
-    '【浏览器工具的前提】',
-    '  要真的打开网页，需要一个**外接的真 Chrome**，dsh 通过调试端口驱动它：',
+    '【浏览器工具】',
+    '  agent 调 browser_open 会打开 **dsh 自己的浏览器窗口**，不需要外接 Chrome。',
+    '  想改用外接 Chrome（调试端口模式）：先起',
     '',
     '      chrome.exe --remote-debugging-port=9222 --user-data-dir="%TEMP%\\dsh-chrome"',
     '',
-    '  这个 Chrome 先起来，再让 agent 调 browser_open。默认连 127.0.0.1:9222；',
-    '  换端口就设环境变量 DSH_BROWSER_CDP_ENDPOINT（优先级高于插件配置）。',
+    '  再设环境变量 DSH_BROWSER_PROVIDER=cdp（换端口用 DSH_BROWSER_CDP_ENDPOINT）后重启。',
     '  不要用桌面端自带的嵌入式 Chromium 当目标：它不实现 PUT /json/new，',
     '  连上去只会得到「Could not create new page」。',
     '',
