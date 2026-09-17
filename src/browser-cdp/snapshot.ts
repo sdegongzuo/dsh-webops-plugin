@@ -65,7 +65,7 @@ export const DEFAULT_SNAPSHOT_LIMITS: SnapshotLimits = {
 }
 
 /**
- * `maxLines` 的硬上限（`browser_snapshot` 的 `max_lines` 参数封顶）。
+ * `maxLines` 的硬上限（`webpage_snapshot` 的 `max_lines` 参数封顶）。
  *
  * 为什么封顶而不是无限：大纲直接进上下文预算，5000 行已经是一屏长文页全量（≈250KB 文本），
  * 再大就不是「紧凑大纲」了。超限按上限夹住，不报错 —— 模型要的只是「多给点」。
@@ -206,7 +206,7 @@ export interface SnapshotOutline {
    * 因预算耗尽而**没有**输出的节点数（含因 `maxDepth` 被砍掉的子树根）。
    *
    * 存在的意义是让截断「可解释」：只说 `truncated: true` 时模型不知道是差几行还是差几千行，
-   * 也就无从决定「抬预算」还是「换招」（`browser_find` / `browser_scroll`）。
+   * 也就无从决定「抬预算」还是「换招」（`webpage_find` / `webpage_scroll`）。
    */
   readonly droppedElements: number
 }

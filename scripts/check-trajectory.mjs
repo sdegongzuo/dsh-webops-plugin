@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// 只读+视图切换：点击「轨迹」tab，抓取轨迹全文里 c7（browser_execute 详情页正文）的结果行，
+// 只读+视图切换：点击「轨迹」tab，抓取轨迹全文里 c7（webpage_execute 详情页正文）的结果行，
 // 验证 detailDigest 依赖的 `Runtime.evaluate on session_id=` 格式是否存在。
 const PORT = process.env.RENDERER_PORT ?? 9222
 const pages = await (await fetch(`http://127.0.0.1:${String(PORT)}/json/list`)).json()
@@ -42,12 +42,12 @@ const clicked = await evalJs(`(() => {
 console.log('轨迹 tab 候选数:', clicked)
 await new Promise(r => setTimeout(r, 1500))
 
-// 2. 抓轨迹全文中 browser_execute / Runtime.evaluate 相关行
+// 2. 抓轨迹全文中 webpage_execute / Runtime.evaluate 相关行
 const text = await evalJs('document.body.innerText')
 const lines = String(text ?? '').split('\n')
 const hits = []
 for (let i = 0; i < lines.length; i++) {
-  if (/browser_execute|Runtime\.evaluate|session_id=/.test(lines[i])) {
+  if (/webpage_execute|Runtime\.evaluate|session_id=/.test(lines[i])) {
     hits.push(lines.slice(i, i + 6).join('\n'))
     i += 6
   }

@@ -7,17 +7,17 @@
  * 断言链（任何一条不过就退出码非 0）：
  *
  * 1. 打开 example.com，snapshot 出 ref。
- * 2. `browser_console`：先读一次（触发 enable），再通过 evaluate 打一条带标记的
+ * 2. `webpage_console`：先读一次（触发 enable），再通过 evaluate 打一条带标记的
  *    console.log，再读一次 —— 必须恰好收到这条（重放 + 高水位去重不重复不遗漏）。
- * 3. `browser_network`：evaluate 发一个 fetch，list 必须采到它；再用事件里的
+ * 3. `webpage_network`：evaluate 发一个 fetch，list 必须采到它；再用事件里的
  *    requestId 直接取回响应体（[V18] 不做映射）。
- * 4. `browser_execute`：`1 + 1` 正常返回；`document.body` 识别为不可序列化而不是
+ * 4. `webpage_execute`：`1 + 1` 正常返回；`document.body` 识别为不可序列化而不是
  *    静默 `{}`（[V22]）；`Emulation.setDeviceMetricsOverride` 被白名单拒
  *    （BROWSER_EXECUTE_NOT_ALLOWED，消息带 method 全文）。
- * 5. `browser_locate`：对 heading 的 ref 现算 rect（宽高 > 0），带高亮时窗口上
+ * 5. `webpage_locate`：对 heading 的 ref 现算 rect（宽高 > 0），带高亮时窗口上
  *    overlay 只覆盖目标元素（[V31][V32] 用 highlightNode）。
  *
- * `browser_find` 是纯本地检索（零 CDP），单测已覆盖，这里不重复。
+ * `webpage_find` 是纯本地检索（零 CDP），单测已覆盖，这里不重复。
  *
  * 用法：`pnpm run smoke:p2p3`
  */

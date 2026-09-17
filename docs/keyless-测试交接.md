@@ -4,11 +4,11 @@
 
 ## 1. 这套测试在验什么
 
-`dsh-webops-plugin` 的浏览器工具链（browser_open / snapshot / execute / find / click / tabs）在**真实网页**上跑通「弹窗转标签收编」全链路：
+`dsh-webops-plugin` 的浏览器工具链（webpage_open / snapshot / execute / find / click / tabs）在**真实网页**上跑通「弹窗转标签收编」全链路：
 
 1. fake-llm（脚本回放，不花钱）驱动 agent 打开百度 → 读热搜榜 → **点击第五条**（target=_blank → 弹窗）
 2. 宿主 host.cjs 把弹窗转成新标签（t2），dom-ready 后发 `{type:'opened'}` 通报
-3. provider `adoptSession` 收编 t2 进会话注册表 → `browser_tabs list` 必须列出 `t2 [foreground]`
+3. provider `adoptSession` 收编 t2 进会话注册表 → `webpage_tabs list` 必须列出 `t2 [foreground]`
 4. 在 t2 上读正文 → fake-llm 收尾轮从轨迹抽证据（第五条标题 / 详情页 URL / 正文摘录）拼成**可见回复**
 
 ## 2. 测试步骤（按顺序，一条别跳）
@@ -38,12 +38,12 @@ VERIFY_MESSAGE="打开百度，点击热搜榜第五条，读取详情内容" pn
 verify:card 输出依次要看到：
 
 ```
-verify-card: 工具卡片 browser_open → state=ok url=https://www.baidu.com/   ← URL 必须是 baidu
-verify-card: 工具卡片 browser_snapshot → state=ok
-verify-card: 工具卡片 browser_execute → state=ok
-verify-card: 工具卡片 browser_find → state=ok                              ← 本轮应 >0 matches
-verify-card: 工具卡片 browser_tabs → state=ok
-verify-card: 工具卡片 browser_click → state=ok
+verify-card: 工具卡片 webpage_open → state=ok url=https://www.baidu.com/   ← URL 必须是 baidu
+verify-card: 工具卡片 webpage_snapshot → state=ok
+verify-card: 工具卡片 webpage_execute → state=ok
+verify-card: 工具卡片 webpage_find → state=ok                              ← 本轮应 >0 matches
+verify-card: 工具卡片 webpage_tabs → state=ok
+verify-card: 工具卡片 webpage_click → state=ok
 verify-card: 弹窗标签已进 tabs 清单（结果含前台 t2）                        ← 收编链路硬证据
 verify-card: PASS —— ...
 ```
@@ -79,7 +79,7 @@ verify-card: PASS —— ...
 | `src/browser-electron/bridge.ts` | `onTabOpened` 通报分发（无 command id 的 `{type:'opened'}` 分支） |
 | `src/browser-electron/provider.ts` | `adoptSession` 收编（先登记后等加载，防 click→tabs 竞态） |
 | `src/browser-cdp/provider.ts` | `adoptSession` 通用实现（基类） |
-| `src/tool-browser/index.ts` | browser_find 空白归一化匹配（NBSP 坑的修复点） |
+| `src/tool-browser/index.ts` | webpage_find 空白归一化匹配（NBSP 坑的修复点） |
 | `scripts/check-reply-visible.mjs` / `scripts/check-trajectory.mjs` | 只读辅助：查聊天回复 / 轨迹文本（连 9222，不改状态） |
 | `scripts/check-execute-result.mjs` / `scripts/dump-hotsearch-evidence.mjs` | 只读辅助：抓 execute 返回的 `fifth` JSON / 抓 c3·c4·t2 证据，排查 `detailDigest` 降级时用 |
 | `src/fake-llm/index.ts` 的 `detailDigest` | 收尾轮的证据抽取；失败分支都带 `reason` + 尾部快照，日志里一眼看得出是哪段没抽到 |
@@ -88,8 +88,8 @@ verify-card: PASS —— ...
 
 - **已验证 PASS**（2026-09-13 23:33 一轮）：6 张卡片全 ok、open=baidu、t2 [foreground] 收编断言通过。仅截图步骤曾超时（已改为失败只警告不失败）。
 - **已修复（2026-09-14）**：`detailDigest` 动态证据降级。**真因不是正文截断，是 URL 把整段挤没了** —— 详情页 URL 两三百字，工具结果进 llm 请求历史时被截断，断在 URL 中间，旧实现死等 `(at …) ` 里的 `) `，于是整段判死。打点原文：`原因=paren: "(at " 之后没有 ") "，尾部="(at https://www.baidu.com/s?wd=…&hisfilt"`。修法两条：① 锚点改为 `(at ` 之后到首个空白或逗号，不再要求其后有 `, ref epoch N) `；② 详情页正文表达式 4000 → 1200 字（摘录最多展示 600 字，取更多纯属浪费，且正文越长越容易把 URL 尾部一起挤掉）。复验：日志无降级打点，聊天回复里第五/URL/摘录三行齐全，URL 完整未截断。
-- **click → tabs 的时序坑（2026-09-14，2026-09-17 结构性修掉）**：弹窗转标签是**异步**的（宿主发 opened 通报 → provider adoptSession 登记），click 返回时它可能还没进注册表。当时同一份代码两次跑，一次「tabs 清单里有 t2」一次「只有 t1」，脚本第 6 轮于是先发 `browser_wait(1.5s)` 再 `browser_tabs`。
-  - **现在的机制**：`CdpBrowserProvider.mutate` 在动作前取会话台账快照，动作后取差集，把新收编的标签页写进回执的 `opened_tabs`（`TAB_OPEN_WATCH_MS = 250`，实测通报延迟中位 152ms）。不导航的点击本来就要跑满 800ms 导航轮询，天然覆盖；「导航且弹窗」那条早退路径由补观测窗口兜住。所以 `browser_wait(1.5s)` 已经不是必需的了（留着无害）。
+- **click → tabs 的时序坑（2026-09-14，2026-09-17 结构性修掉）**：弹窗转标签是**异步**的（宿主发 opened 通报 → provider adoptSession 登记），click 返回时它可能还没进注册表。当时同一份代码两次跑，一次「tabs 清单里有 t2」一次「只有 t1」，脚本第 6 轮于是先发 `webpage_wait(1.5s)` 再 `webpage_tabs`。
+  - **现在的机制**：`CdpBrowserProvider.mutate` 在动作前取会话台账快照，动作后取差集，把新收编的标签页写进回执的 `opened_tabs`（`TAB_OPEN_WATCH_MS = 250`，实测通报延迟中位 152ms）。不导航的点击本来就要跑满 800ms 导航轮询，天然覆盖；「导航且弹窗」那条早退路径由补观测窗口兜住。所以 `webpage_wait(1.5s)` 已经不是必需的了（留着无害）。
   - 看到「弹窗标签没进 tabs 清单」仍然先怀疑时序/收编链路，别急着改 `adoptSession`；但**若 `opened_tabs` 也空**，那才是收编真出问题。
 - **未提交**：无（adoptSession 收编链、client 15 视图、fake-llm 热搜流+动态收尾、find 空白归一化、verify-card 加固均已提交）。
 - 单测基线：289 passed / 3 skipped（2026-09-14，含 `src/bundle-patch.test.ts` 出货 patch 守卫、fake-llm 闸门用例、5 条 `detailDigest` 抽取用例与 P2/P3 三组回归用例）。

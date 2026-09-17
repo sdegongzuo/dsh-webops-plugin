@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// 只读：连 renderer，点击「轨迹」视图后抓取 browser_execute 行的返回文本，
+// 只读：连 renderer，点击「轨迹」视图后抓取 webpage_execute 行的返回文本，
 // 验证新版 HOTSEARCH_EXPRESSION 抽到的 fifth 是否真是榜单序号 5。
 import { writeFileSync } from 'node:fs'
 

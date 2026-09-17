@@ -17,17 +17,17 @@
 
 | 工具 | 能力级 | 一句话 |
 |---|---|---|
-| `browser_open` / `browser_navigate` | read | 开**新**标签页 / 当前页跳转（永不接管用户已有标签） |
-| `browser_snapshot` | read | 可访问性大纲 + ref；ref 在会话内单调不复用，旧 ref 必然失效 |
-| `browser_screenshot` | read | 截图存成 attachment（可选 `ref` 只截单个元素） |
-| `browser_tabs` | mutate | `list` / `activate` / `close`，只列、只碰本会话自己开的标签页 |
-| `browser_click` / `fill` / `press` / `scroll` | mutate | 按 ref 操作；**写前**先查纪元，失效返回可重试的 `BROWSER_STALE_REF` |
-| `browser_wait` | read | 等时间 / 等文本出现 / 等 ref 元素消失（不改页面） |
-| `browser_find` | read | 在最近一次 snapshot 的大纲上做零状态文本检索，不发任何 CDP 命令 |
-| `browser_locate` | read | 按 ref 现算视口坐标盒 + `in_viewport`（默认不滚视口） |
-| `browser_console` | read | console 环形缓冲（Runtime + Log 合流、按高水位去重、默认只给当前文档） |
-| `browser_network` | read | 请求表 + 按 `requestId` 取响应体（断开窗口期的请求按「会丢」处理） |
-| `browser_execute` | mutate | 白名单制 CDP 逃生舱：一次一条允许列表内的命令，其余一律 `BROWSER_EXECUTE_NOT_ALLOWED` |
+| `webpage_open` / `webpage_navigate` | read | 开**新**标签页 / 当前页跳转（永不接管用户已有标签） |
+| `webpage_snapshot` | read | 可访问性大纲 + ref；ref 在会话内单调不复用，旧 ref 必然失效 |
+| `webpage_screenshot` | read | 截图存成 attachment（可选 `ref` 只截单个元素） |
+| `webpage_tabs` | mutate | `list` / `activate` / `close`，只列、只碰本会话自己开的标签页 |
+| `webpage_click` / `fill` / `press` / `scroll` | mutate | 按 ref 操作；**写前**先查纪元，失效返回可重试的 `BROWSER_STALE_REF` |
+| `webpage_wait` | read | 等时间 / 等文本出现 / 等 ref 元素消失（不改页面） |
+| `webpage_find` | read | 在最近一次 snapshot 的大纲上做零状态文本检索，不发任何 CDP 命令 |
+| `webpage_locate` | read | 按 ref 现算视口坐标盒 + `in_viewport`（默认不滚视口） |
+| `webpage_console` | read | console 环形缓冲（Runtime + Log 合流、按高水位去重、默认只给当前文档） |
+| `webpage_network` | read | 请求表 + 按 `requestId` 取响应体（断开窗口期的请求按「会丢」处理） |
+| `webpage_execute` | mutate | 白名单制 CDP 逃生舱：一次一条允许列表内的命令，其余一律 `BROWSER_EXECUTE_NOT_ALLOWED` |
 
 两个 provider，用 `DSH_BROWSER_PROVIDER` 选（桌面端默认 `electron`）：
 
@@ -66,9 +66,9 @@ pnpm run check:desktop  # 从外部用 CDP 断言「host 认了 / 客户端跑�
 cd /d/dev/cli/deepseek-harness && pnpm dsh --profile browserp0
 
 # 3) 让模型做事：
-#    browser_open { "url": "https://example.com" }  → session_id
-#    browser_snapshot { "session_id": "…" }         → 大纲 + ref
-#    browser_screenshot { "session_id": "…" }       → attachment
+#    webpage_open { "url": "https://example.com" }  → session_id
+#    webpage_snapshot { "session_id": "…" }         → 大纲 + ref
+#    webpage_screenshot { "session_id": "…" }       → attachment
 ```
 
 > **端口别用 9222**：本机 9222 通常是 dsh 桌面端 Electron renderer 的调试端口，此时插件连上的是

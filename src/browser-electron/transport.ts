@@ -158,7 +158,7 @@ export class ElectronWindowTransport implements CdpTransport {
    * 订阅「宿主自己开的新标签」通报（页面弹窗 / 标签条「+」）。
    *
    * 这些标签不走 `newTab()`（没有 open 命令应答），上层会话注册表天然看不见它们；
-   * 上层收到通报后收编会话，`browser_tabs(list)` 才能列出弹窗标签。
+   * 上层收到通报后收编会话，`webpage_tabs(list)` 才能列出弹窗标签。
    * 与 `onTakeover` 一样按需启动宿主。
    *
    * @param listener - 每个新标签在 dom-ready 后调用一次 `(tabId, url, title)`。
@@ -171,7 +171,7 @@ export class ElectronWindowTransport implements CdpTransport {
 
   /**
    * 当前前台标签 id。宿主的标签条自己维护「谁在前台」，问它要就行；
-   * 这也是 electron provider 的 `browser_tabs(list)` 能标出 `active` 的原因。
+   * 这也是 electron provider 的 `webpage_tabs(list)` 能标出 `active` 的原因。
    */
   async activeTargetId(): Promise<string | undefined> {
     const bridge = await this.requireBridge()

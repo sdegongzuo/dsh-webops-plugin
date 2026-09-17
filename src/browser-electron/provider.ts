@@ -75,7 +75,7 @@ export class ElectronBrowserProvider extends CdpBrowserProvider {
    * 订阅「宿主自己开的新标签」通报（只挂一次）。
    *
    * 页面弹窗转的新标签、标签条「+」开的标签都没走 `open()` —— 不订阅通报的话，
-   * 它们对 `browser_tabs(list)` 和一切工具永远不可见（2026-09-13 实测：窗口上明明
+   * 它们对 `webpage_tabs(list)` 和一切工具永远不可见（2026-09-13 实测：窗口上明明
    * 有两个标签，`tabs(list)` 只报一个）。收到通报就调用基类 `adoptSession` 收编；
    * 收编失败静默放过 —— 通报链路本身不能成为工具失败源。
    */

@@ -184,7 +184,7 @@ async function main() {
   environment.DSH_FAKE_LLM ??= '1'
   // 桌面端的浏览器 provider 用 `electron`：它开的是**桌面端自己的 BrowserWindow**。
   // 不用 `cdp` 是因为桌面端那个调试端口（9222）就是它自己的渲染进程，嵌入式 Chromium
-  // 不实现 `PUT /json/new` —— 连它做 browser_open 只会得到「Could not create new page」。
+  // 不实现 `PUT /json/new` —— 连它做 webpage_open 只会得到「Could not create new page」。
   environment.DSH_BROWSER_PROVIDER ??= 'electron'
   // 窗口宿主需要真的 Electron 二进制；这里就用跑桌面端的这一个。
   environment.DSH_BROWSER_ELECTRON_PATH ??= electron

@@ -58,12 +58,12 @@ export type BrowserErrorCode =
    */
   | 'BROWSER_STATE_CONTENDED'
   /**
-   * P2：`browser_execute` 的返回值无法序列化（`document.body` 会**静默**变成 `{}`，
+   * P2：`webpage_execute` 的返回值无法序列化（`document.body` 会**静默**变成 `{}`，
    * 循环引用 / `Symbol` 会抛错，`[V22]`）。提示模型改用原始值或 JSON 字符串。
    */
   | 'BROWSER_EXECUTE_RESULT_UNSERIALIZABLE'
   /**
-   * P2：`browser_execute` 只放行白名单里的 CDP 命令（方案 3.3）。不在允许列表里的
+   * P2：`webpage_execute` 只放行白名单里的 CDP 命令（方案 3.3）。不在允许列表里的
    * `domain.method` 一律拒绝 —— **新命令默认拒**，避免黑名单永远追不上协议演进。
    * 错误消息里带被拒的 method 全文。
    */
@@ -307,7 +307,7 @@ export interface BrowserConsoleEntry {
   readonly source: 'runtime' | 'log'
 }
 
-/** `browser_console` 的结果。 */
+/** `webpage_console` 的结果。 */
 export interface BrowserConsoleResult {
   readonly kind: 'console'
   readonly sessionId: string
@@ -363,7 +363,7 @@ export interface BrowserNetworkEntry {
   readonly errorText?: string
 }
 
-/** `browser_network` 的结果。 */
+/** `webpage_network` 的结果。 */
 export interface BrowserNetworkResult {
   readonly kind: 'network'
   readonly sessionId: string
@@ -384,7 +384,7 @@ export interface BrowserNetworkResult {
   readonly truncatedByBudget?: boolean
 }
 
-/** P2：`browser_execute` —— 唯一能直接发任意 CDP 命令的逃生舱。 */
+/** P2：`webpage_execute` —— 唯一能直接发任意 CDP 命令的逃生舱。 */
 export interface BrowserExecuteRequest {
   readonly sessionId: string
   /** `domain.method` 全文，例如 `Runtime.evaluate`。 */
@@ -392,7 +392,7 @@ export interface BrowserExecuteRequest {
   readonly params?: Record<string, unknown>
 }
 
-/** `browser_execute` 的结果。 */
+/** `webpage_execute` 的结果。 */
 export interface BrowserExecuteResult {
   readonly kind: 'execute'
   readonly sessionId: string
@@ -410,7 +410,7 @@ export interface BrowserExecuteResult {
   readonly truncated: boolean
 }
 
-/** P3：`browser_locate` —— 按 ref 现算元素的视口坐标盒（方案 4.3）。 */
+/** P3：`webpage_locate` —— 按 ref 现算元素的视口坐标盒（方案 4.3）。 */
 export interface BrowserLocateRequest {
   readonly sessionId: string
   /** 最新一次 snapshot 里的元素 ref。旧 ref 一律 `BROWSER_STALE_REF`。 */
@@ -425,7 +425,7 @@ export interface BrowserLocateRequest {
   readonly scroll?: boolean
 }
 
-/** `browser_locate` 的结果：视口坐标（语义与 click 的落点计算一致）。 */
+/** `webpage_locate` 的结果：视口坐标（语义与 click 的落点计算一致）。 */
 export interface BrowserLocateResult {
   readonly kind: 'locate'
   readonly sessionId: string

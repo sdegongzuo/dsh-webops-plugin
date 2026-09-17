@@ -253,43 +253,43 @@ function tool(harness: Harness, toolName: string): ToolDefinition {
 describe('registration', () => {
   it('exposes exactly the P0 read-only tools, the P1 operation tools, the P2 collectors and the P3 locators', () => {
     expect([...mount().tools.keys()].sort()).toEqual([
-      'browser_click',
-      'browser_console',
-      'browser_execute',
-      'browser_fill',
-      'browser_find',
-      'browser_locate',
-      'browser_navigate',
-      'browser_network',
-      'browser_open',
-      'browser_press',
-      'browser_screenshot',
-      'browser_scroll',
-      'browser_snapshot',
-      'browser_tabs',
-      'browser_wait',
+      'webpage_click',
+      'webpage_console',
+      'webpage_execute',
+      'webpage_fill',
+      'webpage_find',
+      'webpage_locate',
+      'webpage_navigate',
+      'webpage_network',
+      'webpage_open',
+      'webpage_press',
+      'webpage_screenshot',
+      'webpage_scroll',
+      'webpage_snapshot',
+      'webpage_tabs',
+      'webpage_wait',
     ])
   })
 
   it('classifies read vs mutate tools in the capability metadata', () => {
     expect(BROWSER_TOOL_CAPABILITIES).toMatchObject({
-      browser_open: 'read',
-      browser_navigate: 'read',
-      browser_snapshot: 'read',
-      browser_screenshot: 'read',
-      browser_wait: 'read',
+      webpage_open: 'read',
+      webpage_navigate: 'read',
+      webpage_snapshot: 'read',
+      webpage_screenshot: 'read',
+      webpage_wait: 'read',
       // P2：console / network 是纯读采集；execute 的允许列表里有 Page.navigate，归 mutate。
-      browser_console: 'read',
-      browser_network: 'read',
-      browser_execute: 'mutate',
+      webpage_console: 'read',
+      webpage_network: 'read',
+      webpage_execute: 'mutate',
       // P3：find 是纯本地检索；locate 只观察（scrollIntoView 是观察辅助，不是页面操作）。
-      browser_find: 'read',
-      browser_locate: 'read',
-      browser_tabs: 'mutate',
-      browser_click: 'mutate',
-      browser_fill: 'mutate',
-      browser_press: 'mutate',
-      browser_scroll: 'mutate',
+      webpage_find: 'read',
+      webpage_locate: 'read',
+      webpage_tabs: 'mutate',
+      webpage_click: 'mutate',
+      webpage_fill: 'mutate',
+      webpage_press: 'mutate',
+      webpage_scroll: 'mutate',
     })
     // 元数据必须覆盖全部已注册工具，新工具进来忘了分级会在这里炸。
     expect(Object.keys(BROWSER_TOOL_CAPABILITIES).sort()).toEqual([...mount().tools.keys()].sort())
@@ -310,7 +310,7 @@ describe('registration', () => {
 
     expect(text).toContain('untrusted')
     expect(text).toContain('BROWSER_STALE_REF')
-    expect(text).toContain('browser_snapshot')
+    expect(text).toContain('webpage_snapshot')
   })
 
   it('contributes nothing to the prompt when the tools are not visible in that scope', () => {
@@ -332,7 +332,7 @@ describe('registration', () => {
       console: false, network: false, execute: false, find: false, locate: false,
     })
 
-    expect([...tools.keys()].sort()).toEqual(['browser_navigate', 'browser_open'])
+    expect([...tools.keys()].sort()).toEqual(['webpage_navigate', 'webpage_open'])
   })
 })
 
@@ -344,16 +344,16 @@ describe('argument and output contracts', () => {
   })
 
   it('rejects arguments that violate the declared schema', async () => {
-    await expect(tool(harness, 'browser_snapshot').execute({}, exec())).rejects.toThrow(/session_id/u)
+    await expect(tool(harness, 'webpage_snapshot').execute({}, exec())).rejects.toThrow(/session_id/u)
   })
 
   it('rejects a screenshot asking for a ref and the full page at once', async () => {
-    await expect(tool(harness, 'browser_screenshot').execute({ session_id: 's1', ref: 'e1', full_page: true }, exec()))
+    await expect(tool(harness, 'webpage_screenshot').execute({ session_id: 's1', ref: 'e1', full_page: true }, exec()))
       .rejects.toThrow(/mutually exclusive/u)
   })
 
   it('forwards the session id and url to ctx.browser.navigate', async () => {
-    const value = await tool(harness, 'browser_navigate').execute(
+    const value = await tool(harness, 'webpage_navigate').execute(
       { session_id: 's1', url: 'https://example.com/next' },
       exec(),
     )
@@ -365,23 +365,23 @@ describe('argument and output contracts', () => {
   })
 
   it('omits the url entirely when the model opens a blank page', async () => {
-    await tool(harness, 'browser_open').execute({}, exec())
+    await tool(harness, 'webpage_open').execute({}, exec())
     expect(harness.browserCalls).toEqual([{ method: 'open', args: {} }])
   })
 
   it('passes a snapshot through the seam and returns its refs', async () => {
-    const value = await tool(harness, 'browser_snapshot').execute({ session_id: 's1' }, exec())
+    const value = await tool(harness, 'webpage_snapshot').execute({ session_id: 's1' }, exec())
 
     expect(harness.browserCalls).toEqual([
       { method: 'observe', args: { kind: 'snapshot', sessionId: 's1' } },
     ])
     expect(value).toMatchObject({ session_id: 's1', epoch: 4, refs: [{ ref: 'e1', role: 'button', name: 'Submit' }] })
     expect(value).toSatisfy((candidate: unknown) =>
-      validateJsonSchemaValue(tool(harness, 'browser_snapshot').output.schema, candidate).length === 0)
+      validateJsonSchemaValue(tool(harness, 'webpage_snapshot').output.schema, candidate).length === 0)
   })
 
   it('renders the outline together with the ref lifetime warning', () => {
-    const definition = tool(harness, 'browser_snapshot')
+    const definition = tool(harness, 'webpage_snapshot')
     const blocks = definition.output.render({ session_id: 's1' }, {
       session_id: 's1',
       url: SESSION.url,
@@ -399,7 +399,7 @@ describe('argument and output contracts', () => {
   })
 })
 
-describe('browser_tabs and the P1 mutation tools', () => {
+describe('webpage_tabs and the P1 mutation tools', () => {
   let harness: Harness
 
   beforeEach(() => {
@@ -407,7 +407,7 @@ describe('browser_tabs and the P1 mutation tools', () => {
   })
 
   it('forwards list / activate / close to ctx.browser.tabs', async () => {
-    const definition = tool(harness, 'browser_tabs')
+    const definition = tool(harness, 'webpage_tabs')
     const listed = await definition.execute({ action: 'list' }, exec())
     expect(harness.browserCalls).toEqual([{ method: 'tabs', args: { kind: 'list' } }])
     expect(listed).toEqual({
@@ -422,13 +422,13 @@ describe('browser_tabs and the P1 mutation tools', () => {
   })
 
   it('rejects tabs actions that miss their session id or use an unknown action', async () => {
-    const definition = tool(harness, 'browser_tabs')
+    const definition = tool(harness, 'webpage_tabs')
     await expect(definition.execute({ action: 'activate' }, exec())).rejects.toThrow(/session_id/u)
     await expect(definition.execute({ action: 'reboot', session_id: 's1' }, exec())).rejects.toThrow(/list, activate, close/u)
   })
 
   it('forwards click with the ref and reports the resulting epoch', async () => {
-    const definition = tool(harness, 'browser_click')
+    const definition = tool(harness, 'webpage_click')
     const value = await definition.execute({ session_id: 's1', ref: 'e1' }, exec())
 
     expect(harness.browserCalls).toEqual([
@@ -446,9 +446,9 @@ describe('browser_tabs and the P1 mutation tools', () => {
   })
 
   it('passes fill / press / scroll arguments through unchanged', async () => {
-    await tool(harness, 'browser_fill').execute({ session_id: 's1', ref: 'e1', value: 'hi' }, exec())
-    await tool(harness, 'browser_press').execute({ session_id: 's1', ref: 'e1', key: 'Enter' }, exec())
-    await tool(harness, 'browser_scroll').execute({ session_id: 's1', ref: 'e1', delta_y: 300 }, exec())
+    await tool(harness, 'webpage_fill').execute({ session_id: 's1', ref: 'e1', value: 'hi' }, exec())
+    await tool(harness, 'webpage_press').execute({ session_id: 's1', ref: 'e1', key: 'Enter' }, exec())
+    await tool(harness, 'webpage_scroll').execute({ session_id: 's1', ref: 'e1', delta_y: 300 }, exec())
 
     expect(harness.browserCalls).toEqual([
       { method: 'mutate', args: { kind: 'fill', sessionId: 's1', ref: 'e1', value: 'hi' } },
@@ -458,13 +458,13 @@ describe('browser_tabs and the P1 mutation tools', () => {
   })
 
   it('wait reports satisfied; the "exactly one condition" rule is enforced in the provider', async () => {
-    const value = await tool(harness, 'browser_wait').execute({ session_id: 's1', time_ms: 5 }, exec())
+    const value = await tool(harness, 'webpage_wait').execute({ session_id: 's1', time_ms: 5 }, exec())
     expect(value).toMatchObject({ action: 'wait', satisfied: true })
     expect(harness.browserCalls).toEqual([{ method: 'mutate', args: { kind: 'wait', sessionId: 's1', timeMs: 5 } }])
   })
 
   it('renders a navigated mutation with the re-snapshot instruction', async () => {
-    const definition = tool(harness, 'browser_click')
+    const definition = tool(harness, 'webpage_click')
     const blocks = definition.output.render({ session_id: 's1' }, {
       session_id: 's1',
       action: 'click',
@@ -476,7 +476,7 @@ describe('browser_tabs and the P1 mutation tools', () => {
 
     const text = String((blocks[0] as { text: string }).text)
     expect(text).toContain('NAVIGATION DETECTED')
-    expect(text).toContain('browser_snapshot')
+    expect(text).toContain('webpage_snapshot')
     expect(text).toContain('untrusted')
   })
 
@@ -487,7 +487,7 @@ describe('browser_tabs and the P1 mutation tools', () => {
       title: '热搜第五条',
     }]
 
-    const value = await tool(harness, 'browser_click').execute({ session_id: 's1', ref: 'e1' }, exec())
+    const value = await tool(harness, 'webpage_click').execute({ session_id: 's1', ref: 'e1' }, exec())
 
     expect(value).toMatchObject({
       session_id: 's1',
@@ -496,11 +496,11 @@ describe('browser_tabs and the P1 mutation tools', () => {
       opened_tabs: [{ session_id: 't2', url: 'https://example.com/hot-5', title: '热搜第五条' }],
     })
     // required 之外的字段一旦出现，必须能被工具输出契约接受。
-    expect(validateJsonSchemaValue(tool(harness, 'browser_click').output.schema, value)).toEqual([])
+    expect(validateJsonSchemaValue(tool(harness, 'webpage_click').output.schema, value)).toEqual([])
   })
 
   it('renders the new tab(s) prominently so the model stops assuming a single tab', async () => {
-    const blocks = tool(harness, 'browser_click').output.render({ session_id: 's1' }, {
+    const blocks = tool(harness, 'webpage_click').output.render({ session_id: 's1' }, {
       session_id: 's1',
       action: 'click',
       epoch: 4,
@@ -517,7 +517,7 @@ describe('browser_tabs and the P1 mutation tools', () => {
     expect(text).toContain('session_id=s1 is still open')
     // 「refs 不受影响」只在没导航时成立；导航并弹窗时不能与下面的 NAVIGATION DETECTED 打架。
     expect(text).toContain('refs are unaffected')
-    const alsoNavigated = String((tool(harness, 'browser_click').output.render({ session_id: 's1' }, {
+    const alsoNavigated = String((tool(harness, 'webpage_click').output.render({ session_id: 's1' }, {
       session_id: 's1',
       action: 'click',
       epoch: 5,
@@ -530,7 +530,7 @@ describe('browser_tabs and the P1 mutation tools', () => {
     expect(alsoNavigated).toContain('NAVIGATION DETECTED')
     expect(alsoNavigated).not.toContain('refs are unaffected')
     // 反向：没开新标签时不许出现这段提示（否则模型会去找不存在的标签页）。
-    const plain = tool(harness, 'browser_click').output.render({ session_id: 's1' }, {
+    const plain = tool(harness, 'webpage_click').output.render({ session_id: 's1' }, {
       session_id: 's1',
       action: 'click',
       epoch: 4,
@@ -542,7 +542,7 @@ describe('browser_tabs and the P1 mutation tools', () => {
   })
 })
 
-describe('browser_screenshot', () => {
+describe('webpage_screenshot', () => {
   let harness: Harness
 
   beforeEach(() => {
@@ -550,7 +550,7 @@ describe('browser_screenshot', () => {
   })
 
   it('stores the PNG as an attachment and returns an image content block', async () => {
-    const definition = tool(harness, 'browser_screenshot')
+    const definition = tool(harness, 'webpage_screenshot')
     const value = await definition.execute({ session_id: 's1' }, exec())
 
     expect(harness.savedImages).toEqual([{ name: 'browser-screenshot.png', mediaType: 'image/png', bytes: 24 }])
@@ -565,7 +565,7 @@ describe('browser_screenshot', () => {
   })
 
   it('forwards an element ref so a stale ref fails instead of capturing the wrong thing', async () => {
-    await tool(harness, 'browser_screenshot').execute({ session_id: 's1', ref: 'e1' }, exec())
+    await tool(harness, 'webpage_screenshot').execute({ session_id: 's1', ref: 'e1' }, exec())
     expect(harness.browserCalls).toEqual([
       { method: 'observe', args: { kind: 'screenshot', sessionId: 's1', ref: 'e1' } },
     ])
@@ -575,13 +575,13 @@ describe('browser_screenshot', () => {
     const failure = Object.assign(new Error('ref belongs to an obsolete epoch'), { code: 'BROWSER_STALE_REF' })
     harness.failObserve = failure
 
-    await expect(tool(harness, 'browser_screenshot').execute({ session_id: 's1', ref: 'e1' }, exec()))
+    await expect(tool(harness, 'webpage_screenshot').execute({ session_id: 's1', ref: 'e1' }, exec()))
       .rejects.toThrow('ref belongs to an obsolete epoch')
     expect(harness.savedImages).toEqual([])
   })
 })
 
-describe('browser_console / browser_network / browser_execute', () => {
+describe('webpage_console / webpage_network / webpage_execute', () => {
   let harness: Harness
 
   beforeEach(() => {
@@ -589,7 +589,7 @@ describe('browser_console / browser_network / browser_execute', () => {
   })
 
   it('forwards console filters and maps replayTruncated to snake_case', async () => {
-    const definition = tool(harness, 'browser_console')
+    const definition = tool(harness, 'webpage_console')
     const value = await definition.execute(
       { session_id: 's1', limit: 10, level: 'error', text: 'boom' },
       exec(),
@@ -613,7 +613,7 @@ describe('browser_console / browser_network / browser_execute', () => {
   })
 
   it('forwards network list and body actions; body requires request_id', async () => {
-    const definition = tool(harness, 'browser_network')
+    const definition = tool(harness, 'webpage_network')
     const listed = await definition.execute({ session_id: 's1', action: 'list', url: 'api' }, exec())
 
     expect(harness.browserCalls).toEqual([
@@ -639,12 +639,12 @@ describe('browser_console / browser_network / browser_execute', () => {
   })
 
   it('rejects an unknown network action', async () => {
-    await expect(tool(harness, 'browser_network').execute({ session_id: 's1', action: 'replay' }, exec()))
+    await expect(tool(harness, 'webpage_network').execute({ session_id: 's1', action: 'replay' }, exec()))
       .rejects.toThrow(/list, body/u)
   })
 
   it('forwards the whitelisted CDP command with its params and returns the value', async () => {
-    const definition = tool(harness, 'browser_execute')
+    const definition = tool(harness, 'webpage_execute')
     const value = await definition.execute(
       { session_id: 's1', method: 'Runtime.evaluate', params: { expression: '1 + 1' } },
       exec(),
@@ -659,7 +659,7 @@ describe('browser_console / browser_network / browser_execute', () => {
   })
 })
 
-describe('browser_find / browser_locate (P3)', () => {
+describe('webpage_find / webpage_locate (P3)', () => {
   let harness: Harness
 
   beforeEach(() => {
@@ -674,11 +674,11 @@ describe('browser_find / browser_locate (P3)', () => {
   }
 
   it('refuses to search before a snapshot is cached, then matches case-insensitively', async () => {
-    const definition = tool(harness, 'browser_find')
+    const definition = tool(harness, 'webpage_find')
     await expect(definition.execute({ session_id: 's1', query: 'submit' }, exec()))
       .rejects.toThrow(expect.objectContaining({ code: 'BROWSER_SNAPSHOT_REQUIRED' }))
 
-    await tool(harness, 'browser_snapshot').execute({ session_id: 's1' }, exec())
+    await tool(harness, 'webpage_snapshot').execute({ session_id: 's1' }, exec())
     const value = await definition.execute({ session_id: 's1', query: 'SUBMIT' }, exec())
 
     expect(harness.browserCalls.filter(call => call.method === 'observe')).toHaveLength(1)
@@ -691,8 +691,8 @@ describe('browser_find / browser_locate (P3)', () => {
   })
 
   it('supports regex mode and rejects invalid patterns as argument errors', async () => {
-    await tool(harness, 'browser_snapshot').execute({ session_id: 's1' }, exec())
-    const definition = tool(harness, 'browser_find')
+    await tool(harness, 'webpage_snapshot').execute({ session_id: 's1' }, exec())
+    const definition = tool(harness, 'webpage_find')
 
     const value = await definition.execute({ session_id: 's1', query: '^\\s*- button', regex: true }, exec()) as FindResultView
     expect(value.matches).toHaveLength(1)
@@ -712,9 +712,9 @@ describe('browser_find / browser_locate (P3)', () => {
       ].join('\n'),
       refs: [{ ref: 'e1', role: 'link', name: `needle ${longText}` }],
     }
-    await tool(harness, 'browser_snapshot').execute({ session_id: 's1' }, exec())
+    await tool(harness, 'webpage_snapshot').execute({ session_id: 's1' }, exec())
 
-    const value = await tool(harness, 'browser_find')
+    const value = await tool(harness, 'webpage_find')
       .execute({ session_id: 's1', query: 'needle', limit: 2 }, exec()) as FindResultView
 
     expect(value.truncated).toBe(true)
@@ -742,23 +742,23 @@ describe('browser_find / browser_locate (P3)', () => {
         { ref: 'e40', role: 'link', name: '15 其他' },
       ],
     }
-    await tool(harness, 'browser_snapshot').execute({ session_id: 's1' }, exec())
-    const value = await tool(harness, 'browser_find')
+    await tool(harness, 'webpage_snapshot').execute({ session_id: 's1' }, exec())
+    const value = await tool(harness, 'webpage_find')
       .execute({ session_id: 's1', query: 'link "5 ' }, exec()) as FindResultView
     expect(value.matches).toHaveLength(1)
     expect(value.matches[0]).toMatchObject({ ref: 'e35', role: 'link' })
   })
 
   it('drops the cached outline on navigate so stale refs cannot be searched', async () => {
-    await tool(harness, 'browser_snapshot').execute({ session_id: 's1' }, exec())
-    await tool(harness, 'browser_navigate').execute({ session_id: 's1', url: 'https://example.com/next' }, exec())
+    await tool(harness, 'webpage_snapshot').execute({ session_id: 's1' }, exec())
+    await tool(harness, 'webpage_navigate').execute({ session_id: 's1', url: 'https://example.com/next' }, exec())
 
-    await expect(tool(harness, 'browser_find').execute({ session_id: 's1', query: 'submit' }, exec()))
+    await expect(tool(harness, 'webpage_find').execute({ session_id: 's1', query: 'submit' }, exec()))
       .rejects.toThrow(expect.objectContaining({ code: 'BROWSER_SNAPSHOT_REQUIRED' }))
   })
 
   it('renders find output with the untrusted-content notice', () => {
-    const blocks = tool(harness, 'browser_find').output.render({ session_id: 's1' }, {
+    const blocks = tool(harness, 'webpage_find').output.render({ session_id: 's1' }, {
       session_id: 's1',
       truncated: false,
       matches: [{ ref: 'e1', role: 'button', name: 'Submit', line: '- button "Submit" [ref=e1]' }],
@@ -770,7 +770,7 @@ describe('browser_find / browser_locate (P3)', () => {
   })
 
   it('forwards locate with ref and optional flags, mapping the result to snake_case', async () => {
-    const definition = tool(harness, 'browser_locate')
+    const definition = tool(harness, 'webpage_locate')
     const value = await definition.execute({ session_id: 's1', ref: 'e1', highlight: true }, exec())
 
     expect(harness.browserCalls).toEqual([
@@ -790,7 +790,7 @@ describe('browser_find / browser_locate (P3)', () => {
   })
 
   it('forwards scroll=false and lets stale-ref failures surface untouched', async () => {
-    const definition = tool(harness, 'browser_locate')
+    const definition = tool(harness, 'webpage_locate')
     await definition.execute({ session_id: 's1', ref: 'e1', scroll: false }, exec())
     expect(harness.browserCalls).toEqual([
       { method: 'locate', args: { sessionId: 's1', ref: 'e1', scroll: false } },
@@ -801,7 +801,7 @@ describe('browser_find / browser_locate (P3)', () => {
   })
 
   it('renders locate output with the fresh-measurement note', () => {
-    const blocks = tool(harness, 'browser_locate').output.render({ session_id: 's1' }, {
+    const blocks = tool(harness, 'webpage_locate').output.render({ session_id: 's1' }, {
       session_id: 's1',
       ref: 'e1',
       x: 10,
@@ -825,7 +825,7 @@ describe('2026-09-14 五个场景报告的逐条修复', () => {
   })
 
   it('#2 long-page truncation is explainable and the budget can be raised', async () => {
-    const definition = tool(harness, 'browser_snapshot')
+    const definition = tool(harness, 'webpage_snapshot')
     const value = await definition.execute({ session_id: 's1', max_lines: 2_000 }, exec())
 
     expect(harness.browserCalls).toEqual([
@@ -852,7 +852,7 @@ describe('2026-09-14 五个场景报告的逐条修复', () => {
   })
 
   it('#5/#9 a snapshot with zero refs says there is nothing actionable', () => {
-    const blocks = tool(harness, 'browser_snapshot').output.render({ session_id: 's1' }, {
+    const blocks = tool(harness, 'webpage_snapshot').output.render({ session_id: 's1' }, {
       session_id: 's1',
       url: 'https://the-internet.herokuapp.com/windows/new',
       title: 'New Window',
@@ -869,21 +869,21 @@ describe('2026-09-14 五个场景报告的逐条修复', () => {
   })
 
   it('#9 an empty title is spelled out instead of silently omitted', () => {
-    const session = tool(harness, 'browser_navigate').output.render(
+    const session = tool(harness, 'webpage_navigate').output.render(
       { session_id: 's1' },
       { session_id: 's1', url: 'https://httpbin.org/html', title: '', epoch: 2 } as never,
     )
     expect(String((session[0] as { text: string }).text)).toContain('title: (empty')
 
-    const snapshot = tool(harness, 'browser_snapshot').output.render({ session_id: 's1' }, {
+    const snapshot = tool(harness, 'webpage_snapshot').output.render({ session_id: 's1' }, {
       session_id: 's1', url: 'https://httpbin.org/html', title: '', epoch: 2,
       outline: '- text "hi"', truncated: false, outline_lines: 1, refs: [],
     } as never)
     expect(String((snapshot[0] as { text: string }).text)).toContain('title: (empty')
   })
 
-  it('#4 browser_scroll no longer needs a ref: it can scroll at the viewport centre', async () => {
-    const definition = tool(harness, 'browser_scroll')
+  it('#4 webpage_scroll no longer needs a ref: it can scroll at the viewport centre', async () => {
+    const definition = tool(harness, 'webpage_scroll')
     const value = await definition.execute({ session_id: 's1', delta_y: 300 }, exec())
 
     expect(harness.browserCalls).toEqual([
@@ -900,7 +900,7 @@ describe('2026-09-14 五个场景报告的逐条修复', () => {
   })
 
   it('#3 locate does not scroll the viewport by default and reports in_viewport', async () => {
-    const definition = tool(harness, 'browser_locate')
+    const definition = tool(harness, 'webpage_locate')
     const value = await definition.execute({ session_id: 's1', ref: 'e1' }, exec())
 
     expect(harness.browserCalls).toEqual([{ method: 'locate', args: { sessionId: 's1', ref: 'e1' } }])
@@ -913,7 +913,7 @@ describe('2026-09-14 五个场景报告的逐条修复', () => {
   })
 
   it('#8 console / network default to the current document and say how much they hid', async () => {
-    const consoleValue = await tool(harness, 'browser_console')
+    const consoleValue = await tool(harness, 'webpage_console')
       .execute({ session_id: 's1', all_documents: true }, exec())
     expect(harness.browserCalls[0]).toEqual({
       method: 'console',
@@ -921,14 +921,14 @@ describe('2026-09-14 五个场景报告的逐条修复', () => {
     })
     expect(consoleValue).toMatchObject({ document: 1, earlier_documents: 3 })
 
-    const consoleText = String((tool(harness, 'browser_console').output.render({}, consoleValue as never)[0] as { text: string }).text)
+    const consoleText = String((tool(harness, 'webpage_console').output.render({}, consoleValue as never)[0] as { text: string }).text)
     expect(consoleText).toContain('earlier document')
     expect(consoleText).toContain('all_documents=true')
 
-    const networkValue = await tool(harness, 'browser_network')
+    const networkValue = await tool(harness, 'webpage_network')
       .execute({ session_id: 's1', action: 'list' }, exec())
     expect(networkValue).toMatchObject({ document: 1, earlier_documents: 2 })
-    const networkText = String((tool(harness, 'browser_network').output.render({}, networkValue as never)[0] as { text: string }).text)
+    const networkText = String((tool(harness, 'webpage_network').output.render({}, networkValue as never)[0] as { text: string }).text)
     expect(networkText).toContain('earlier document')
     expect(networkText).toContain('all_documents=true')
   })
@@ -939,31 +939,31 @@ describe('2026-09-14 五个场景报告的逐条修复', () => {
 
     // 被总量预算截断：调大 limit 拿不到更多，必须改口成「过滤」。
     harness.truncation = 'budget'
-    const consoleValue = await tool(harness, 'browser_console').execute({ session_id: 's1' }, exec())
+    const consoleValue = await tool(harness, 'webpage_console').execute({ session_id: 's1' }, exec())
     expect(consoleValue).toMatchObject({ truncated: true, truncated_by_budget: true })
-    const consoleText = render('browser_console', consoleValue)
+    const consoleText = render('webpage_console', consoleValue)
     expect(consoleText).toContain('raising limit will not add more')
     expect(consoleText).toContain('level/text')
 
-    const networkValue = await tool(harness, 'browser_network')
+    const networkValue = await tool(harness, 'webpage_network')
       .execute({ session_id: 's1', action: 'list' }, exec())
     expect(networkValue).toMatchObject({ truncated: true, truncated_by_budget: true })
-    const networkText = render('browser_network', networkValue)
+    const networkText = render('webpage_network', networkValue)
     expect(networkText).toContain('raising limit will not add more')
     expect(networkText).toContain('url')
 
     // 只是被 limit 截断：这时「调大 limit 有用」，给的是另一条建议。两条路不能混。
     harness.truncation = 'limit'
-    const byLimit = await tool(harness, 'browser_network')
+    const byLimit = await tool(harness, 'webpage_network')
       .execute({ session_id: 's1', action: 'list' }, exec())
     expect(byLimit).toMatchObject({ truncated: true, truncated_by_budget: false })
-    const byLimitText = render('browser_network', byLimit)
+    const byLimitText = render('webpage_network', byLimit)
     expect(byLimitText).toContain('higher limit')
     expect(byLimitText).not.toContain('will not add more')
   })
 
   it('#10 a base64 body is spelled out as binary noise instead of being silently dumped', () => {
-    const text = String((tool(harness, 'browser_network').output.render({}, {
+    const text = String((tool(harness, 'webpage_network').output.render({}, {
       session_id: 's1',
       action: 'body',
       requests: [],
@@ -975,7 +975,7 @@ describe('2026-09-14 五个场景报告的逐条修复', () => {
 
     expect(text).toContain('base64-encoded')
     expect(text).toContain('binary')
-    expect(text).toContain('browser_screenshot')
+    expect(text).toContain('webpage_screenshot')
     // 不能建议「再取一次」—— 再取一次是同样的噪声。
     expect(text).toContain('Do NOT request it again')
   })

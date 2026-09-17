@@ -11,7 +11,7 @@
  *
  * **⚠ 同域内也不能类推**：`Network.setBlockedURLs`（`[V12]`）与
  * `Runtime.setAsyncCallStackDepth`（`[V30]`）实测 session 私有，**不进簿记**；
- * `Network.setCacheDisabled` 作用域无法判定（`[V27]`）→ `browser_execute` 直接拒。
+ * `Network.setCacheDisabled` 作用域无法判定（`[V27]`）→ `webpage_execute` 直接拒。
  *
  * ## owner: 'human' 从哪来（2.3.1）
  *
@@ -38,7 +38,7 @@
  *
  * ## 现状（阶段 A）
  *
- * 当前没有任何工具真的写 target 级状态（`browser_execute` 在阶段 B 会拒掉全部这类命令），
+ * 当前没有任何工具真的写 target 级状态（`webpage_execute` 在阶段 B 会拒掉全部这类命令），
  * 所以这里只是**骨架 + 单测**，尚未接进运行时调用链。导出保持干净，阶段 B/C 直接复用。
  *
  * @module dsh-webops-plugin/browser-cdp/state
@@ -247,7 +247,7 @@ function contended(sessionId: string, key: string, holder: StateOwner, at: numbe
     `target-level state "${key}" on session "${sessionId}" is contended: currently held by ${holder} `
     + `since ${String(at)} (${new Date(at).toISOString()}); ${why}. `
     + 'This is NOT retryable — resending the same command fails again because the state has not changed. '
-    + 'Recover by taking a fresh browser_snapshot (refs from before a takeover are obsolete), waiting for the '
+    + 'Recover by taking a fresh webpage_snapshot (refs from before a takeover are obsolete), waiting for the '
     + 'takeover to end, or passing force: true to overwrite the current holder explicitly.',
     'BROWSER_STATE_CONTENDED',
   )

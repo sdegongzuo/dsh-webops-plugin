@@ -9,11 +9,41 @@
 
 ---
 
+## v0.2.6（2026-09-17 本机手打，未上 CI）
+
+**包里变了什么**：全部工具更名 `browser_*` → `webpage_*`（15 个：open / navigate / snapshot /
+find / locate / click / fill / press / scroll / wait / screenshot / console / network / execute /
+tabs）。动机：`browser_` 让 agent 以为要「调用浏览器软件」而不是「操作网页」，实践中反复产生
+误会。选 `webpage_` 而不是 `web_`：dsh 内置已有 `web_search` / `web_fetch`，`web_` 会撞车；
+`webpage_` 与状态条文案「网页操作」同语义。客户端半边按前缀认领工具的逻辑（`BROWSER_TOOL_PREFIX`）
+同步改为 `webpage_`，状态条观察不受影响。**错误码仍是 `BROWSER_*`**（协议不变量，不随工具名走）。
+上一版的上下文预算硬化全部随包携带。
+
+| 项 | 值 |
+|---|---|
+| 产物 | `dist/dsh-webops-desktop-v0.2.6-win-x64-portable.zip` |
+| 体积 | 250.0 MB / 10469 个条目 |
+| sha256 | `612331a584db97fc5c10807e429d3170d39d2150e45e505a9e2bc1b50a7d4a6b` |
+
+**验证**（解压到 `D:\dsh-v0.2.6-verify`，10358 个文件 / 0 个 NUL 污染）：
+
+| 自检 | 结论 |
+|---|---|
+| `verify:portable --dir` | 全部通过 |
+| `verify:settings --dir` | 通过（unisound / u2-flash） |
+| `verify:ptc --dir` | 通过（Electron 运行时下 sandbox runner 用包内真 node） |
+| `verify:browser-host --dir` | 通过（真开窗口 → 快照 → 截图） |
+| 工具名抽查 | 包内 15 个工具全部 `webpage_*`，0 处 `browser_` 残留 |
+
+**迁移注意**：引用过旧工具名的自定义提示词要同步改名；dsh 无内置 `browser_*` 工具，改名无冲突。
+
+---
+
 ## v0.2.5（2026-09-17 本机手打，未上 CI；当晚重打一次，见下）
 
-**包里变了什么**：结构性修掉「模型看不见新标签页」这个盲区（`browser_click` 等 mutation
+**包里变了什么**：结构性修掉「模型看不见新标签页」这个盲区（`webpage_click` 等 mutation
 回执新增 `opened_tabs`），加上上一轮的窗口空白修复（`layout()` 守卫 + `restore/show` 补跑）
-与 `browser_click` 描述同步。链路与验证见 `docs/实现与踩坑.md`「窗口空白」那一节。
+与 `webpage_click` 描述同步。链路与验证见 `docs/实现与踩坑.md`「窗口空白」那一节。
 
 **2026-09-17 晚重打**（同名 v0.2.5，sha256 见下）：包进上下文预算硬化
 （commit `f2d0e1a`）—— `limit` 硬上限 500→150、console/network 各加 4 万字符总量闸门、
@@ -38,7 +68,7 @@ base64 正文上限单独压到 2000、新增 `truncated_by_budget` 且两类截
 | `verify:browser-host --dir` | 通过（包内产物在打包 exe 上开真窗口 → 快照 → 截图 27705 字节） |
 | 插件内容抽查 | 包内 `lib/tool-browser/index.js` 含 `1-150`、`truncated_by_budget` 与两条新建议措辞；`lib/provider-*.js` 含 `activeTargetId` 前台标注 |
 
-**仍未覆盖**：模型真的调 `browser_open`（要 API key）、窗口外观与「双击后的状态条」（要人眼）。
+**仍未覆盖**：模型真的调 `webpage_open`（要 API key）、窗口外观与「双击后的状态条」（要人眼）。
 
 ---
 
@@ -254,7 +284,7 @@ home\                    ← 全部用户数据：会话、设置、凭据、已
 
 ## 验证插件生效
 
-启动后在输入框上方应能看到「网页操作」状态条；让 agent 调用 `browser_open` 能开页面。
+启动后在输入框上方应能看到「网页操作」状态条；让 agent 调用 `webpage_open` 能开页面。
 
 ## 已知事项
 

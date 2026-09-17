@@ -104,14 +104,14 @@ export class RefRegistry {
     const targets = this.targets
     if (targets === undefined) {
       throw new BrowserError(
-        `ref "${ref}" cannot be resolved: this session has never been observed; run browser_snapshot first`,
+        `ref "${ref}" cannot be resolved: this session has never been observed; run webpage_snapshot first`,
         'BROWSER_SNAPSHOT_REQUIRED',
       )
     }
     const target = targets.get(ref)
     if (target === undefined) {
       throw new BrowserError(
-        `ref "${ref}" belongs to an obsolete observation epoch (current epoch ${this.epoch}); run browser_snapshot again and use the refs it returns`,
+        `ref "${ref}" belongs to an obsolete observation epoch (current epoch ${this.epoch}); run webpage_snapshot again and use the refs it returns`,
         'BROWSER_STALE_REF',
       )
     }

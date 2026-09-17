@@ -51,7 +51,7 @@
 - 截图分辨率 2374×1498。
 
 **问题（已修 #2/#3/#4）：** 长页大纲截断；locate 默认改视口；scroll 必须有 ref。
-改后：`browser_snapshot` 支持 `max_lines` 且截断可解释；locate 默认不动视口并回 `in_viewport`；scroll 的 `ref` 可省（落在视口中心）。
+改后：`webpage_snapshot` 支持 `max_lines` 且截断可解释；locate 默认不动视口并回 `in_viewport`；scroll 的 `ref` 可省（落在视口中心）。
 
 ### S4 新窗口收编（click / tabs）
 
@@ -96,11 +96,11 @@ S2 点击跳转、S4 弹窗收编、S5 stale-ref 按设计工作，未改动。
 
 | 场景 | 改前 | 改后 |
 |---|---|---|
-| `browser_press` Enter 跳转 | 立刻返回 `title: ""` | 等新文档可用，返回真实标题（上限 5s，超时不失败） |
-| 长文页 `browser_snapshot` | `truncated: true`，无下文 | `truncated` + `outline_lines` + `dropped_elements` + `max_lines` 参数可按需放大 |
-| `browser_locate` | 默认把元素滚到视口中央（`centered: true`） | 默认不动视口，回 `centered: false` + `in_viewport`；要居中传 `scroll: true` |
-| `browser_scroll` | `ref` 必填 | `ref` 可省，落在视口中心（长页 / 零 ref 页可用） |
-| `browser_console` | Runtime 时间戳比 Log 小 1000 倍 | 两域同一把尺子（毫秒） |
-| `browser_execute` `fetch(...).then(...)` | `BROWSER_EXECUTE_RESULT_UNSERIALIZABLE`（但请求已发出） | 等 Promise 落定返回值；抛错时给真实异常文本 |
+| `webpage_press` Enter 跳转 | 立刻返回 `title: ""` | 等新文档可用，返回真实标题（上限 5s，超时不失败） |
+| 长文页 `webpage_snapshot` | `truncated: true`，无下文 | `truncated` + `outline_lines` + `dropped_elements` + `max_lines` 参数可按需放大 |
+| `webpage_locate` | 默认把元素滚到视口中央（`centered: true`） | 默认不动视口，回 `centered: false` + `in_viewport`；要居中传 `scroll: true` |
+| `webpage_scroll` | `ref` 必填 | `ref` 可省，落在视口中心（长页 / 零 ref 页可用） |
+| `webpage_console` | Runtime 时间戳比 Log 小 1000 倍 | 两域同一把尺子（毫秒） |
+| `webpage_execute` `fetch(...).then(...)` | `BROWSER_EXECUTE_RESULT_UNSERIALIZABLE`（但请求已发出） | 等 Promise 落定返回值；抛错时给真实异常文本 |
 | 导航后读 console/network | 上一个页面的条目混在里面 | 默认只给当前文档 + `earlier_documents` 计数；`all_documents` 可读旧文档 |
 

@@ -5,7 +5,7 @@
  * 为什么这条 env 覆盖值得单测：桌面端的 profile 目录由应用独占并每次重建，
  * 往里写 `config.endpoint` 活不过一次重启；一旦这条覆盖断了，桌面端里的
  * 浏览器工具就会去连桌面端自己的渲染进程（嵌入式 Chromium，不实现
- * `PUT /json/new`），表现为 `browser_open` 报「Could not create a new tab」。
+ * `PUT /json/new`），表现为 `webpage_open` 报「Could not create a new tab」。
  * 这是个只在真机上才看得见的故障，所以把判据钉在单测里。
  */
 

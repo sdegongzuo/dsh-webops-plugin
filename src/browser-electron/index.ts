@@ -5,7 +5,7 @@
  *
  * P0 的 `browser-cdp` provider 连的是**外部** Chrome 的调试端口。在 dsh 桌面端里这条路走不通 ——
  * 桌面端自己的调试端口（9222）就是它的渲染进程，而嵌入式 Chromium 不实现 `PUT /json/new`，
- * 于是 `browser_open` 只会得到一句「Could not create a new page」。
+ * 于是 `webpage_open` 只会得到一句「Could not create a new page」。
  *
  * 本插件换成让 host 进程 **spawn 一个 Electron 窗口宿主**：窗口是桌面端自己的 `BrowserWindow`，
  * 由 `webContents.debugger`（同一套 CDP）驱动。同一份 `CdpBrowserProvider` 原样复用，

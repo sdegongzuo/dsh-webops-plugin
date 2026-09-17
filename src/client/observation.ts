@@ -31,7 +31,7 @@ export interface BrowserCall {
   readonly argsRaw: string
   /** 已结算结果里 `text` 块拼接出的正文。 */
   readonly resultText: string
-  /** 结果里的第一张图（`browser_screenshot` 用）。 */
+  /** 结果里的第一张图（`webpage_screenshot` 用）。 */
   readonly image: WireImageRef | undefined
 }
 
@@ -50,7 +50,7 @@ export interface BrowserObservation {
 }
 
 /** 本插件认领的工具名前缀。 */
-export const BROWSER_TOOL_PREFIX = 'browser_'
+export const BROWSER_TOOL_PREFIX = 'webpage_'
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
@@ -186,8 +186,8 @@ export function observeBrowser(calls: readonly BrowserCall[]): BrowserObservatio
   for (const call of calls) {
     if (!call.settled) running = true
     if (call.settled && call.isError) failures += 1
-    if (call.toolName === 'browser_snapshot') snapshots += 1
-    if (call.toolName === 'browser_screenshot') screenshots += 1
+    if (call.toolName === 'webpage_snapshot') snapshots += 1
+    if (call.toolName === 'webpage_screenshot') screenshots += 1
     url = parseBrowserUrl(call.argsRaw) ?? url
   }
   return {

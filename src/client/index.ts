@@ -5,7 +5,7 @@
  *
  * 1. `conversation.input.dock` —— 常驻状态条；数据来自对话快照里已有的 `browser_*`
  *    工具调用节点，因此天然「跟随 agent 操作」，无需新增 RPC。
- * 2. `tool.call.toolview` 的四个 key —— 让 `browser_open / navigate / snapshot /
+ * 2. `tool.call.toolview` 的四个 key —— 让 `webpage_open / navigate / snapshot /
  *    screenshot` 各自有专属卡片（地址、大纲、截图），而不是落进通用兜底卡片。
  *
  * 注册一律走 `ctx.slots.inject`：`tool.call.toolview` 由 ui-tool 在更深的组合里声明，
@@ -26,21 +26,21 @@ export const inject = ['slots', 'locale']
 
 /** 本插件认领的工具（P0 只读四个 + P1 的 tabs 与五个操作工具 + P2/P3 的五个调试工具）。 */
 const BROWSER_TOOLS = [
-  'browser_open',
-  'browser_navigate',
-  'browser_snapshot',
-  'browser_screenshot',
-  'browser_tabs',
-  'browser_click',
-  'browser_fill',
-  'browser_press',
-  'browser_scroll',
-  'browser_wait',
-  'browser_console',
-  'browser_network',
-  'browser_execute',
-  'browser_find',
-  'browser_locate',
+  'webpage_open',
+  'webpage_navigate',
+  'webpage_snapshot',
+  'webpage_screenshot',
+  'webpage_tabs',
+  'webpage_click',
+  'webpage_fill',
+  'webpage_press',
+  'webpage_scroll',
+  'webpage_wait',
+  'webpage_console',
+  'webpage_network',
+  'webpage_execute',
+  'webpage_find',
+  'webpage_locate',
 ] as const
 
 /**

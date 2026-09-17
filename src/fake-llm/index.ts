@@ -2,13 +2,13 @@
  * 脚本化假模型（keyless 验证驱动）：把 `llm/stream` 整条拦下来，按预定脚本回放
  * 模型块流 —— 驱动真 agent loop 走完整条工具链，覆盖主上的真实任务流：
  *
- *   1. `browser_open { url }`                    → 打开百度，拿 session_id
- *   2. `browser_snapshot { session_id }`         → 拿 ref（纪元从这里开始）
- *   3. `browser_execute`（Runtime.evaluate）     → 读热搜榜，返回 `{ fifth, list }`
- *   4. `browser_find { query: 第五条标题 }`      → 在大纲里确定性拿到热搜链接的 ref
- *   5. `browser_click { session_id, ref }`       → 真实点击（target=_blank → 弹窗转新标签页）
- *   6. `browser_wait`(1.5s) + `browser_tabs`      → 弹窗标签必须已收编且在前台（[foreground]）
- *   7. `browser_execute`（在前台新标签上）       → 读详情页正文
+ *   1. `webpage_open { url }`                    → 打开百度，拿 session_id
+ *   2. `webpage_snapshot { session_id }`         → 拿 ref（纪元从这里开始）
+ *   3. `webpage_execute`（Runtime.evaluate）     → 读热搜榜，返回 `{ fifth, list }`
+ *   4. `webpage_find { query: 第五条标题 }`      → 在大纲里确定性拿到热搜链接的 ref
+ *   5. `webpage_click { session_id, ref }`       → 真实点击（target=_blank → 弹窗转新标签页）
+ *   6. `webpage_wait`(1.5s) + `webpage_tabs`      → 弹窗标签必须已收编且在前台（[foreground]）
+ *   7. `webpage_execute`（在前台新标签上）       → 读详情页正文
  *   8. 纯文本收尾（finish: stop）
  *
  * 热搜榜是实时数据：第五条标题从第 3 轮 execute 的结果文本里现抽（`"fifth":"…"`），
@@ -35,7 +35,7 @@ function debugNote(scope: string, message: string): void {
 
 /** 插件配置。 */
 export interface FakeLlmConfig {
-  /** `browser_open` 打开的地址。默认 `https://example.com/`。 */
+  /** `webpage_open` 打开的地址。默认 `https://example.com/`。 */
   url?: string
   /** 收尾（脚本走完）的助手文本。 */
   text?: string
@@ -125,7 +125,7 @@ function firstSessionId(history: string): string | undefined {
 }
 
 /**
- * 只从 `browser_find` 渲染里抽 ref（`- [eN] role "name"`）。
+ * 只从 `webpage_find` 渲染里抽 ref（`- [eN] role "name"`）。
  * 不回退到 snapshot 的 `[ref=eN]`：find 0 命中时点大纲最后一项会点错行。
  */
 export function lastRef(history: string): string | undefined {
@@ -151,7 +151,7 @@ export function pickFifthTitle(items: readonly { rank: string; title: string }[]
 }
 
 /**
- * 从 `browser_execute` 的结果文本里抽「热搜第五条」标题。
+ * 从 `webpage_execute` 的结果文本里抽「热搜第五条」标题。
  *
  * execute 的表达式返回 `{"fifth":"…","list":[…]}`（JSON 字符串），渲染进历史后
  * 按键名捞值即可；标题里的引号按 JSON 转义还原。
@@ -167,7 +167,7 @@ function fifthHotSearch(history: string): string | undefined {
   }
 }
 
-/** 从 `browser_tabs(list)` 的结果文本里抽**最后**一个前台标签的 session id（弹窗标签）。 */
+/** 从 `webpage_tabs(list)` 的结果文本里抽**最后**一个前台标签的 session id（弹窗标签）。 */
 function foregroundSessionId(history: string): string | undefined {
   return [...history.matchAll(/- session_id=([A-Za-z0-9._-]+) \[foreground\]/gu)].at(-1)?.[1]
 }
@@ -279,19 +279,19 @@ export function apply(ctx: import('@deepseek-ai/cordis').Context, config: FakeLl
   // provider adoptSession 收编）→ tabs(list) 确认弹窗标签在前台 → 在**新标签**上读正文。
   // 热搜榜是实时数据，第五条标题从 execute 结果里现抽（`"fifth":"…"`），不写死。
   const script: ((request: unknown) => StreamChunk[] | undefined)[] = [
-    () => toolCallTurn([{ id: 'c1', name: 'browser_open', args: { url } }]),
+    () => toolCallTurn([{ id: 'c1', name: 'webpage_open', args: { url } }]),
     (request) => {
       const sessionId = firstSessionId(historyText(request))
       return sessionId === undefined
         ? undefined
-        : toolCallTurn([{ id: 'c2', name: 'browser_snapshot', args: { session_id: sessionId } }])
+        : toolCallTurn([{ id: 'c2', name: 'webpage_snapshot', args: { session_id: sessionId } }])
     },
     (request) => {
       const sessionId = firstSessionId(historyText(request))
       if (sessionId === undefined) return undefined
       return toolCallTurn([{
         id: 'c3',
-        name: 'browser_execute',
+        name: 'webpage_execute',
         args: { session_id: sessionId, method: 'Runtime.evaluate', params: { expression: HOTSEARCH_EXPRESSION } },
       }])
     },
@@ -300,7 +300,7 @@ export function apply(ctx: import('@deepseek-ai/cordis').Context, config: FakeLl
       if (sessionId === undefined) return undefined
       return toolCallTurn([{
         id: 'c4',
-        name: 'browser_find',
+        name: 'webpage_find',
         // 大纲可访问名是 `link "5 标题"`；用这个前缀定位序号 5，
         // 不拿 execute 抽到的标题去 find（标题抽错就会点到第二条）。
         args: { session_id: sessionId, query: HOTSEARCH_FIND_QUERY },
@@ -311,7 +311,7 @@ export function apply(ctx: import('@deepseek-ai/cordis').Context, config: FakeLl
       const sessionId = firstSessionId(history)
       const ref = lastRef(history)
       if (sessionId === undefined || ref === undefined) return undefined
-      return toolCallTurn([{ id: 'c5', name: 'browser_click', args: { session_id: sessionId, ref } }])
+      return toolCallTurn([{ id: 'c5', name: 'webpage_click', args: { session_id: sessionId, ref } }])
     },
     (request) => {
       const sessionId = firstSessionId(historyText(request))
@@ -320,8 +320,8 @@ export function apply(ctx: import('@deepseek-ai/cordis').Context, config: FakeLl
       // adoptSession 登记），click 返回时它可能还没进注册表。不睡会偶发「tabs 里只有
       // t1」（2026-09-14 实测：同一份代码两次跑，一次收编一次没收编）。
       return toolCallTurn([
-        { id: 'c6a', name: 'browser_wait', args: { session_id: sessionId, time_ms: 1500 } },
-        { id: 'c6', name: 'browser_tabs', args: { action: 'list' } },
+        { id: 'c6a', name: 'webpage_wait', args: { session_id: sessionId, time_ms: 1500 } },
+        { id: 'c6', name: 'webpage_tabs', args: { action: 'list' } },
       ])
     },
     (request) => {
@@ -329,7 +329,7 @@ export function apply(ctx: import('@deepseek-ai/cordis').Context, config: FakeLl
       if (detailSession === undefined) return undefined
       return toolCallTurn([{
         id: 'c7',
-        name: 'browser_execute',
+        name: 'webpage_execute',
         args: { session_id: detailSession, method: 'Runtime.evaluate', params: { expression: CONTENT_EXPRESSION } },
       }])
     },

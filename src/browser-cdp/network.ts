@@ -54,7 +54,7 @@ export const NETWORK_MAX_BODY_CHARS = 20_000
  *
  * 为什么不一视同仁：base64 的 2 万字符约合 5.7k token，而它编码的是图片 / 字体 / wasm ——
  * 模型既解不出来也读不懂，属于纯噪声。留一小段只为「看出这是什么格式」（PNG 头、`woff2` 等），
- * 真要看图得走 `browser_screenshot`（工具层会用一句话把这件事讲明）。
+ * 真要看图得走 `webpage_screenshot`（工具层会用一句话把这件事讲明）。
  */
 export const NETWORK_MAX_BASE64_CHARS = 2_000
 

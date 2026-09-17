@@ -302,7 +302,7 @@ function mapCdpError(error: CdpErrorPayload): BrowserError {
   if (detail.includes('No target available')) {
     return new BrowserError(
       `the CDP debugger is detached from this target (${detail}); it re-attaches by itself once DevTools `
-      + 'finishes opening — retry the same call or take a fresh browser_snapshot',
+      + 'finishes opening — retry the same call or take a fresh webpage_snapshot',
       'BROWSER_DEBUGGER_DETACHED',
     )
   }

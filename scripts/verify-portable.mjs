@@ -295,7 +295,7 @@ if (existsSync(shippedPluginDir)) {
   check(body.includes('dsh-webops-plugin/tool-browser'), '出货 patch 含 tool-browser 行')
   check(/name:\s*['"]?dsh-webops-plugin['"]?\s*$/mu.test(body), '出货 patch 含裸包名行（客户端半边靠它被发现）')
   // 「行存在」不够 —— 2026-09-15 事故就是「行在、config 没了」：provider 于是从不参与
-  // 选择，browser_open 落到桌面端的死路上，症状是「没法打开新的窗口」，且不报任何错。
+  // 选择，webpage_open 落到桌面端的死路上，症状是「没法打开新的窗口」，且不报任何错。
   const electronAt = body.indexOf('browser-electron')
   const nextRowAt = electronAt === -1 ? -1 : body.indexOf('- id:', electronAt + 1)
   const electronRow = electronAt === -1 ? '' : body.slice(electronAt, nextRowAt === -1 ? undefined : nextRowAt)
@@ -339,7 +339,7 @@ if (check(existsSync(asarPath), 'app/resources/app.asar 在包里')) {
     [/\(process\.env\.DSH_HOME \?\? ['"]{2}\)\.trim\(\) === ['"]{2}/u, '便携兜底只在 $DSH_HOME 为空时生效'],
     [/process\.env\.DSH_BROWSER_ELECTRON_HOST/u, '窗口宿主的早期分支'],
     // 2026-09-17 补：桌面端里 `cdp` 与 `electron` 会同时「可用」（前者 available() 乐观为真），
-    // 没人指定 provider 就抛 BROWSER_PROVIDER_AMBIGUOUS —— `browser_open` 直接失败，而
+    // 没人指定 provider 就抛 BROWSER_PROVIDER_AMBIGUOUS —— `webpage_open` 直接失败，而
     // profile 每次重建、写不进 `config.provider`，只能由 shell 落这个默认值。
     // 两条一起断言：既要「判空后兜底」的写法在，也要兜底值真的是 electron。
     [/process\.env\.DSH_BROWSER_PROVIDER \?\? ['"]{2}/u, '浏览器 provider 的判空兜底'],

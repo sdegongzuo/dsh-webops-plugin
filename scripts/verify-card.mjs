@@ -4,9 +4,9 @@
  *
  * 1. 连桌面端渲染进程的调试端口（9222）。
  * 2. 在聊天输入框里注入一条用户消息并触发发送。
- * 3. agent loop 由 `fake-llm` 驱动（脚本第一轮回 `browser_open` 工具调用）——
+ * 3. agent loop 由 `fake-llm` 驱动（脚本第一轮回 `webpage_open` 工具调用）——
  *    工具**真的执行**（Electron 窗口真的弹出并加载页面）。
- * 4. 轮询会话 DOM，直到插件认领的工具卡片 `[data-dsh-browser-row="browser_open"]`
+ * 4. 轮询会话 DOM，直到插件认领的工具卡片 `[data-dsh-browser-row="webpage_open"]`
  *    出现 —— 这就是「工具卡片自身渲染」的硬证据。
  * 5. `Page.captureScreenshot` 存一张整页截图。
  *
@@ -147,7 +147,7 @@ async function main() {
 
     // 4) 轮询工具卡片：P0 的 open 卡片 + P1 的 snapshot / tabs / click + P2 的 execute
     //    + P3 的 find（fake-llm 脚本 2026-09-13 起走弹窗转标签页全链路）。
-    const EXPECTED_ROWS = ['browser_open', 'browser_snapshot', 'browser_execute', 'browser_find', 'browser_tabs', 'browser_click']
+    const EXPECTED_ROWS = ['webpage_open', 'webpage_snapshot', 'webpage_execute', 'webpage_find', 'webpage_tabs', 'webpage_click']
     /** row → { state, url, text }，出现即记录。 */
     const cards = new Map()
     while (Date.now() < deadline && cards.size < EXPECTED_ROWS.length) {
@@ -214,21 +214,21 @@ async function main() {
     // 5) 真实任务流的硬证据：热搜第五条是 target=_blank 链接，点击后弹窗被 host 转成
     //    新标签、provider 经 opened 通报收编进会话注册表 —— tabs(list) 的结果必须
     //    列出第二个标签（session_id=t2，且 [foreground] 在前台上）。
-    const tabsText = cards.get('browser_tabs').text === '(from trajectory)'
+    const tabsText = cards.get('webpage_tabs').text === '(from trajectory)'
       ? (await evaluate(call, 'document.body.innerText'))
-      : cards.get('browser_tabs').text
+      : cards.get('webpage_tabs').text
     if (!/session_id=t2\b/.test(tabsText) || !tabsText.includes('[foreground]')) {
-      throw new Error(`弹窗标签没进 tabs 清单：browser_tabs 结果里没有前台 t2 → ${tabsText.slice(0, 300)}`)
+      throw new Error(`弹窗标签没进 tabs 清单：webpage_tabs 结果里没有前台 t2 → ${tabsText.slice(0, 300)}`)
     }
     console.log('verify-card: 弹窗标签已进 tabs 清单（结果含前台 t2）')
 
     // 第五条 = 大纲里带数字 5 的那条（`link "5 …"`），不是 DOM 第 5 个。
     // 2026-09-13 实测 find 拿了第五个 DOM 标题，点到了第二条。
-    const findText = cards.get('browser_find').text === '(from trajectory)'
+    const findText = cards.get('webpage_find').text === '(from trajectory)'
       ? (await evaluate(call, 'document.body.innerText'))
-      : cards.get('browser_find').text
+      : cards.get('webpage_find').text
     if (!/link "5 /.test(findText)) {
-      throw new Error(`没按榜单序号 5 定位：browser_find 结果里没有 link "5 …" → ${findText.slice(0, 300)}`)
+      throw new Error(`没按榜单序号 5 定位：webpage_find 结果里没有 link "5 …" → ${findText.slice(0, 300)}`)
     }
     console.log('verify-card: find 命中榜单序号 5（大纲含 link "5 ）')
 
@@ -241,7 +241,7 @@ async function main() {
     } catch (error) {
       console.log(`verify-card: 截图跳过（${error instanceof Error ? error.message : String(error)}）——不影响 PASS 判定`)
     }
-    console.log('verify-card: PASS —— browser_open / snapshot / tabs / click 真执行、'
+    console.log('verify-card: PASS —— webpage_open / snapshot / tabs / click 真执行、'
       + `四张工具卡片真渲染且 state=ok（${EXPECTED_ROWS.map(name => `${name}=${cards.get(name).state}`).join(', ')}）`)
   })
 }

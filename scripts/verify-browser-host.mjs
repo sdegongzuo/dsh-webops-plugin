@@ -1,5 +1,5 @@
 /**
- * 验证便携版里「agent 调 `browser_open` 能开出真窗口」这条链 —— **全程自动**。
+ * 验证便携版里「agent 调 `webpage_open` 能开出真窗口」这条链 —— **全程自动**。
  *
  * ## 为什么要有这个脚本
  *
@@ -32,7 +32,7 @@
  *
  * ## 它验不了什么（两件，必须留给人）
  *
- * - **模型真的调用 `browser_open`**：需要一个能用的 API key，key 只在用户机器上；
+ * - **模型真的调用 `webpage_open`**：需要一个能用的 API key，key 只在用户机器上；
  * - **窗口外观**：截图（`--out` 落盘）能替代一部分，「窗口在屏幕上、拖得动」只能人看。
  *
  * ## 一个实现上的坑（踩过）
@@ -250,6 +250,6 @@ if (failures.length > 0) {
 }
 console.log('\n✓ verify:browser-host 通过：包内产物能在打包 exe 上开出真窗口（open → 快照 → 截图），')
 console.log('  且 cdp/electron 同时可用时的 provider 选择不再撞 ambiguous。')
-console.log('  仍未覆盖：模型真的调用 browser_open（要 API key）、窗口外观（要人眼）。')
+console.log('  仍未覆盖：模型真的调用 webpage_open（要 API key）、窗口外观（要人眼）。')
 // 宿主 keepAlive=false，连接一断就自己退；显式退出免得等它。
 process.exit(0)

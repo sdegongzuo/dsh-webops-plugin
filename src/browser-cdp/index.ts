@@ -62,7 +62,7 @@ export interface Config {
   navigationTimeoutMs?: number
   /** `available()` 缓存探测结果的有效期（毫秒）。默认 1000。 */
   probeTtlMs?: number
-  /** `browser_wait` 里 text / hidden 条件的默认超时（毫秒）。默认 10000。 */
+  /** `webpage_wait` 里 text / hidden 条件的默认超时（毫秒）。默认 10000。 */
   waitTimeoutMs?: number
   /** 紧凑大纲的规模上限。 */
   snapshotLimits?: {

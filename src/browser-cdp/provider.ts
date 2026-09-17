@@ -120,7 +120,7 @@ const TAB_OPEN_WATCH_POLL_MS = 25
 /**
  * 探测到导航之后再等新文档「能用」的上限（毫秒）。
  *
- * 为什么需要：地址变了不等于新文档已解析完 —— 报告 S1 实测 `browser_press` 回车跳维基搜索页时
+ * 为什么需要：地址变了不等于新文档已解析完 —— 报告 S1 实测 `webpage_press` 回车跳维基搜索页时
  * 返回的 `title` 是**空串**（文档已提交，`<title>` 还没解析出来），调用方据此会误判「页没就绪」。
  * 所以检测到导航后额外等一小段：`readyState === 'complete'` 或标题出现即返回，超时也返回
  * （页面是慢，不是错，别把 `press` 拖成失败）。窗口远小于工具超时（60s）。
@@ -130,7 +130,7 @@ export const MUTATION_NAVIGATION_SETTLE_MS = 5_000
 /** `wait` 轮询 text / hidden 条件的间隔（毫秒）。 */
 const WAIT_POLL_INTERVAL_MS = 100
 
-/** `browser_console` / `browser_network` 的默认返回条数（从最新往回）。 */
+/** `webpage_console` / `webpage_network` 的默认返回条数（从最新往回）。 */
 export const DEFAULT_P2_LIMIT = 50
 
 /**
@@ -144,7 +144,7 @@ export const DEFAULT_P2_LIMIT = 50
  */
 export const MAX_P2_LIMIT = 150
 
-/** `browser_execute` 结果的裁剪上限（字符）；逃生舱可能返回极大对象，别撑爆上下文。 */
+/** `webpage_execute` 结果的裁剪上限（字符）；逃生舱可能返回极大对象，别撑爆上下文。 */
 export const EXECUTE_MAX_RESULT_CHARS = 20_000
 
 /**
@@ -352,7 +352,7 @@ export class CdpBrowserProvider implements BrowserProvider {
    *
    * 场景：窗口宿主里页面弹窗转的新标签、标签条「+」开的标签 —— 它们没走 `open()`
    * （没有 `newTab` 应答），会话注册表天然看不见；宿主在 dom-ready 后通报
-   * `{ type: 'opened' }`，provider 据此调用这里把它们收编进来，`browser_tabs(list)`
+   * `{ type: 'opened' }`，provider 据此调用这里把它们收编进来，`webpage_tabs(list)`
    * 与后续工具才可操作。通知到达时调试器已接上、文档已提交，所以：
    *
    * - `Page.enable` 等全部**尽力而为**：收编失败不该炸掉通报链路（标签顶多继续不可见，
@@ -793,14 +793,14 @@ export class CdpBrowserProvider implements BrowserProvider {
       if (error instanceof BrowserError
         && (error.code === 'BROWSER_DEBUGGER_DETACHED' || error.code === 'BROWSER_CONNECTION_LOST')) throw error
       throw new BrowserError(
-        `the element for ref "${request.ref}" is gone from the document; run browser_snapshot again`,
+        `the element for ref "${request.ref}" is gone from the document; run webpage_snapshot again`,
         'BROWSER_STALE_REF',
         { cause: error },
       )
     }
     if (objectId === undefined) {
       throw new BrowserError(
-        `the element for ref "${request.ref}" is no longer attached to the document; run browser_snapshot again`,
+        `the element for ref "${request.ref}" is no longer attached to the document; run webpage_snapshot again`,
         'BROWSER_STALE_REF',
       )
     }
@@ -814,7 +814,7 @@ export class CdpBrowserProvider implements BrowserProvider {
       if (connected.result?.value !== true) {
         throw new BrowserError(
           `the element for ref "${request.ref}" was removed from the document (the page may have `
-          + 're-rendered); run browser_snapshot again',
+          + 're-rendered); run webpage_snapshot again',
           'BROWSER_STALE_REF',
         )
       }
@@ -904,7 +904,7 @@ export class CdpBrowserProvider implements BrowserProvider {
     const session = this.sessions.get(sessionId)
     if (session === undefined) {
       throw new BrowserError(
-        `unknown browser session "${sessionId}"; open one with browser_open and reuse the session id it returns`,
+        `unknown browser session "${sessionId}"; open one with webpage_open and reuse the session id it returns`,
         'BROWSER_TARGET_NOT_FOUND',
       )
     }
@@ -1012,7 +1012,7 @@ export class CdpBrowserProvider implements BrowserProvider {
     const objectId = resolved.object?.objectId
     if (objectId === undefined) {
       throw new BrowserError(
-        'the observed element is no longer attached to the document; run browser_snapshot again',
+        'the observed element is no longer attached to the document; run webpage_snapshot again',
         'BROWSER_STALE_REF',
       )
     }
@@ -1073,7 +1073,7 @@ export class CdpBrowserProvider implements BrowserProvider {
     const objectId = await this.resolveNodeObjectId(session, target.backendNodeId, signal)
     if (objectId === undefined) {
       throw new BrowserError(
-        'the observed element is no longer attached to the document; run browser_snapshot again',
+        'the observed element is no longer attached to the document; run webpage_snapshot again',
         'BROWSER_STALE_REF',
       )
     }
@@ -1094,10 +1094,10 @@ export class CdpBrowserProvider implements BrowserProvider {
    * 后者给的是文档坐标，而 `Input.dispatchMouseEvent` 吃的是视口坐标；
    * 元素在视口外时文档坐标直接把事件点到看不见的地方去。
    *
-   * `scroll=false` 跳过 `scrollIntoView`（`browser_locate` 的默认路径）：只读坐标、不动视口。
+   * `scroll=false` 跳过 `scrollIntoView`（`webpage_locate` 的默认路径）：只读坐标、不动视口。
    * 零尺寸在此统一拒绝 —— click 的落点与 locate 的「不可见」判定都不能建立在 0 宽高的盒子上。
    *
-   * 同一次调用顺带把视口尺寸带回来（`browser_locate` 判 `in_viewport` 用，省一次往返）；
+   * 同一次调用顺带把视口尺寸带回来（`webpage_locate` 判 `in_viewport` 用，省一次往返）；
    * 老实现没有这两个字段，所以按可选读，读不到就是 `undefined`。
    */
   private async elementViewportBox(
@@ -1149,7 +1149,7 @@ export class CdpBrowserProvider implements BrowserProvider {
   }
 
   /**
-   * 读一次视口尺寸（CSS 像素）。`browser_scroll` 不带 ref 时用它算落点（视口中心）。
+   * 读一次视口尺寸（CSS 像素）。`webpage_scroll` 不带 ref 时用它算落点（视口中心）。
    * 读不到时退到 400×300 —— 滚轮事件落在视口内的任意一点都行，只有「落在视口外」才无效。
    */
   private async viewportSize(session: SessionState, signal?: AbortSignal): Promise<{ width: number; height: number }> {
@@ -1171,7 +1171,7 @@ export class CdpBrowserProvider implements BrowserProvider {
   }
 
   /**
-   * 在元素上画一层高亮（方案 4.3，`browser_locate` 的 `highlight: true`）。
+   * 在元素上画一层高亮（方案 4.3，`webpage_locate` 的 `highlight: true`）。
    *
    * 两道门缺一不可（`[V15][V20]`）：本 session 必须先 `DOM.enable` 才能成功
    * `Overlay.enable`，必须先 `Overlay.enable` 才能调 `Overlay.highlightNode`。
@@ -1198,7 +1198,7 @@ export class CdpBrowserProvider implements BrowserProvider {
   }
 
   /**
-   * 弹掉本 client 画的那层高亮（`browser_locate` 的 `highlight: false` 且此前画过时调用）。
+   * 弹掉本 client 画的那层高亮（`webpage_locate` 的 `highlight: false` 且此前画过时调用）。
    * `hideHighlight` 只弹自己那层（`[V31]`）；enable 门与 paint 相同，防止 re-attach 后
    * Overlay 未 enable 时 hide 直接失败。
    */
@@ -1321,7 +1321,7 @@ export class CdpBrowserProvider implements BrowserProvider {
     const dx = typeof deltaX === 'number' && Number.isFinite(deltaX) ? deltaX : 0
     const dy = typeof deltaY === 'number' && Number.isFinite(deltaY) ? deltaY : 0
     if (dx === 0 && dy === 0) {
-      throw new BrowserError('browser_scroll needs a non-zero deltaX or deltaY', 'BROWSER_PROTOCOL_ERROR')
+      throw new BrowserError('webpage_scroll needs a non-zero deltaX or deltaY', 'BROWSER_PROTOCOL_ERROR')
     }
     const beforeUrl = session.url
     const point = ref === undefined
@@ -1362,7 +1362,7 @@ export class CdpBrowserProvider implements BrowserProvider {
     const wantsRef = request.ref !== undefined
     if ([wantsTime, wantsText, wantsRef].filter(chosen => chosen).length !== 1) {
       throw new BrowserError(
-        'browser_wait needs exactly one of time_ms, text, or ref',
+        'webpage_wait needs exactly one of time_ms, text, or ref',
         'BROWSER_PROTOCOL_ERROR',
       )
     }
@@ -1371,7 +1371,7 @@ export class CdpBrowserProvider implements BrowserProvider {
     if (request.timeMs !== undefined) {
       if (!(request.timeMs > 0) || request.timeMs > MAX_WAIT_TIME_MS) {
         throw new BrowserError(
-          `browser_wait time_ms must be between 1 and ${String(MAX_WAIT_TIME_MS)}`,
+          `webpage_wait time_ms must be between 1 and ${String(MAX_WAIT_TIME_MS)}`,
           'BROWSER_PROTOCOL_ERROR',
         )
       }
@@ -1497,7 +1497,7 @@ export class CdpBrowserProvider implements BrowserProvider {
    * 等新文档「真的能用」：读到非空标题，或文档已 `complete`（那说明它本来就没有 `<title>`），
    * 或窗口耗尽。
    *
-   * 报告 S1 的成因很具体：`browser_press` 回车跳维基搜索页，`Page.navigate` 已提交（地址变了），
+   * 报告 S1 的成因很具体：`webpage_press` 回车跳维基搜索页，`Page.navigate` 已提交（地址变了），
    * 但 `<title>` 还在解析中，于是工具立刻返回 `title: ''`，调用方据此误判「页还没就绪」。
    * 这里只补这一小段等待，**超时不算失败**（页面是慢，不是错），也绝不把 `press` 拖成超时。
    */
@@ -1679,7 +1679,7 @@ export class CdpBrowserProvider implements BrowserProvider {
   }
 }
 
-/** `browser_press` 认得的键：名字 → CDP 键参数。 */
+/** `webpage_press` 认得的键：名字 → CDP 键参数。 */
 const KNOWN_KEYS: ReadonlyMap<string, { key: string; code: string; virtualKeyCode: number; text?: string }> = new Map([
   ['Enter', { key: 'Enter', code: 'Enter', virtualKeyCode: 13, text: '\r' }],
   ['Tab', { key: 'Tab', code: 'Tab', virtualKeyCode: 9 }],

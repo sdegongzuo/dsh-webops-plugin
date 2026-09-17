@@ -7,7 +7,7 @@
  * 那一行是「合法配置」，插件也是「合法加载」。
  *
  * 2026-09-15 又添一例同类事故：`browser-electron` 那一行**在**，但它该有的 `config`
- * 没了 —— provider 于是从不参与选择，`browser_open` 落到桌面端的死路上，症状就是
+ * 没了 —— provider 于是从不参与选择，`webpage_open` 落到桌面端的死路上，症状就是
  * 「没法打开新的窗口」。同样是「合法配置、合法加载、测试全绿」。
  *
  * 所以这里直接对**文件内容**断言三件事：
@@ -77,7 +77,7 @@ describe('出货 patch（cordis.patch.yml）', () => {
   it('browser-electron 那行必须显式启用（2026-09-15 事故：行在、config 没了，窗口开不出来）', () => {
     const block = rowBlock(body, 'browser-electron')
 
-    // 不写 enabled 的话 available() 恒为 false，browser_open 会落到 browser-cdp ——
+    // 不写 enabled 的话 available() 恒为 false，webpage_open 会落到 browser-cdp ——
     // 而它在桌面端里是死路（内置 Chromium 不实现 PUT /json/new）。
     expect(block, '少了 enabled: true，provider 不会参与选择')
       .toContain('enabled: true')
@@ -142,7 +142,7 @@ describe('便携 home 兜底（双击 exe 也能自带配置）', () => {
 describe('便携版使用说明（scripts/package-desktop-portable.mjs）', () => {
   const script = readRepoFile('scripts/package-desktop-portable.mjs')
 
-  it('说明里不再要求「先起外接 Chrome」（v0.2.1 起 browser_open 用 dsh 自己的窗口）', () => {
+  it('说明里不再要求「先起外接 Chrome」（v0.2.1 起 webpage_open 用 dsh 自己的窗口）', () => {
     // 旧文案让用户以为必须手起 Chrome，照着做反而误判功能坏了。
     expect(script).not.toContain('这个 Chrome 先起来')
     expect(script, '说明没告诉用户可以不外接 Chrome').toContain('不需要外接 Chrome')

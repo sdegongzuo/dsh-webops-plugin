@@ -1,5 +1,5 @@
 /**
- * `browser_execute` 的能力边界与返回值处理（方案 3.3）。
+ * `webpage_execute` 的能力边界与返回值处理（方案 3.3）。
  *
  * ## 白名单制，默认拒
  *
@@ -20,7 +20,7 @@
  * | `Target.*` | `Target.attachToTarget` 可拿到**其它标签页**的 session，越出本会话边界 |
  * | `Browser.*` | `Browser.close` 关掉整个浏览器 |
  * | `Emulation.*` / `Fetch.*` | 跨 client 污染 `[V6][V9]`；`Fetch.enable` 还能拦截、改写请求 |
- * | `Overlay.*` | **理由不是「跨 client」**：`[V31]` 实测多 client 高亮各自独立。拒它是因为它是**给眼睛看的副作用**——会污染截图、干扰人工在 DevTools Elements 里的高亮，而 `highlightRect` 的 `color` 还会把整个视口染色 `[V32]`。agent 的高亮走 `browser_locate` 这条受控通道 |
+ * | `Overlay.*` | **理由不是「跨 client」**：`[V31]` 实测多 client 高亮各自独立。拒它是因为它是**给眼睛看的副作用**——会污染截图、干扰人工在 DevTools Elements 里的高亮，而 `highlightRect` 的 `color` 还会把整个视口染色 `[V32]`。agent 的高亮走 `webpage_locate` 这条受控通道 |
  * | `Input.*` | 绕过 P1 的 `BROWSER_TOOL_CAPABILITIES` 分级，架空 `read`/`mutate` 判定 |
  * | `Network.emulateNetworkConditions` / `Network.setExtraHTTPHeaders` | `[V25][V26]` 实测跨 client 覆盖、后写赢，会污染人工会话 |
  * | `Network.setCacheDisabled` | `[V27]` 作用域无法判定，按最坏假设处理 |
@@ -117,7 +117,7 @@ export function assertExecuteAllowed(method: string): void {
   if (!BROWSER_EXECUTE_ALLOWED.includes(method)) {
     throw notAllowed(
       method,
-      'it is not on the browser_execute allow-list, and every command is denied by default — a new command '
+      'it is not on the webpage_execute allow-list, and every command is denied by default — a new command '
       + 'must be reviewed and added to the allow-list explicitly, never admitted by omission',
     )
   }
@@ -126,7 +126,7 @@ export function assertExecuteAllowed(method: string): void {
 /** 造一条带 method 全文的拒绝错误。 */
 function notAllowed(method: string, reason: string): BrowserError {
   return new BrowserError(
-    `browser_execute refused the CDP command "${method}": ${reason}. `
+    `webpage_execute refused the CDP command "${method}": ${reason}. `
     + 'Only the read-only / session-private commands on its allow-list may run through this escape hatch.',
     'BROWSER_EXECUTE_NOT_ALLOWED',
   )

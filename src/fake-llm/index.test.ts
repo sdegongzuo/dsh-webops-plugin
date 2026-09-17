@@ -90,7 +90,7 @@ describe('lastRef', () => {
     const history = [
       '- link "2 渔民落水11天后事都办了 人回来了" [ref=e22]',
       '- link "5 亚朵店长叫“现长”店助叫“政委”" [ref=e35]',
-      'session_id=t1 — 1 match(es) in the cached outline of the last browser_snapshot',
+      'session_id=t1 — 1 match(es) in the cached outline of the last webpage_snapshot',
       '- [e35] link "5 亚朵店长叫“现长”店助叫“政委”" — - link "5 亚朵店长叫“现长”店助叫“政委”" [ref=e35]',
     ].join('\n')
     expect(lastRef(history)).toBe('e35')
@@ -116,7 +116,7 @@ describe('detailDigest', () => {
 
   function historyOf(body: string, url = URL): string {
     return [
-      'browser_execute → ok',
+      'webpage_execute → ok',
       FIFTH,
       `Runtime.evaluate on session_id=t2 (at ${url}, ref epoch 2) ${body}`,
     ].join('\n')
