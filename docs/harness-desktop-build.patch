@@ -1,3 +1,22 @@
+diff --git a/apps/desktop-host/config/desktop.cordis.patch.yml b/apps/desktop-host/config/desktop.cordis.patch.yml
+index 92f4df6ddf..d19b0008cb 100644
+--- a/apps/desktop-host/config/desktop.cordis.patch.yml
++++ b/apps/desktop-host/config/desktop.cordis.patch.yml
+@@ -32,3 +32,14 @@
+ 
+     - id: ui-directory-picker-native
+       name: '@deepseek-ai/dsh-client-ui-directory-picker-native'
++
++# PTC（`run_code`）子进程的 node 可执行文件。
++#
++# 默认值是 `process.execPath`，打包态那是 Electron 主 exe —— ptc-runtime-node 构造子进程
++# 环境时会删掉 `ELECTRON_RUN_AS_NODE`，Electron 于是不会进入 node 模式，子进程永远不回应，
++# `run_code` 挂到超时。shell 在 main.ts 顶层注入 DSH_PTC_NODE 指向包内的真 node
++# （`resources\runtime\node`），这里读它；开发态没有该变量，回落到 execPath 本身
++# —— 开发者直接跑 node，那本来就是对的。
++- id: ptc-runtime
++  config:
++    nodeExecutable: !!js process.env.DSH_PTC_NODE ?? process.execPath
 diff --git a/apps/desktop/electron-builder.config.mjs b/apps/desktop/electron-builder.config.mjs
 index 752a3c4134..b745e522cb 100644
 --- a/apps/desktop/electron-builder.config.mjs
@@ -39,7 +58,7 @@ index d3f9dae8a3..f83a0923ed 100644
      const targetName = resolveDesktopBuildTarget()
      const target = { platform: process.platform, arch: targetName.endsWith('arm64') ? 'arm64' : 'x64' }
 diff --git a/apps/desktop/src/main.ts b/apps/desktop/src/main.ts
-index e63e21588a..d215a2a7ef 100644
+index e63e21588a..52e0178f92 100644
 --- a/apps/desktop/src/main.ts
 +++ b/apps/desktop/src/main.ts
 @@ -1,6 +1,7 @@
@@ -59,7 +78,7 @@ index e63e21588a..d215a2a7ef 100644
  import { DesktopProjectManager, type DesktopProjectHooks } from './project-manager.ts'
  import { DesktopHostProcess } from './host-process.ts'
  import { DesktopBackendController, type DesktopBackendState } from './backend-controller.ts'
-@@ -23,6 +24,21 @@ import { DesktopUpdateCoordinator } from './update-coordinator.ts'
+@@ -23,6 +24,40 @@ import { DesktopUpdateCoordinator } from './update-coordinator.ts'
  import { desktopErrorState } from './startup-error.ts'
  import { startupFailureDocument } from './startup-document.ts'
  
@@ -67,6 +86,25 @@ index e63e21588a..d215a2a7ef 100644
 +// electron.exe，browser-electron 的窗口宿主只能用这个 exe 起第二个实例。
 +// 注意**不能**用 `DSH_DESKTOP_` 前缀：`host-process.ts` 会把那个前缀的变量全部过滤掉。
 +process.env.DSH_APP_EXECUTABLE = process.execPath
++
++// PTC 子进程（`run_code` 的实际执行体）必须由**真正的 node** 启动。
++//
++// 打包态的 `process.execPath` 是 Electron 主 exe，host 子进程靠 `ELECTRON_RUN_AS_NODE=1`
++// 才以 node 模式运行；而 `@deepseek-ai/dsh-ptc-runtime-node` 给 PTC 子进程构造环境时
++// 会把 `ELECTRON_RUN_AS_NODE` 一起删掉（它只保留 PATH/PATHEXT/SYSTEMROOT/WINDIR/TEMP/TMP，
++// 再按 `pkg` 打包标记补自己的变量，而 Electron 没有那个标记）。于是 Electron exe 不再
++// 进入 node 模式，stdin/stdout 上的控制协议永远建立不起来，`run_code` 挂到超时 —— 症状
++// 就是「ptc 模式下工具起不来」。
++//
++// 便携包自带一份真 node（`resources\runtime\node\node.exe`，打包时随 runtime 目录进来），
++// 指过去即可；开发态回落到 execPath 本身（那本来就是 node）。由 desktop-host 的
++// composition patch 读这个变量写进 `ptc-runtime` 行的 `nodeExecutable`。
++process.env.DSH_PTC_NODE = join(
++  process.resourcesPath,
++  'runtime',
++  'node',
++  process.platform === 'win32' ? 'node.exe' : 'node',
++)
 +
 +// 便携模式：主 exe 的上一级如果存在 `home\`，就把这份安装当成便携版，把它认作 $DSH_HOME。
 +// 便携版的布局是 `<root>\app\<exe>` + `<root>\home`，于是**双击 exe 本体**也能自带配置
@@ -81,7 +119,7 @@ index e63e21588a..d215a2a7ef 100644
  const SCHEME = 'dsh-app'
  let focusPrimaryWindow = (): void => {}
  type RecoveryAction = 'restart' | 'plugins' | 'reset'
-@@ -76,8 +92,11 @@ function runtimeResources(): RuntimeResources {
+@@ -76,8 +111,11 @@ function runtimeResources(): RuntimeResources {
      : process.execPath
    const pnpm = (development ? process.env.DSH_DESKTOP_PNPM_ENTRY : undefined)
      ?? join(process.resourcesPath, 'runtime', 'pnpm', 'bin', 'pnpm.mjs')
@@ -95,7 +133,7 @@ index e63e21588a..d215a2a7ef 100644
    return { node, pnpm, dsh, ...(development ? {} : { profileResolution: 'runtime' }) }
  }
  
-@@ -507,19 +526,31 @@ async function main(): Promise<void> {
+@@ -507,19 +545,31 @@ async function main(): Promise<void> {
    setTimeout(() => { void checkAndPrompt(false) }, 10_000)
  }
  

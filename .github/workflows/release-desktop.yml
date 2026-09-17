@@ -209,6 +209,16 @@ jobs:
         # 验的是**解压后的 zip**：打包脚本收尾会 rmSync 掉 .desktop-stage
         # （package-desktop-portable.mjs:259），所以那个中间目录在这里已经没了。
         # 验解压产物反而更忠实 —— 那正是用户拿到的东西，顺带证明 zip 本身没坏。
+        #
+        # 后两条是 2026-09-17 补的，都验「构建得出来 ≠ 跑得起来」那一类：
+        #   verify-ptc      —— ptc 模式下 run_code 的执行体（子进程）真能跑起来。
+        #                      打包态 process.execPath 是 Electron exe，而 ptc 子进程会
+        #                      删掉 ELECTRON_RUN_AS_NODE，于是永远不回应。只验「服务存在」
+        #                      拦不住，必须真跑一段程序看返回值。
+        #   verify-settings —— 出厂 settings.yaml 真的注册成了 llm provider。
+        #                      字段名写错（baseURL/baseUrl）或取值越界时，pi-ai 会把
+        #                      **整条路由静默拒掉**，用户只看到「一个模型都没有」。
+        # 两者都只用临时 home，不会把待验目录「启动过」，所以能跟在 verify-portable 后面。
         shell: pwsh
         env:
           # harness 是插件仓的兄弟目录（同「取 deepseek-harness 源码」step 的 Split-Path 结果）。
@@ -221,6 +231,10 @@ jobs:
           Write-Host "解压后再自检: $zip -> $dest"
           Expand-Archive -LiteralPath $zip -DestinationPath $dest -Force
           node "$env:GITHUB_WORKSPACE/scripts/verify-portable.mjs" --dir "$dest" --harness "$env:HARNESS_ROOT"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          node "$env:GITHUB_WORKSPACE/scripts/verify-ptc.mjs" --dir "$dest"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          node "$env:GITHUB_WORKSPACE/scripts/verify-settings.mjs" --dir "$dest"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: 写 release 说明
@@ -235,8 +249,22 @@ jobs:
           ### 用法
 
           1. 解压到**不含中文和空格**的路径
-          2. 双击 **启动.cmd**（不要直接点 app 目录里的 exe —— 那样 `$DSH_HOME` 会落回用户目录，配置不再随包走）
+          2. 双击 **启动.cmd**；直接双击 `app\` 里的 exe 也一样 —— 从 v0.2.2 起 exe 会自己
+             认出旁边的 `home\`（`resolvePortableDshHome`），配置照样随包走
           3. 首次运行会被 SmartScreen 拦，点「更多信息」→「仍要运行」
+
+          ### 第一次打开：填一个模型 API Key
+
+          包里的 `home\settings.yaml` 已经预置好**云知声 MaaS**（[maas.unisound.com](https://maas.unisound.com)，
+          OpenAI 兼容），默认模型 `u2-flash`，备选 17 个（DeepSeek / Kimi / GLM / MiniMax / Qwen 等）。
+          **包里不含任何 API Key**，需要你自己填一个：
+
+          1. 打开「设置 → 模型」，找到 **云知声 MaaS**
+          2. 粘贴你的 API Key —— 它会写进 `home\.credentials.yaml`，下次启动自动带上
+
+          也可以不改界面，直接设环境变量 `UNISOUND_API_KEY`（环境变量优先级更高，但只读、不会被设置页改写）。
+
+          API Key 在 [maas.unisound.com](https://maas.unisound.com) 控制台申请。
 
           ### 这一版装在里面的是什么
 

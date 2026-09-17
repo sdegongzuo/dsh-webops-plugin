@@ -8,6 +8,7 @@
  *   node scripts/package-desktop-portable.mjs --app <win-unpacked 目录> [--version 0.1.0]
  *   node scripts/package-desktop-portable.mjs [--version 0.1.0]        # 复用缓存的 base
  *   node scripts/package-desktop-portable.mjs --app <dir> --cache-base # 构建后顺便缓存 base
+ *   node scripts/package-desktop-portable.mjs --app <dir> --stage .desktop-stage-2  # 默认暂存目录被占用时
  *
  * 产出：
  *   dist/dsh-webops-desktop-v<ver>-win-x64-portable.zip
@@ -31,16 +32,15 @@
  * 这个坑 2026-09-14 才被发现：v0.1.0 和 v0.2.0 的包都因此启动后没有任何插件。
  */
 
-import { execFileSync } from 'node:child_process'
+import { spawnSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
-import { cpSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
+import { cpSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { readRuntimeDescriptor } from './desktop-runtime.mjs'
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const DIST = join(ROOT, 'dist')
-const STAGE = join(ROOT, '.desktop-stage')
 /** 第 1 层 base 的本地缓存：dsh 本体不常变，缓存后插件发版无需重编译。 */
 const BASE_CACHE = join(ROOT, '.desktop-base', 'app')
 
@@ -57,6 +57,16 @@ const readArg = (name) => {
 
 const cacheBase = args.includes('--cache-base')
 let appDir = readArg('app')
+/**
+ * 暂存目录。默认 `<仓库根>/.desktop-stage`；`--stage` 可临时换一个。
+ *
+ * 为什么留这个口子（2026-09-17）：本机出现过 `.desktop-stage\app\resources\app.asar`
+ * 被某个进程**内存映射**住（能 `r+` 打开，但拿不到删除权，`unlink` 恒 EBUSY、
+ * 连目录都改不了名）。脚本开头那句 `rmSync(STAGE)` 于是直接抛 `EBUSY`，
+ * 整个打包在「主程序: …」之后一步都走不动，看着完全像打包脚本坏了。
+ * 换个空目录就能继续，不必等那个句柄自己消失（CI 每次都是新目录，碰不到）。
+ */
+const STAGE = resolve(readArg('stage') ?? join(ROOT, '.desktop-stage'))
 const pkg = JSON.parse(readFileSync(join(ROOT, 'package.json'), 'utf8'))
 const version = readArg('version') ?? pkg.version
 const pluginName = pkg.name
@@ -68,6 +78,7 @@ if (appDir === undefined && existsSync(BASE_CACHE)) {
 if (appDir === undefined || !existsSync(appDir)) {
   console.error('用法: node scripts/package-desktop-portable.mjs --app <win-unpacked 目录> [--version x.y.z]')
   console.error('      node scripts/package-desktop-portable.mjs [--version x.y.z]   # 复用 .desktop-base/app')
+  console.error('      加 --stage <目录> 可换掉默认的 .desktop-stage（被占用时用）')
   process.exit(1)
 }
 if (cacheBase) {
@@ -92,10 +103,22 @@ console.log(`主程序: ${exe}`)
 const zipName = `dsh-webops-desktop-v${version}-win-x64-portable.zip`
 const zipPath = join(DIST, zipName)
 
-rmSync(STAGE, { recursive: true, force: true })
+try {
+  rmSync(STAGE, { recursive: true, force: true })
+} catch (error) {
+  // 最常见的两种：`EBUSY` = 里面某个文件被内存映射住（见上面 STAGE 的注释），
+  // `EPERM` = 有进程把它当工作目录。都不是「打包脚本坏了」，换个目录即可。
+  console.error(`package-desktop-portable: 清不掉暂存目录 ${STAGE} —— ${error.code ?? ''} ${error.message}`)
+  console.error('  多半是有进程占着里面的文件（内存映射 / 工作目录）。两个办法：')
+  console.error('    · 关掉占用它的进程后再跑；或')
+  console.error('    · 换个暂存目录：--stage .desktop-stage-2')
+  process.exit(1)
+}
 mkdirSync(DIST, { recursive: true })
 mkdirSync(STAGE, { recursive: true })
-if (existsSync(zipPath)) rmSync(zipPath)
+// 这里**不**删旧的同名 zip。理由：删掉之后一旦压缩环节失败，就既没有新产物、也把上一版
+// 打好的包弄没了（2026-09-17 真踩过：Compress-Archive 无声失败，dist/ 里空了一次）。
+// 新 zip 先写成 `.building-<name>.zip`，确认落盘后再原子替换，见第 6 节。
 
 // 1) 应用本体
 cpSync(appDir, join(STAGE, 'app'), { recursive: true })
@@ -179,6 +202,18 @@ writeFileSync(
 )
 console.log(`  + home/profiles/desktop/desktop-runtime-state.json (node ${runtime.release.nodeVersion}, ${runtime.platform}/${runtime.arch})`)
 
+// 2.7) 出厂 settings.yaml：预置模型接入。便携版的 home\ 是全新的一份，不写这里的话
+//      用户开箱只有 dsh 自带的默认路由、且没有凭据，等于没有可用模型。
+//      模板在 scripts/portable-home-settings.yaml：**凭据引用名**（apiKeyEnv）进包，
+//      API Key 本身不进包，由用户在「设置 → 模型」里填，落到 home\.credentials.yaml。
+const settingsTemplate = join(ROOT, 'scripts', 'portable-home-settings.yaml')
+if (!existsSync(settingsTemplate)) {
+  console.error(`package-desktop-portable: 缺少出厂配置模板 ${settingsTemplate}`)
+  process.exit(1)
+}
+cpSync(settingsTemplate, join(STAGE, 'home', 'settings.yaml'))
+console.log('  + home/settings.yaml（预置云知声 MaaS provider）')
+
 // 3) 插件真身。必须是**真实文件**：validateDesktopPluginGraph 见 symlink 就拒。
 //    发布版 package.json 剔除 devDependencies 里指向本机 harness 的 link:。
 const pluginDir = join(profileDir, 'node_modules', pluginName)
@@ -238,6 +273,19 @@ writeFileSync(
     `  ${pluginName} 已经预装在 home\\profiles\\desktop\\node_modules\\ 下，`,
     '  并在该 profile 的 dsh.profile.bundles 里登记过，开箱即用。',
     '',
+    '【第一次打开：填一个模型 API Key】',
+    '  home\\settings.yaml 已经预置好云知声 MaaS（https://maas.unisound.com，',
+    '  OpenAI 兼容），默认模型 u2-flash，另有 17 个备选（DeepSeek / Kimi / GLM /',
+    '  MiniMax / Qwen 等）。**包里不含任何 API Key**，需要你自己填一个：',
+    '',
+    '    1) 打开「设置 → 模型」，找到「云知声 MaaS」',
+    '    2) 粘贴你的 API Key（会写进 home\\.credentials.yaml，下次启动自动带上）',
+    '',
+    '  也可以不改界面，直接设环境变量 UNISOUND_API_KEY 再启动',
+    '  （环境变量优先级更高，但只读、不会被设置页改写）。',
+    '  Key 在 https://maas.unisound.com 控制台申请。',
+    '  没填就发消息的话，dsh 会报 MISSING_CREDENTIAL 并提示要设哪个变量。',
+    '',
     '【验证插件生效】',
     '  1) 先「选择工作区」，然后新建一个会话。',
     '     状态条挂在**会话面**的输入框上方；停在工作区选择页时它不会出现 ——',
@@ -269,18 +317,47 @@ writeFileSync(
 // .node、图片），Optimal 换来的体积收益是个位数 MB，代价却是几分钟的 CPU ——
 // 实测这一整步（物化 profile + 打 zip）在 CI 上要 294s，压缩占了绝大部分。
 // 产物仍是标准 zip（Compress-Archive 只换 deflate 级别），不影响用户侧解压。
-execFileSync(
+//
+// 为什么先写临时名再改名（2026-09-17 踩坑后改）：
+//   · `Compress-Archive` 的失败是 **PowerShell 的非终止错误**，进程退出码仍是 0；
+//     原来的 `execFileSync(..., { stdio: 'pipe' })` 把 stderr 吞了，于是脚本「成功」
+//     地去读一个根本没生成的 zip，报一句莫名其妙的 ENOENT。
+//   · 现在显式 `$ErrorActionPreference='Stop'` 逼出非零退出，并把 stderr 打出来，
+//     同时自己断言产物真的存在。
+//   · 先写临时名后改名，则失败时旧 zip 原封不动 —— 打好的包不该被一次失败的重打弄丢。
+//
+// 临时名**必须以 `.zip` 结尾**：`Compress-Archive` 的 `-DestinationPath` 会校验扩展名，
+// 写成 `xxx.zip.part` 会直接报「不是支持的存档文件格式。只有 .zip 才是」而不产出任何文件
+// （2026-09-17 实测，第一次改成 `.part` 就是这么挂的）。所以用 `.building-` 前缀 + 原名。
+const partial = join(DIST, `.building-${zipName}`)
+if (existsSync(partial)) rmSync(partial)
+const archived = spawnSync(
   'powershell',
   [
     '-NoProfile',
     '-NonInteractive',
     '-Command',
-    `Compress-Archive -Path '${join(STAGE, '*')}' -DestinationPath '${zipPath}' -CompressionLevel Fastest -Force`,
+    `$ErrorActionPreference='Stop'; Compress-Archive -Path '${join(STAGE, '*')}' -DestinationPath '${partial}' -CompressionLevel Fastest`,
   ],
-  { stdio: 'pipe' },
+  { encoding: 'utf8' },
 )
+if (archived.status !== 0 || !existsSync(partial)) {
+  console.error(`package-desktop-portable: Compress-Archive 失败（exit=${String(archived.status)}）`)
+  console.error((archived.stderr ?? '').trim() || (archived.stdout ?? '').trim() || '(无输出)')
+  console.error(`  暂存目录原样保留在 ${STAGE}，可手工压缩排查；上一版 zip 未被改动。`)
+  if (existsSync(partial)) console.error(`  半截产物也留在 ${partial}，确认后自行删除。`)
+  process.exit(1)
+}
+if (existsSync(zipPath)) rmSync(zipPath)
+renameSync(partial, zipPath)
 
-rmSync(STAGE, { recursive: true, force: true })
+// 收尾清理。zip 已经落盘了，这里失败**不该**把整次打包判成失败
+// （本机见过暂存目录被占用导致这一步抛 EBUSY 的情况），所以只告警。
+try {
+  rmSync(STAGE, { recursive: true, force: true })
+} catch (error) {
+  console.warn(`\n注意: 暂存目录没能清掉（${error.code ?? ''}），zip 不受影响，可稍后手工删 ${STAGE}`)
+}
 
 const bytes = readFileSync(zipPath)
 console.log(`\n${zipName}  (${(bytes.length / 1024 / 1024).toFixed(1)} MB)`)

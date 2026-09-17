@@ -4,10 +4,10 @@ dist/
 .portable-stage/
 # dsh 桌面端本体缓存（611MB，只作本地构建加速，不入库）
 .desktop-base/
-# 打包中间产物（app/ + profile/ 的临时拼装目录）
-.desktop-stage/
+# 打包中间产物（app/ + profile/ 的临时拼装目录；`--stage` 可带后缀，故用通配）
+.desktop-stage*/
 # verify:portable 用的解压副本（几百 MB，一次性；本机 safe-delete 会拦大目录删除）
-.rel-verify/
+.rel-verify*/
 coverage/
 *.tsbuildinfo
 *.log
