@@ -406,11 +406,24 @@ const archived = spawnSync(
   { encoding: 'utf8' },
 )
 if (archived.status !== 0 || !existsSync(partial)) {
-  console.error(`package-desktop-portable: Compress-Archive 失败（exit=${String(archived.status)}）`)
-  console.error((archived.stderr ?? '').trim() || (archived.stdout ?? '').trim() || '(无输出)')
-  console.error(`  暂存目录原样保留在 ${STAGE}，可手工压缩排查；上一版 zip 未被改动。`)
-  if (existsSync(partial)) console.error(`  半截产物也留在 ${partial}，确认后自行删除。`)
-  process.exit(1)
+  // 常见失败原因：火绒 HipsDaemon 对新建的 app.asar 挂扫描句柄（只挡独占/删除，不挡共享读），
+  // `Compress-Archive` 打不开就直接 PermissionDenied。`scripts/zip-stage.py` 走共享读，
+  // 同一个暂存目录能照常压完 —— 退化到它，产物等价（2026-09-17 实测 17s 压完 12497 条目）。
+  console.warn(`package-desktop-portable: Compress-Archive 失败（exit=${String(archived.status)}），退化到 scripts/zip-stage.py`)
+  console.warn((archived.stderr ?? '').trim() || (archived.stdout ?? '').trim() || '(无输出)')
+  const fallback = spawnSync(
+    'python',
+    [join(ROOT, 'scripts', 'zip-stage.py'), '--stage', STAGE, '--out', partial],
+    { encoding: 'utf8' },
+  )
+  console.log((fallback.stdout ?? '').trim())
+  if (fallback.status !== 0 || !existsSync(partial)) {
+    console.error(`package-desktop-portable: 退化压缩也失败（exit=${String(fallback.status)}）`)
+    console.error((fallback.stderr ?? '').trim() || '(无 stderr)')
+    console.error(`  暂存目录原样保留在 ${STAGE}，可手工压缩排查；上一版 zip 未被改动。`)
+    if (existsSync(partial)) console.error(`  半截产物也留在 ${partial}，确认后自行删除。`)
+    process.exit(1)
+  }
 }
 if (existsSync(zipPath)) rmSync(zipPath)
 renameSync(partial, zipPath)
