@@ -228,3 +228,56 @@ index da2d5c478d..df8381a4d5 100644
    checkKoffi()
    await checkSharp()
    checkHtml()
+diff --git a/packages/sandbox/sandbox-local/src/index.ts b/packages/sandbox/sandbox-local/src/index.ts
+index 037dc90079..298b438fd0 100644
+--- a/packages/sandbox/sandbox-local/src/index.ts
++++ b/packages/sandbox/sandbox-local/src/index.ts
+@@ -147,6 +147,30 @@ interface AclTempCapability {
+   grant: AclWriteGrant
+ }
+ 
++/**
++ * The node executable the windows-acl runner argv is prefixed with.
++ *
++ * Deliberately not a bare `process.execPath`: packaged desktop runs the host as
++ * the Electron MAIN executable (`process.execPath` plus the injected
++ * `ELECTRON_RUN_AS_NODE=1`). A spawner that scrubs the child environment — the
++ * PTC runtime keeps only PATH/PATHEXT/SYSTEMROOT/WINDIR/TEMP/TMP — drops that
++ * variable, so prefixing with `process.execPath` hands `runner.js` to Electron
++ * as a GUI app. It then takes the single-instance path and exits 0 without ever
++ * loading the script, so every confined PTC execution fails as
++ * `worker-exit: Node process exited before completing (0)` with no output.
++ *
++ * The desktop package ships a real node for this purpose
++ * (`resources/runtime/node`), so use it whenever we ARE the Electron runtime and
++ * it is present. Dev, CLI and test runs keep `process.execPath` unchanged.
++ */
++function runnerExecutable(): string {
++  if (process.versions.electron === undefined) return process.execPath
++  const resources = (process as unknown as { resourcesPath?: string }).resourcesPath
++  if (resources === undefined || resources.length === 0) return process.execPath
++  const bundled = join(resources, 'runtime', 'node', process.platform === 'win32' ? 'node.exe' : 'node')
++  return existsSync(bundled) ? bundled : process.execPath
++}
++
+ /**
+  * The runner chain per platform — selection is BY PLATFORM first, probes
+  * second: a platform's chain is probed in preference order only when it has
+@@ -557,13 +581,15 @@ export class LocalSandboxProvider extends SandboxProvider {
+    * Pin the source loader and TypeScript paths to this installation, independently
+    * of target cwd or environment overrides.
+    * The prefix stays `[node, runner, ...]` — a future native-exe runner keeps
+-   * the same argv contract and only swaps these entries.
++   * the same argv contract and only swaps these entries. The `node` slot comes
++   * from {@link runnerExecutable}, which is why packaged desktop does not
++   * launch the runner through the Electron main executable.
+    */
+   private windowsAclRunnerInvocation(): string[] {
+     const override = this.internals.windowsAclRunnerArgs
+     if (override !== undefined) return override
+     const builtEntry = this.internals.windowsAclRunnerEntry ?? fileURLToPath(import.meta.resolve('@deepseek-ai/dsh-sandbox-windows-acl/runner'))
+-    if (existsSync(builtEntry)) return [process.execPath, builtEntry]
++    if (existsSync(builtEntry)) return [runnerExecutable(), builtEntry]
+     const sourceEntry = fileURLToPath(import.meta.resolve('@deepseek-ai/dsh-sandbox-windows-acl/src/runner.ts'))
+     const sourceConfig = fileURLToPath(new URL('../../../../tsconfig.base.json', import.meta.url))
+     const registration = `import { register } from ${JSON.stringify(import.meta.resolve('tsx/esm/api'))}; register({ tsconfig: ${JSON.stringify(sourceConfig)} });`
