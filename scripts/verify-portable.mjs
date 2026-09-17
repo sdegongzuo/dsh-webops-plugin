@@ -117,12 +117,28 @@ function parseArgs(argv) {
   return options
 }
 
-const options = parseArgs(process.argv.slice(2))
-const packageRoot = resolve(options.dir)
+// 用法错误（缺 --dir、指错目录）不是「自检失败」，是「命令敲错了」：
+// 以前这里直接 throw，顶层未捕获 → 打一屏栈、退出码还是 1，看日志的人分不清
+// 究竟是包没过还是参数没给对。现在统一打一行原因 + 用法，退出码 2。
+let options
+let packageRoot
+let appRoot
+try {
+  options = parseArgs(process.argv.slice(2))
+  packageRoot = resolve(options.dir)
+  appRoot = join(packageRoot, 'app')
+  if (!existsSync(appRoot)) {
+    throw new Error(`${appRoot} 不存在 —— --dir 要指到解压后的便携版根目录（里面有 app/）`)
+  }
+} catch (error) {
+  const reason = error instanceof Error ? error.message : String(error)
+  // parseArgs 自己的消息已经带过前缀，别打成「verify-portable: verify-portable: …」。
+  console.error(`verify-portable: ${reason.replace(/^verify-portable:\s*/u, '')}`)
+  console.error('用法：node scripts/verify-portable.mjs --dir <解压后的便携版根目录> '
+    + '[--harness <deepseek-harness 源根目录>] [--profile <名>] [--port <端口>] [--cdp-port <端口>] [--keep-home]')
+  process.exit(2)
+}
 const profileDir = join(packageRoot, 'home', 'profiles', options.profile)
-
-const appRoot = join(packageRoot, 'app')
-if (!existsSync(appRoot)) throw new Error(`verify-portable: ${appRoot} 不存在 —— --dir 要指到解压后的便携版根目录（里面有 app/）`)
 
 // dsh 0.1.6 起运行时被打进 app.asar，磁盘上不是真目录（见 desktop-runtime.mjs 文件头）。
 // 纯 Node 脚本读不了 asar，先物化成临时目录再验；0.1.5 的 `resources\dsh` 直接用。
@@ -220,6 +236,14 @@ if (check(existsSync(statePath), 'desktop-runtime-state.json 在位（缺了它�
   check(!existsSync(join(profileDir, 'desktop-packages-pending')), '没有遗留 desktop-packages-pending（否则启动即报「准备未完成」）')
 }
 
+// fail fast：完整性 / runtime 身份不过，说明**这棵树本身就是坏的**。
+// 后面四步读的是同一棵树，继续跑只会把同一个结论重复四遍，还把真正的失败项淹在后面。
+if (failures.length > 0) {
+  console.error(`\n[1/5] 已失败 ${String(failures.length)} 项 —— 产物本身不对，后面四步验的是同一棵树，就此打住：`)
+  for (const message of failures) console.error(`  ✗ ${message}`)
+  process.exit(1)
+}
+
 /* ---------- 2. 复刻桌面端 prepareProfile ---------- */
 
 console.log('\n[2/5] 复刻桌面端 prepareProfile（建链 + 依赖图校验）')
@@ -244,10 +268,12 @@ if (existsSync(profileDir)) {
 
   const nmDir = join(profileDir, 'node_modules')
   const shipped = existsSync(nmDir) ? readdirSync(nmDir) : []
-  notes.push(`出厂态 profile/node_modules 只有 ${String(shipped.length)} 个条目（${shipped.join(', ')}）——` +
-    resolutionMode === 'runtime'
+  // 括号不能省：`A + b === 'runtime' ? X : Y` 求值为 `(A + b) === 'runtime' ? X : Y`，
+  // 恒取 Y —— 2026-09-17 之前 runtime 模式一直在打印「会建链接」的错误说明。
+  notes.push(`出厂态 profile/node_modules 只有 ${String(shipped.length)} 个条目（${shipped.join(', ')}）——`
+    + (resolutionMode === 'runtime'
       ? `${String(runtime.sharedPackages.length)} 个宿主包由运行时目录直接供给（runtime 模式不建链），这是设计如此`
-      : `${String(runtime.sharedPackages.length)} 条宿主链接由桌面端首次启动时建立，不在 zip 里，这是设计如此`)
+      : `${String(runtime.sharedPackages.length)} 条宿主链接由桌面端首次启动时建立，不在 zip 里，这是设计如此`))
 
   try {
     if (resolutionMode === 'runtime') {
@@ -447,6 +473,19 @@ const host = await runDesktopHost(runtimeDir, workProfileDir, async (frame) => f
 const ORIGIN = `http://127.0.0.1:${String(options.port)}`
 let nextStreamId = 1
 
+/**
+ * 宿主 fetch 的等待上限。
+ *
+ * 以前这里没有超时：宿主起了但**不回**这条流，`done` 永远不 settle，脚本就一直挂着 ——
+ * CI 上表现为「这一步跑了一小时」，看日志只知道卡住，不知道卡在等谁。
+ */
+// env 传进来的是字符串，拼错就是 NaN —— 那样 setTimeout 会立刻触发，
+// 报成「宿主 0ms 没回」，把人往完全错误的方向引。
+const configuredFetchTimeout = Number(process.env.VERIFY_HOST_FETCH_TIMEOUT_MS)
+const HOST_FETCH_TIMEOUT_MS = Number.isFinite(configuredFetchTimeout) && configuredFetchTimeout > 0
+  ? configuredFetchTimeout
+  : 20_000
+
 /** 走宿主的 fetch 通道取一个路径，把响应缓冲成完整 body。 */
 async function hostFetch(pathname) {
   const streamId = nextStreamId++
@@ -460,8 +499,25 @@ async function hostFetch(pathname) {
       error: (message) => rejectPromise(new Error(message)),
     })
   })
+  let timer
+  const timeout = new Promise((_resolve, rejectPromise) => {
+    timer = setTimeout(() => {
+      rejectPromise(new Error(`宿主 ${String(HOST_FETCH_TIMEOUT_MS)}ms 没回 ${pathname} —— 宿主起了但通道没通（不是包坏了）`))
+    }, HOST_FETCH_TIMEOUT_MS)
+  })
   await host.fetch({ streamId, request: { url: `${ORIGIN}${pathname}`, method: 'GET', headers: [] } }, null)
-  return await done
+  try {
+    return await Promise.race([done, timeout])
+  } catch (error) {
+    // 超时 / 出错后这条流的 sink 不会被 end 收走，留在表里就是泄漏。
+    sinks.delete(streamId)
+    // `done` 可能在超时之后才 reject；没接管的话 Node 会把它当成未处理的 Promise 拒绝，
+    // 于是「宿主没回」这个本来能读懂的错，变成一个看不懂的崩溃。
+    void done.catch(() => undefined)
+    throw error
+  } finally {
+    clearTimeout(timer)
+  }
 }
 
 const index = await hostFetch('/index.html')

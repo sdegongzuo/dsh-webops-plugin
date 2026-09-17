@@ -25,11 +25,30 @@
  * 用法：`pnpm run check:desktop`（可选环境变量 RENDERER_PORT，默认 9222）。
  */
 
+import { readFileSync } from 'node:fs'
+import { fileURLToPath } from 'node:url'
+
 const PORT = Number(process.env.RENDERER_PORT ?? 9222)
 const DEADLINE_MS = Number(process.env.CHECK_DEADLINE_MS ?? 60_000)
 const PLUGIN_ID = 'dsh-webops-plugin'
-/** 客户端应注册的工具卡片数：open / navigate / snapshot / screenshot / tabs / click / fill / press / scroll / wait。 */
-const EXPECTED_TOOL_VIEWS = 10
+
+/**
+ * 客户端应注册的工具卡片数。
+ *
+ * **不写死**：从 `src/client/index.ts` 的 `BROWSER_TOOLS` 现读。2026-09-17 之前这里写的是
+ * `10`，而清单早就是 15 个 —— 魔数一过期脚本就恒红，又因为 `check:desktop` 不在任何
+ * workflow 里，一直没人发现。宁可解析失败就报错，也不要再给一个会撒谎的默认值。
+ */
+function expectedToolViews() {
+  const override = process.env.CHECK_EXPECTED_TOOL_VIEWS
+  if (override !== undefined && override !== '') return Number(override)
+
+  const sourcePath = new URL('../src/client/index.ts', import.meta.url)
+  const match = /export const BROWSER_TOOLS = \[([\s\S]*?)\] as const/u.exec(readFileSync(sourcePath, 'utf8'))
+  // `fileURLToPath` 而不是 `.pathname`：后者在 Windows 上会打成 `/D:/dev/...`。
+  if (match === null) throw new Error(`没能在 ${fileURLToPath(sourcePath)} 里找到 BROWSER_TOOLS 清单`)
+  return [...match[1].matchAll(/'([^']+)'/gu)].length
+}
 
 const PROBE = `(() => {
   const boot = globalThis.__DSH_BOOT__;
@@ -91,6 +110,7 @@ async function evaluate(webSocketDebuggerUrl, expression) {
 }
 
 async function main() {
+  const EXPECTED_TOOL_VIEWS = expectedToolViews()
   const deadline = Date.now() + DEADLINE_MS
   let pages = []
   while (Date.now() < deadline) {
