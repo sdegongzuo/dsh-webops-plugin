@@ -306,6 +306,18 @@ if (existsSync(shippedPluginDir)) {
   check(existsSync(join(shippedPluginDir, 'lib', 'client.js')), '客户端产物 lib/client.js 在包里')
   check(existsSync(join(shippedPluginDir, 'lib', 'tool-browser', 'index.js')), '工具产物 lib/tool-browser/index.js 在包里')
   check(existsSync(join(shippedPluginDir, 'lib', 'browser-electron', 'host.cjs')), '窗口宿主脚本 lib/browser-electron/host.cjs 在包里')
+  // 窗口名是给人看的（任务栏 / Alt-Tab 里认人），所以出货包里的标题必须仍是那个中文名。
+  // 它只写在 host.cjs 一处，改错了没有任何别的地方会报错 —— 只有真机肉眼看才发现的类型。
+  const hostSource = readFileSync(join(shippedPluginDir, 'lib', 'browser-electron', 'host.cjs'), 'utf8')
+  check(hostSource.includes('dsh网页窗口'), '宿主窗口标题是「dsh网页窗口」')
+  check(!hostSource.includes("'dsh browser'"), '宿主窗口标题没有退回旧的 dsh browser')
+  // 最小化 / 隐藏时 `getContentBounds()` 返回 0×0，采信它就会把视图钉成 0 宽，
+  // 而尺寸归零的 webContents 不再出帧 —— 真机症状是「内容整片变白、CDP 却正常」。
+  // 这两条是那个 bug 的完整防线：不采信退化读数 + 重新可见时补 layout。
+  check(/isMinimized\(\)\s*\|\|\s*!shell\.isVisible\(\)/u.test(hostSource),
+    'layout() 不采信退化读数（最小化 / 隐藏 / 0 尺寸时不跑）')
+  check(hostSource.includes("shell.on('restore', layout)") && hostSource.includes("shell.on('show', layout)"),
+    '重新可见时会补跑 layout（restore / show）')
 }
 
 check(!existsSync(join(profileDir, 'cordis.patch.yml')),

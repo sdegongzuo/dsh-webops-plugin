@@ -104,6 +104,20 @@ export const MAX_WAIT_TIME_MS = 30_000
 export const MUTATION_NAVIGATION_POLL_MS = 800
 
 /**
+ * 一次 mutation 里「页面可能开出来的新标签页」必须被观测到的时间点：**动作发起点 + 本值**（毫秒）。
+ *
+ * 为什么是这个数：宿主的「弹窗转标签」链路（`setWindowOpenHandler` → `openTab` →
+ * `{type:'opened'}` 通报 → provider `adoptSession`）是异步的，本机实测（2026-09-17，
+ * `D:\Temp\dshhost\measure-opened.mjs`，n=5）从 `window.open` 被派发到父进程收到通报：
+ * **min 140ms / 中位 152ms / max 156ms**。取 250ms 是给慢机器留余量 ——
+ * 这个窗口只在「来不及观测」的路径上真正付出等待，代价见 {@link collectOpenedTabs}。
+ */
+export const TAB_OPEN_WATCH_MS = 250
+
+/** 补观测新标签页时的轮询间隔（毫秒）；远小于窗口本身，够细。 */
+const TAB_OPEN_WATCH_POLL_MS = 25
+
+/**
  * 探测到导航之后再等新文档「能用」的上限（毫秒）。
  *
  * 为什么需要：地址变了不等于新文档已解析完 —— 报告 S1 实测 `browser_press` 回车跳维基搜索页时
@@ -487,9 +501,27 @@ export class CdpBrowserProvider implements BrowserProvider {
    * **写前检查纪元**是这里的铁律：每个分支的第一步都是 `refs.resolve(ref)`
    * （经 `resolveObjectId`），旧 ref 在任何页面命令发出之前就失败 ——
    * 不存在「先点了一下才发现 ref 错了」的中间态。
+   *
+   * 本方法只做「动作前后各包一层」：前取会话台账快照、后补新标签页差集（见
+   * {@link collectOpenedTabs}）；动作本体在 {@link dispatchMutation}。
    */
   async mutate(request: BrowserMutationRequest, signal?: AbortSignal): Promise<BrowserMutationResult> {
     const session = this.require(request.sessionId)
+    // **操作前**先记下已有会话；收尾时取差集就是「本次操作顺带开出来的标签页」。
+    // 快照点必须在动作之前：页面可能在动作里就 adopt 出新会话（虽然实测要 150ms 级）。
+    const beforeIds = new Set(this.sessions.keys())
+    const watchUntil = Date.now() + TAB_OPEN_WATCH_MS
+    const result = await this.dispatchMutation(session, request, signal)
+    const openedTabs = await this.collectOpenedTabs(beforeIds, watchUntil, signal)
+    return openedTabs.length === 0 ? result : { ...result, openedTabs }
+  }
+
+  /** 按请求类型分发到具体动作；`mutate` 只负责「前后各包一层」（见上）。 */
+  private async dispatchMutation(
+    session: SessionState,
+    request: BrowserMutationRequest,
+    signal?: AbortSignal,
+  ): Promise<BrowserMutationResult> {
     switch (request.kind) {
       case 'click':
         return this.click(session, request.ref, signal)
@@ -501,6 +533,38 @@ export class CdpBrowserProvider implements BrowserProvider {
         return this.scroll(session, request.ref, request.deltaX, request.deltaY, signal)
       case 'wait':
         return this.wait(session, request, signal)
+    }
+  }
+
+  /**
+   * 取「本次操作新接管的标签页」：动作前会话 id 的集合与此刻台账的差集。
+   *
+   * 通报延迟（中位 152ms）在两条路径上的待遇不同，所以才需要 `watchUntil` 这个截止点：
+   *
+   * - **不导航的弹窗点击**（报告里的真实场景）：click 自己的导航轮询要跑满
+   *   `MUTATION_NAVIGATION_POLL_MS`（首检不是导航后就一直轮询），800ms 天然盖住 152ms，
+   *   回到这里时差集已经就绪，**一次读取即返回，零额外等待**。
+   * - **导航且弹窗**（页面脚本里 `location.href = ...` 与 `window.open` 并发）：导航首检即命中，
+   *   `detectNavigation` 立刻返回，800ms 窗口提前结束，150ms 后才到的通报就会被漏掉。
+   *   这时按截止点补等一小段 —— 只在**已经过了截止点**才补，所以慢路径不付代价（`Date.now()
+   *   >= watchUntil` 直接返回）。
+   *
+   * `wait` 也可能命中：等待期间页面自己弹窗，差集照样算得出来。
+   */
+  private async collectOpenedTabs(
+    beforeIds: ReadonlySet<string>,
+    watchUntil: number,
+    signal?: AbortSignal,
+  ): Promise<readonly BrowserTabInfo[]> {
+    const diff = (): readonly BrowserTabInfo[] => [...this.sessions.values()]
+      .filter((session) => !beforeIds.has(session.targetId))
+      .map((session) => ({ sessionId: session.targetId, url: session.url, title: session.title }))
+    for (;;) {
+      const opened = diff()
+      // 不等 `url` 非空：`adoptSession` 是「先登记、后等加载」，通报值本身就是这个弹窗的
+      // 真实地址（页面加载完还会刷一次），先给模型一个能用的 session_id 比等标题更重要。
+      if (opened.length > 0 || Date.now() >= watchUntil) return opened
+      await delay(TAB_OPEN_WATCH_POLL_MS, signal)
     }
   }
 

@@ -3,7 +3,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import type { ToolDefinition, ToolRunContext } from '@deepseek-ai/dsh-tools'
 import { validateJsonSchemaValue } from '@deepseek-ai/dsh-tools'
 import { apply, BROWSER_TOOL_CAPABILITIES, name as pluginName, TOOL_BROWSER_SECTION_ORDER } from './index.ts'
-import type { BrowserObservation, BrowserSession, BrowserSnapshot } from '../browser/index.ts'
+import type { BrowserObservation, BrowserSession, BrowserSnapshot, BrowserTabInfo } from '../browser/index.ts'
 
 const SESSION: BrowserSession = { id: 's1', url: 'https://example.com/', title: 'Example', epoch: 4 }
 
@@ -31,6 +31,8 @@ interface Harness {
   failLocate: Error | undefined
   /** snapshot 观察的返回体；find 的缓存测试会换上多行大纲的版本。 */
   snapshotResponse: BrowserSnapshot
+  /** 设置后 `mutate` 结果带上 `openedTabs`（模拟点击弹出了新标签页）。 */
+  openedTabs: BrowserTabInfo[] | undefined
 }
 
 const SNAPSHOT: BrowserSnapshot = {
@@ -74,6 +76,7 @@ function mount(): Harness {
     failObserve: undefined,
     failLocate: undefined,
     snapshotResponse: SNAPSHOT,
+    openedTabs: undefined,
   }
 
   const ctx = {
@@ -134,6 +137,7 @@ function mount(): Harness {
           title: SESSION.title,
           navigated: false,
           ...args.kind === 'wait' ? { satisfied: true } : {},
+          ...harness.openedTabs !== undefined ? { openedTabs: harness.openedTabs } : {},
         })
       },
       observe: (args: { kind: string }) => {
@@ -464,6 +468,67 @@ describe('browser_tabs and the P1 mutation tools', () => {
     expect(text).toContain('NAVIGATION DETECTED')
     expect(text).toContain('browser_snapshot')
     expect(text).toContain('untrusted')
+  })
+
+  it('surfaces a popup the click opened as opened_tabs (snake_case, schema-valid)', async () => {
+    harness.openedTabs = [{
+      sessionId: 't2',
+      url: 'https://example.com/hot-5',
+      title: '热搜第五条',
+    }]
+
+    const value = await tool(harness, 'browser_click').execute({ session_id: 's1', ref: 'e1' }, exec())
+
+    expect(value).toMatchObject({
+      session_id: 's1',
+      // 回执里的**原会话不变**：新标签页是并存，不是替换。
+      url: SESSION.url,
+      opened_tabs: [{ session_id: 't2', url: 'https://example.com/hot-5', title: '热搜第五条' }],
+    })
+    // required 之外的字段一旦出现，必须能被工具输出契约接受。
+    expect(validateJsonSchemaValue(tool(harness, 'browser_click').output.schema, value)).toEqual([])
+  })
+
+  it('renders the new tab(s) prominently so the model stops assuming a single tab', async () => {
+    const blocks = tool(harness, 'browser_click').output.render({ session_id: 's1' }, {
+      session_id: 's1',
+      action: 'click',
+      epoch: 4,
+      url: SESSION.url,
+      title: SESSION.title,
+      navigated: false,
+      opened_tabs: [{ session_id: 't2', url: 'https://example.com/hot-5', title: '热搜第五条' }],
+    })
+
+    const text = String((blocks[0] as { text: string }).text)
+    expect(text).toContain('NEW TAB(S) OPENED')
+    expect(text).toContain('session_id=t2')
+    expect(text).toContain('https://example.com/hot-5')
+    expect(text).toContain('session_id=s1 is still open')
+    // 「refs 不受影响」只在没导航时成立；导航并弹窗时不能与下面的 NAVIGATION DETECTED 打架。
+    expect(text).toContain('refs are unaffected')
+    const alsoNavigated = String((tool(harness, 'browser_click').output.render({ session_id: 's1' }, {
+      session_id: 's1',
+      action: 'click',
+      epoch: 5,
+      url: 'https://example.com/next',
+      title: 'Next',
+      navigated: true,
+      opened_tabs: [{ session_id: 't2', url: 'https://example.com/hot-5', title: '热搜第五条' }],
+    })[0] as { text: string }).text)
+    expect(alsoNavigated).toContain('NEW TAB(S) OPENED')
+    expect(alsoNavigated).toContain('NAVIGATION DETECTED')
+    expect(alsoNavigated).not.toContain('refs are unaffected')
+    // 反向：没开新标签时不许出现这段提示（否则模型会去找不存在的标签页）。
+    const plain = tool(harness, 'browser_click').output.render({ session_id: 's1' }, {
+      session_id: 's1',
+      action: 'click',
+      epoch: 4,
+      url: SESSION.url,
+      title: SESSION.title,
+      navigated: false,
+    })
+    expect(String((plain[0] as { text: string }).text)).not.toContain('NEW TAB(S) OPENED')
   })
 })
 

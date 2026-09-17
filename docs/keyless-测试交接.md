@@ -88,7 +88,9 @@ verify-card: PASS —— ...
 
 - **已验证 PASS**（2026-09-13 23:33 一轮）：6 张卡片全 ok、open=baidu、t2 [foreground] 收编断言通过。仅截图步骤曾超时（已改为失败只警告不失败）。
 - **已修复（2026-09-14）**：`detailDigest` 动态证据降级。**真因不是正文截断，是 URL 把整段挤没了** —— 详情页 URL 两三百字，工具结果进 llm 请求历史时被截断，断在 URL 中间，旧实现死等 `(at …) ` 里的 `) `，于是整段判死。打点原文：`原因=paren: "(at " 之后没有 ") "，尾部="(at https://www.baidu.com/s?wd=…&hisfilt"`。修法两条：① 锚点改为 `(at ` 之后到首个空白或逗号，不再要求其后有 `, ref epoch N) `；② 详情页正文表达式 4000 → 1200 字（摘录最多展示 600 字，取更多纯属浪费，且正文越长越容易把 URL 尾部一起挤掉）。复验：日志无降级打点，聊天回复里第五/URL/摘录三行齐全，URL 完整未截断。
-- **click → tabs 的时序坑（2026-09-14）**：弹窗转标签是**异步**的（宿主发 opened 通报 → provider adoptSession 登记），click 返回时它可能还没进注册表。同一份代码两次跑，一次「tabs 清单里有 t2」一次「只有 t1」。脚本第 6 轮现在先发 `browser_wait(1.5s)` 再 `browser_tabs`。看到「弹窗标签没进 tabs 清单」先怀疑时序，别急着改收编逻辑。
+- **click → tabs 的时序坑（2026-09-14，2026-09-17 结构性修掉）**：弹窗转标签是**异步**的（宿主发 opened 通报 → provider adoptSession 登记），click 返回时它可能还没进注册表。当时同一份代码两次跑，一次「tabs 清单里有 t2」一次「只有 t1」，脚本第 6 轮于是先发 `browser_wait(1.5s)` 再 `browser_tabs`。
+  - **现在的机制**：`CdpBrowserProvider.mutate` 在动作前取会话台账快照，动作后取差集，把新收编的标签页写进回执的 `opened_tabs`（`TAB_OPEN_WATCH_MS = 250`，实测通报延迟中位 152ms）。不导航的点击本来就要跑满 800ms 导航轮询，天然覆盖；「导航且弹窗」那条早退路径由补观测窗口兜住。所以 `browser_wait(1.5s)` 已经不是必需的了（留着无害）。
+  - 看到「弹窗标签没进 tabs 清单」仍然先怀疑时序/收编链路，别急着改 `adoptSession`；但**若 `opened_tabs` 也空**，那才是收编真出问题。
 - **未提交**：无（adoptSession 收编链、client 15 视图、fake-llm 热搜流+动态收尾、find 空白归一化、verify-card 加固均已提交）。
 - 单测基线：289 passed / 3 skipped（2026-09-14，含 `src/bundle-patch.test.ts` 出货 patch 守卫、fake-llm 闸门用例、5 条 `detailDigest` 抽取用例与 P2/P3 三组回归用例）。
 - **发版前必过**：`pnpm run verify:portable -- --dir <解压后的便携版目录>`（可加 `--browser <chrome>`）。它先用 harness 真代码（`apps/desktop/src/{runtime-tree,profile-packages}.ts`，`--harness` 可指路径）走一遍桌面端启动准备 —— 全量 sha256 完整性、`state.runtimeId` / `nodeVersion` / `platform` / `arch` 逐项对齐、建 241 条宿主链接 + `validateDesktopPluginGraph` —— 再真起宿主读 boot graph、可选验浏览器信标。约 40 项断言，任一转红即 exit 1。

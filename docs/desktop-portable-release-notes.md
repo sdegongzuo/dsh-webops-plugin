@@ -9,6 +9,31 @@
 
 ---
 
+## v0.2.5（2026-09-17 本机手打，未上 CI）
+
+**包里变了什么**：结构性修掉「模型看不见新标签页」这个盲区（`browser_click` 等 mutation
+回执新增 `opened_tabs`），加上上一轮的窗口空白修复（`layout()` 守卫 + `restore/show` 补跑）
+与 `browser_click` 描述同步。链路与验证见 `docs/实现与踩坑.md`「窗口空白」那一节。
+
+| 项 | 值 |
+|---|---|
+| 产物 | `dist/dsh-webops-desktop-v0.2.5-win-x64-portable.zip` |
+| 体积 | 250.0 MB / 10470 个条目 |
+| sha256 | `1c4f87f3b26474bbaefb78ffaff2e2c021fa7f96f3efd2df96058287d7a7c4fd` |
+
+**验证**（解压到 `D:\dsh-v0.2.5-verify`，10359 个文件 / 0 个 NUL 污染）：
+
+| 自检 | 结论 |
+|---|---|
+| `verify:portable --dir` | 全部通过（含窗口标题、`layout()` 守卫与 restore/show 钩子、asar 内四处注入的源码级断言） |
+| `verify:ptc --dir` | 通过（真跑 PTC，Electron 运行时下 sandbox runner 用的是包内真 node） |
+| `verify:settings --dir` | 通过（出厂配置注册 unisound，默认模型 unisound/u2-flash） |
+| `verify:browser-host --dir` | 通过（包内产物在打包 exe 上开真窗口 → 快照 → 截图 27705 字节） |
+
+**仍未覆盖**：模型真的调 `browser_open`（要 API key）、窗口外观与「双击后的状态条」（要人眼）。
+
+---
+
 ## 发版必读：三个坑（都踩过，都会静默）
 
 #### 坑：profile 光写 `package.json` 不够，插件会被静默抹掉

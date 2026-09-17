@@ -67,6 +67,33 @@ let appDir = readArg('app')
  * 换个空目录就能继续，不必等那个句柄自己消失（CI 每次都是新目录，碰不到）。
  */
 const STAGE = resolve(readArg('stage') ?? join(ROOT, '.desktop-stage'))
+
+/** win-unpacked 里的主 exe（electron-builder 按 productName 命名）。 */
+function findMainExe(dir) {
+  return readdirSync(dir).find(name => name.endsWith('.exe') && !/uninstall|elevate/i.test(name))
+}
+
+/**
+ * 断言一个目录「像」完整的 win-unpacked：有主 exe + `resources\{app.asar,dsh,runtime}`。
+ *
+ * 为什么要有这一道：`.desktop-base\app` 曾被一次中断的缓存更新删残（18 个条目 → 7 个），
+ * 之后不带 `--app` 就会把它当 base，而报错要等到很后面才出现（「没找到主 exe」或自检里的
+ * 完整性失败），很容易被误判成「包坏了」。所以在**拷贝完就验**，把残缺挡在提升之前。
+ */
+function assertLooksLikeApp(dir, label) {
+  const exe = findMainExe(dir)
+  const missing = ['resources/app.asar', 'resources/dsh', 'resources/runtime']
+    .filter(rel => !existsSync(join(dir, rel)))
+  if (exe === undefined) missing.unshift('主 exe')
+  if (missing.length > 0) {
+    throw Object.assign(
+      new Error(`${label} ${dir} 不像完整的 win-unpacked，缺：${missing.join('、')}`),
+      { code: 'EPARTIAL' },
+    )
+  }
+  return exe
+}
+
 const pkg = JSON.parse(readFileSync(join(ROOT, 'package.json'), 'utf8'))
 const version = readArg('version') ?? pkg.version
 const pluginName = pkg.name
@@ -82,20 +109,55 @@ if (appDir === undefined || !existsSync(appDir)) {
   process.exit(1)
 }
 if (cacheBase) {
-  rmSync(BASE_CACHE, { recursive: true, force: true })
-  mkdirSync(dirname(BASE_CACHE), { recursive: true })
-  cpSync(appDir, BASE_CACHE, { recursive: true })
-  console.log(`已缓存 dsh 本体到 ${BASE_CACHE}（下次发版可省略 --app）`)
+  // 缓存是**优化**不是**前置**：清不掉旧缓存（`EBUSY` = `app.asar` 被内存映射住，多半是
+  // 上一轮自检/复现留下的进程；`EPERM` = 有进程把它当工作目录）就只能「这次没缓存」，
+  // 不该把整个打包带崩 —— 2026-09-17 真踩过：这一步抛在 `rmSync`，脚本连 zip 都没开始打。
+  //
+  // 旧写法是「先拷 `.new`，再 `rmSync` 旧目录，最后改名」。它只保证了**新副本**完整，
+  // 没保证**旧缓存**不被删残：2026-09-17 实测 `rmSync` 删到第 12 个条目才撞上被映射的
+  // `resources\app.asar`，于是 `.desktop-base\app` 从 18 个条目变成 7 个，`.new` 留在原地 ——
+  // 一个**残缺缓存**就位，下次不带 `--app` 会拿它当 base（报「没找到主 exe」，且极易误判成包坏了）。
+  //
+  // 现在改成：拷贝 → 校验副本像不像一个完整的 win-unpacked → 旧目录**改名挪开**（rename 不会
+  // 部分删除，挪不动就整段失败，旧缓存原封不动）→ 副本顶上去 → 最后才回收旧目录（回收失败
+  // 只是留个 `.retired`，不影响任何东西）。
+  const baseStaging = `${BASE_CACHE}.new`
+  const baseRetired = `${BASE_CACHE}.retired`
+  try {
+    rmSync(baseStaging, { recursive: true, force: true })
+    mkdirSync(dirname(BASE_CACHE), { recursive: true })
+    cpSync(appDir, baseStaging, { recursive: true })
+    assertLooksLikeApp(baseStaging, '缓存副本')
+    rmSync(baseRetired, { recursive: true, force: true })
+    if (existsSync(BASE_CACHE)) renameSync(BASE_CACHE, baseRetired)
+    renameSync(baseStaging, BASE_CACHE)
+    try {
+      rmSync(baseRetired, { recursive: true, force: true })
+    } catch {
+      console.warn(`package-desktop-portable: 旧缓存留在 ${baseRetired}（删不掉，可手动清）`)
+    }
+    console.log(`已缓存 dsh 本体到 ${BASE_CACHE}（下次发版可省略 --app）`)
+  } catch (error) {
+    console.warn(`package-desktop-portable: 更新 dsh 本体缓存失败（${error.code ?? ''} ${error.message}）`)
+    console.warn('  不影响本次打包（用的是 --app 指的那个目录）；只是下次仍需要带 --app。')
+    console.warn('  要修的话：关掉占用它的进程（常见是上一轮复现留下的 DeepSeek Harness.exe）再跑。')
+  }
 }
 if (!existsSync(join(ROOT, 'lib'))) {
   console.error('package-desktop-portable: 缺少 lib/，先跑 pnpm build')
   process.exit(1)
 }
 
-/** win-unpacked 里的主 exe（electron-builder 按 productName 命名）。 */
-const exe = readdirSync(appDir).find(name => name.endsWith('.exe') && !/uninstall|elevate/i.test(name))
-if (exe === undefined) {
-  console.error(`package-desktop-portable: ${appDir} 里没找到主 exe`)
+/** 校验 base 目录完整性，再取主 exe —— 缓存残缺要在这里就说清楚，别拖到打包中途/自检。 */
+let exe
+try {
+  exe = assertLooksLikeApp(appDir, appDir === BASE_CACHE ? '缓存的 dsh 本体' : '--app 指定的目录')
+} catch (error) {
+  console.error(`package-desktop-portable: ${error.message}`)
+  if (appDir === BASE_CACHE) {
+    console.error(`  ${BASE_CACHE} 是**缓存**，残缺时加 --app <win-unpacked> 指真产物即可，`)
+    console.error('  也可以直接删掉这个目录让它下次重建。')
+  }
   process.exit(1)
 }
 console.log(`主程序: ${exe}`)

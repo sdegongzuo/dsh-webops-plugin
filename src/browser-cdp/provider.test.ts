@@ -35,6 +35,20 @@ class FakeChrome {
   boxModel: readonly number[] | undefined = [10, 20, 110, 20, 110, 60, 10, 60]
   /** P1：点击是否引发导航（模拟链接点击）。 */
   navigateOnClick = false
+  /**
+   * P1：设置后，点击的 `mouseReleased` 会「弹出一个新窗口」（模拟 `target=_blank` /
+   * `window.open`）。真链路上是宿主 `setWindowOpenHandler` → `openTab` → 通报 → 收编，
+   * 这里由测试直接调 `adoptSession` 代替，只弹一次。
+   */
+  popupOnClick: CdpTarget | undefined
+  /** 弹窗发生时的回调；测试用它把新目标收编成会话。 */
+  onPopup: ((target: CdpTarget) => void) | undefined
+  /**
+   * 弹窗「通报」的延迟（毫秒）。**必须大于 0**：真链路上宿主收编是异步的，实测从派发到
+   * provider 登记为 min 140 / 中位 152ms。默认 120 就是照着这个量级来的 ——
+   * 若同步触发，`click` 的 800ms 轮询与补观测窗口都成了摆设，测试会假绿。
+   */
+  popupDelayMs = 120
   /** P1：回车是否引发导航（模拟表单提交，报告 S1 的维基搜索）。 */
   navigateOnEnter = false
   /**
@@ -157,6 +171,14 @@ class FakeChrome {
           this.href = 'https://example.com/next'
           this.page = { url: 'https://example.com/next', title: 'Next' }
         }
+        // 模拟「这点开了一个新窗口」：与导航可以同时发生（脚本里两者并发）。
+        if (this.popupOnClick !== undefined && params['type'] === 'mouseReleased') {
+          const target = this.popupOnClick
+          this.popupOnClick = undefined
+          const fire = (): void => { this.onPopup?.(target) }
+          if (this.popupDelayMs > 0) setTimeout(fire, this.popupDelayMs)
+          else fire()
+        }
         return {}
       case 'Input.dispatchKeyEvent':
         if (this.navigateOnEnter && params['type'] === 'keyUp' && params['key'] === 'Enter') {
@@ -241,6 +263,27 @@ class FakeSocket implements CdpSocket {
   /** 触发一个入站事件。 */
   dispatch(type: string, event: unknown): void {
     for (const listener of [...this.handlers.get(type) ?? []]) listener(event)
+  }
+}
+
+/**
+ * 把 protected 的 `adoptSession` 露出来，模拟宿主「弹窗转标签」链路的最后一跳
+ * （`ElectronBrowserProvider.ensureTabOpenedChannel` 收到 `{type:'opened'}` 就是这么调的）。
+ */
+class AdoptableProvider extends CdpBrowserProvider {
+  adopt(target: CdpTarget): Promise<unknown> {
+    return this.adoptSession(target)
+  }
+}
+
+/** 一个刚被页面弹出来的新标签页（`webSocketDebuggerUrl` 在假 transport 里没用途）。 */
+function popupTarget(): CdpTarget {
+  return {
+    id: 'popup-9',
+    type: 'page',
+    url: 'https://example.com/hot-5',
+    title: '热搜第五条',
+    webSocketDebuggerUrl: 'ws://127.0.0.1:9222/devtools/page/popup-9',
   }
 }
 
@@ -582,12 +625,12 @@ describe('CdpBrowserProvider.tabs (P1)', () => {
 
 describe('CdpBrowserProvider.mutate (P1)', () => {
   let chrome: FakeChrome
-  let provider: CdpBrowserProvider
+  let provider: AdoptableProvider
 
   beforeEach(() => {
     chrome = new FakeChrome()
     chrome.axeNodes = PAGE_TREE
-    provider = new CdpBrowserProvider({ navigationTimeoutMs: 200 }, chrome.transport())
+    provider = new AdoptableProvider({ navigationTimeoutMs: 200 }, chrome.transport())
   })
 
   /** 开会话并 snapshot，返回第一个 ref。 */
@@ -665,6 +708,54 @@ describe('CdpBrowserProvider.mutate (P1)', () => {
     // 旧 ref 已随导航作废：旧 ref 再来一次点击必须立刻失败。
     await expect(provider.mutate({ kind: 'click', sessionId: session.id, ref }))
       .rejects.toThrow(expect.objectContaining({ code: 'BROWSER_STALE_REF' }))
+  })
+
+  it('reports a tab the page popped open during the click (openedTabs)', async () => {
+    const ref = await firstRef()
+    // 闭包必须绑**本用例的实例**：`provider` 是 module 级变量，会被 beforeEach 重指，
+    // 若直接引用变量，延迟触发的通报会落进下一个用例的 provider（串台）。
+    const instance = provider
+    let adopted: Promise<unknown> | undefined
+    chrome.popupOnClick = popupTarget()
+    // 真链路上是宿主收编；这里直接调 adoptSession 走同一条登记路径。
+    chrome.onPopup = target => { adopted = instance.adopt(target) }
+
+    const result = await provider.mutate({ kind: 'click', sessionId: 'tab-1', ref })
+
+    expect(result.navigated).toBe(false)
+    // 不导航的点击会跑满 800ms 导航轮询，150ms 级的通报天然被覆盖 —— 无需补窗口。
+    expect(result.openedTabs?.map(tab => tab.sessionId)).toEqual(['popup-9'])
+    await adopted
+  })
+
+  it('reports the popup even when the click also navigated the opener (grace window)', async () => {
+    const session = await provider.open({})
+    const snapshot = await provider.observe({ kind: 'snapshot', sessionId: session.id })
+    if (snapshot.kind !== 'snapshot') throw new Error('expected a snapshot')
+    const ref = snapshot.refs[0]?.ref as string
+    // 脚本里 `location.href = ...` 与 `window.open` 并发：导航首检即命中，
+    // 800ms 轮询窗口提前结束 —— 通报还没到。这正是补观测窗口存在的理由。
+    chrome.navigateOnClick = true
+    const instance = provider
+    let adopted: Promise<unknown> | undefined
+    chrome.popupOnClick = popupTarget()
+    chrome.onPopup = target => { adopted = instance.adopt(target) }
+
+    const result = await provider.mutate({ kind: 'click', sessionId: session.id, ref })
+
+    expect(result.navigated).toBe(true)
+    expect(result.openedTabs?.map(tab => tab.sessionId)).toEqual(['popup-9'])
+    await adopted
+  })
+
+  it('omits openedTabs when the click opened nothing (反向验证)', async () => {
+    const ref = await firstRef()
+
+    const result = await provider.mutate({ kind: 'click', sessionId: 'tab-1', ref })
+
+    // 字段本身不出现（不是空数组）：工具层据此决定要不要渲染那一段提示。
+    expect(result.openedTabs).toBeUndefined()
+    expect('openedTabs' in result).toBe(false)
   })
 
   it('fills through the native value setter and fires input + change', async () => {

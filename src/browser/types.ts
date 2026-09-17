@@ -244,6 +244,17 @@ export interface BrowserMutationResult {
   readonly navigated: boolean
   /** wait 独有：条件是否在超时前成立（超时为 false，不是错误）。 */
   readonly satisfied?: boolean
+  /**
+   * 本次操作**新接管**的标签页：页面自己开了新窗口（`target=_blank` 链接、`window.open`），
+   * 宿主把它收编成了同窗口里的新受控会话。
+   *
+   * 收编是**异步**的（宿主的「弹窗转标签」通报实测 140~156ms 才到 provider），所以这是
+   * 收尾时按会话台账取差集的结果，不是点击那一刻的快照。无新增时为 `undefined`。
+   *
+   * 存在的理由见 {@link BrowserMutationResult} 的调用方（`tool-browser`）：没有这个字段时，
+   * 模型点完弹窗链接会一直以为只有一个标签，整条弯路都从这儿开始。
+   */
+  readonly openedTabs?: readonly BrowserTabInfo[]
 }
 
 /** 标签页清单里的一项（本插件自己开的受控标签页）。 */

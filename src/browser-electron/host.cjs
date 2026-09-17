@@ -193,10 +193,22 @@ function handleNav(action, url) {
  *
  * 标签条每次都重新插入到末尾（最顶层）：`addChildView` 是「追加到顶」语义，
  * 新开的标签视图会盖住它，不重排的话标签条就被页面盖住了。
+ *
+ * ⚠ **退化读数一律不采信**（2026-09-17 真机事故）：窗口最小化 / 隐藏时
+ * `shell.getContentBounds()` 返回 `{x:-16000, y:-16000, width:0, height:0}`，
+ * 而这条路径上的尺寸**全部**来自它。真机表现是「窗口内容整片变白、只剩壳的
+ * backgroundColor，但 CDP 一切正常」—— 因为视图被 `setBounds` 成 0×0 之后
+ * **webContents 就不再出帧，把尺寸改回来也救不回**（实测：之后手动补跑一次
+ * `layout()` 能把 bounds 修对，画面依旧空白）。所以宁可不跑，也不能跑错。
+ *
+ * 真机那次是怎么触发的：窗口被最小化期间，插件收到了 `activate`（切标签）→ 跑了一次
+ * `layout()` → 视图全成 0 宽 → 用户把窗口恢复回来时**没有任何代码会再跑 layout**
+ * （当时只挂了 `'resize'`），于是永远白着。
  */
 function layout() {
   if (shell === undefined || shell.isDestroyed()) return
   const bounds = shell.getContentBounds()
+  if (shell.isMinimized() || !shell.isVisible() || bounds.width <= 0 || bounds.height <= 0) return
   const contentHeight = Math.max(0, bounds.height - TAB_BAR_HEIGHT)
   tabBar.setBounds({ x: 0, y: 0, width: bounds.width, height: TAB_BAR_HEIGHT })
   const container = shell.contentView
@@ -222,7 +234,10 @@ function ensureShell(size) {
     width: size?.width ?? 1200,
     height: size?.height ?? 860,
     show: true,
-    title: 'dsh browser',
+    // 窗口名给用户看的，所以用中文、且**不看页面标题**：宿主是 `BaseWindow`，
+    // 标题只认这一处（页面标题变不会改窗口名）。这么定是为了在任务栏 / Alt-Tab
+    // 里一眼认出「这是 dsh 开的网页窗口」，而不是一串网页标题里找哪个是它。
+    title: 'dsh网页窗口',
     backgroundColor: '#f2f3f5',
   })
   tabBar = new WebContentsView({
@@ -236,6 +251,13 @@ function ensureShell(size) {
   layout()
   void tabBar.webContents.loadFile(path.join(__dirname, 'tabbar.html'))
   shell.on('resize', layout)
+  // 恢复 / 重新显示时补跑一次。两道保险各管一类：
+  //   - `layout()` 的最小化守卫会跳过「窗口不可见期间的 layout」，那期间新开的标签
+  //     视图还没拿到过尺寸，靠这里补；
+  //   - 反过来，任何来源的过期几何（用户手动改尺寸、切显示器、DPI 变化）也在这里归位。
+  // 只要守卫生效，这些回调在正常路径上是幂等的。
+  shell.on('restore', layout)
+  shell.on('show', layout)
   shell.on('closed', () => {
     shell = undefined
     // 壳没了，标签页跟着全没；把剩下的一并通报给父进程。

@@ -61,7 +61,7 @@ import type { ImageAttachmentRef } from '@deepseek-ai/dsh-attachment'
 import type {} from '@deepseek-ai/dsh-system-prompt'
 import { BrowserError } from '../browser/index.ts'
 import type {} from '../browser/index.ts'
-import type { BrowserMutationRequest, BrowserNetworkEntry, BrowserSession } from '../browser/index.ts'
+import type { BrowserMutationRequest, BrowserNetworkEntry, BrowserSession, BrowserTabInfo } from '../browser/index.ts'
 import { noteLoaded } from '../debug.ts'
 
 /** Cordis 插件名，用于加载器诊断。 */
@@ -190,11 +190,24 @@ function formatScreenshotOutput(args: { session_id: string }, value: ScreenshotO
   return `Captured ${scope} at ${value.width}x${value.height} px (session_id=${args.session_id}, ref epoch ${value.epoch}), saved as image attachment ${value.attachment.attachmentId}.`
 }
 
+/** 受控标签页在工具输出里的投影（snake_case），`browser_tabs` 与 mutation 回执共用。 */
+type TabOutput = { session_id: string; url: string; title: string; active?: boolean }
+
+/** provider 的标签页信息 → 工具输出。 */
+function toTabOutput(tab: BrowserTabInfo): TabOutput {
+  return {
+    session_id: tab.sessionId,
+    url: tab.url,
+    title: tab.title,
+    ...tab.active !== undefined ? { active: tab.active } : {},
+  }
+}
+
 /** `browser_tabs` 的输出。 */
 interface TabsOutput {
   action: 'list' | 'activate' | 'close'
   session_id?: string
-  tabs: { session_id: string; url: string; title: string; active?: boolean }[]
+  tabs: TabOutput[]
 }
 
 /** mutation 工具的输出。 */
@@ -206,6 +219,8 @@ interface MutationOutput {
   title: string
   navigated: boolean
   satisfied?: boolean
+  /** 本次操作新接管的标签页（页面自己弹的窗）；空则省略。 */
+  opened_tabs?: TabOutput[]
 }
 
 /** 标签页清单的文本渲染。 */
@@ -222,6 +237,19 @@ function formatTabsOutput(value: TabsOutput): string {
 
 /** mutation 结果的文本渲染：模型最需要知道的是「页面是否被导航、ref 是否还活着」。 */
 function formatMutationOutput(value: MutationOutput): string {
+  // 点弹窗链接后**必须**明确点名新标签页：真机报告里模型点开 t2 之后 6 分钟毫不知情，
+  // 一直对着旧页面做判断，最后在窗口最小化时发 activate → 撞出整窗空白。
+  // 放在最前面（紧跟标题行）是因为它是本次调用里唯一「模型不查就永远不知道」的事实。
+  const opened = value.opened_tabs === undefined || value.opened_tabs.length === 0
+    ? ''
+    : [
+      // 「refs 不受影响」只在没导航时成立；导航并弹窗时下面那段 NAVIGATION DETECTED 才是正文，
+      // 这里不能替它下结论（自相矛盾的提示比没有提示更糟）。
+      `\nNEW TAB(S) OPENED by this ${value.action}: ${value.opened_tabs.length}. The page handed a popup / new-window target to this browser and it is now a controlled tab in the SAME window — session_id=${value.session_id} is still open${value.navigated ? '.' : ', and its refs are unaffected.'}`,
+      ...value.opened_tabs.map(tab =>
+        `- session_id=${tab.session_id}${tab.active === true ? ' [foreground]' : ''} — ${tab.url}${tab.title.length > 0 ? ` (${tab.title})` : ' (title not read yet — the page may still be loading)'}`),
+      `Act on it with the new session_id (browser_snapshot on it, browser_tabs(action=activate, session_id=...) to bring it forward, browser_tabs(action=close, ...) to discard it). If what you were looking for ended up in one of these tabs, switch to it — do NOT re-navigate the old tab hunting for it.`,
+    ].join('\n')
   const navigation = value.navigated
     ? '\nNAVIGATION DETECTED: every ref from earlier snapshots is now invalid — run browser_snapshot again before any ref-based call.'
     : '\nRefs from the latest snapshot are still valid unless the page changed on its own.'
@@ -238,6 +266,7 @@ function formatMutationOutput(value: MutationOutput): string {
   const where = value.title.length > 0 ? `${value.url} — ${value.title}` : value.url
   return [
     `${value.action} done on session_id=${value.session_id} (now at ${where}, ref epoch ${value.epoch}).`,
+    opened,
     navigation,
     title,
     wait,
@@ -691,6 +720,9 @@ const MUTATION_OUTPUT_SCHEMA = {
     url: { type: 'string', required: true },
     title: { type: 'string', required: true },
     navigated: { type: 'boolean', required: true },
+    // 页面自己弹出来的新受控标签页（target=_blank / window.open）。不是每次都有，
+    // 所以不标 required；有就必须点名，否则模型不知道它存在。
+    opened_tabs: { type: 'array', items: TAB_ITEM_SCHEMA },
   },
 } as const
 
@@ -1084,12 +1116,7 @@ function registerTabs(ctx: Context, cache: SnapshotCache): void {
       return {
         action: result.action,
         ...result.sessionId !== undefined ? { session_id: result.sessionId } : {},
-        tabs: result.tabs.map(tab => ({
-          session_id: tab.sessionId,
-          url: tab.url,
-          title: tab.title,
-          ...tab.active !== undefined ? { active: tab.active } : {},
-        })),
+        tabs: result.tabs.map(toTabOutput),
       }
     },
     presentCall: args => observeCall(
@@ -1441,6 +1468,7 @@ function registerMutationTool(
         title: result.title,
         navigated: result.navigated,
         ...result.satisfied !== undefined ? { satisfied: result.satisfied } : {},
+        ...result.openedTabs !== undefined ? { opened_tabs: result.openedTabs.map(toTabOutput) } : {},
       }
     },
     presentCall: rawArgs => observeCall(
@@ -1464,6 +1492,11 @@ function registerMutations(
     action: 'click',
     description:
       'Click an element by ref (from the latest browser_snapshot) with real mouse events at its center; the element is scrolled into view first. Use browser_snapshot first so refs exist. A click may navigate the page; when it does, the result reports navigated=true and every earlier ref becomes invalid. '
+      // 点击 target=_blank / window.open 链接会在**同一个窗口**里开出一个新的受控标签页
+      // （宿主的「弹窗转标签」通报异步收编）。2026-09-17 真机：点热搜第 5 条开出 t2，
+      // 模型 6 分钟里毫不知情 —— 于是 provider 侧按会话差集把新标签页写进回执的
+      // `opened_tabs`，这里只需告诉模型「看到这个字段就换到那个 session_id 去干活」。
+      + 'Clicking a link that opens a popup or a target=_blank target creates a NEW controlled tab in the SAME window; when that happens this result carries `opened_tabs`, listing the new session_id(s). Treat those as first-class tabs — keep working on the one that actually has your content instead of assuming you are still on a single tab. '
       + STALE_NOTICE + ' ' + UNTRUSTED_PAGE_CONTENT_NOTICE,
     parameters: {
       session_id: SESSION_ID_PARAMETER,
