@@ -1,5 +1,11 @@
 import { describe, expect, it } from 'vitest'
-import { CONSOLE_RING_CAPACITY, ConsoleCollector, normalizeTimestamp } from './console.ts'
+import {
+  CONSOLE_RESULT_MAX_CHARS,
+  CONSOLE_RING_CAPACITY,
+  CONSOLE_TEXT_MAX_CHARS,
+  ConsoleCollector,
+  normalizeTimestamp,
+} from './console.ts'
 import { CdpConnection } from './protocol.ts'
 import type { CdpSocket } from './protocol.ts'
 
@@ -224,6 +230,35 @@ describe('ConsoleCollector', () => {
       .toEqual(['Another error', 'Failed to load'])
     expect(collector.read({ limit: 50, text: 'CACHE' }).entries.map(entry => entry.text)).toEqual(['Cache miss'])
     expect(collector.read({ limit: 50, text: 'nomatch' }).entries).toEqual([])
+  })
+
+  it('separates a limit cut from the text size budget — only one of them is fixed by a bigger limit', () => {
+    const socket = new EventSocket()
+    const collector = new ConsoleCollector(new CdpConnection(socket))
+
+    // 每条恰好顶到单条上限（2000 字符，不会被 clip 加长），且文本互不相同（去重键含 text）。
+    for (let index = 0; index < 25; index += 1) {
+      const text = `${String(index).padStart(4, '0')}${'x'.repeat(CONSOLE_TEXT_MAX_CHARS - 4)}`
+      socket.emit('Runtime.consoleAPICalled', rtParams(1000 + index * 10, text, 'log', 1))
+    }
+
+    // 闸门是在「push 之前」判 `>=`，所以放行条数 = ceil(预算 / 每行)。
+    // limit 给到 50 也没用 —— 这正是要如实报出来的事。
+    const fitsByBudget = Math.ceil(CONSOLE_RESULT_MAX_CHARS / CONSOLE_TEXT_MAX_CHARS)
+    const budgeted = collector.read({ limit: 50 })
+    expect(budgeted.entries).toHaveLength(fitsByBudget)
+    expect(budgeted.truncated).toBe(true)
+    expect(budgeted.truncatedByBudget).toBe(true)
+
+    // 小 limit 时是条数截断：调大 limit 有用，两个标志必须分得开。
+    const byLimit = collector.read({ limit: 3 })
+    expect(byLimit.entries).toHaveLength(3)
+    expect(byLimit.truncated).toBe(true)
+    expect(byLimit.truncatedByBudget).toBe(false)
+
+    // 预算够用时一个字都不能多报（否则工具层会给出「调大 limit 没用」的假建议）。
+    expect(collector.read({ limit: 50, level: 'nomatch' }))
+      .toMatchObject({ truncated: false, truncatedByBudget: false })
   })
 
   it('sends Runtime.enable before Log.enable on every refresh and never disables anything', async () => {

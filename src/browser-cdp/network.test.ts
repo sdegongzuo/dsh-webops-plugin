@@ -1,5 +1,11 @@
 import { describe, expect, it } from 'vitest'
-import { NETWORK_TABLE_CAPACITY, NetworkCollector } from './network.ts'
+import {
+  NETWORK_LIST_MAX_CHARS,
+  NETWORK_MAX_BASE64_CHARS,
+  NETWORK_MAX_BODY_CHARS,
+  NETWORK_TABLE_CAPACITY,
+  NetworkCollector,
+} from './network.ts'
 import { CdpConnection } from './protocol.ts'
 import type { CdpSocket } from './protocol.ts'
 
@@ -18,7 +24,7 @@ class EventSocket implements CdpSocket {
    */
   muted = false
 
-  constructor(private readonly body = 'pong') {}
+  constructor(private readonly body = 'pong', private readonly base64Encoded = false) {}
 
   send(data: string): void {
     const request = JSON.parse(data) as { id: number; method: string; params?: Record<string, unknown> }
@@ -26,7 +32,7 @@ class EventSocket implements CdpSocket {
     this.sent.push({ method: request.method, params })
     queueMicrotask(() => {
       const result = request.method === 'Network.getResponseBody'
-        ? { body: this.body, base64Encoded: false }
+        ? { body: this.body, base64Encoded: this.base64Encoded }
         : {}
       this.dispatch('message', { data: JSON.stringify({ id: request.id, result }) })
     })
@@ -103,6 +109,66 @@ describe('NetworkCollector', () => {
     expect(result.truncated).toBe(true)
     expect(result.body.length).toBeLessThan(25_000)
     expect(result.body).toContain('truncated')
+    expect(result.body).toContain(`truncated ${25_000 - NETWORK_MAX_BODY_CHARS} chars`)
+  })
+
+  it('caps a base64 body ten times tighter than a text body — binary is unreadable noise', async () => {
+    const binary = 'iVBORw0KGgo'.repeat(3_000) // 36000 字符：超过两个上限，能看出分流
+    const result = await new NetworkCollector(new CdpConnection(new EventSocket(binary, true)))
+      .body('img', { timeoutMs: 100 })
+
+    expect(result.base64Encoded).toBe(true)
+    expect(result.truncated).toBe(true)
+    expect(result.body).toContain(`truncated ${binary.length - NETWORK_MAX_BASE64_CHARS} chars`)
+    // 前缀保留到 base64 上限为止 —— 够看出「这是什么格式」，读不出内容。
+    expect(result.body.startsWith(binary.slice(0, NETWORK_MAX_BASE64_CHARS))).toBe(true)
+
+    // 同一份长度，文本响应仍然拿得到 2 万字符：上限是**按编码分流**的，不是一刀切。
+    const text = await new NetworkCollector(new CdpConnection(new EventSocket('y'.repeat(36_000))))
+      .body('big', { timeoutMs: 100 })
+    expect(text.body.length).toBeGreaterThan(NETWORK_MAX_BASE64_CHARS * 5)
+  })
+
+  it('stops the list at the URL size budget and marks it as a budget cut, not a limit cut', () => {
+    const socket = new EventSocket()
+    const collector = new NetworkCollector(new CdpConnection(socket))
+
+    // 每条 URL 约 2 万字符（data: URI 就是这个量级）；预算 4 万 → 第三条被挡下。
+    const longUrl = (index: number): string => `https://example.com/${index}/${'u'.repeat(20_000)}`
+    for (let index = 0; index < 5; index += 1) {
+      socket.emit('Network.requestWillBeSent', requestEvent(`r-${index}`, 'GET', longUrl(index)))
+    }
+
+    // 闸门是在「push 之前」判 `>=`，所以放行条数 = ceil(预算 / 单条 URL 长度)。
+    const budgeted = collector.list(50)
+    expect(budgeted.requests)
+      .toHaveLength(Math.ceil(NETWORK_LIST_MAX_CHARS / longUrl(0).length))
+    expect(budgeted.requests[0]?.url.length).toBeGreaterThan(NETWORK_LIST_MAX_CHARS / 4)
+    expect(budgeted.truncated).toBe(true)
+    // 关键：这是**预算**截断 —— 调大 limit 拿不到更多，只能靠 url 过滤。
+    expect(budgeted.truncatedByBudget).toBe(true)
+
+    // 小 limit 时是「条数」截断：两个标志必须分得开，否则工具层会给出假建议。
+    const byLimit = collector.list(1)
+    expect(byLimit.requests).toHaveLength(1)
+    expect(byLimit.truncated).toBe(true)
+    expect(byLimit.truncatedByBudget).toBe(false)
+
+    // 一条都不匹配时不算截断：没有「还有更多」这回事。
+    expect(collector.list(50, 'nomatch')).toMatchObject({ truncated: false, truncatedByBudget: false })
+  })
+
+  it('never reports truncation when everything fits (budget accounting does not over-fire)', () => {
+    const socket = new EventSocket()
+    const collector = new NetworkCollector(new CdpConnection(socket))
+
+    socket.emit('Network.requestWillBeSent', requestEvent('1', 'GET', 'https://api.example.com/x'))
+    socket.emit('Network.requestWillBeSent', requestEvent('2', 'GET', 'https://api.example.com/y'))
+
+    expect(collector.list(50)).toMatchObject({ truncated: false, truncatedByBudget: false })
+    // 正则边界：恰好取满 `limit` 且没有更多时，也不能报截断。
+    expect(collector.list(2)).toMatchObject({ truncated: false, truncatedByBudget: false })
+    expect(collector.list(1)).toMatchObject({ truncated: true, truncatedByBudget: false })
   })
 
   it('filters by a case-insensitive URL substring', () => {

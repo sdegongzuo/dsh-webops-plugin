@@ -46,8 +46,27 @@ import type { CdpConnection } from './protocol.ts'
  */
 export const NETWORK_TABLE_CAPACITY = 500
 
-/** `Network.getResponseBody` 返回体的裁剪上限（字符）。 */
+/** `Network.getResponseBody` 返回体的裁剪上限（字符）。只对**文本**响应生效。 */
 export const NETWORK_MAX_BODY_CHARS = 20_000
+
+/**
+ * 二进制响应（`base64Encoded: true`）的裁剪上限（字符），比文本那条**紧十倍**。
+ *
+ * 为什么不一视同仁：base64 的 2 万字符约合 5.7k token，而它编码的是图片 / 字体 / wasm ——
+ * 模型既解不出来也读不懂，属于纯噪声。留一小段只为「看出这是什么格式」（PNG 头、`woff2` 等），
+ * 真要看图得走 `browser_screenshot`（工具层会用一句话把这件事讲明）。
+ */
+export const NETWORK_MAX_BASE64_CHARS = 2_000
+
+/**
+ * 一次 `list` 返回的 URL 总字符预算。
+ *
+ * 数量上限（`limit`）挡不住单条超长：`data:` 开头的 URL 本身就能有几百 KB，请求表里
+ * **从来不做 URL 截断**（截了会误导——URL 是要给模型复制出去用的）。所以再加一道**总量**闸门：
+ * URL 累加超过本值就停，并在结果里如实说明「是被总量截断的」——那时调大 `limit` 没有用，
+ * 得靠 `url` 过滤。（第一条永远返回，否则模型拿不到任何线索。）
+ */
+export const NETWORK_LIST_MAX_CHARS = 40_000
 
 /** 一条网络请求（可能是降级的半截记录）。 */
 export interface NetworkEntry {
@@ -104,6 +123,15 @@ export interface NetworkListResult {
   readonly document: number
   /** 表里属于更早文档、**没被列出**的条目数（`allDocuments: true` 时恒为 0 —— 都列出来了）。 */
   readonly earlierDocuments: number
+  /** 匹配的条目多于返回的（被 `limit` 或总量预算截断；两者都算「还有更多」）。 */
+  readonly truncated: boolean
+  /**
+   * 是否**被总量预算**（{@link NETWORK_LIST_MAX_CHARS}）截断，而不是被 `limit` 截断。
+   *
+   * 两者要分开报：被 `limit` 截断时「调大 limit」有用，被预算截断时**调大 limit 没用**，
+   * 得换 `url` 过滤。给错建议比不给更糟。
+   */
+  readonly truncatedByBudget: boolean
 }
 
 /** 读一个对象字段里的字符串。 */
@@ -161,7 +189,10 @@ function readString(source: Record<string, unknown>, key: string): string | unde
   }
 
   /**
-   * 列出请求（从最新往回，最多 `limit` 条）。
+   * 列出请求（从最新往回，最多 `limit` 条，且 URL 总量不超过 {@link NETWORK_LIST_MAX_CHARS}）。
+   *
+   * 两道闸门分别记在 `truncated` / `truncatedByBudget` 上：前者调大 `limit` 有用，
+   * 后者调大没用、只能靠 `url` 过滤。
    *
    * @param limit - 数量上限。
    * @param urlFilter - 只保留 URL 包含该子串的条目（大小写不敏感）。
@@ -171,6 +202,9 @@ function readString(source: Record<string, unknown>, key: string): string | unde
     const needle = urlFilter?.toLowerCase()
     const requests: NetworkEntry[] = []
     let earlierDocuments = 0
+    let chars = 0
+    let truncated = false
+    let truncatedByBudget = false
     const values = [...this.requests.values()]
     for (let index = values.length - 1; index >= 0; index -= 1) {
       const entry = values[index]
@@ -181,10 +215,21 @@ function readString(source: Record<string, unknown>, key: string): string | unde
         continue
       }
       if (needle !== undefined && !entry.url.toLowerCase().includes(needle)) continue
+      // 走到这里说明本条**是匹配的**，所以任何一次 break 都意味着「还有更多没返回」。
+      // `limit` 优先判定；总量闸门第一条必进（否则模型拿不到任何线索）。
+      if (requests.length >= limit) {
+        truncated = true
+        break
+      }
+      if (requests.length > 0 && chars >= NETWORK_LIST_MAX_CHARS) {
+        truncated = true
+        truncatedByBudget = true
+        break
+      }
       requests.push(entry)
-      if (requests.length >= limit) break
+      chars += entry.url.length
     }
-    return { requests, document: this.document, earlierDocuments }
+    return { requests, document: this.document, earlierDocuments, truncated, truncatedByBudget }
   }
 
   /** 取一条记录（诊断用）。 */
@@ -194,6 +239,10 @@ function readString(source: Record<string, unknown>, key: string): string | unde
 
   /**
    * 取响应体。直接用收到的事件里的 `requestId`（`[V18]`，不需要任何映射）。
+   *
+   * 上限**按编码分流**：文本 2 万字符，二进制（base64）只有 2 千 —— 后者模型解不出来，
+   * 给再多也是烧上下文（见 {@link NETWORK_MAX_BASE64_CHARS}）。
+   *
    * @param requestId - 事件里的请求 id。
    * @param options - 单次命令的超时与取消信号。
    */
@@ -205,9 +254,10 @@ function readString(source: Record<string, unknown>, key: string): string | unde
     )
     const body = typeof response.body === 'string' ? response.body : ''
     const base64Encoded = response.base64Encoded === true
-    if (body.length <= NETWORK_MAX_BODY_CHARS) return { body, base64Encoded, truncated: false }
+    const cap = base64Encoded ? NETWORK_MAX_BASE64_CHARS : NETWORK_MAX_BODY_CHARS
+    if (body.length <= cap) return { body, base64Encoded, truncated: false }
     return {
-      body: `${body.slice(0, NETWORK_MAX_BODY_CHARS)}\n…[truncated ${body.length - NETWORK_MAX_BODY_CHARS} chars]`,
+      body: `${body.slice(0, cap)}\n…[truncated ${body.length - cap} chars]`,
       base64Encoded,
       truncated: true,
     }

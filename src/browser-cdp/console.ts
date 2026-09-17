@@ -72,6 +72,18 @@ export const CONSOLE_RING_CAPACITY = 1000
 /** 单条 console 文本的裁剪上限（字符）；控制台内容是不可信数据，别让它撑爆上下文。 */
 export const CONSOLE_TEXT_MAX_CHARS = 2_000
 
+/**
+ * 一次 `read` 返回的**文本总量**预算（字符）。
+ *
+ * 只有 `limit`（条数）挡不住总量：单条上限 2000 字符 × `limit` 500 = 一百万字符 ≈ 28 万 token，
+ * 一次调用就能把上下文吃掉。而现实里 `console.log(JSON.stringify(大对象))` 这种单条顶到
+ * 2000 字符上限的条目并不罕见，所以「条数」这个维度必须配一个「总量」闸门。
+ *
+ * 预算耗尽时如实标记 `truncatedByBudget` —— 那种情况下**调大 limit 没有用**，
+ * 得用 `level` / `text` 过滤（工具层会照这个说法给建议）。
+ */
+export const CONSOLE_RESULT_MAX_CHARS = 40_000
+
 /** 归一化后的一条 console 条目（毫秒时间戳）。 */
 export interface ConsoleEntry {
   /** `Runtime` 用事件 type（log / info / warning / error …）；`Log` 用 `entry.level`。 */
@@ -108,6 +120,13 @@ export interface ConsoleReadResult {
   readonly document: number
   /** 缓冲里属于更早文档、**没被返回**的条目数（`allDocuments: true` 时恒为 0 —— 都返回了）。 */
   readonly earlierDocuments: number
+  /**
+   * 是否**被文本总量预算**（{@link CONSOLE_RESULT_MAX_CHARS}）截断，而不是被 `limit` 截断。
+   *
+   * 分开报的理由同 network：被 `limit` 截断时「调大 limit」有用，被预算截断时调大 limit 没用，
+   * 得换 `level` / `text` 过滤。给错建议比不给更糟。
+   */
+  readonly truncatedByBudget: boolean
 }
 
 /**
@@ -244,6 +263,8 @@ export class ConsoleCollector {
     const matched: ConsoleEntry[] = []
     let total = 0
     let earlierDocuments = 0
+    let chars = 0
+    let truncatedByBudget = false
     for (let index = this.entries.length - 1; index >= 0; index -= 1) {
       const entry = this.entries[index]
       if (entry === undefined) continue
@@ -255,7 +276,14 @@ export class ConsoleCollector {
       if (level !== undefined && entry.level.toLowerCase() !== level) continue
       if (text !== undefined && !entry.text.toLowerCase().includes(text)) continue
       total += 1
-      if (matched.length < options.limit) matched.push(entry)
+      if (matched.length >= options.limit) continue
+      // 总量闸门（第一条必进：否则模型拿不到任何线索）；`limit` 仍优先判定。
+      if (matched.length > 0 && chars >= CONSOLE_RESULT_MAX_CHARS) {
+        truncatedByBudget = true
+        continue
+      }
+      matched.push(entry)
+      chars += entry.text.length
     }
     return {
       entries: matched,
@@ -263,6 +291,7 @@ export class ConsoleCollector {
       buffered: this.entries.length,
       document: this.document,
       earlierDocuments,
+      truncatedByBudget,
     }
   }
 

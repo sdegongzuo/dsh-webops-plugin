@@ -325,6 +325,11 @@ export interface BrowserConsoleResult {
   readonly document: number
   /** 属于更早文档、**没被返回**的条目数（`allDocuments: true` 时恒为 0 —— 都被返回了）。 */
   readonly earlierDocuments: number
+  /**
+   * 是否被**文本总量预算**截断（而不是被 `limit` 截断）。
+   * 分开报的理由：被 `limit` 截断时调大 limit 有用，被预算截断时没用，得换 `level`/`text` 过滤。
+   */
+  readonly truncatedByBudget: boolean
 }
 
 /** P2：网络采集的两种动作。 */
@@ -369,11 +374,14 @@ export interface BrowserNetworkResult {
   /** body 动作才有：响应体（可能被裁剪）。 */
   readonly body?: string
   readonly base64Encoded?: boolean
+  /** body 动作：正文超长被裁剪。list 动作：还有更多请求没返回（`limit` 或总量预算截断）。 */
   readonly truncated?: boolean
   /** list 动作才有：当前文档序号（0 起）。 */
   readonly document?: number
   /** list 动作才有：属于更早文档、**没被列出**的请求数（`allDocuments: true` 时恒为 0）。 */
   readonly earlierDocuments?: number
+  /** list 动作才有：被 URL 总量预算截断（调大 limit 无用，得用 url 过滤）。 */
+  readonly truncatedByBudget?: boolean
 }
 
 /** P2：`browser_execute` —— 唯一能直接发任意 CDP 命令的逃生舱。 */

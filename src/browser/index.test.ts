@@ -54,6 +54,7 @@ function makeProvider(id: string, available: boolean): BrowserProvider {
       replayTruncated: false,
       document: 0,
       earlierDocuments: 0,
+      truncatedByBudget: false,
     }),
     network: (request: BrowserNetworkRequest) => Promise.resolve({
       kind: 'network',

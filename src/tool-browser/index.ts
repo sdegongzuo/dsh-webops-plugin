@@ -284,6 +284,8 @@ interface ConsoleOutput {
   document: number
   /** 属于更早文档、**没被返回**的条目数（`all_documents: true` 时恒为 0）。 */
   earlier_documents: number
+  /** 被文本总量预算截断（调大 limit 无用，得用 level/text 过滤）。 */
+  truncated_by_budget: boolean
   entries: { level: string; text: string; timestamp: number; source: string }[]
 }
 
@@ -305,11 +307,14 @@ interface NetworkOutput {
   request_id?: string
   body?: string
   base64_encoded?: boolean
+  /** list：还有更多请求没返回；body：正文超长被裁剪。 */
   truncated?: boolean
   /** list 动作才有：当前文档序号（0 起）。 */
   document?: number
   /** list 动作才有：属于更早文档、**没被列出**的请求数（`all_documents: true` 时恒为 0）。 */
   earlier_documents?: number
+  /** list 动作才有：被 URL 总量预算截断（调大 limit 无用，得用 url 过滤）。 */
+  truncated_by_budget?: boolean
 }
 
 /** `browser_execute` 的输出。 */
@@ -332,7 +337,15 @@ function formatConsoleOutput(value: ConsoleOutput): string {
     ? ['(no console entries match)']
     : value.entries.map(entry => `[${entry.source}/${entry.level}] ${entry.text}`)
   const notes = [UNTRUSTED_PAGE_CONTENT_NOTICE]
-  if (value.truncated) notes.unshift('Only the newest entries are shown; pass a higher limit for more.')
+  if (value.truncated_by_budget) {
+    // 被**总量预算**截断时「调大 limit」是假建议 —— 必须说成「过滤」。
+    notes.unshift(
+      'The result was cut to fit the size budget (a single console entry can be 2000 chars), so '
+      + '**raising limit will not add more** — narrow it with level/text instead.',
+    )
+  } else if (value.truncated) {
+    notes.unshift('Only the newest entries are shown; pass a higher limit for more.')
+  }
   if (value.earlier_documents > 0) {
     // 跨导航的过滤必须说清楚「遮了多少」：条目还在缓冲里，不是丢了（报告 S5）。
     notes.unshift(
@@ -369,6 +382,15 @@ function formatNetworkList(value: NetworkOutput): string {
     'A request marked partial has no requestWillBeSent event (it started while the debugger was detached), '
     + 'so its method and headers are unknown.',
   ]
+  if (value.truncated_by_budget === true) {
+    // 被**总量预算**截断时「调大 limit」是假建议 —— 必须说成「过滤」。
+    notes.unshift(
+      'The list was cut to fit the total size budget (URLs can be very long), so **raising limit will not '
+      + 'add more** — narrow it with url instead.',
+    )
+  } else if (value.truncated === true) {
+    notes.unshift('Only the newest requests are shown; pass a higher limit or narrow with url for more.')
+  }
   if ((value.earlier_documents ?? 0) > 0) {
     notes.unshift(
       `${value.earlier_documents ?? 0} recorded request(s) belong to an earlier document (this tab navigated `
@@ -386,12 +408,29 @@ function formatNetworkList(value: NetworkOutput): string {
 
 /** network body 的文本渲染。 */
 function formatNetworkBody(value: NetworkOutput): string {
+  const notes: string[] = []
+  if (value.base64_encoded === true) {
+    // base64 正文对模型几乎不可读，且很容易吃掉整个窗口预算 —— 明确劝退。
+    notes.push(
+      'This body is base64-encoded, which means the resource is binary (an image, font, archive or media '
+      + 'file): the text below is not readable, and it is capped at 2000 chars so it is also incomplete. '
+      + 'Do NOT request it again — use browser_screenshot for a visual, or read the HTML/JSON/text resources '
+      + 'instead.',
+    )
+  }
+  if (value.truncated === true && value.base64_encoded !== true) {
+    notes.push(
+      'The body was truncated to fit the size budget (20000 chars); the rest is not retrievable through this '
+      + 'tool.',
+    )
+  }
   return [
     `session_id=${value.session_id} — response body for request_id=${value.request_id ?? ''}`
     + `${value.base64_encoded === true ? ' (base64 encoded)' : ''}${value.truncated === true ? ', truncated' : ''}:`,
     '',
     value.body ?? '',
     '',
+    ...notes,
     UNTRUSTED_PAGE_CONTENT_NOTICE,
   ].join('\n')
 }
@@ -759,6 +798,7 @@ const CONSOLE_OUTPUT_SCHEMA = {
     replay_truncated: { type: 'boolean', required: true },
     document: { type: 'integer', required: true },
     earlier_documents: { type: 'integer', required: true },
+    truncated_by_budget: { type: 'boolean', required: true },
     entries: { type: 'array', required: true, items: CONSOLE_ENTRY_SCHEMA },
   },
 } as const
@@ -794,6 +834,7 @@ const NETWORK_OUTPUT_SCHEMA = {
     truncated: { type: 'boolean' },
     document: { type: 'integer' },
     earlier_documents: { type: 'integer' },
+    truncated_by_budget: { type: 'boolean' },
   },
 } as const
 
@@ -1159,7 +1200,12 @@ function registerConsole(ctx: Context): void {
       + UNTRUSTED_PAGE_CONTENT_NOTICE,
     parameters: {
       session_id: SESSION_ID_PARAMETER,
-      limit: { type: 'integer', description: 'Maximum number of entries to return, newest first (1-500). Default 50.' },
+      limit: {
+        type: 'integer',
+        description: 'Maximum number of entries to return, newest first (1-150). Default 50. '
+          + 'A single entry can be 2000 chars, so the whole result is also cut by a total size budget — '
+          + 'when truncated_by_budget is true, narrowing with level/text helps and raising this does not.',
+      },
       level: { type: 'string', description: 'Only entries with this exact level, e.g. log, info, warning, error, debug, verbose.' },
       text: { type: 'string', description: 'Only entries whose text contains this substring (case-insensitive).' },
       all_documents: {
@@ -1188,6 +1234,7 @@ function registerConsole(ctx: Context): void {
         replay_truncated: result.replayTruncated,
         document: result.document,
         earlier_documents: result.earlierDocuments,
+        truncated_by_budget: result.truncatedByBudget,
         entries: result.entries.map(entry => ({
           level: entry.level,
           text: entry.text,
@@ -1216,7 +1263,12 @@ function registerNetwork(ctx: Context): void {
       session_id: SESSION_ID_PARAMETER,
       action: { type: 'string', required: true, description: 'One of: list, body.' },
       request_id: { type: 'string', description: 'request_id to fetch the response body for. Required for action=body.' },
-      limit: { type: 'integer', description: 'Maximum number of requests to return for action=list (1-500). Default 50.' },
+      limit: {
+        type: 'integer',
+        description: 'Maximum number of requests to return for action=list (1-150). Default 50. '
+          + 'URLs can be very long, so the whole list is also cut by a total size budget — when '
+          + 'truncated_by_budget is true, narrowing with url helps and raising this does not.',
+      },
       url: { type: 'string', description: 'Only requests whose URL contains this substring (case-insensitive). action=list only.' },
       all_documents: {
         type: 'boolean',
@@ -1267,6 +1319,8 @@ function registerNetwork(ctx: Context): void {
         requests: result.requests.map(toNetworkRequestOutput),
         ...result.document !== undefined ? { document: result.document } : {},
         ...result.earlierDocuments !== undefined ? { earlier_documents: result.earlierDocuments } : {},
+        ...result.truncated !== undefined ? { truncated: result.truncated } : {},
+        ...result.truncatedByBudget !== undefined ? { truncated_by_budget: result.truncatedByBudget } : {},
       }
     },
     presentCall: args => observeCall(`Network ${args.action} ${args.session_id}`, 'read', args.action),

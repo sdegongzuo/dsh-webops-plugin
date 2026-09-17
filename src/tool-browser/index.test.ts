@@ -33,6 +33,12 @@ interface Harness {
   snapshotResponse: BrowserSnapshot
   /** 设置后 `mutate` 结果带上 `openedTabs`（模拟点击弹出了新标签页）。 */
   openedTabs: BrowserTabInfo[] | undefined
+  /**
+   * console / network list 的桩要模拟哪种截断：
+   * `limit` 是「条数到了」，`budget` 是「总量到了」。用来验证工具层的建议
+   * **分得清**「调大 limit 有用」和「调大没用、得过滤」。
+   */
+  truncation: 'none' | 'limit' | 'budget'
 }
 
 const SNAPSHOT: BrowserSnapshot = {
@@ -77,6 +83,7 @@ function mount(): Harness {
     failLocate: undefined,
     snapshotResponse: SNAPSHOT,
     openedTabs: undefined,
+    truncation: 'none',
   }
 
   const ctx = {
@@ -173,10 +180,11 @@ function mount(): Harness {
             { level: 'error', text: 'boom again', timestamp: 1235, source: 'log' },
           ],
           buffered: 2,
-          truncated: false,
+          truncated: harness.truncation !== 'none',
           replayTruncated: true,
           document: 1,
           earlierDocuments: 3,
+          truncatedByBudget: harness.truncation === 'budget',
         })
       },
       network: (args: { kind: string; requestId?: string }) => {
@@ -195,6 +203,8 @@ function mount(): Harness {
             }],
             document: 1,
             earlierDocuments: 2,
+            truncated: harness.truncation !== 'none',
+            truncatedByBudget: harness.truncation === 'budget',
           })
           : Promise.resolve({
             kind: 'network',
@@ -921,5 +931,52 @@ describe('2026-09-14 五个场景报告的逐条修复', () => {
     const networkText = String((tool(harness, 'browser_network').output.render({}, networkValue as never)[0] as { text: string }).text)
     expect(networkText).toContain('earlier document')
     expect(networkText).toContain('all_documents=true')
+  })
+
+  it('#10 a SIZE BUDGET cut must not suggest raising limit — that advice would be a lie', async () => {
+    const render = (name: string, value: unknown): string =>
+      String((tool(harness, name).output.render({}, value as never)[0] as { text: string }).text)
+
+    // 被总量预算截断：调大 limit 拿不到更多，必须改口成「过滤」。
+    harness.truncation = 'budget'
+    const consoleValue = await tool(harness, 'browser_console').execute({ session_id: 's1' }, exec())
+    expect(consoleValue).toMatchObject({ truncated: true, truncated_by_budget: true })
+    const consoleText = render('browser_console', consoleValue)
+    expect(consoleText).toContain('raising limit will not add more')
+    expect(consoleText).toContain('level/text')
+
+    const networkValue = await tool(harness, 'browser_network')
+      .execute({ session_id: 's1', action: 'list' }, exec())
+    expect(networkValue).toMatchObject({ truncated: true, truncated_by_budget: true })
+    const networkText = render('browser_network', networkValue)
+    expect(networkText).toContain('raising limit will not add more')
+    expect(networkText).toContain('url')
+
+    // 只是被 limit 截断：这时「调大 limit 有用」，给的是另一条建议。两条路不能混。
+    harness.truncation = 'limit'
+    const byLimit = await tool(harness, 'browser_network')
+      .execute({ session_id: 's1', action: 'list' }, exec())
+    expect(byLimit).toMatchObject({ truncated: true, truncated_by_budget: false })
+    const byLimitText = render('browser_network', byLimit)
+    expect(byLimitText).toContain('higher limit')
+    expect(byLimitText).not.toContain('will not add more')
+  })
+
+  it('#10 a base64 body is spelled out as binary noise instead of being silently dumped', () => {
+    const text = String((tool(harness, 'browser_network').output.render({}, {
+      session_id: 's1',
+      action: 'body',
+      requests: [],
+      request_id: 'req-1',
+      body: 'iVBORw0KGgo=',
+      base64_encoded: true,
+      truncated: true,
+    } as never)[0] as { text: string }).text)
+
+    expect(text).toContain('base64-encoded')
+    expect(text).toContain('binary')
+    expect(text).toContain('browser_screenshot')
+    // 不能建议「再取一次」—— 再取一次是同样的噪声。
+    expect(text).toContain('Do NOT request it again')
   })
 })

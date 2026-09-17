@@ -133,6 +133,17 @@ const WAIT_POLL_INTERVAL_MS = 100
 /** `browser_console` / `browser_network` 的默认返回条数（从最新往回）。 */
 export const DEFAULT_P2_LIMIT = 50
 
+/**
+ * `limit` 的硬上限（条）。**从 500 收到 150**（2026-09-17）。
+ *
+ * 500 那条是照采集环形容量抄的，但它同时是「一次调用能塞进上下文的条数」：
+ * console 单条上限 2000 字符 × 500 = 100 万字符，network 长 URL 一行 276 字符 × 500 =
+ * 13.8 万字符 —— 都远超一次观察该有的体量。收到 150 之后，配合各自的**总量预算**
+ * （`CONSOLE_RESULT_MAX_CHARS` / `NETWORK_LIST_MAX_CHARS`，见各自模块），单次观察的最坏
+ * 情况被钉在几万字符量级。要更多就分页/过滤，那本来就比一次拉满更好用。
+ */
+export const MAX_P2_LIMIT = 150
+
 /** `browser_execute` 结果的裁剪上限（字符）；逃生舱可能返回极大对象，别撑爆上下文。 */
 export const EXECUTE_MAX_RESULT_CHARS = 20_000
 
@@ -596,6 +607,7 @@ export class CdpBrowserProvider implements BrowserProvider {
       replayTruncated: session.consoleCollector.truncatedReplay,
       document: result.document,
       earlierDocuments: result.earlierDocuments,
+      truncatedByBudget: result.truncatedByBudget,
     }
   }
 
@@ -637,6 +649,8 @@ export class CdpBrowserProvider implements BrowserProvider {
       requests: listed.requests,
       document: listed.document,
       earlierDocuments: listed.earlierDocuments,
+      truncated: listed.truncated,
+      truncatedByBudget: listed.truncatedByBudget,
     }
   }
 
@@ -1697,10 +1711,10 @@ function describeKey(key: string): { key: string; code: string; virtualKeyCode: 
   )
 }
 
-/** 收窄 `limit`：缺省 / 非法落到默认值，过大压到 500。 */
+/** 收窄 `limit`：缺省 / 非法落到默认值，过大压到 {@link MAX_P2_LIMIT}。 */
 function normalizeLimit(limit: number | undefined): number {
   if (limit === undefined || !Number.isFinite(limit) || limit <= 0) return DEFAULT_P2_LIMIT
-  return Math.min(Math.floor(limit), 500)
+  return Math.min(Math.floor(limit), MAX_P2_LIMIT)
 }
 
 /**
