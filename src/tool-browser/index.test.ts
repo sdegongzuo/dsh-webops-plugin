@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it } from 'vitest'
+import { readFileSync } from 'node:fs'
 import type { Context } from '@deepseek-ai/cordis'
 import type { ToolDefinition, ToolRunContext } from '@deepseek-ai/dsh-tools'
 import { validateJsonSchemaValue } from '@deepseek-ai/dsh-tools'
@@ -33,6 +34,12 @@ interface Harness {
   snapshotResponse: BrowserSnapshot
   /** 设置后 `mutate` 结果带上 `openedTabs`（模拟点击弹出了新标签页）。 */
   openedTabs: BrowserTabInfo[] | undefined
+  /** 置 true 让 `mutate` 报 `navigated:true`（模拟点击跳走了页面）。 */
+  mutateNavigated: boolean
+  /** `mutate` 结果里的 sessionId；默认 s1，用来断言只丢导航的那一个会话。 */
+  mutateSessionId: string
+  /** 置 true 让 `execute` 报 `navigated:true`（模拟表达式改了 location）。 */
+  executeNavigated: boolean
   /**
    * console / network list 的桩要模拟哪种截断：
    * `limit` 是「条数到了」，`budget` 是「总量到了」。用来验证工具层的建议
@@ -83,6 +90,9 @@ function mount(): Harness {
     failLocate: undefined,
     snapshotResponse: SNAPSHOT,
     openedTabs: undefined,
+    mutateNavigated: false,
+    mutateSessionId: 's1',
+    executeNavigated: false,
     truncation: 'none',
   }
 
@@ -137,21 +147,27 @@ function mount(): Harness {
         browserCalls.push({ method: 'mutate', args })
         return Promise.resolve({
           kind: 'mutation',
-          sessionId: 's1',
+          sessionId: harness.mutateSessionId,
           action: args.kind,
           epoch: 4,
           url: SESSION.url,
           title: SESSION.title,
-          navigated: false,
+          navigated: harness.mutateNavigated,
           ...args.kind === 'wait' ? { satisfied: true } : {},
           ...harness.openedTabs !== undefined ? { openedTabs: harness.openedTabs } : {},
         })
       },
-      observe: (args: { kind: string }) => {
+      observe: (args: { kind: string; sessionId?: string }) => {
         browserCalls.push({ method: 'observe', args })
         if (harness.failObserve !== undefined) return Promise.reject(harness.failObserve)
         const observation: BrowserObservation = args.kind === 'snapshot' ? harness.snapshotResponse : SCREENSHOT
-        return Promise.resolve(observation)
+        // snapshot 的返回体决定 find 缓存的 key —— 桩要能跟着请求的 sessionId 走，
+        // 否则「只丢导航的那个会话」这种回归没法在工具层断言。
+        return Promise.resolve(
+          args.sessionId === undefined || args.sessionId === 's1'
+            ? observation
+            : { ...observation, sessionId: args.sessionId } as BrowserObservation,
+        )
       },
       locate: (args: { sessionId: string; ref: string; highlight?: boolean; scroll?: boolean }) => {
         browserCalls.push({ method: 'locate', args })
@@ -225,7 +241,7 @@ function mount(): Harness {
           method: args.method,
           epoch: 4,
           url: SESSION.url,
-          navigated: false,
+          navigated: harness.executeNavigated,
           value: 2,
           truncated: false,
         })
@@ -978,5 +994,122 @@ describe('2026-09-14 五个场景报告的逐条修复', () => {
     expect(text).toContain('webpage_screenshot')
     // 不能建议「再取一次」—— 再取一次是同样的噪声。
     expect(text).toContain('Do NOT request it again')
+  })
+})
+
+describe('2026-09-17 导航后 find 缓存必须失效', () => {
+  let harness: Harness
+
+  beforeEach(() => {
+    harness = mount()
+  })
+
+  /** 先让某个会话有一份缓存大纲：snapshot 一次就是缓存写入的全部途径。 */
+  async function cacheSnapshot(sessionId = 's1'): Promise<void> {
+    await tool(harness, 'webpage_snapshot').execute({ session_id: sessionId }, exec())
+  }
+
+  it('#1 a click that navigates drops the cached outline (find then asks for a fresh snapshot)', async () => {
+    await cacheSnapshot()
+    harness.mutateNavigated = true
+    await tool(harness, 'webpage_click').execute({ session_id: 's1', ref: 'e1' }, exec())
+
+    await expect(tool(harness, 'webpage_find').execute({ session_id: 's1', query: 'submit' }, exec()))
+      .rejects.toThrow(expect.objectContaining({ code: 'BROWSER_SNAPSHOT_REQUIRED' }))
+  })
+
+  it('#1 an execute that navigates drops the cached outline too', async () => {
+    await cacheSnapshot()
+    harness.executeNavigated = true
+    await tool(harness, 'webpage_execute').execute(
+      { session_id: 's1', method: 'Runtime.evaluate', params: { expression: 'location.href="/x"' } },
+      exec(),
+    )
+
+    await expect(tool(harness, 'webpage_find').execute({ session_id: 's1', query: 'submit' }, exec()))
+      .rejects.toThrow(expect.objectContaining({ code: 'BROWSER_SNAPSHOT_REQUIRED' }))
+  })
+
+  it('#1 a NON-navigating mutation keeps the outline (no needless re-snapshot)', async () => {
+    await cacheSnapshot()
+    await tool(harness, 'webpage_click').execute({ session_id: 's1', ref: 'e1' }, exec())
+
+    const value = await tool(harness, 'webpage_find').execute({ session_id: 's1', query: 'submit' }, exec())
+    expect(value).toMatchObject({ session_id: 's1', matches: [{ ref: 'e1' }] })
+  })
+
+  it('#1 only the session that navigated is dropped, the others keep their outline', async () => {
+    await cacheSnapshot('s1')
+    await cacheSnapshot('s2')
+    harness.mutateNavigated = true
+    harness.mutateSessionId = 's1'
+    await tool(harness, 'webpage_click').execute({ session_id: 's1', ref: 'e1' }, exec())
+
+    // s1 跳走了 —— 它的旧大纲不能再用。
+    await expect(tool(harness, 'webpage_find').execute({ session_id: 's1', query: 'submit' }, exec()))
+      .rejects.toThrow(expect.objectContaining({ code: 'BROWSER_SNAPSHOT_REQUIRED' }))
+    // s2 没动过 —— 整表清空的实现会在这里露馅。
+    await expect(tool(harness, 'webpage_find').execute({ session_id: 's2', query: 'submit' }, exec()))
+      .resolves.toMatchObject({ session_id: 's2', matches: [{ ref: 'e1' }] })
+  })
+})
+
+describe('2026-09-17 工具清单必须单点真相', () => {
+  // 2026-09-17：`scripts/check-desktop.mjs` 里写死 `EXPECTED_TOOL_VIEWS = 10`，
+  // 而清单早就 15 个 —— 魔数过期脚本恒红，还因为没进 CI 一直没人发现。
+  // 这条测试让「客户端要渲染的卡片」与「工具层真正注册的工具」必须对得上，
+  // 从此任一侧增删工具都会在这里转红，而不是等到有人手工跑 check:desktop。
+  it('client 的 BROWSER_TOOLS 与 BROWSER_TOOL_CAPABILITIES 同名同数', () => {
+    const source = readFileSync(new URL('../client/index.ts', import.meta.url), 'utf8')
+    const match = /export const BROWSER_TOOLS = \[([\s\S]*?)\] as const/u.exec(source)
+    if (match === null) throw new Error('没能在 src/client/index.ts 里找到 BROWSER_TOOLS 清单')
+
+    const body = match[1] ?? ''
+    const clientTools = [...body.matchAll(/'([^']+)'/gu)]
+      .map(found => found[1] ?? '')
+      .filter(name => name !== '')
+      .sort()
+    expect(clientTools).toEqual(Object.keys(BROWSER_TOOL_CAPABILITIES).sort())
+    expect(clientTools.length).toBeGreaterThan(0)
+  })
+})
+
+describe('2026-09-17 回执与卡片文本的护栏', () => {
+  // 这批断言是为一次事故立的：那天用正则批量把描述里的数字换成常量插值，
+  // 正则连**代码里的字符串**一起改了 —— 反引号被塞进字符串内部，语法照样合法、
+  // tsc 照样过、当时所有测试照样绿，但模型收到的回执里 session_id / url / title 全没了。
+  // 所以这里专门盯「模型直接读的那几段文本」的完整内容，而不是只测「不抛错」。
+  const harness = mount()
+
+  it('tabs 的 activate / close 回执带上 session_id（正则曾把它整段吃掉）', () => {
+    const value = {
+      session_id: 's1',
+      action: 'close',
+      tabs: [{ session_id: 't2', url: 'https://example.com/hot-5', title: 'Hot 5', active: false }],
+    }
+    const blocks = tool(harness, 'webpage_tabs').output.render({ session_id: 's1' }, value as never)
+    const text = String((blocks[0] as { text: string }).text)
+
+    expect(text).toContain('Closed session_id=s1')
+    expect(text).toContain('session_id=t2')
+    expect(text).toContain('https://example.com/hot-5')
+    expect(text).toContain('Hot 5')
+    // 反引号漏进输出的典型症状：把模板占位符当字面量吐出来。
+    expect(text).not.toContain('${')
+    expect(text).not.toContain('`')
+  })
+
+  it('press 的待执行卡片标题带上 key 与 ref（正则曾让它们变成 undefined）', () => {
+    const definition = tool(harness, 'webpage_press')
+    if (definition.presentCall === undefined) throw new Error('webpage_press 没有 presentCall')
+    const title = definition.presentCall({
+      session_id: 's1',
+      ref: 'e12',
+      key: 'Enter',
+    } as never)
+
+    expect(JSON.stringify(title)).toContain('Enter')
+    expect(JSON.stringify(title)).toContain('e12')
+    expect(JSON.stringify(title)).not.toContain('undefined')
   })
 })

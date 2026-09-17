@@ -25,7 +25,7 @@ import { BROWSER_NS, en, zh } from './locales.ts'
 export const inject = ['slots', 'locale']
 
 /** 本插件认领的工具（P0 只读四个 + P1 的 tabs 与五个操作工具 + P2/P3 的五个调试工具）。 */
-const BROWSER_TOOLS = [
+export const BROWSER_TOOLS = [
   'webpage_open',
   'webpage_navigate',
   'webpage_snapshot',

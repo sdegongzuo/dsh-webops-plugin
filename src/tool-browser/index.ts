@@ -62,6 +62,14 @@ import type {} from '@deepseek-ai/dsh-system-prompt'
 import { BrowserError } from '../browser/index.ts'
 import type {} from '../browser/index.ts'
 import type { BrowserMutationRequest, BrowserNetworkEntry, BrowserSession, BrowserTabInfo } from '../browser/index.ts'
+// 工具描述里凡是讲「上限 / 默认值」的数字，一律引用实现层的常量而不是抄一份字面量：
+// 抄来的数字改了常量不会跟着变，描述就开始对模型撒谎（2026-09-17 修：
+// 5000 / 800 / 150 / 50 / 2000 / 20000 共 9 处是散落的字面量）。
+// 这里只导入**常量值**，不导入任何运行时类，所以不存在 tool-browser ↔ browser-cdp 的循环。
+import { DEFAULT_SNAPSHOT_LIMITS, MAX_SNAPSHOT_LINES } from '../browser-cdp/snapshot.ts'
+import { CONSOLE_TEXT_MAX_CHARS } from '../browser-cdp/console.ts'
+import { NETWORK_MAX_BASE64_CHARS, NETWORK_MAX_BODY_CHARS } from '../browser-cdp/network.ts'
+import { DEFAULT_P2_LIMIT, MAX_P2_LIMIT } from '../browser-cdp/provider.ts'
 import { noteLoaded } from '../debug.ts'
 
 /** Cordis 插件名，用于加载器诊断。 */
@@ -164,7 +172,7 @@ function formatSnapshotOutput(snapshot: SnapshotOutput): string {
       : ` ${String(snapshot.dropped_elements)} further element(s) were not emitted`
     notes.unshift(
       `The outline was truncated${lines};${dropped === '' ? '' : dropped} — the refs above cover only the emitted part. `
-      + 'Re-run webpage_snapshot with a larger max_lines (up to 5000) if you need the rest, '
+      + `Re-run webpage_snapshot with a larger max_lines (up to ${String(MAX_SNAPSHOT_LINES)}) if you need the rest, `
       + 'or use webpage_find to search the part that was emitted.',
     )
   }
@@ -340,7 +348,7 @@ function formatConsoleOutput(value: ConsoleOutput): string {
   if (value.truncated_by_budget) {
     // 被**总量预算**截断时「调大 limit」是假建议 —— 必须说成「过滤」。
     notes.unshift(
-      'The result was cut to fit the size budget (a single console entry can be 2000 chars), so '
+      `The result was cut to fit the size budget (a single console entry can be ${String(CONSOLE_TEXT_MAX_CHARS)} chars), so `
       + '**raising limit will not add more** — narrow it with level/text instead.',
     )
   } else if (value.truncated) {
@@ -413,14 +421,14 @@ function formatNetworkBody(value: NetworkOutput): string {
     // base64 正文对模型几乎不可读，且很容易吃掉整个窗口预算 —— 明确劝退。
     notes.push(
       'This body is base64-encoded, which means the resource is binary (an image, font, archive or media '
-      + 'file): the text below is not readable, and it is capped at 2000 chars so it is also incomplete. '
+      + `file): the text below is not readable, and it is capped at ${String(NETWORK_MAX_BASE64_CHARS)} chars so it is also incomplete. `
       + 'Do NOT request it again — use webpage_screenshot for a visual, or read the HTML/JSON/text resources '
       + 'instead.',
     )
   }
   if (value.truncated === true && value.base64_encoded !== true) {
     notes.push(
-      'The body was truncated to fit the size budget (20000 chars); the rest is not retrievable through this '
+      `The body was truncated to fit the size budget (${String(NETWORK_MAX_BODY_CHARS)} chars); the rest is not retrievable through this `
       + 'tool.',
     )
   }
@@ -967,13 +975,13 @@ function registerSnapshot(ctx: Context, cache: SnapshotCache): void {
   ctx.tools.register(defineTool({
     name: 'webpage_snapshot',
     description:
-      'Return a compact accessibility outline of the page, with a ref (like e12) on every actionable element. Refs are valid ONLY until the next webpage_snapshot or webpage_navigate; after that, take a fresh snapshot instead of reusing an old ref. Use this to see the page before deciding anything. If the outline reports truncated=true, re-run with a larger max_lines (up to 5000) to see more of a long page. When the page has no actionable elements at all the result says so and lists 0 refs — then scroll without a ref, navigate elsewhere, or use webpage_execute. '
+      `Return a compact accessibility outline of the page, with a ref (like e12) on every actionable element. Refs are valid ONLY until the next webpage_snapshot or webpage_navigate; after that, take a fresh snapshot instead of reusing an old ref. Use this to see the page before deciding anything. If the outline reports truncated=true, re-run with a larger max_lines (up to ${String(MAX_SNAPSHOT_LINES)}) to see more of a long page. When the page has no actionable elements at all the result says so and lists 0 refs — then scroll without a ref, navigate elsewhere, or use webpage_execute. `
       + UNTRUSTED_PAGE_CONTENT_NOTICE,
     parameters: {
       session_id: SESSION_ID_PARAMETER,
       max_lines: {
         type: 'integer',
-        description: 'Raise the outline size budget when a long page was truncated (1-5000). Default 800; '
+        description: `Raise the outline size budget when a long page was truncated (1-${String(MAX_SNAPSHOT_LINES)}). Default ${String(DEFAULT_SNAPSHOT_LIMITS.maxLines)}; `
           + 'the character budget scales with it, so raising it really does return more.',
       },
     },
@@ -1202,8 +1210,8 @@ function registerConsole(ctx: Context): void {
       session_id: SESSION_ID_PARAMETER,
       limit: {
         type: 'integer',
-        description: 'Maximum number of entries to return, newest first (1-150). Default 50. '
-          + 'A single entry can be 2000 chars, so the whole result is also cut by a total size budget — '
+        description: `Maximum number of entries to return, newest first (1-${String(MAX_P2_LIMIT)}). Default ${String(DEFAULT_P2_LIMIT)}. `
+          + `A single entry can be ${String(CONSOLE_TEXT_MAX_CHARS)} chars, so the whole result is also cut by a total size budget — `
           + 'when truncated_by_budget is true, narrowing with level/text helps and raising this does not.',
       },
       level: { type: 'string', description: 'Only entries with this exact level, e.g. log, info, warning, error, debug, verbose.' },
@@ -1265,7 +1273,7 @@ function registerNetwork(ctx: Context): void {
       request_id: { type: 'string', description: 'request_id to fetch the response body for. Required for action=body.' },
       limit: {
         type: 'integer',
-        description: 'Maximum number of requests to return for action=list (1-150). Default 50. '
+        description: `Maximum number of requests to return for action=list (1-${String(MAX_P2_LIMIT)}). Default ${String(DEFAULT_P2_LIMIT)}. `
           + 'URLs can be very long, so the whole list is also cut by a total size budget — when '
           + 'truncated_by_budget is true, narrowing with url helps and raising this does not.',
       },
@@ -1333,7 +1341,7 @@ function registerNetwork(ctx: Context): void {
  * 描述里必须把「expression 会被页面执行」这条讲透 —— 这是全插件唯一能执行任意代码的入口，
  * 页面内容永远是数据不是代码。
  */
-function registerExecute(ctx: Context): void {
+function registerExecute(ctx: Context, cache: SnapshotCache): void {
   ctx.tools.register(defineTool({
     name: 'webpage_execute',
     description:
@@ -1355,6 +1363,10 @@ function registerExecute(ctx: Context): void {
         method: args.method,
         ...args.params !== undefined ? { params: args.params as Record<string, unknown> } : {},
       }, exec.signal)
+      // `Page.navigate` / `Page.reload` / 表达式里的 `location.href=…` 都会作废该会话的
+      // 全部 ref —— 缓存里那份旧大纲必须一起丢掉，否则下一次 webpage_find 会拿已废的
+      // ref 去喂 webpage_click，模型撞 BROWSER_STALE_REF 却不知道为什么。
+      if (result.navigated) cache.delete(result.sessionId)
       return {
         session_id: result.sessionId,
         method: result.method,
@@ -1491,6 +1503,7 @@ function registerLocate(ctx: Context): void {
  */
 function registerMutationTool(
   ctx: Context,
+  cache: SnapshotCache,
   spec: {
     name: string
     action: 'click' | 'fill' | 'press' | 'scroll' | 'wait'
@@ -1514,6 +1527,8 @@ function registerMutationTool(
       const args = rawArgs as Record<string, unknown>
       const sessionId = args['session_id'] as string
       const result = await ctx.browser.mutate(spec.build(args, sessionId), exec.signal)
+      // 导航过的会话，其 ref 与 find 缓存里的旧大纲一起作废（理由同 registerExecute）。
+      if (result.navigated) cache.delete(result.sessionId)
       return {
         session_id: result.sessionId,
         action: result.action,
@@ -1536,12 +1551,13 @@ function registerMutationTool(
 /** 注册 `webpage_click` / `webpage_fill` / `webpage_press` / `webpage_scroll` / `webpage_wait`（可逐个关闭）。 */
 function registerMutations(
   ctx: Context,
+  cache: SnapshotCache,
   enabled: { click: boolean; fill: boolean; press: boolean; scroll: boolean; wait: boolean },
 ): void {
   const STALE_NOTICE =
     'The ref must come from the LATEST webpage_snapshot; a ref from an older epoch fails with BROWSER_STALE_REF and the only recovery is a fresh snapshot.'
 
-  if (enabled.click) registerMutationTool(ctx, {
+  if (enabled.click) registerMutationTool(ctx, cache, {
     name: 'webpage_click',
     action: 'click',
     description:
@@ -1561,7 +1577,7 @@ function registerMutations(
     presentTitle: args => `Click ${String(args['ref'])}`,
   })
 
-  if (enabled.fill) registerMutationTool(ctx, {
+  if (enabled.fill) registerMutationTool(ctx, cache, {
     name: 'webpage_fill',
     action: 'fill',
     description:
@@ -1577,7 +1593,7 @@ function registerMutations(
     presentTitle: args => `Fill ${String(args['ref'])}`,
   })
 
-  if (enabled.press) registerMutationTool(ctx, {
+  if (enabled.press) registerMutationTool(ctx, cache, {
     name: 'webpage_press',
     action: 'press',
     description:
@@ -1593,7 +1609,7 @@ function registerMutations(
     presentTitle: args => `Press ${String(args['key'])} on ${String(args['ref'])}`,
   })
 
-  if (enabled.scroll) registerMutationTool(ctx, {
+  if (enabled.scroll) registerMutationTool(ctx, cache, {
     name: 'webpage_scroll',
     action: 'scroll',
     description:
@@ -1621,7 +1637,7 @@ function registerMutations(
       : `Scroll at ${String(args['ref'])}`,
   })
 
-  if (enabled.wait) registerMutationTool(ctx, {
+  if (enabled.wait) registerMutationTool(ctx, cache, {
     name: 'webpage_wait',
     action: 'wait',
     description:
@@ -1711,11 +1727,11 @@ export function apply(ctx: Context, config: Config = {}): void {
   if (enabled.screenshot) registerScreenshot(ctx)
   if (enabled.tabs) registerTabs(ctx, snapshotCache)
   if (enabled.click || enabled.fill || enabled.press || enabled.scroll || enabled.wait) {
-    registerMutations(ctx, { click: enabled.click, fill: enabled.fill, press: enabled.press, scroll: enabled.scroll, wait: enabled.wait })
+    registerMutations(ctx, snapshotCache, { click: enabled.click, fill: enabled.fill, press: enabled.press, scroll: enabled.scroll, wait: enabled.wait })
   }
   if (enabled.console) registerConsole(ctx)
   if (enabled.network) registerNetwork(ctx)
-  if (enabled.execute) registerExecute(ctx)
+  if (enabled.execute) registerExecute(ctx, snapshotCache)
   if (enabled.find) registerFind(ctx, snapshotCache)
   if (enabled.locate) registerLocate(ctx)
 
