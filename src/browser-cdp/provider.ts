@@ -567,14 +567,23 @@ export class CdpBrowserProvider implements BrowserProvider {
     watchUntil: number,
     signal?: AbortSignal,
   ): Promise<readonly BrowserTabInfo[]> {
-    const diff = (): readonly BrowserTabInfo[] => [...this.sessions.values()]
-      .filter((session) => !beforeIds.has(session.targetId))
-      .map((session) => ({ sessionId: session.targetId, url: session.url, title: session.title }))
+    // 前台判定与 listTabs 同一信号：transport 能回答就给新标签补 active，
+    // 让 `opened_tabs` 能标出 [foreground]（判不了时省略，与 tabs 清单同口径）。
+    const withActive = async (opened: readonly BrowserTabInfo[]): Promise<readonly BrowserTabInfo[]> => {
+      if (opened.length === 0) return opened
+      const activeId = this.transport.activeTargetId === undefined
+        ? undefined
+        : await this.transport.activeTargetId().catch(() => undefined)
+      return opened.map((tab) =>
+        activeId !== undefined && activeId === tab.sessionId ? { ...tab, active: true } : tab,
+      )
+    }
     for (;;) {
-      const opened = diff()
+      const opened = [...this.sessions.values()].filter((session) => !beforeIds.has(session.targetId))
+        .map((session) => ({ sessionId: session.targetId, url: session.url, title: session.title }))
       // 不等 `url` 非空：`adoptSession` 是「先登记、后等加载」，通报值本身就是这个弹窗的
       // 真实地址（页面加载完还会刷一次），先给模型一个能用的 session_id 比等标题更重要。
-      if (opened.length > 0 || Date.now() >= watchUntil) return opened
+      if (opened.length > 0 || Date.now() >= watchUntil) return withActive(opened)
       await delay(TAB_OPEN_WATCH_POLL_MS, signal)
     }
   }

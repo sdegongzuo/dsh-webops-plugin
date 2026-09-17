@@ -725,6 +725,30 @@ describe('CdpBrowserProvider.mutate (P1)', () => {
     expect(result.navigated).toBe(false)
     // 不导航的点击会跑满 800ms 导航轮询，150ms 级的通报天然被覆盖 —— 无需补窗口。
     expect(result.openedTabs?.map(tab => tab.sessionId)).toEqual(['popup-9'])
+    // transport 判不了前台（默认 FakeChrome 没有 activeTargetId）时省略 active 字段。
+    expect(result.openedTabs?.[0]).toEqual({ sessionId: 'popup-9', url: expect.any(String), title: expect.any(String) })
+    await adopted
+  })
+
+  it('marks the popped-open tab as foreground when the transport can tell (openedTabs active)', async () => {
+    // 与 listTabs 同一信号（transport.activeTargetId）：新标签被点名时还带 [foreground]。
+    const activeChrome = new FakeChrome()
+    activeChrome.axeNodes = PAGE_TREE
+    const withActive = new AdoptableProvider({ navigationTimeoutMs: 200 }, {
+      ...activeChrome.transport(),
+      activeTargetId: () => Promise.resolve('popup-9'),
+    })
+    const session = await withActive.open({})
+    const snapshot = await withActive.observe({ kind: 'snapshot', sessionId: session.id })
+    if (snapshot.kind !== 'snapshot') throw new Error('expected a snapshot')
+    const ref = snapshot.refs[0]?.ref as string
+    let adopted: Promise<unknown> | undefined
+    activeChrome.popupOnClick = popupTarget()
+    activeChrome.onPopup = target => { adopted = withActive.adopt(target) }
+
+    const result = await withActive.mutate({ kind: 'click', sessionId: session.id, ref })
+
+    expect(result.openedTabs?.[0]).toMatchObject({ sessionId: 'popup-9', active: true })
     await adopted
   })
 
