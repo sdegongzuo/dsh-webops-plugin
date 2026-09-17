@@ -578,14 +578,18 @@ export class CdpBrowserProvider implements BrowserProvider {
         activeId !== undefined && activeId === tab.sessionId ? { ...tab, active: true } : tab,
       )
     }
-    for (;;) {
-      const opened = [...this.sessions.values()].filter((session) => !beforeIds.has(session.targetId))
-        .map((session) => ({ sessionId: session.targetId, url: session.url, title: session.title }))
-      // 不等 `url` 非空：`adoptSession` 是「先登记、后等加载」，通报值本身就是这个弹窗的
-      // 真实地址（页面加载完还会刷一次），先给模型一个能用的 session_id 比等标题更重要。
-      if (opened.length > 0 || Date.now() >= watchUntil) return withActive(opened)
-      await delay(TAB_OPEN_WATCH_POLL_MS, signal)
-    }
+    let opened: readonly BrowserTabInfo[] = []
+    await this.pollUntil(
+      async () => {
+        opened = [...this.sessions.values()].filter((session) => !beforeIds.has(session.targetId))
+          .map((session) => ({ sessionId: session.targetId, url: session.url, title: session.title }))
+        // 不等 `url` 非空：`adoptSession` 是「先登记、后等加载」，通报值本身就是这个弹窗的
+        // 真实地址（页面加载完还会刷一次），先给模型一个能用的 session_id 比等标题更重要。
+        return opened.length > 0
+      },
+      { timeoutMs: Math.max(0, watchUntil - Date.now()), intervalMs: TAB_OPEN_WATCH_POLL_MS, signal },
+    )
+    return await withActive(opened)
   }
 
   /**
@@ -730,13 +734,23 @@ export class CdpBrowserProvider implements BrowserProvider {
       }
       const value = extractEvaluateValue(raw)
       const capped = capResult(value)
+      // 表达式能改地址（`location.href = '/x'` 这类同步改址，evaluate 返回时地址已变）。
+      // 以前这里恒报 `navigated:false`，于是工具回执一边说「refs 仍有效」、一边页面已经换了，
+      // 模型下一次 click / find 撞 BROWSER_STALE_REF 却毫无预兆。
+      // `awaitNavigation=false`：没导航时只读一次地址，不跑轮询窗口（evaluate 是逃生舱，
+      // 不能为「可能导航」给每次调用都加等待）；真导航了再补一次 settle，让新文档落地。
+      // **覆盖不到异步导航**：`form.submit()` 或「点了某个按钮」在 evaluate 返回时往往还没换页，
+      // 这种仍会报 false。要覆盖就得给每次 evaluate 加一个轮询窗口，代价是每次调用都变慢 ——
+      // 逃生舱不值当。模型侧的兜底不变：navigated=false 时用 ref 失败仍会拿到 BROWSER_STALE_REF。
+      const navigated = await this.detectNavigation(session, beforeUrl, false, signal)
+      if (navigated) await this.settleDocument(session, signal)
       return {
         kind: 'execute',
         sessionId: session.targetId,
         method: request.method,
         epoch: session.refs.currentEpoch,
         url: session.url,
-        navigated: false,
+        navigated,
         value: capped.payload,
         truncated: capped.truncated,
       }
@@ -1379,7 +1393,6 @@ export class CdpBrowserProvider implements BrowserProvider {
     } else if (wantsText) {
       const text = request.text as string
       satisfied = await this.pollUntil(
-        signal,
         async () => {
           const evaluated = await session.connection.send<EvaluateResult>(
             'Runtime.evaluate',
@@ -1388,7 +1401,8 @@ export class CdpBrowserProvider implements BrowserProvider {
           )
           return evaluated.result?.value === true
         },
-        this.config.waitTimeoutMs,
+        // wait 的 probe 会真发命令：失败要当「还没等到」继续等，而不是让整个工具失败。
+        { timeoutMs: this.config.waitTimeoutMs, signal, swallowErrors: true },
       )
     } else {
       const ref = request.ref as string
@@ -1396,7 +1410,6 @@ export class CdpBrowserProvider implements BrowserProvider {
       const objectId = await this.resolveObjectId(session, ref, signal)
       try {
         satisfied = await this.pollUntil(
-          signal,
           async () => {
             const evaluated = await session.connection.send<EvaluateResult>(
               'Runtime.callFunctionOn',
@@ -1405,7 +1418,8 @@ export class CdpBrowserProvider implements BrowserProvider {
             )
             return evaluated.result?.value === true
           },
-          this.config.waitTimeoutMs,
+          // 同上：hidden 分支的 probe 也是直接发命令，同样不能让工具失败。
+          { timeoutMs: this.config.waitTimeoutMs, signal, swallowErrors: true },
         )
       } finally {
         this.releaseObject(session, objectId, signal)
@@ -1415,17 +1429,43 @@ export class CdpBrowserProvider implements BrowserProvider {
     return { ...result, satisfied }
   }
 
-  /** 轮询一个条件直到成立或超时；返回是否成立。 */
+  /**
+   * 统一的轮询骨架：**先探一次，再判超时，最后按间隔等**。
+   *
+   * 2026-09-17 之前，等待逻辑在本文件里写了六遍（pollUntil / detectNavigation /
+   * settleDocument / waitForNavigation / waitForDocument / collectOpenedTabs），
+   * 每一遍都是 `for(;;){probe; deadline; delay}` 的复制品，间隔常量还不统一
+   * （100 与 `min(100, 剩余)` 两种），而「先探还是先判超时」这个顺序一旦写反，
+   * `timeoutMs = 0` 就变成「一次都不探」。所以收敛到这里，六处只留各自的判定条件。
+   *
+   * 间隔取 `min(intervalMs, 剩余时间)`：正常情况就是 `intervalMs`，窗口快到时不会睡过头。
+   *
+   * @param probe - 探一次；返回真即停下。
+   * @param options - 超时上限、轮询间隔（默认 {@link WAIT_POLL_INTERVAL_MS}）、取消信号；
+   *   `swallowErrors` 为真时把 `probe` 的异常当「还没成立」继续等（**默认不吞** ——
+   *   多数等待的 probe 自己就有 try/catch，吞掉反而会藏住真错）。
+   * @returns `probe` 是否成立过。
+   */
   private async pollUntil(
-    signal: AbortSignal | undefined,
-    condition: () => Promise<boolean>,
-    timeoutMs: number,
+    probe: () => Promise<boolean>,
+    options: {
+      timeoutMs: number
+      intervalMs?: number | undefined
+      signal?: AbortSignal | undefined
+      swallowErrors?: boolean | undefined
+    },
   ): Promise<boolean> {
-    const deadline = Date.now() + timeoutMs
+    const interval = options.intervalMs ?? WAIT_POLL_INTERVAL_MS
+    const deadline = Date.now() + options.timeoutMs
     for (;;) {
-      if (await condition().catch(() => false)) return true
-      if (Date.now() >= deadline) return false
-      await delay(WAIT_POLL_INTERVAL_MS, signal)
+      // `webpage_wait` 的两处 probe 是直接发 CDP 命令，页面中途导航会让 objectId 失效、
+      // 单条命令也可能超时 —— 那不是「等的条件不满足」，但也不该让整个工具失败。
+      // 旧骨架在这里是吞异常继续等的，语义必须保住（2026-09-17 收敛时差点丢掉）。
+      const ok = options.swallowErrors === true ? await probe().catch(() => false) : await probe()
+      if (ok) return true
+      const remaining = deadline - Date.now()
+      if (remaining <= 0) return false
+      await delay(Math.min(interval, remaining), options.signal)
     }
   }
 
@@ -1473,22 +1513,24 @@ export class CdpBrowserProvider implements BrowserProvider {
     signal?: AbortSignal,
   ): Promise<boolean> {
     let navigated = false
-    const deadline = awaitNavigation ? Date.now() + MUTATION_NAVIGATION_POLL_MS : 0
-    for (;;) {
-      const meta = await this.readPageMeta(session.connection, signal)
-      if (meta !== undefined) {
-        if (meta.url !== '' && meta.url !== beforeUrl) {
-          // 页面换掉了：旧 ref 全部作废，绝不许旧 ref 静默命中新页面上的元素。
-          session.refs.invalidate()
-          navigated = true
-          this.noteDocumentChange(session)
+    // `timeoutMs = 0` 时骨架仍会先探一次再判超时 —— 这正是「只读一次」的语义。
+    await this.pollUntil(
+      async () => {
+        const meta = await this.readPageMeta(session.connection, signal)
+        if (meta !== undefined) {
+          if (meta.url !== '' && meta.url !== beforeUrl) {
+            // 页面换掉了：旧 ref 全部作废，绝不许旧 ref 静默命中新页面上的元素。
+            session.refs.invalidate()
+            navigated = true
+            this.noteDocumentChange(session)
+          }
+          session.url = meta.url
+          session.title = meta.title
         }
-        session.url = meta.url
-        session.title = meta.title
-      }
-      if (navigated || Date.now() >= deadline) break
-      await delay(WAIT_POLL_INTERVAL_MS, signal)
-    }
+        return navigated
+      },
+      { timeoutMs: awaitNavigation ? MUTATION_NAVIGATION_POLL_MS : 0, signal },
+    )
     if (navigated && awaitNavigation) await this.settleDocument(session, signal)
     return navigated
   }
@@ -1502,19 +1544,19 @@ export class CdpBrowserProvider implements BrowserProvider {
    * 这里只补这一小段等待，**超时不算失败**（页面是慢，不是错），也绝不把 `press` 拖成超时。
    */
   private async settleDocument(session: SessionState, signal?: AbortSignal): Promise<void> {
-    const deadline = Date.now() + MUTATION_NAVIGATION_SETTLE_MS
-    for (;;) {
-      const meta = await this.readPageMeta(session.connection, signal)
-      if (meta !== undefined) {
-        session.url = meta.url
-        session.title = meta.title
-        if (meta.title.length > 0) return
-      }
-      // 加载完还读不到标题 ⇒ 这个页面本来就没有 `<title>`，没必要等满窗口。
-      if (await this.documentComplete(session.connection, signal)) return
-      if (Date.now() >= deadline) return
-      await delay(WAIT_POLL_INTERVAL_MS, signal)
-    }
+    await this.pollUntil(
+      async () => {
+        const meta = await this.readPageMeta(session.connection, signal)
+        if (meta !== undefined) {
+          session.url = meta.url
+          session.title = meta.title
+          if (meta.title.length > 0) return true
+        }
+        // 加载完还读不到标题 ⇒ 这个页面本来就没有 `<title>`，没必要等满窗口。
+        return await this.documentComplete(session.connection, signal)
+      },
+      { timeoutMs: MUTATION_NAVIGATION_SETTLE_MS, signal },
+    )
   }
 
   /**
@@ -1612,12 +1654,10 @@ export class CdpBrowserProvider implements BrowserProvider {
     signal: AbortSignal | undefined,
     timeoutMs: number,
   ): Promise<boolean> {
-    const deadline = Date.now() + timeoutMs
-    for (;;) {
-      if (await this.navigationSettled(connection, previousUrl, signal)) return true
-      if (Date.now() >= deadline) return false
-      await delay(Math.min(100, Math.max(1, deadline - Date.now())), signal)
-    }
+    return await this.pollUntil(
+      () => this.navigationSettled(connection, previousUrl, signal),
+      { timeoutMs, signal },
+    )
   }
 
   /** 问一次「地址变了吗 + 加载完了吗」；任何读取失败都当作「还没完成」。 */
@@ -1656,12 +1696,10 @@ export class CdpBrowserProvider implements BrowserProvider {
     signal: AbortSignal | undefined,
     timeoutMs: number,
   ): Promise<boolean> {
-    const deadline = Date.now() + timeoutMs
-    for (;;) {
-      if (await this.documentComplete(connection, signal)) return true
-      if (Date.now() >= deadline) return false
-      await delay(Math.min(100, Math.max(1, deadline - Date.now())), signal)
-    }
+    return await this.pollUntil(
+      () => this.documentComplete(connection, signal),
+      { timeoutMs, signal },
+    )
   }
 
   /** 问一次 `document.readyState`；任何读取失败都当作「还没完成」。 */

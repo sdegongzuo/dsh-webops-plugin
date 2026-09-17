@@ -68,6 +68,19 @@ export const NETWORK_MAX_BASE64_CHARS = 2_000
  */
 export const NETWORK_LIST_MAX_CHARS = 40_000
 
+/**
+ * 请求表的**字节**上界（URL 字符总数）。
+ *
+ * {@link NETWORK_TABLE_CAPACITY} 只按**条数**封顶，而单条 URL 的长度是不受控的：
+ * 长 query string、`data:` / `blob:` URL 都能到几十甚至几百 KB。500 条 × 几百 KB
+ * 就是几十上百 MB 的常驻 —— 而 {@link NETWORK_LIST_MAX_CHARS} 那道闸门管的是
+ * **输出给模型的量**，管不了内存在存多少。所以存储侧再加一道字节预算。
+ *
+ * 2M 字符（≈2MB）的选法：常态下 500 条 × 平均几百字节不过几十 KB，永远碰不到这条线，
+ * 也就是说它**只**在真的遇到超长 URL 时才生效，不会改变正常页面的行为。
+ */
+export const NETWORK_TABLE_MAX_URL_CHARS = 2_000_000
+
 /** 一条网络请求（可能是降级的半截记录）。 */
 export interface NetworkEntry {
   readonly requestId: string
@@ -146,6 +159,8 @@ function readString(source: Record<string, unknown>, key: string): string | unde
   private readonly connection: CdpConnection
   /** 按到达顺序保存；`Map` 保留插入序，所以最早插入的就是最旧的。 */
   private readonly requests = new Map<string, NetworkEntry>()
+  /** 表里所有 URL 的字符总数；{@link NETWORK_TABLE_MAX_URL_CHARS} 的计数器。 */
+  private urlChars = 0
   private readonly unsubscribes: (() => void)[] = []
   /** 当前文档序号（0 起）；provider 每次观察到导航就 +1。 */
   private document = 0
@@ -269,14 +284,33 @@ function readString(source: Record<string, unknown>, key: string): string | unde
     this.unsubscribes.length = 0
   }
 
-  /** 写一条记录并维持 500 条的环形上界（最旧的先出）。 */
+  /** 淘汰最旧的一条，并同步维护字节计数器。 */
+  private evictOldest(): void {
+    const oldest = this.requests.keys().next().value
+    if (oldest === undefined) return
+    const dropped = this.requests.get(oldest)
+    if (dropped !== undefined) this.urlChars -= dropped.url.length
+    this.requests.delete(oldest)
+  }
+
+  /**
+   * 写一条记录并维持两道上界：条数 {@link NETWORK_TABLE_CAPACITY} 与
+   * URL 字符总数 {@link NETWORK_TABLE_MAX_URL_CHARS}（最旧的先出）。
+   */
   private put(entry: MutableEntry): void {
     // 没带文档序号的是「新到达」的事件（带序号的是更新已有记录），归入当前文档。
-    this.requests.set(entry.requestId, { ...entry, document: entry.document ?? this.document })
-    if (this.requests.size > NETWORK_TABLE_CAPACITY) {
-      const oldest = this.requests.keys().next().value
-      if (oldest !== undefined) this.requests.delete(oldest)
-    }
+    const stored = { ...entry, document: entry.document ?? this.document }
+    // 更新已有记录时先扣掉旧 URL 的长度，否则计数器只增不减。
+    const previous = this.requests.get(entry.requestId)
+    if (previous !== undefined) this.urlChars -= previous.url.length
+    this.requests.set(entry.requestId, stored)
+    this.urlChars += stored.url.length
+
+    while (this.requests.size > NETWORK_TABLE_CAPACITY) this.evictOldest()
+    // `size > 1` 是循环能停下的**条件**，不是「至少留一条」的副作用：单条 URL 本身就
+    // 超过预算时，删无可删只能认了 —— 一条超长记录也好过一张空表（空表连「有什么请求」
+    // 都答不上来）。
+    while (this.urlChars > NETWORK_TABLE_MAX_URL_CHARS && this.requests.size > 1) this.evictOldest()
   }
 
   /** `requestWillBeSent`：建档的唯一来源。 */

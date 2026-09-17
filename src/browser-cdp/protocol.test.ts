@@ -146,6 +146,33 @@ describe('CdpConnection', () => {
       .rejects.toThrow(expect.objectContaining({ code: 'BROWSER_PROTOCOL_ERROR' }))
   })
 
+  it('unhooks its abort listener when the command times out (2026-09-17)', async () => {
+    const connection = new CdpConnection(socket)
+    const controller = new AbortController()
+    const signal = controller.signal
+    // 计数 abort 监听的挂上 / 摘下：超时路径以前只 `pending.delete`，不摘监听。
+    let added = 0
+    let removed = 0
+    const add = signal.addEventListener.bind(signal)
+    const remove = signal.removeEventListener.bind(signal)
+    signal.addEventListener = ((...args: Parameters<typeof add>) => {
+      added += 1
+      return add(...args)
+    }) as typeof add
+    signal.removeEventListener = ((...args: Parameters<typeof remove>) => {
+      removed += 1
+      return remove(...args)
+    }) as typeof remove
+
+    await expect(connection.send('Page.enable', undefined, { signal, timeoutMs: 5 }))
+      .rejects.toThrow(expect.objectContaining({ code: 'BROWSER_PROTOCOL_ERROR' }))
+
+    // 工具的 exec.signal 是长生命周期的：一次工具调用里发好几条命令，
+    // 每条超时都漏一个监听就会一直攒下去。
+    expect(added).toBe(1)
+    expect(removed).toBe(1)
+  })
+
   it('dispatches events to subscribers and stops after unsubscribe', () => {
     const connection = new CdpConnection(socket)
     const seen: unknown[] = []

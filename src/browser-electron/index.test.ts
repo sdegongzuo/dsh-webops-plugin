@@ -481,7 +481,9 @@ describe('弹窗标签收编（tab opened 通报）', () => {
     // 收编后 execute 不应报「会话不存在」；命令应转发到 t9 的标签。
     const before = host.commands.filter(c => c.tabId === 't9').length
     await provider.execute({ sessionId: 't9', method: 'Runtime.evaluate', params: { expression: '1 + 1', returnByValue: true } })
-    expect(host.commands.filter(c => c.tabId === 't9').length).toBe(before + 1)
+    // +1 是 evaluate 本身；再 +1 是 2026-09-17 补的导航检测 —— 表达式能改地址
+    // （`location.href = …`），不探一次就会报 navigated=false，让模型拿着已废的 ref 继续点。
+    expect(host.commands.filter(c => c.tabId === 't9').length).toBe(before + 2)
   })
 })
 

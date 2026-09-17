@@ -265,6 +265,38 @@ describe('NetworkCollector', () => {
     expect(collector.get(`r-${NETWORK_TABLE_CAPACITY + 5}`)).toBeDefined()
   })
 
+  it('caps the table by TOTAL url characters too, not only by entry count (2026-09-17)', () => {
+    const socket = new EventSocket()
+    const collector = new NetworkCollector(new CdpConnection(socket))
+    // 单条 300K 字符：十条就 3M > 2M 预算，而条数（10）远不到 500 ——
+    // 只按条数封顶的话这十条会全留着，常驻 3MB 只为十条请求。
+    const longUrl = `https://example.com/?q=${'x'.repeat(300_000)}`
+
+    for (let index = 1; index <= 10; index += 1) {
+      socket.emit('Network.requestWillBeSent', requestEvent(`big-${index}`, 'GET', longUrl))
+    }
+
+    expect(collector.size).toBeLessThan(10)
+    // 留下来的是最新的那几条，最旧的先没。
+    expect(collector.get('big-1')).toBeUndefined()
+    expect(collector.get('big-10')).toBeDefined()
+    // 至少留一条，不会把表清成空。
+    expect(collector.size).toBeGreaterThanOrEqual(1)
+  })
+
+  it('does NOT let the byte budget shrink a table of normal-sized urls', () => {
+    const socket = new EventSocket()
+    const collector = new NetworkCollector(new CdpConnection(socket))
+
+    for (let index = 1; index <= 50; index += 1) {
+      socket.emit('Network.requestWillBeSent', requestEvent(`r-${index}`, 'GET', `https://example.com/${index}`))
+    }
+
+    // 常态下字节预算（2M）根本碰不到，行为与只按条数封顶时完全一致。
+    expect(collector.size).toBe(50)
+    expect(collector.get('r-1')).toBeDefined()
+  })
+
   it('hides earlier-document requests by default and reports how many are hidden (2026-09-14)', () => {
     const socket = new EventSocket()
     const collector = new NetworkCollector(new CdpConnection(socket))

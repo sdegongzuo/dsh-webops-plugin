@@ -12,6 +12,7 @@
 
 import { BrowserError } from '../browser/types.ts'
 import type { BrowserErrorCode } from '../browser/types.ts'
+import { noteLoaded } from '../debug.ts'
 
 /** Chrome DevTools HTTP 端点描述的一个 target。 */
 export interface CdpTarget {
@@ -153,7 +154,12 @@ export class CdpConnection {
     const timeoutMs = options?.timeoutMs ?? this.commandTimeoutMs
     return new Promise<T>((resolve, reject) => {
       const timer = setTimeout(() => {
+        const entry = this.pending.get(id)
         this.pending.delete(id)
+        // 超时这条路径以前只 `pending.delete`，**没摘 abort 监听**。工具的 `exec.signal`
+        // 是长生命周期的（一次工具调用里要发好几条命令），每超时一条就多挂一个
+        // `{ once: true }` 监听却永不触发 —— 会话活得越久攒得越多。
+        entry?.detachAbort()
         reject(new BrowserError(
           `CDP command "${method}" did not complete within ${timeoutMs} ms`,
           'BROWSER_PROTOCOL_ERROR',
@@ -256,8 +262,14 @@ export class CdpConnection {
       for (const listener of this.listeners.get(message.method) ?? []) {
         try {
           listener(message.params)
-        } catch {
-          // 订阅者自己的异常不该影响其它订阅者。
+        } catch (error: unknown) {
+          // 订阅者自己的异常不该影响其它订阅者 —— 但**也不能静默**：
+          // 采集器（console / network）里的逻辑 bug 只会在处理事件时炸，以前这里全吞，
+          // 症状是「采集器悄悄不干活了」而日志一条没有。
+          // 走 `noteLoaded` 而不是 `console.error`：本插件默认不往 stdout/stderr 写东西，
+          // 而且桌面端把子进程的 stderr 攒在内存里、只在失败时才抛 —— 写 stderr 等于没写
+          // （见 debug.ts 文件头）。需要看时开 `DSH_BROWSER_PLUGIN_DEBUG=1`。
+          noteLoaded('browser-cdp', `${message.method} 的订阅者抛错，该条事件已跳过：${error instanceof Error ? error.message : String(error)}`)
         }
       }
     }

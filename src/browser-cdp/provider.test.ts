@@ -938,6 +938,34 @@ describe('P2: console / network / execute', () => {
     expect(call?.params['awaitPromise']).toBe(true)
   })
 
+  it('reports navigated=true when the evaluated expression changed the URL (2026-09-17)', async () => {
+    await provider.open({})
+    // 表达式本身照旧返回 2，但页面地址被它改了（`location.href = '/next'` 那类副作用）。
+    chrome.page = { url: 'https://example.com/next', title: 'Next' }
+
+    const result = await provider.execute({
+      sessionId: 'tab-1',
+      method: 'Runtime.evaluate',
+      params: { expression: '1 + 1' },
+    })
+
+    // 以前这里恒 false —— 回执说「refs 仍有效」，模型拿着已废的 ref 继续点，
+    // 撞 BROWSER_STALE_REF 时毫无预兆。
+    expect(result).toMatchObject({ kind: 'execute', navigated: true, url: 'https://example.com/next', value: 2 })
+  })
+
+  it('still reports navigated=false when the expression left the URL alone', async () => {
+    await provider.open({})
+
+    const result = await provider.execute({
+      sessionId: 'tab-1',
+      method: 'Runtime.evaluate',
+      params: { expression: '1 + 1' },
+    })
+
+    expect(result.navigated).toBe(false)
+  })
+
   it('overrides a caller that tries to turn awaitPromise off', async () => {
     await provider.open({})
     await provider.execute({
