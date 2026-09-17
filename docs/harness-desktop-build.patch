@@ -58,7 +58,7 @@ index d3f9dae8a3..f83a0923ed 100644
      const targetName = resolveDesktopBuildTarget()
      const target = { platform: process.platform, arch: targetName.endsWith('arm64') ? 'arm64' : 'x64' }
 diff --git a/apps/desktop/src/main.ts b/apps/desktop/src/main.ts
-index e63e21588a..52e0178f92 100644
+index e63e21588a..d3efad6e57 100644
 --- a/apps/desktop/src/main.ts
 +++ b/apps/desktop/src/main.ts
 @@ -1,6 +1,7 @@
@@ -78,7 +78,7 @@ index e63e21588a..52e0178f92 100644
  import { DesktopProjectManager, type DesktopProjectHooks } from './project-manager.ts'
  import { DesktopHostProcess } from './host-process.ts'
  import { DesktopBackendController, type DesktopBackendState } from './backend-controller.ts'
-@@ -23,6 +24,40 @@ import { DesktopUpdateCoordinator } from './update-coordinator.ts'
+@@ -23,6 +24,53 @@ import { DesktopUpdateCoordinator } from './update-coordinator.ts'
  import { desktopErrorState } from './startup-error.ts'
  import { startupFailureDocument } from './startup-document.ts'
  
@@ -86,6 +86,19 @@ index e63e21588a..52e0178f92 100644
 +// electron.exe，browser-electron 的窗口宿主只能用这个 exe 起第二个实例。
 +// 注意**不能**用 `DSH_DESKTOP_` 前缀：`host-process.ts` 会把那个前缀的变量全部过滤掉。
 +process.env.DSH_APP_EXECUTABLE = process.execPath
++
++// 浏览器 provider 的默认选择：桌面端里 `cdp` 与 `electron` 会**同时**「可用」——
++// `browser-cdp` 的 `available()` 是乐观的（探测不到就返回 true），而 `browser-electron`
++// 由出货 patch 带着 `enabled: true`。两个可用又没人指定，能力缝隙就抛
++// `BROWSER_PROVIDER_AMBIGUOUS`（`multiple usable browser providers are registered`），
++// `browser_open` 直接失败。
++//
++// 而默认值写不进 profile：桌面端的 profile 目录由应用独占并每次重建，`config.provider`
++// 活不过一次重启。所以只能由 shell 在最早的时刻落进环境。
++//
++// 只在没人显式指定时生效 —— 想改用外接 Chrome 仍可设 `DSH_BROWSER_PROVIDER=cdp`
++// （`启动.cmd`、系统环境变量、或 dev-desktop 都行）覆盖这里。
++if ((process.env.DSH_BROWSER_PROVIDER ?? '') === '') process.env.DSH_BROWSER_PROVIDER = 'electron'
 +
 +// PTC 子进程（`run_code` 的实际执行体）必须由**真正的 node** 启动。
 +//
@@ -119,7 +132,7 @@ index e63e21588a..52e0178f92 100644
  const SCHEME = 'dsh-app'
  let focusPrimaryWindow = (): void => {}
  type RecoveryAction = 'restart' | 'plugins' | 'reset'
-@@ -76,8 +111,11 @@ function runtimeResources(): RuntimeResources {
+@@ -76,8 +124,11 @@ function runtimeResources(): RuntimeResources {
      : process.execPath
    const pnpm = (development ? process.env.DSH_DESKTOP_PNPM_ENTRY : undefined)
      ?? join(process.resourcesPath, 'runtime', 'pnpm', 'bin', 'pnpm.mjs')
@@ -133,7 +146,7 @@ index e63e21588a..52e0178f92 100644
    return { node, pnpm, dsh, ...(development ? {} : { profileResolution: 'runtime' }) }
  }
  
-@@ -507,19 +545,31 @@ async function main(): Promise<void> {
+@@ -507,19 +558,31 @@ async function main(): Promise<void> {
    setTimeout(() => { void checkAndPrompt(false) }, 10_000)
  }
  

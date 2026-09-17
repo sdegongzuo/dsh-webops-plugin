@@ -295,6 +295,8 @@ writeFileSync(
     '',
     '【浏览器工具】',
     '  agent 调 browser_open 会打开 **dsh 自己的浏览器窗口**，不需要外接 Chrome。',
+    '  （默认 provider 就是包内窗口宿主：桌面端里 cdp 与 electron 会同时「可用」，',
+    '    shell 启动时已把 DSH_BROWSER_PROVIDER 落成 electron，否则缝隙会报 ambiguous。）',
     '  想改用外接 Chrome（调试端口模式）：先起',
     '',
     '      chrome.exe --remote-debugging-port=9222 --user-data-dir="%TEMP%\\dsh-chrome"',

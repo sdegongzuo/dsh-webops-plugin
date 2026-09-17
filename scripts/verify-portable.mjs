@@ -326,6 +326,12 @@ if (check(existsSync(asarPath), 'app/resources/app.asar 在包里')) {
     [/resolvePortableDshHome\(process\.execPath\)/u, '便携 home 兜底（双击 exe 免启动脚本）'],
     [/\(process\.env\.DSH_HOME \?\? ['"]{2}\)\.trim\(\) === ['"]{2}/u, '便携兜底只在 $DSH_HOME 为空时生效'],
     [/process\.env\.DSH_BROWSER_ELECTRON_HOST/u, '窗口宿主的早期分支'],
+    // 2026-09-17 补：桌面端里 `cdp` 与 `electron` 会同时「可用」（前者 available() 乐观为真），
+    // 没人指定 provider 就抛 BROWSER_PROVIDER_AMBIGUOUS —— `browser_open` 直接失败，而
+    // profile 每次重建、写不进 `config.provider`，只能由 shell 落这个默认值。
+    // 两条一起断言：既要「判空后兜底」的写法在，也要兜底值真的是 electron。
+    [/process\.env\.DSH_BROWSER_PROVIDER \?\? ['"]{2}/u, '浏览器 provider 的判空兜底'],
+    [/process\.env\.DSH_BROWSER_PROVIDER = ['"]electron['"]/u, '浏览器 provider 默认落成 electron（避免 cdp/electron 撞 ambiguous）'],
   ]) {
     check(pattern.test(asarText), `app.asar 主进程含 ${what}`)
   }
@@ -480,6 +486,10 @@ if (pluginEntry !== undefined) {
 
 if (options.browser === undefined) {
   console.log('\n[5/5] 跳过浏览器验证（没给 --browser，客户端注册那一步未验）')
+  // 这里的 [5/5] 只覆盖「客户端半边在真浏览器里注册」，与「窗口开不开得出来」是两件事。
+  // 后者 2026-09-17 起由 verify-browser-host.mjs 覆盖（它自己起窗口宿主，不需要浏览器），
+  // 两次真机事故（打不开窗口 / provider ambiguous）都落在那一段。别再以为这里跳过了就没人管。
+  console.log('      注：「窗口真开得出来 + provider 选对了」由 scripts/verify-browser-host.mjs 覆盖。')
 } else {
   console.log('\n[5/5] 真浏览器里确认客户端半边注册')
 

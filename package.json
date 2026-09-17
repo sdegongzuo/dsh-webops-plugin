@@ -61,6 +61,7 @@
     "verify:card": "node scripts/verify-card.mjs",
     "verify:portable": "node scripts/verify-portable.mjs",
     "verify:ptc": "node scripts/verify-ptc.mjs",
+    "verify:browser-host": "node scripts/verify-browser-host.mjs",
     "verify:settings": "node scripts/verify-settings.mjs",
     "shot:desktop": "node scripts/shot-desktop.mjs",
     "smoke:dispatch": "tsx scripts/smoke-dispatch.ts",
