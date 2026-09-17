@@ -49,7 +49,7 @@ describe('parseBrowserUrl', () => {
 })
 
 describe('browserCallsFrom', () => {
-  it('只收 browser_* 调用，其它工具被滤掉', () => {
+  it('只收 webpage_* 调用，其它工具被滤掉', () => {
     const calls = browserCallsFrom(snapshot([
       settled('read_file', '{}'),
       settled('webpage_navigate', '{"url":"https://a.test"}'),

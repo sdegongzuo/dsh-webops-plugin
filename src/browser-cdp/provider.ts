@@ -6,7 +6,7 @@
  * 浏览器下载与构建脚本授权（pnpm 的 allowBuilds 是默认拒绝的白名单制）。
  *
  * ```text
- *   模型 → browser_* 工具 → ctx.browser → CdpBrowserProvider
+ *   模型 → webpage_* 工具 → ctx.browser → CdpBrowserProvider
  *                                            ├── HttpCdpTransport  /json/{version,list,new,close}
  *                                            └── CdpConnection（WebSocket 上的 { id, method, params }）
  * ```

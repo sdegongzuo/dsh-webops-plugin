@@ -1,5 +1,5 @@
 /**
- * `browser_*` 工具的卡片视图。
+ * `webpage_*` 工具的卡片视图。
  *
  * 认领 `tool.call.toolview` 的四个 key（open / navigate / snapshot / screenshot），
  * 让这四次调用不再落到通用兜底卡片上，而是显示：工具名 → 目标地址 → 结果正文或截图。
@@ -65,7 +65,7 @@ function outlineOf(text: string): string {
 }
 
 /**
- * 一次 `browser_*` 调用的卡片。
+ * 一次 `webpage_*` 调用的卡片。
  * @param props - slot 运行时下发的 owner、Session 标准件与本地化。
  */
 export function BrowserToolRow(props: BrowserToolRowProps) {

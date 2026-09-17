@@ -17,7 +17,7 @@
  * 来自 open/snapshot 的回显，`[ref=eN]` 来自 snapshot 大纲、`[eN]` 来自 find 结果。
  * 抽不到（比如工具执行失败）就降级为兜底文本，绝不炸会话。
  *
- * 用途只有一个：没有 `DEEPSEEK_API_KEY` 时也能跑通「真 agent loop → 真 browser_*
+ * 用途只有一个：没有 `DEEPSEEK_API_KEY` 时也能跑通「真 agent loop → 真 webpage_*
  * 工具执行 → 客户端真的渲染工具卡片」这条链。它不是 mock 测试基建 —— 那是官方
  * `@deepseek-ai/dsh-llm-replay` 的事；这个插件刻意极简，脚本写死、全局队列按序消费，
  * 脚本耗尽后的额外调用（比如标题生成）一律回一句兜底文本。

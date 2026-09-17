@@ -41,24 +41,23 @@ tabs）。动机：`browser_` 让 agent 以为要「调用浏览器软件」而�
 
 ## v0.2.5（2026-09-17 本机手打，未上 CI；当晚重打一次，见下）
 
-**包里变了什么**：结构性修掉「模型看不见新标签页」这个盲区（`webpage_click` 等 mutation
+**包里变了什么**：结构性修掉「模型看不见新标签页」这个盲区（`browser_click` 等 mutation
 回执新增 `opened_tabs`），加上上一轮的窗口空白修复（`layout()` 守卫 + `restore/show` 补跑）
-与 `webpage_click` 描述同步。链路与验证见 `docs/实现与踩坑.md`「窗口空白」那一节。
+与 `browser_click` 描述同步。链路与验证见 `docs/实现与踩坑.md`「窗口空白」那一节。
 
 **2026-09-17 晚重打**（同名 v0.2.5，sha256 见下）：包进上下文预算硬化
 （commit `f2d0e1a`）—— `limit` 硬上限 500→150、console/network 各加 4 万字符总量闸门、
-base64 正文上限单独压到 2000、新增 `truncated_by_budget` 且两类截断给**不同**建议；
-外加 review 补的一处（`opened_tabs` 的前台标注，见下）。`app/` 本体没变，只有插件 overlay
-换了。打包时 `Compress-Archive` 被火绒扫描句柄挡住过一次，现已内置退化到
-`scripts/zip-stage.py`（共享读）。
+base64 正文上限单独压到 2000、新增 `truncated_by_budget` 且两类截断给**不同**建议。
+`app/` 本体没变，只有插件 overlay 换了。打包时 `Compress-Archive` 被火绒扫描句柄挡住，
+退化到 `scripts/zip-stage.py`（共享读）压完。
 
 | 项 | 值 |
 |---|---|
 | 产物 | `dist/dsh-webops-desktop-v0.2.5-win-x64-portable.zip` |
-| 体积 | 250.0 MB / 12497 个条目（10358 文件 + 2139 目录） |
-| sha256 | `09a4a024d0e7e675a99f8507d6e58e38973284de8d9f81b12fab2d1f5c477be2` |
+| 体积 | 250.4 MB / 12497 个条目（10358 文件 + 2139 目录） |
+| sha256 | `146330e118ee4a723566ead9e581926811e32221c7857d1db6dd3d0f047370e8` |
 
-**验证**（解压到 `D:\dsh-v0.2.5-verify3`，10358 个文件 / 0 个 NUL 污染）：
+**验证**（解压到 `D:\dsh-v0.2.5-verify2`，10358 个文件 / 0 个 NUL 污染）：
 
 | 自检 | 结论 |
 |---|---|
@@ -66,9 +65,9 @@ base64 正文上限单独压到 2000、新增 `truncated_by_budget` 且两类截
 | `verify:ptc --dir` | 通过（真跑 PTC，Electron 运行时下 sandbox runner 用的是包内真 node） |
 | `verify:settings --dir` | 通过（出厂配置注册 unisound，默认模型 unisound/u2-flash） |
 | `verify:browser-host --dir` | 通过（包内产物在打包 exe 上开真窗口 → 快照 → 截图 27705 字节） |
-| 插件内容抽查 | 包内 `lib/tool-browser/index.js` 含 `1-150`、`truncated_by_budget` 与两条新建议措辞；`lib/provider-*.js` 含 `activeTargetId` 前台标注 |
+| 插件内容抽查 | 包内 `lib/tool-browser/index.js` 含 `1-150`、`truncated_by_budget` 与两条新建议措辞（确认本次硬化真进了包） |
 
-**仍未覆盖**：模型真的调 `webpage_open`（要 API key）、窗口外观与「双击后的状态条」（要人眼）。
+**仍未覆盖**：模型真的调 `browser_open`（要 API key）、窗口外观与「双击后的状态条」（要人眼）。
 
 ---
 
@@ -284,7 +283,7 @@ home\                    ← 全部用户数据：会话、设置、凭据、已
 
 ## 验证插件生效
 
-启动后在输入框上方应能看到「网页操作」状态条；让 agent 调用 `webpage_open` 能开页面。
+启动后在输入框上方应能看到「网页操作」状态条；让 agent 调用 `browser_open` 能开页面。
 
 ## 已知事项
 

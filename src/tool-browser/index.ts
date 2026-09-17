@@ -1,5 +1,5 @@
 /**
- * tool-browser —— 把 `ctx.browser` 暴露成模型可见的 `browser_*` 工具。
+ * tool-browser —— 把 `ctx.browser` 暴露成模型可见的 `webpage_*` 工具。
  *
  * P0 只给 4 个只读工具（模型「看」页面）：
  *
@@ -643,7 +643,7 @@ export const Config: z<Config> = z.object({
 })
 
 /**
- * 能力分级：每个 `browser_*` 工具是只读（`read`）还是会改页面/状态（`mutate`）。
+ * 能力分级：每个 `webpage_*` 工具是只读（`read`）还是会改页面/状态（`mutate`）。
  *
  * `webpage_tabs` 按动作分级没有单一答案（list 是读、close 是改），按最坏情况归为
  * `mutate`；`webpage_wait` 不改页面，归 `read`；`webpage_navigate` 改的是地址栏

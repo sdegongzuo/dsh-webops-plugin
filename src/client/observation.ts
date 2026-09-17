@@ -20,7 +20,7 @@ export interface WireImageRef {
   readonly name: string | undefined
 }
 
-/** 会话里的一次 `browser_*` 调用，运行中与已结算统一成同一个形状。 */
+/** 会话里的一次 `webpage_*` 调用，运行中与已结算统一成同一个形状。 */
 export interface BrowserCall {
   readonly callId: string
   readonly toolName: string
@@ -144,7 +144,7 @@ export function callFromBlock(block: unknown, toolName: string): BrowserCall {
 }
 
 /**
- * 从对话快照里抽出全部 `browser_*` 调用。
+ * 从对话快照里抽出全部 `webpage_*` 调用。
  *
  * 取的是 `legacy.nodes`（已结算，按日志顺序）与 `legacy.runningCalls`（运行中），
  * 保持原顺序追加：已结算的在前、在跑的在后，于是「最后一项」天然就是最新的那次调用。

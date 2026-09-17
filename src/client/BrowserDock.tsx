@@ -2,7 +2,7 @@
  * 浏览器观察面板：挂在 `conversation.input.dock` 上，**常驻显示**。
  *
  * 为什么无活动也要占位：这个插件要「装完在界面里看得见」。只在模型真的调用过
- * `browser_*` 之后才出现的话，用户装完插件打开会话什么也看不到，等于没有证据表明
+ * `webpage_*` 之后才出现的话，用户装完插件打开会话什么也看不到，等于没有证据表明
  * 客户端半边活了。所以无活动时显示一行「网页操作 · 已就绪 / agent 可打开、观察与操作网页」。
  * 这一行同时也是 `scripts/check-desktop.mjs` 的第四项硬证据。
  *
@@ -34,7 +34,7 @@ const identity = (state: unknown): unknown => state
 const constantChat: ChatSelector = () => undefined
 
 /**
- * 订阅对话快照并抽出全部 `browser_*` 调用。
+ * 订阅对话快照并抽出全部 `webpage_*` 调用。
  * @param useChat - slot 标准件里的 chat 选择器 hook。
  */
 function useBrowserCalls(useChat: unknown): readonly BrowserCall[] {

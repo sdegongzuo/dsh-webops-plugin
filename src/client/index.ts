@@ -3,7 +3,7 @@
  *
  * 它做两件事，都只读、都不新增基础设施：
  *
- * 1. `conversation.input.dock` —— 常驻状态条；数据来自对话快照里已有的 `browser_*`
+ * 1. `conversation.input.dock` —— 常驻状态条；数据来自对话快照里已有的 `webpage_*`
  *    工具调用节点，因此天然「跟随 agent 操作」，无需新增 RPC。
  * 2. `tool.call.toolview` 的四个 key —— 让 `webpage_open / navigate / snapshot /
  *    screenshot` 各自有专属卡片（地址、大纲、截图），而不是落进通用兜底卡片。
