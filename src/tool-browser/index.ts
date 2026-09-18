@@ -66,7 +66,7 @@ import type { BrowserMutationRequest, BrowserNetworkEntry, BrowserSession, Brows
 // 抄来的数字改了常量不会跟着变，描述就开始对模型撒谎（2026-09-17 修：
 // 5000 / 800 / 150 / 50 / 2000 / 20000 共 9 处是散落的字面量）。
 // 这里只导入**常量值**，不导入任何运行时类，所以不存在 tool-browser ↔ browser-cdp 的循环。
-import { DEFAULT_SNAPSHOT_LIMITS, MAX_SNAPSHOT_LINES } from '../browser-cdp/snapshot.ts'
+import { DEFAULT_SNAPSHOT_LIMITS, FOLD_MARKER_PREFIX, MAX_SNAPSHOT_LINES } from '../browser-cdp/snapshot.ts'
 import { CONSOLE_TEXT_MAX_CHARS } from '../browser-cdp/console.ts'
 import { NETWORK_MAX_BASE64_CHARS, NETWORK_MAX_BODY_CHARS } from '../browser-cdp/network.ts'
 import { DEFAULT_P2_LIMIT, MAX_P2_LIMIT } from '../browser-cdp/provider.ts'
@@ -119,6 +119,8 @@ interface SnapshotOutput extends SessionOutput {
   outline_lines?: number
   /** 被截断时：因预算没输出的元素个数。 */
   dropped_elements?: number
+  /** 被折叠而未打印的重复行数（与 `dropped_elements` 是两套口径：元素都还在 `refs` 里）。 */
+  folded_repeats?: number
   refs: { ref: string; role: string; name: string }[]
   /** P3：有人正开着 DevTools 操作这个页面（结果可能随时失效，但 ref 纪元不受影响）。 */
   takeover?: boolean
@@ -174,6 +176,15 @@ function formatSnapshotOutput(snapshot: SnapshotOutput): string {
       `The outline was truncated${lines};${dropped === '' ? '' : dropped} — the refs above cover only the emitted part. `
       + `Re-run webpage_snapshot with a larger max_lines (up to ${String(MAX_SNAPSHOT_LINES)}) if you need the rest, `
       + 'or use webpage_find to search the part that was emitted.',
+    )
+  }
+  if (snapshot.folded_repeats !== undefined) {
+    // 折叠与截断是两回事，必须分开说：折叠的元素**没丢**，ref 还在，只是没打印。
+    // 混在一起说会让模型以为「少的东西要靠抬 max_lines 找回来」，而抬预算对折叠毫无作用。
+    notes.unshift(
+      `${String(snapshot.folded_repeats)} repeated row(s) were folded into "(folded) … ×N" markers. `
+      + 'Nothing was lost: every folded element still has its own ref — use webpage_find to list all of them '
+      + 'with their refs and the section each belongs to, then hand one of those refs to webpage_click.',
     )
   }
   if (snapshot.refs.length === 0) {
@@ -471,7 +482,7 @@ function observeCall(title: string, kind: 'read' | 'fetch' | 'edit' | 'execute',
 // ---------------------------------------------------------------------------
 
 /**
- * `webpage_find` 用的「最近一次 snapshot」缓存：`session_id → SnapshotOutput`。
+ * `webpage_find` 用的「最近一次 snapshot」缓存：`session_id → SnapshotCacheEntry`。
  *
  * 方案 4.2 的零状态语义落在 tool 层：find 只查这份缓存，**绝不发任何 CDP 命令**，
  * 因此也没有归属问题。维护规则：
@@ -480,7 +491,19 @@ function observeCall(title: string, kind: 'read' | 'fetch' | 'edit' | 'execute',
  * - 容量封顶（{@link SNAPSHOT_CACHE_CAPACITY}），超出按插入序淘汰最旧 —— tool 层没有
  *   会话关闭的现成清理钩子，用容量上限兜底防泄漏。
  */
-type SnapshotCache = Map<string, SnapshotOutput>
+type SnapshotCache = Map<string, SnapshotCacheEntry>
+
+interface SnapshotCacheEntry {
+  session_id: string
+  /**
+   * 检索底稿：**折叠前**的完整大纲（`BrowserSnapshot.fullOutline`）。
+   *
+   * 必须是折叠前的那一份 —— 折叠标记对模型承诺「用 webpage_find 拿全部实例的 ref」，
+   * 而 find 查的就是这里。存折叠后的大纲，被折叠的实例就永远搜不到，承诺当场落空。
+   */
+  outline: string
+  refs: { ref: string; role: string; name: string }[]
+}
 
 /** 缓存的会话数上限。 */
 const SNAPSHOT_CACHE_CAPACITY = 32
@@ -492,12 +515,22 @@ const MAX_FIND_LIMIT = 100
 /** 单条命中行的长度上限 —— 大纲是不可信数据，输出前先限长。 */
 const FIND_LINE_MAX_CHARS = 200
 
+/** 单条命中行附带的「所属上下文」的长度上限。 */
+const FIND_CONTEXT_MAX_CHARS = 80
+
 /** `webpage_find` 的一条命中。`ref` 为空串表示该行没有可操作元素（只是内容行）。 */
 interface FindMatch {
   ref: string
   role: string
   name: string
   line: string
+  /**
+   * 该行所属的最近 heading / 静态文本（形如 `heading "Rust 官方文档"`）。
+   *
+   * 折叠把「点哪个」的决策转嫁给 find，但 12 个「翻译此页」在 find 结果里文本完全相同 ——
+   * 没有这一条，模型拿到 12 个 ref 也不知道该点哪个，折叠反而变成「更难用」。
+   */
+  context?: string
 }
 
 /** `webpage_find` 的输出。 */
@@ -519,13 +552,22 @@ interface LocateOutput {
   in_viewport?: boolean
 }
 
-/** 把一次成功的 snapshot 放进缓存（容量封顶，淘汰最旧）。 */
-function rememberSnapshot(cache: SnapshotCache, snapshot: SnapshotOutput): void {
+/**
+ * 把一次成功的 snapshot 放进缓存（容量封顶，淘汰最旧）。
+ * @param cache - 会话缓存。
+ * @param snapshot - 刚产出的快照输出（取会话号与 ref 表）。
+ * @param searchOutline - find 的检索底稿，**必须**是折叠前的那份（见 {@link SnapshotCacheEntry}）。
+ */
+function rememberSnapshot(cache: SnapshotCache, snapshot: SnapshotOutput, searchOutline: string): void {
   if (!cache.has(snapshot.session_id) && cache.size >= SNAPSHOT_CACHE_CAPACITY) {
     const oldest = cache.keys().next().value
     if (oldest !== undefined) cache.delete(oldest)
   }
-  cache.set(snapshot.session_id, snapshot)
+  cache.set(snapshot.session_id, {
+    session_id: snapshot.session_id,
+    outline: searchOutline,
+    refs: snapshot.refs,
+  })
 }
 
 /** 收窄 `limit`：非法落到默认值，过大压到上限（与 console / network 的 limit 同风格）。 */
@@ -539,25 +581,81 @@ function normalizeWhitespace(text: string): string {
   return text.replace(/\s+/gu, ' ')
 }
 
+/** 大纲的一行 = 缩进 + `- ` + 正文。缩进每层 2 空格（`renderOutline` 的格式）。 */
+const OUTLINE_LINE = /^( *)- (.*)$/u
+
+/** 取一行的大纲深度；不是大纲格式的行按 0 处理（宁可少给上下文，也不要错认亲子关系）。 */
+function outlineDepth(line: string): number {
+  const match = OUTLINE_LINE.exec(line)
+  return match === null ? 0 : Math.floor((match[1] ?? '').length / 2)
+}
+
+/**
+ * 给每一行算出「所属上下文」：祖先链上最近的 heading / 静态文本行。
+ *
+ * 为什么靠缩进反推而不是让 provider 传结构化行：缩进本身就是祖先链的完整编码，解析它
+ * 不必给 `webpage_find` 单开一条数据通道。代价是这条格式约定必须钉在测试里
+ * （`renderOutline` 的缩进规则一改，这里必须跟着改）。
+ *
+ * 兜底：祖先链上一个 heading / 静态文本都没有时（SERP 的结果标题常是 link，不是 heading），
+ * 退到「本行之前最近的一个 heading / 静态文本」。它不保证就是同一条结果的标题，所以回执里
+ * 字段叫 `context` 而不是「父节点」—— 它是消歧提示，不是结构断言。
+ */
+function outlineContexts(lines: readonly string[]): (string | undefined)[] {
+  const contexts: (string | undefined)[] = []
+  const stack: { depth: number; context: string | undefined }[] = []
+  let previous: string | undefined
+  for (const line of lines) {
+    const depth = outlineDepth(line)
+    while (stack.length > 0 && (stack[stack.length - 1]?.depth ?? 0) >= depth) stack.pop()
+    const inherited = stack[stack.length - 1]?.context
+    contexts.push(inherited ?? previous)
+    const match = OUTLINE_LINE.exec(line)
+    const body = match === null ? undefined : match[2]
+    const own = body !== undefined && /^(?:heading|text)\b/u.test(body)
+      ? body.replace(/\s*\[ref=e\d+\]$/u, '')
+      : undefined
+    if (own !== undefined) previous = own
+    stack.push({ depth, context: own ?? inherited })
+  }
+  return contexts
+}
+
+/** 命中行的限长（大纲是不可信数据，输出前先夹住）。 */
+function clipFindText(text: string, maxChars: number): string {
+  return text.length <= maxChars ? text : `${text.slice(0, maxChars - 1)}…`
+}
+
 /**
  * 在大纲文本上做一次检索。
  *
  * 命中行若带 `[ref=eN]` 标记就从 ref 表补全 role / name；不带（纯内容行）也返回，
  * `ref` 留空串 —— 模型可以据此了解上下文，但不能拿去操作。
+ *
+ * 检索底稿是**折叠前**的大纲，所以被折叠的实例照样命中，各自带自己的 ref；
+ * 再给每条命中附上所属上下文，12 个同名按钮才分得清是「哪一条结果的按钮」。
  */
-function searchOutline(snapshot: SnapshotOutput, matcher: (line: string) => boolean, limit: number): FindMatch[] {
+function searchOutline(snapshot: SnapshotCacheEntry, matcher: (line: string) => boolean, limit: number): FindMatch[] {
   const byRef = new Map(snapshot.refs.map(item => [item.ref, item]))
+  const lines = snapshot.outline.length === 0 ? [] : snapshot.outline.split('\n')
+  const contexts = outlineContexts(lines)
   const matches: FindMatch[] = []
-  for (const line of snapshot.outline.split('\n')) {
+  for (const [index, line] of lines.entries()) {
+    const body = OUTLINE_LINE.exec(line)?.[2]
+    // 折叠标记行是插件自己写的注释，不是页面元素：底稿万一就是折叠后的那份，
+    // 放它进来会多出一条没有 ref、点不了的幻影命中。
+    if (body?.startsWith(FOLD_MARKER_PREFIX) === true) continue
     if (!matcher(line)) continue
     const marked = /\[ref=(e\d+)\]/u.exec(line)
     const refId = marked?.[1]
     const known = refId === undefined ? undefined : byRef.get(refId)
+    const context = contexts[index]
     matches.push({
       ref: known?.ref ?? refId ?? '',
       role: known?.role ?? '',
       name: known?.name ?? '',
-      line: line.length <= FIND_LINE_MAX_CHARS ? line : `${line.slice(0, FIND_LINE_MAX_CHARS - 1)}…`,
+      line: clipFindText(line, FIND_LINE_MAX_CHARS),
+      ...context !== undefined ? { context: clipFindText(context, FIND_CONTEXT_MAX_CHARS) } : {},
     })
     if (matches.length >= limit) break
   }
@@ -570,7 +668,8 @@ function formatFindOutput(value: FindOutput): string {
     ? ['(no outline line matches)']
     : value.matches.map((match) => {
       const tag = match.ref.length > 0 ? `[${match.ref}] ${match.role} "${match.name}" — ` : ''
-      return `- ${tag}${match.line}`
+      const context = match.context === undefined ? '' : `  ← context: ${match.context}`
+      return `- ${tag}${match.line}${context}`
     })
   const lines = [
     `session_id=${value.session_id} — ${value.matches.length} match(es) in the cached outline of the last webpage_snapshot`,
@@ -871,6 +970,7 @@ const FIND_MATCH_SCHEMA = {
     role: { type: 'string', required: true },
     name: { type: 'string', required: true },
     line: { type: 'string', required: true },
+    context: { type: 'string' },
   },
 } as const
 
@@ -975,7 +1075,7 @@ function registerSnapshot(ctx: Context, cache: SnapshotCache): void {
   ctx.tools.register(defineTool({
     name: 'webpage_snapshot',
     description:
-      `Return a compact accessibility outline of the page, with a ref (like e12) on every actionable element. Refs are valid ONLY until the next webpage_snapshot or webpage_navigate; after that, take a fresh snapshot instead of reusing an old ref. Use this to see the page before deciding anything. If the outline reports truncated=true, re-run with a larger max_lines (up to ${String(MAX_SNAPSHOT_LINES)}) to see more of a long page. When the page has no actionable elements at all the result says so and lists 0 refs — then scroll without a ref, navigate elsewhere, or use webpage_execute. `
+      `Return a compact accessibility outline of the page, with a ref (like e12) on every actionable element. Refs are valid ONLY until the next webpage_snapshot or webpage_navigate; after that, take a fresh snapshot instead of reusing an old ref. Use this to see the page before deciding anything. Repeated controls are folded: when the same (role, name) appears 4+ times (search-result pages repeat "Translate this page" / "View details" on every result), only the first line is printed and a "(folded) … ×N" marker follows — the refs of the folded instances still exist, so use webpage_find to list every instance with its own ref and the section it belongs to. If the outline reports truncated=true, re-run with a larger max_lines (up to ${String(MAX_SNAPSHOT_LINES)}) to see more of a long page. When the page has no actionable elements at all the result says so and lists 0 refs — then scroll without a ref, navigate elsewhere, or use webpage_execute. `
       + UNTRUSTED_PAGE_CONTENT_NOTICE,
     parameters: {
       session_id: SESSION_ID_PARAMETER,
@@ -995,6 +1095,7 @@ function registerSnapshot(ctx: Context, cache: SnapshotCache): void {
           truncated: { type: 'boolean', required: true },
           outline_lines: { type: 'integer' },
           dropped_elements: { type: 'integer' },
+          folded_repeats: { type: 'integer' },
           refs: { type: 'array', required: true, items: REF_ITEM_SCHEMA },
           takeover: { type: 'boolean' },
         },
@@ -1021,11 +1122,14 @@ function registerSnapshot(ctx: Context, cache: SnapshotCache): void {
         truncated: observation.truncated,
         outline_lines: observation.outlineLines,
         ...observation.droppedElements !== undefined ? { dropped_elements: observation.droppedElements } : {},
+        ...observation.foldedRepeats !== undefined ? { folded_repeats: observation.foldedRepeats } : {},
         refs: observation.refs.map(({ ref, role, name }) => ({ ref, role, name })),
         ...observation.takeover === true ? { takeover: true } : {},
       }
       // 落缓存给 webpage_find 用：它只查这份大纲，不再发任何 CDP 命令。
-      rememberSnapshot(cache, output)
+      // 底稿用**折叠前**的那份 —— 折叠标记承诺「用 find 拿全部实例的 ref」，缓存里少了实例，
+      // 这句承诺就是假的（provider 不提供 fullOutline 时退回模型看到的那份，至少不更差）。
+      rememberSnapshot(cache, output, observation.fullOutline ?? observation.outline)
       return output
     },
     presentCall: args => observeCall(`Snapshot ${args.session_id}`, 'read', args.session_id),
@@ -1392,7 +1496,7 @@ function registerFind(ctx: Context, cache: SnapshotCache): void {
   ctx.tools.register(defineTool({
     name: 'webpage_find',
     description:
-      'Search the outline of the LAST webpage_snapshot for this session (local text search only — no commands are sent to the page). query is a case-insensitive substring, or a JavaScript regular expression when regex=true. Each match returns the ref of the element on that line (empty when the line has no actionable element) plus the whole outline line, so you can hand the ref to webpage_click / webpage_fill / webpage_locate. Refuses to run when no snapshot is cached (BROWSER_SNAPSHOT_REQUIRED) — take a fresh webpage_snapshot first. '
+      'Search the outline of the LAST webpage_snapshot for this session (local text search only — no commands are sent to the page). query is a case-insensitive substring, or a JavaScript regular expression when regex=true. Each match returns the ref of the element on that line (empty when the line has no actionable element) plus the whole outline line, so you can hand the ref to webpage_click / webpage_fill / webpage_locate. Matches include the ones the snapshot folded away (repeated controls), so this is how you pick the right instance among identical rows: each match also carries its "context" — the nearest heading or text it belongs to — which is what tells 12 identical "Translate this page" buttons apart. Refuses to run when no snapshot is cached (BROWSER_SNAPSHOT_REQUIRED) — take a fresh webpage_snapshot first. '
       + UNTRUSTED_PAGE_CONTENT_NOTICE,
     parameters: {
       session_id: SESSION_ID_PARAMETER,

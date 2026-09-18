@@ -980,10 +980,14 @@ export class CdpBrowserProvider implements BrowserProvider {
       url: session.url,
       title: session.title,
       outline: renderOutline(outline, publication.refs),
+      // 折叠前的完整大纲：`webpage_find` 的检索底稿。折叠标记承诺「用 find 拿全部实例的 ref」，
+      // 前提是 find 手上那份底稿里一个实例都不少（`rows` 本来就是全量的，这里只是把它渲染出来）。
+      fullOutline: renderOutline(outline, publication.refs, { unfoldRepeats: true }),
       refs: session.refs.list(),
       truncated: publication.truncated,
       outlineLines: outline.lines.length,
       ...outline.truncated ? { droppedElements: outline.droppedElements } : {},
+      ...outline.foldedRepeats > 0 ? { foldedRepeats: outline.foldedRepeats } : {},
       // 人工接管只加提示，**不动 epoch** —— 开合 DevTools 不该作废模型的 ref（[V31]）。
       ...session.takeover ? { takeover: true } : {},
     }

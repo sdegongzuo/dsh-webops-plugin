@@ -1113,3 +1113,146 @@ describe('2026-09-17 回执与卡片文本的护栏', () => {
     expect(JSON.stringify(title)).not.toContain('undefined')
   })
 })
+
+describe('2026-09-18 折叠：find 必须能拿回被折叠的实例，并说清是哪一条', () => {
+  // 折叠把「点哪个」的决策转嫁给 find。这条链路一旦断，折叠就从「省密度」变成「更难用」：
+  // 模型看到一行标记 + 12 个文本完全相同的实例，不知道点哪个，只能重新 snapshot 把上下文再烧一遍。
+  let harness: Harness
+
+  beforeEach(() => {
+    harness = mount()
+  })
+
+  interface FoldedFindView {
+    session_id: string
+    truncated: boolean
+    matches: { ref: string; role: string; name: string; line: string; context?: string }[]
+  }
+
+  /** 折叠前的底稿：4 条结果各带一个同名按钮（文本完全一样，只能靠上下文区分）。 */
+  const FULL_OUTLINE = [
+    '- list',
+    '  - listitem',
+    '    - link "Rust 官方文档" [ref=e1]',
+    '    - text "Rust 是一门系统编程语言"',
+    '    - button "翻译此页" [ref=e5]',
+    '  - listitem',
+    '    - link "Rust 圣经" [ref=e2]',
+    '    - text "在线中文版 Rust 教程"',
+    '    - button "翻译此页" [ref=e6]',
+    '  - listitem',
+    '    - link "Rust 中文社区" [ref=e3]',
+    '    - text "社区与文档索引"',
+    '    - button "翻译此页" [ref=e7]',
+    '  - listitem',
+    '    - link "Rust 论坛" [ref=e4]',
+    '    - text "用户讨论区"',
+    '    - button "翻译此页" [ref=e8]',
+  ].join('\n')
+
+  /** 模型看到的那份：(role, name) 出现 4 次 → 只留首个 + 一行标记。 */
+  const FOLDED_OUTLINE = [
+    '- list',
+    '  - listitem',
+    '    - link "Rust 官方文档" [ref=e1]',
+    '    - text "Rust 是一门系统编程语言"',
+    '    - button "翻译此页" [ref=e5]',
+    '    - (folded) button "翻译此页" ×4 — 3 more not shown; webpage_find lists all 4 with their refs',
+    '  - listitem',
+    '    - link "Rust 圣经" [ref=e2]',
+    '    - text "在线中文版 Rust 教程"',
+    '  - listitem',
+    '    - link "Rust 中文社区" [ref=e3]',
+    '    - text "社区与文档索引"',
+    '  - listitem',
+    '    - link "Rust 论坛" [ref=e4]',
+    '    - text "用户讨论区"',
+  ].join('\n')
+
+  const REFS = [
+    { ref: 'e1', role: 'link', name: 'Rust 官方文档' },
+    { ref: 'e2', role: 'link', name: 'Rust 圣经' },
+    { ref: 'e3', role: 'link', name: 'Rust 中文社区' },
+    { ref: 'e4', role: 'link', name: 'Rust 论坛' },
+    { ref: 'e5', role: 'button', name: '翻译此页' },
+    { ref: 'e6', role: 'button', name: '翻译此页' },
+    { ref: 'e7', role: 'button', name: '翻译此页' },
+    { ref: 'e8', role: 'button', name: '翻译此页' },
+  ]
+
+  /** 装上「折叠后的模型视图 + 折叠前的 find 底稿」这一对 observation。 */
+  async function snapshotFolded(): Promise<{ outline: string; folded_repeats?: number; outline_lines?: number }> {
+    harness.snapshotResponse = {
+      ...SNAPSHOT,
+      outline: FOLDED_OUTLINE,
+      fullOutline: FULL_OUTLINE,
+      foldedRepeats: 3,
+      outlineLines: 14,
+      refs: REFS,
+    }
+    return await tool(harness, 'webpage_snapshot').execute({ session_id: 's1' }, exec()) as
+      { outline: string; folded_repeats?: number; outline_lines?: number }
+  }
+
+  it('reports the folding without calling it truncation', async () => {
+    const output = await snapshotFolded()
+
+    expect(output.outline).toContain('(folded) button "翻译此页" ×4')
+    expect(output.folded_repeats).toBe(3)
+    const text = String((tool(harness, 'webpage_snapshot').output.render({ session_id: 's1' }, output as never)[0] as { text: string }).text)
+    // 折叠与截断是两码事：折叠的元素**没丢**，说成截断会把模型推去抬 max_lines（对折叠毫无作用）。
+    expect(text).toContain('3 repeated row(s) were folded')
+    expect(text).toContain('Nothing was lost')
+    expect(text).not.toContain('was truncated')
+  })
+
+  it('finds the 3 instances the model never saw, each with its own ref and context', async () => {
+    await snapshotFolded()
+
+    const value = await tool(harness, 'webpage_find')
+      .execute({ session_id: 's1', query: '翻译此页' }, exec()) as FoldedFindView
+
+    // 4 个实例全部命中 —— 折叠承诺的「用 find 拿全部实例的 ref」必须兑现。
+    expect(value.matches.map(match => match.ref)).toEqual(['e5', 'e6', 'e7', 'e8'])
+    // 标记行不在底稿里，所以不会冒出一条没有 ref 的幻影命中。
+    expect(value.matches.every(match => match.role === 'button')).toBe(true)
+    // 文本完全相同的 4 行，靠所属上下文才分得清是「哪一条结果的按钮」。
+    expect(value.matches.map(match => match.context)).toEqual([
+      'text "Rust 是一门系统编程语言"',
+      'text "在线中文版 Rust 教程"',
+      'text "社区与文档索引"',
+      'text "用户讨论区"',
+    ])
+    expect(validateJsonSchemaValue(tool(harness, 'webpage_find').output.schema, value)).toEqual([])
+  })
+
+  it('renders the context next to the match, and keeps the line clipped', () => {
+    const view = tool(harness, 'webpage_find').output.render({ session_id: 's1' }, {
+      session_id: 's1',
+      truncated: false,
+      matches: [
+        { ref: 'e5', role: 'button', name: '翻译此页', line: '-     - button "翻译此页" [ref=e5]', context: 'text "Rust 是一门系统编程语言"' },
+        { ref: '', role: '', name: '', line: '- link "Rust 圣经"' },
+      ],
+    } as never)
+
+    const text = String((view[0] as { text: string }).text)
+    expect(text).toContain('[e5] button "翻译此页"')
+    expect(text).toContain('← context: text "Rust 是一门系统编程语言"')
+    // 没有上下文的行不硬凑一个空壳字段。
+    expect(text.split('\n').filter(line => line.includes('Rust 圣经'))).toHaveLength(1)
+    expect(text).not.toContain('undefined')
+  })
+
+  it('falls back to the model-visible outline when a provider cannot supply the unfolded one', async () => {
+    harness.snapshotResponse = { ...SNAPSHOT, outline: FOLDED_OUTLINE, foldedRepeats: 3, refs: REFS }
+    await tool(harness, 'webpage_snapshot').execute({ session_id: 's1' }, exec())
+
+    const value = await tool(harness, 'webpage_find')
+      .execute({ session_id: 's1', query: '翻译此页' }, exec()) as FoldedFindView
+
+    // 底稿退回折叠后的那份时，只有代表行能命中；标记行是插件写的注释，不会被当成命中
+    // （否则会冒出一条没有 ref、点不了的幻影）。比报错好，但也不是完整能力，如实如此。
+    expect(value.matches.map(match => match.ref)).toEqual(['e5'])
+  })
+})

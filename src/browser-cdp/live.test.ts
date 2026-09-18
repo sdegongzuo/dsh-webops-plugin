@@ -86,6 +86,33 @@ const FIXTURE_HTML = `<!doctype html>
 </html>
 `
 
+/**
+ * SERP 形状的夹具：5 条结果，每条带同一组重复按钮（爬取类页面的通用形态）。
+ *
+ * 按钮里**一定要有可见文字**：真实树里 `<button aria-label="翻译此页">翻译此页</button>`
+ * 会在按钮下面挂一行同名 StaticText —— 折叠的「实例 + 同名标签行」那套规则就是为它写的。
+ */
+const SERP_HTML = `<!doctype html>
+<html lang="zh">
+  <head><meta charset="utf-8"><title>SERP fixture</title></head>
+  <body>
+    <h1>搜索结果</h1>
+    <div role="list">
+      ${Array.from({ length: 5 }, (_unused, index) => `
+      <div role="listitem">
+        <h3><a href="https://example.com/${String(index)}">结果标题 ${String(index)}</a></h3>
+        <p>结果摘要 ${String(index)}</p>
+        <div>
+          <button aria-label="翻译此页">翻译此页</button>
+          <button aria-label="查看详细信息">查看详细信息</button>
+          <button aria-label="分享">分享</button>
+        </div>
+      </div>`).join('')}
+    </div>
+  </body>
+</html>
+`
+
 describe.runIf(PROBE.run)(`live Chrome at ${ENDPOINT}`, () => {
   let server: Server
   let pageUrl: string
@@ -93,9 +120,11 @@ describe.runIf(PROBE.run)(`live Chrome at ${ENDPOINT}`, () => {
   let home: string
 
   beforeAll(async () => {
-    server = createServer((_request, response) => {
+    server = createServer((request, response) => {
+      // `/serp` 走 SERP 夹具，其余走基础夹具（折叠那组用例要一张有重复控件的页面）。
+      const html = request.url?.startsWith('/serp') === true ? SERP_HTML : FIXTURE_HTML
       response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
-      response.end(FIXTURE_HTML)
+      response.end(html)
     })
     await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve))
     const { port } = server.address() as AddressInfo
@@ -196,6 +225,34 @@ describe.runIf(PROBE.run)(`live Chrome at ${ENDPOINT}`, () => {
       expect(Buffer.from(stored.data)).toEqual(Buffer.from(shot.data))
       const hostPath = store.imageHostPath(ref)
       if (hostPath !== undefined) await expect(stat(hostPath)).resolves.toBeDefined()
+    } finally {
+      await provider.close(session.id)
+    }
+  })
+
+  it('folds repeated controls on a SERP-shaped page, keeping every instance addressable', async () => {
+    // 这条是**形状契约**测试：折叠的整套设计都建立在「真实树里重复按钮长什么样」之上，
+    // 而夹具是我按实测画的 —— Chrome 哪天改了按钮的树形状，只有对着真浏览器跑这条才会知道。
+    // 2026-09-18 就是这么抓到一次：真实按钮下面挂着一行同名 `text`，按「有子行就不折」的规则，
+    // 真实页面上一个都折不掉，而当时的夹具里没有这个子节点，单测全绿。
+    const session = await provider.open({ url: `${pageUrl}serp` })
+    try {
+      const snapshot = await provider.observe({ kind: 'snapshot', sessionId: session.id })
+      if (snapshot.kind !== 'snapshot') throw new Error('expected a snapshot')
+
+      // 5 条结果 × 3 个重复按钮 → 每组折掉 4 个实例。
+      expect(snapshot.foldedRepeats).toBe(12)
+      expect(snapshot.outline).toContain('(folded) button "翻译此页"')
+      // 折叠 ≠ 丢寻址：5 个实例的 ref 一个不少。
+      expect(snapshot.refs.filter(ref => ref.name === '翻译此页')).toHaveLength(5)
+      // 折叠前的底稿里 5 个实例都在（webpage_find 靠它拿回被折叠的 ref）。
+      const full = snapshot.fullOutline ?? ''
+      expect(full.split('\n').filter(line => line.includes('button "翻译此页"'))).toHaveLength(5)
+      // 每个按钮下面那行同名 text 被一起收起（它不是独立元素，也不该继续占行）。
+      expect(snapshot.outline).not.toContain('text "翻译此页"')
+      // 折叠后仍能看到正文（标题与摘要没被噪声挤掉）。
+      expect(snapshot.outline).toContain('link "结果标题 0"')
+      expect(snapshot.outline).toContain('text "结果摘要 0"')
     } finally {
       await provider.close(session.id)
     }

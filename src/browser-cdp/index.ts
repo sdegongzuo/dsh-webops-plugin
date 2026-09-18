@@ -40,8 +40,8 @@ export { RefRegistry } from './refs.ts'
 export type { RefPublication, RefTarget } from './refs.ts'
 export { TargetStateRegistry } from './state.ts'
 export type { StateClaim, StateClaimOptions, StateOwner, StateRecord } from './state.ts'
-export { buildOutline, DEFAULT_SNAPSHOT_LIMITS, MAX_SNAPSHOT_LINES, renderOutline, resolveSnapshotLimits } from './snapshot.ts'
-export type { AxNode, OutlineLine, SnapshotLimits, SnapshotOutline } from './snapshot.ts'
+export { buildOutline, DEFAULT_FOLD_REPEAT_THRESHOLD, DEFAULT_SNAPSHOT_LIMITS, MAX_SNAPSHOT_LINES, renderOutline, resolveSnapshotLimits } from './snapshot.ts'
+export type { AxNode, OutlineLine, RenderOutlineOptions, SnapshotLimits, SnapshotOutline } from './snapshot.ts'
 export { BROWSER_MAX_URL_LENGTH, validateEndpoint, validateTargetUrl } from './url-policy.ts'
 
 /** Cordis 插件名，用于加载器诊断。 */

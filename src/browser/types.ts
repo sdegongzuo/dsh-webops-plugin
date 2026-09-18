@@ -152,6 +152,22 @@ export interface BrowserSnapshot {
   /** 被截断时：因规模预算没被输出的元素个数（差几行还是差几千行，模型据此决定要不要抬预算）。 */
   readonly droppedElements?: number
   /**
+   * **折叠前**的完整大纲，`webpage_find` 用的检索底稿。
+   *
+   * 为什么单独留一份：`outline` 会把重复控件折叠成标记行（SERP 里 36 行噪音压成 6 行），
+   * 而标记行向模型承诺「用 webpage_find 拿全部实例的 ref」—— 兑现它的前提就是 find 手上
+   * 那份底稿里一个实例都不少。`refs` 本来就是全量的，这里只是把同一批元素按折叠前渲染一遍。
+   *
+   * **不进模型上下文**（模型看到的是 `outline`）；provider 不做折叠时可以不填。
+   */
+  readonly fullOutline?: string
+  /**
+   * 被折叠而未打印的重复行数。与 `droppedElements` 是两套口径：那个是「预算不够、没输出」，
+   * 这个是「重复、没打印」—— 元素都还在 `refs` 里。两者必须分开报，否则「要不要抬 max_lines」
+   * 这个判断会失真（给错口径比不给更糟）。
+   */
+  readonly foldedRepeats?: number
+  /**
    * P3 人工接管状态位：`true` 表示有人正开着 DevTools 操作这个页面，**本结果可能随时失效**，
    * 模型应当把它当作「需要重新观察」的信号。
    *

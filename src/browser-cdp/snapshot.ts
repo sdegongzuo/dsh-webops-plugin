@@ -54,7 +54,24 @@ export interface SnapshotLimits {
   readonly maxTextLength: number
   /** 大纲总字符上限。 */
   readonly maxOutlineChars: number
+  /**
+   * 重复折叠阈值：同一 `(role, name)` 在本次输出里出现 **≥** 该次数才折叠。
+   *
+   * 缺省 {@link DEFAULT_FOLD_REPEAT_THRESHOLD}。**不做成插件配置项** —— 它是实现的安全阀，
+   * 不是部署旋钮；测试会显式覆盖它，用来证明阈值真的在起作用（而不是「反正都能折」）。
+   */
+  readonly foldRepeatThreshold?: number
 }
+
+/**
+ * 重复折叠的默认阈值。
+ *
+ * 为什么是「全局 (role, name) 计数」而不是「同父计数」：Google SERP 的重复按钮
+ * （「翻译此页」「查看详细信息」）各自挂在**不同的 listitem** 下，按父分组一条都折不到；
+ * 而 8~10 条结果的跨父计数又够不着「≥10」的旧阈值。SERP 是这个问题被提出来的原始场景，
+ * 阈值必须能在它身上生效，否则等于没做。
+ */
+export const DEFAULT_FOLD_REPEAT_THRESHOLD = 4
 
 /** 默认上限：够覆盖常见页面，又不会把预算烧光。 */
 export const DEFAULT_SNAPSHOT_LIMITS: SnapshotLimits = {
@@ -62,6 +79,7 @@ export const DEFAULT_SNAPSHOT_LIMITS: SnapshotLimits = {
   maxDepth: 40,
   maxTextLength: 120,
   maxOutlineChars: 40_000,
+  foldRepeatThreshold: DEFAULT_FOLD_REPEAT_THRESHOLD,
 }
 
 /**
@@ -197,8 +215,21 @@ export interface OutlineLine {
 
 /** 大纲构建结果。 */
 export interface SnapshotOutline {
-  /** 带缩进的大纲行；ref 名尚未回填。 */
+  /**
+   * 打印出来的大纲行（重复项已折叠压成标记行）。ref 名尚未回填。
+   *
+   * 折叠掉的元素**仍然**在 {@link SnapshotOutline.rows} 里 —— 折叠只减少打印行数，
+   * 不减少可寻址元素。这是本功能的第一原则：折叠是展示层的事，不是寻址层的事。
+   */
   readonly lines: readonly OutlineLine[]
+  /**
+   * 折叠前的完整行序列，**只给 `webpage_find` 当检索底稿**。
+   *
+   * 为什么必须有它：折叠标记向模型承诺「用 webpage_find 拿全部实例的 ref」，而 find 查的
+   * 就是交给它的那份大纲文本 —— 底稿里少了被折叠的实例，这句承诺立刻变成谎话，
+   * 折叠就等于真的丢了寻址能力。它不进模型上下文（模型看到的是 `lines`）。
+   */
+  readonly unfoldedLines: readonly OutlineLine[]
   /** 可操作元素，按出现顺序；ref 名由 `RefRegistry.publish` 分配。 */
   readonly rows: readonly Omit<RefTarget, 'ref'>[]
   readonly truncated: boolean
@@ -207,8 +238,23 @@ export interface SnapshotOutline {
    *
    * 存在的意义是让截断「可解释」：只说 `truncated: true` 时模型不知道是差几行还是差几千行，
    * 也就无从决定「抬预算」还是「换招」（`webpage_find` / `webpage_scroll`）。
+   *
+   * **不含**被折叠的行：它们没丢，只是没打印（折叠数看 {@link SnapshotOutline.foldedRepeats}）。
+   * 两个计数混在一起会让「要不要抬 max_lines」这个判断直接失真。
    */
   readonly droppedElements: number
+  /**
+   * 被折叠而未打印的**重复实例**数（口径 = `Σ(标记里的 ×N − 1)`）。
+   *
+   * 口径只此一个：**本次输出集合**里，因 (role, name) 重复而被压掉的实例数
+   * （区域快照下就是区域内，见任务 5）。它与「区域外还有几个」是两套互不相干的计数，
+   * 回执必须分开报、各自注明口径 —— 与 P2 预算那次「`truncated` 与 `truncatedByBudget`
+   * 不能混报」是同一类教训：给错口径比不给更糟。
+   *
+   * 每个实例下面那份**与它同名的标签行**（真实按钮会带一个）跟着一起收起，但**不**计入这个数
+   * —— 它不是独立元素，只是那个控件的内部文本。所以「标记说 ×5」与「本数是 4 的整数倍」永远对得上。
+   */
+  readonly foldedRepeats: number
 }
 
 /** 折叠空白并裁剪到 `maxLength`，避免一个 `aria-label` 撑爆一行。 */
@@ -279,11 +325,45 @@ function renderLine(
 }
 
 /**
+ * 折叠标记行的前缀。
+ *
+ * 单独导出的原因：标记行是**插件自己生成的注释**，不是页面上的元素。`webpage_find` 检索的
+ * 底稿万一是折叠后的那份（provider 给不出 `fullOutline` 时），没有这条前缀就会把标记行
+ * 当成一条命中返回给模型 —— 没有 ref、也无法点击的幻影命中。
+ */
+export const FOLD_MARKER_PREFIX = '(folded) '
+
+/**
+ * 折叠标记行的文本。
+ *
+ * 措辞必须同时说清三件事：这里**折叠了**、一共有几个、**怎么拿回**全部实例的 ref。
+ * 少最后一条，模型只会看到一个不可点的行，然后回退到「重新 snapshot」把上下文再烧一遍 ——
+ * 那正好是折叠要解决的问题本身。
+ *
+ * @param text - 被折叠下去的那一行（代表行）的完整行文本。
+ * @param size - 本组**可折叠**实例的总数（含代表行）。
+ */
+function foldMarker(text: string, size: number): string {
+  return `${FOLD_MARKER_PREFIX}${text} ×${String(size)} — ${String(size - 1)} more not shown; `
+    + `webpage_find lists all ${String(size)} with their refs`
+}
+
+/**
  * 把一棵可访问性树压成大纲。
+ *
+ * 分两遍：
+ *
+ * 1. **全量走树**，产出候选行，并记录「最近祖先」关系与 (role, name) 计数；
+ * 2. **折叠 + 结算预算**：先按重复计数决定哪些行不打印，再按**折叠后**的集合累计行数与字符数。
+ *
+ * 第 2 步的顺序是关键：折叠若发生在预算之后，省下来的行额换不到任何正文
+ * （SERP 里 36 行噪音压成 6 行，本该换来正文多 30 行），折叠就只剩「看着清爽」这个作用。
+ * 代价是不能再像早期实现那样「超预算即停止下钻」—— 重复计数要看完才能定，所以走完整棵树
+ * （AX 树本来就整棵在内存里，多走一遍是线性的）。
  *
  * @param nodes - `Accessibility.getFullAXTree` 的原始节点数组（平面）。
  * @param limits - 规模上限，默认 {@link DEFAULT_SNAPSHOT_LIMITS}。
- * @returns 大纲行、可操作元素候选行，以及截断情况（是否截断 + 少输出了多少元素）。
+ * @returns 打印行、折叠前的检索底稿、可操作元素候选行，以及三套互相区分的计数。
  */
 export function buildOutline(
   nodes: readonly AxNode[],
@@ -301,12 +381,14 @@ export function buildOutline(
   // 兜底：整棵树互相引用（畸形负载）时至少从第一个节点开始走，不要静默产出空大纲。
   const roots = detected.length > 0 ? detected : nodes.slice(0, 1)
 
-  const lines: OutlineLine[] = []
+  const threshold = limits.foldRepeatThreshold ?? DEFAULT_FOLD_REPEAT_THRESHOLD
+
+  // ---- 第一遍：全量走树，产出候选行（不结算预算）----
+  const candidates: { depth: number; text: string; role: string; name: string; targetRow?: number; foldKey?: string }[] = []
   const rows: Omit<RefTarget, 'ref'>[] = []
   const visited = new Set<string>()
   let truncated = false
   let droppedElements = 0
-  let chars = 0
 
   const visit = (node: AxNode, depth: number): void => {
     if (visited.has(node.nodeId)) return
@@ -317,25 +399,27 @@ export function buildOutline(
     const transparent = node.ignored === true || TRANSPARENT_ROLES.has(role)
     const actionable = !transparent && ACTIONABLE_ROLES.has(role)
 
-    // 预算耗尽后整棵子树都不再输出，并在结果里标记截断（调用方据此提示模型先缩小范围）。
-    if (lines.length >= limits.maxLines || chars >= limits.maxOutlineChars) {
-      truncated = true
-      droppedElements += 1
-      return
-    }
-
     let childDepth = depth
     const text = transparent ? undefined : renderLine(node, role, name, limits.maxTextLength, actionable)
     if (text !== undefined) {
       const targetRow = actionable && typeof node.backendDOMNodeId === 'number'
         ? rows.push({ role, name, backendNodeId: node.backendDOMNodeId }) - 1
         : undefined
-      lines.push({
+      // 只有「可操作 + 有名字 + 不是 statictext」的行才可能被折叠：
+      // - 可操作：折叠是给重复**控件**去噪的，正文与结构行不在此列；
+      // - 有名字：无名控件彼此之间连「重复」都谈不上，折了就是纯粹的信息丢失；
+      // - statictext 永不折叠：搜索结果标题/摘要正是区分两条结果的正文（任务 1 硬约束）。
+      const foldKey = actionable && name.length > 0 && role !== 'statictext'
+        ? `${role}\u0000${name}`
+        : undefined
+      candidates.push({
         depth,
         text,
+        role,
+        name,
         ...targetRow !== undefined ? { targetRow } : {},
+        ...foldKey !== undefined ? { foldKey } : {},
       })
-      chars += text.length + depth * 2 + 3
       childDepth = depth + 1
     }
 
@@ -355,7 +439,143 @@ export function buildOutline(
 
   for (const root of roots) visit(root, 0)
 
-  return { lines, rows, truncated, droppedElements }
+  // ---- 祖先 / 后代关系：DFS 前序里「最近一个深度更小的前驱」就是父行 ----
+  const childrenOf = new Map<number, number[]>()
+  {
+    const stack: number[] = []
+    for (const [index, candidate] of candidates.entries()) {
+      while (stack.length > 0) {
+        const top = stack[stack.length - 1]
+        if (top === undefined || (candidates[top] as { depth: number }).depth < candidate.depth) break
+        stack.pop()
+      }
+      const parent = stack[stack.length - 1]
+      if (parent !== undefined) {
+        const siblings = childrenOf.get(parent)
+        if (siblings === undefined) childrenOf.set(parent, [index])
+        else siblings.push(index)
+      }
+      stack.push(index)
+    }
+  }
+
+  /** 某个候选行的全部后代下标（多层）。 */
+  const descendantsOf = (index: number): number[] => {
+    const out: number[] = []
+    const pending = [...childrenOf.get(index) ?? []]
+    while (pending.length > 0) {
+      const next = pending.pop()
+      if (next === undefined) continue
+      out.push(next)
+      pending.push(...childrenOf.get(next) ?? [])
+    }
+    return out
+  }
+
+  // ---- 折叠决策：同 (role, name) 的**可折叠**实例数 ≥ 阈值即折，只留首个 ----
+  //
+  // 折叠单元是「实例行 + 它下面与它同名的标签行」。这一条是**真机实测**逼出来的：Chrome 的
+  // 可访问性树里 `<button aria-label="翻译此页">翻译此页</button>` 会给出
+  // `button "翻译此页"` 加一个子节点 `text "翻译此页"`（按钮内部的文本是独立的 StaticText）。
+  // 早期实现要求「有已打印子行就不折」，于是真实页面上的重复按钮一个都折不到 ——
+  // 夹具里没有这个子节点，单测全绿也照样漏。(2026-09-18 无头 Chrome 实测)
+  //
+  // 同时立一条护栏：子树里只要夹带了**同名标签之外**的内容就不折。折一个带真内容的容器
+  // 会把内容一起吞掉，那已经不是去噪而是删信息。
+  const mirrorRowsOf = (index: number): number[] | undefined => {
+    const self = candidates[index] as { role: string; name: string }
+    const descendants = descendantsOf(index)
+    const labels: number[] = []
+    for (const descendant of descendants) {
+      const child = candidates[descendant] as { role: string; name: string }
+      if (child.role !== 'statictext' || child.name !== self.name) return undefined
+      labels.push(descendant)
+    }
+    return labels
+  }
+
+  const foldableByKey = new Map<string, number[]>()
+  /** 可能被折的行 → 它连带的同名标签行（折它时跟着一起收起）。 */
+  const labelRows = new Map<number, number[]>()
+  for (const [index, candidate] of candidates.entries()) {
+    const key = candidate.foldKey
+    if (key === undefined) continue
+    const labels = mirrorRowsOf(index)
+    if (labels === undefined) continue
+    labelRows.set(index, labels)
+    const list = foldableByKey.get(key)
+    if (list === undefined) foldableByKey.set(key, [index])
+    else list.push(index)
+  }
+
+  /** 代表行下标 → 本组可折叠实例总数。 */
+  const foldGroups = new Map<number, number>()
+  /** 被折叠掉的**实例行**下标（计数口径：它们才是「重复了几个」）。 */
+  const foldedInstances = new Set<number>()
+  /** 连同同名标签行在内的、不打印的行下标（标签行不算进 `foldedRepeats` —— 它们不是元素）。 */
+  const hiddenRows = new Set<number>()
+  for (const list of foldableByKey.values()) {
+    if (list.length < threshold) continue
+    const first = list[0]
+    if (first === undefined) continue
+    foldGroups.set(first, list.length)
+    // 代表行的同名标签行也是同一份重复，一并收掉：行本身已经带着名字，那行不提供任何新信息。
+    for (const label of labelRows.get(first) ?? []) hiddenRows.add(label)
+    for (let index = 1; index < list.length; index += 1) {
+      const instance = list[index]
+      if (instance === undefined) continue
+      foldedInstances.add(instance)
+      hiddenRows.add(instance)
+      for (const label of labelRows.get(instance) ?? []) hiddenRows.add(label)
+    }
+  }
+
+  // ---- 第二遍：按折叠后的集合结算预算 ----
+  const lines: OutlineLine[] = []
+  const unfoldedLines: OutlineLine[] = []
+  let chars = 0
+  let foldedRepeats = 0
+
+  for (const [index, candidate] of candidates.entries()) {
+    const line: OutlineLine = {
+      depth: candidate.depth,
+      text: candidate.text,
+      ...candidate.targetRow !== undefined ? { targetRow: candidate.targetRow } : {},
+    }
+    if (hiddenRows.has(index)) {
+      // 折叠行不占行额、不占字符额，也不算 droppedElements —— 它没丢，只是没打印。
+      unfoldedLines.push(line)
+      if (foldedInstances.has(index)) foldedRepeats += 1
+      continue
+    }
+    if (lines.length >= limits.maxLines || chars >= limits.maxOutlineChars) {
+      truncated = true
+      droppedElements += 1
+      continue
+    }
+    lines.push(line)
+    unfoldedLines.push(line)
+    chars += candidate.text.length + candidate.depth * 2 + 3
+    const groupSize = foldGroups.get(index)
+    if (groupSize === undefined) continue
+    // 标记行也占一行预算；行额见底时优先保代表行（它有 ref，能直接点）。
+    if (lines.length >= limits.maxLines || chars >= limits.maxOutlineChars) continue
+    const marker = foldMarker(candidate.text, groupSize)
+    lines.push({ depth: candidate.depth, text: marker })
+    chars += marker.length + candidate.depth * 2 + 3
+  }
+
+  return { lines, unfoldedLines, rows, truncated, droppedElements, foldedRepeats }
+}
+
+/** {@link renderOutline} 的可选项。 */
+export interface RenderOutlineOptions {
+  /**
+   * 渲染折叠前的完整行序列（`webpage_find` 的检索底稿）而不是打印行。
+   *
+   * 缺省 false —— 模型看到的是折叠后的大纲。
+   */
+  readonly unfoldRepeats?: boolean
 }
 
 /**
@@ -363,13 +583,16 @@ export function buildOutline(
  *
  * @param outline - {@link buildOutline} 的结果。
  * @param refs - 与 `outline.rows` 一一对应的、已分配 ref 名的元素。
+ * @param options - `unfoldRepeats: true` 时渲染折叠前的检索底稿。
  * @returns 大纲文本。
  */
 export function renderOutline(
   outline: SnapshotOutline,
   refs: readonly RefTarget[],
+  options: RenderOutlineOptions = {},
 ): string {
-  return outline.lines
+  const source = options.unfoldRepeats === true ? outline.unfoldedLines : outline.lines
+  return source
     .map((line) => {
       const indent = '  '.repeat(line.depth)
       const target = line.targetRow === undefined ? undefined : refs[line.targetRow]
