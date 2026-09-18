@@ -168,6 +168,14 @@ export interface BrowserSnapshot {
    */
   readonly foldedRepeats?: number
   /**
+   * 因与**祖先链上的某行同名**而被跳过的行数（同一条链上同一个名字只印一次）。
+   *
+   * 与 `foldedRepeats` 分开报：那个是平级/跨父的重复**实例**，这个是一条祖先链上的同名嵌套
+   * （真实树上结果标题是 `heading "X" > link "X" > text "X"` 三行同文）。两者都不进
+   * `droppedElements` —— 元素没丢、信息也没少，只是不再重复印。
+   */
+  readonly dedupedLines?: number
+  /**
    * P3 人工接管状态位：`true` 表示有人正开着 DevTools 操作这个页面，**本结果可能随时失效**，
    * 模型应当把它当作「需要重新观察」的信号。
    *

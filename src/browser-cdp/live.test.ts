@@ -250,9 +250,51 @@ describe.runIf(PROBE.run)(`live Chrome at ${ENDPOINT}`, () => {
       expect(full.split('\n').filter(line => line.includes('button "翻译此页"'))).toHaveLength(5)
       // 每个按钮下面那行同名 text 被一起收起（它不是独立元素，也不该继续占行）。
       expect(snapshot.outline).not.toContain('text "翻译此页"')
+      // 底稿（find 的检索底稿）里也必须没有它 —— 否则 webpage_find 会为它冒出一条 ref 为空的
+      // 幻影命中：模型手里的大纲没这行，find 却报了。这条只能对着真浏览器验。
+      expect(full).not.toContain('text "翻译此页"')
       // 折叠后仍能看到正文（标题与摘要没被噪声挤掉）。
       expect(snapshot.outline).toContain('link "结果标题 0"')
       expect(snapshot.outline).toContain('text "结果摘要 0"')
+    } finally {
+      await provider.close(session.id)
+    }
+  })
+
+  it('dedupes same-name ancestor chains on a SERP-shaped page without breaking indentation', async () => {
+    // 第二条形状契约：真实 SERP 上每条结果是 `heading "X" > link "X" > text "X"` 三行同文，
+    // 加上 `<h1>搜索结果</h1>` 的 `heading > text`。这套去重建立在**实测的树形状**上，
+    // 夹具一旦和真浏览器漂移，这条就会红。
+    const session = await provider.open({ url: `${pageUrl}serp` })
+    try {
+      const snapshot = await provider.observe({ kind: 'snapshot', sessionId: session.id })
+      if (snapshot.kind !== 'snapshot') throw new Error('expected a snapshot')
+
+      // 5 条结果 × 2 行（heading + 其下同名 text）+ 页面标题那对 = 11。
+      // 注意：被折叠实例、以及按钮下面那行同名 text，都算**折叠**的账，不能重复计进这里。
+      expect(snapshot.dedupedLines).toBe(11)
+      // 留下的必须是带 ref 的那行：`heading` 被抽掉，`link` 顶上。
+      expect(snapshot.outline).toContain('link "结果标题 0"')
+      expect(snapshot.outline).not.toMatch(/heading "结果标题/gu)
+      // 但底稿里只留那行 `link` —— 被去重掉的 heading / text 不进底稿，否则 find 会为它们
+      // 冒出一条 ref 为空的幻影命中（2026-09-18 真机全链路套出来的）。
+      const full = snapshot.fullOutline ?? ''
+      expect(full.split('\n').filter(line => line.includes('"结果标题 0"'))).toHaveLength(1)
+      expect(full).not.toContain('text "结果标题 0"')
+
+      // 缩进规范化：抽掉 heading 后不能留下断层，同属一个 listitem 的兄弟行要齐平。
+      const depthOf = (line: string): number => Math.floor(((/^( *)- /u.exec(line)?.[1] ?? '').length) / 2)
+      const lines = snapshot.outline.split('\n')
+      const title = lines.find(line => line.includes('link "结果标题 0"')) ?? ''
+      const summary = lines.find(line => line.includes('text "结果摘要 0"')) ?? ''
+      expect(depthOf(title)).toBe(depthOf(summary))
+      // 通用不变量：任何一行最多比上一行深一级。
+      let previous = 0
+      for (const line of lines) {
+        const depth = depthOf(line)
+        expect(depth).toBeLessThanOrEqual(previous + 1)
+        previous = depth
+      }
     } finally {
       await provider.close(session.id)
     }

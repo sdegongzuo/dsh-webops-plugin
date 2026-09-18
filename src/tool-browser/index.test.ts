@@ -1206,6 +1206,19 @@ describe('2026-09-18 折叠：find 必须能拿回被折叠的实例，并说清
     expect(text).not.toContain('was truncated')
   })
 
+  it('explains a same-name-chain dedup as "not printed", not as truncation', async () => {
+    harness.snapshotResponse = { ...SNAPSHOT, dedupedLines: 11, refs: REFS }
+    const output = await tool(harness, 'webpage_snapshot').execute({ session_id: 's1' }, exec()) as
+      { deduped_lines?: number }
+
+    expect(output.deduped_lines).toBe(11)
+    const text = String((tool(harness, 'webpage_snapshot').output.render({ session_id: 's1' }, output as never)[0] as { text: string }).text)
+    // 去重同样不是截断：名字已经由保留的那行印出来了，说成截断会让模型去抬 max_lines（毫无作用）。
+    expect(text).toContain('11 nested duplicate row(s) were not printed')
+    expect(text).toContain('Nothing was lost')
+    expect(text).not.toContain('was truncated')
+  })
+
   it('finds the 3 instances the model never saw, each with its own ref and context', async () => {
     await snapshotFolded()
 

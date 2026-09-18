@@ -121,6 +121,8 @@ interface SnapshotOutput extends SessionOutput {
   dropped_elements?: number
   /** 被折叠而未打印的重复行数（与 `dropped_elements` 是两套口径：元素都还在 `refs` 里）。 */
   folded_repeats?: number
+  /** 因与祖先链上的某行同名而被跳过的行数（同一条链上同一个名字只印一次）。 */
+  deduped_lines?: number
   refs: { ref: string; role: string; name: string }[]
   /** P3：有人正开着 DevTools 操作这个页面（结果可能随时失效，但 ref 纪元不受影响）。 */
   takeover?: boolean
@@ -185,6 +187,15 @@ function formatSnapshotOutput(snapshot: SnapshotOutput): string {
       `${String(snapshot.folded_repeats)} repeated row(s) were folded into "(folded) … ×N" markers. `
       + 'Nothing was lost: every folded element still has its own ref — use webpage_find to list all of them '
       + 'with their refs and the section each belongs to, then hand one of those refs to webpage_click.',
+    )
+  }
+  if (snapshot.deduped_lines !== undefined) {
+    // 去重也**不是**丢东西：同一个名字在一条祖先链上被印了三遍（`heading "X" > link "X" > text "X"`），
+    // 只留信息最多的那一行。不解释的话，模型可能会怀疑大纲漏了内容。
+    notes.unshift(
+      `${String(snapshot.deduped_lines)} nested duplicate row(s) were not printed because an ancestor line already `
+      + 'prints the same text (e.g. a heading wrapping a link with its own label text). Nothing was lost — the kept '
+      + 'row carries the same name, and it is the actionable one whenever the chain has one.',
     )
   }
   if (snapshot.refs.length === 0) {
@@ -496,10 +507,13 @@ type SnapshotCache = Map<string, SnapshotCacheEntry>
 interface SnapshotCacheEntry {
   session_id: string
   /**
-   * 检索底稿：**折叠前**的完整大纲（`BrowserSnapshot.fullOutline`）。
+   * 检索底稿：**打印行 ∪ 被折叠掉的实例行**（`BrowserSnapshot.fullOutline`，由 buildOutline 产出）。
    *
-   * 必须是折叠前的那一份 —— 折叠标记对模型承诺「用 webpage_find 拿全部实例的 ref」，
-   * 而 find 查的就是这里。存折叠后的大纲，被折叠的实例就永远搜不到，承诺当场落空。
+   * 必须是这份 —— 折叠标记对模型承诺「用 webpage_find 拿全部实例的 ref」，而 find 查的就是这里。
+   * 存折叠后的大纲，被折叠的实例就永远搜不到，承诺当场落空。
+   *
+   * 也不能图省事换成「所有原始行」：同名标签行、被去重掉的副本行是刻意隐藏的，混进来就会
+   * 多出 ref 为空的幻影命中（2026-09-18 真机实测：翻页按钮的标签行整批变成幻影）。
    */
   outline: string
   refs: { ref: string; role: string; name: string }[]
@@ -556,7 +570,7 @@ interface LocateOutput {
  * 把一次成功的 snapshot 放进缓存（容量封顶，淘汰最旧）。
  * @param cache - 会话缓存。
  * @param snapshot - 刚产出的快照输出（取会话号与 ref 表）。
- * @param searchOutline - find 的检索底稿，**必须**是折叠前的那份（见 {@link SnapshotCacheEntry}）。
+ * @param searchOutline - find 的检索底稿：打印行 ∪ 被折叠的实例行（见 {@link SnapshotCacheEntry}）。
  */
 function rememberSnapshot(cache: SnapshotCache, snapshot: SnapshotOutput, searchOutline: string): void {
   if (!cache.has(snapshot.session_id) && cache.size >= SNAPSHOT_CACHE_CAPACITY) {
@@ -632,7 +646,8 @@ function clipFindText(text: string, maxChars: number): string {
  * 命中行若带 `[ref=eN]` 标记就从 ref 表补全 role / name；不带（纯内容行）也返回，
  * `ref` 留空串 —— 模型可以据此了解上下文，但不能拿去操作。
  *
- * 检索底稿是**折叠前**的大纲，所以被折叠的实例照样命中，各自带自己的 ref；
+ * 检索底稿含被折叠的实例（外加模型已经看到的那份打印大纲），所以被折叠的实例照样命中、各自带
+ * 自己的 ref；刻意隐藏的同名副本行不在底稿里，不会多出点不了的幻影命中。
  * 再给每条命中附上所属上下文，12 个同名按钮才分得清是「哪一条结果的按钮」。
  */
 function searchOutline(snapshot: SnapshotCacheEntry, matcher: (line: string) => boolean, limit: number): FindMatch[] {
@@ -1096,6 +1111,7 @@ function registerSnapshot(ctx: Context, cache: SnapshotCache): void {
           outline_lines: { type: 'integer' },
           dropped_elements: { type: 'integer' },
           folded_repeats: { type: 'integer' },
+          deduped_lines: { type: 'integer' },
           refs: { type: 'array', required: true, items: REF_ITEM_SCHEMA },
           takeover: { type: 'boolean' },
         },
@@ -1123,11 +1139,12 @@ function registerSnapshot(ctx: Context, cache: SnapshotCache): void {
         outline_lines: observation.outlineLines,
         ...observation.droppedElements !== undefined ? { dropped_elements: observation.droppedElements } : {},
         ...observation.foldedRepeats !== undefined ? { folded_repeats: observation.foldedRepeats } : {},
+        ...observation.dedupedLines !== undefined ? { deduped_lines: observation.dedupedLines } : {},
         refs: observation.refs.map(({ ref, role, name }) => ({ ref, role, name })),
         ...observation.takeover === true ? { takeover: true } : {},
       }
       // 落缓存给 webpage_find 用：它只查这份大纲，不再发任何 CDP 命令。
-      // 底稿用**折叠前**的那份 —— 折叠标记承诺「用 find 拿全部实例的 ref」，缓存里少了实例，
+      // 底稿 = 打印行 ∪ 被折叠的实例行 —— 折叠标记承诺「用 find 拿全部实例的 ref」，缓存里少了实例，
       // 这句承诺就是假的（provider 不提供 fullOutline 时退回模型看到的那份，至少不更差）。
       rememberSnapshot(cache, output, observation.fullOutline ?? observation.outline)
       return output

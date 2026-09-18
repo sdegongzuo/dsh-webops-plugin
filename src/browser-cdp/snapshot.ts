@@ -223,11 +223,15 @@ export interface SnapshotOutline {
    */
   readonly lines: readonly OutlineLine[]
   /**
-   * 折叠前的完整行序列，**只给 `webpage_find` 当检索底稿**。
+   * find 的检索底稿：**打印行 ∪ 被折叠掉的实例行**，按文档顺序。
    *
    * 为什么必须有它：折叠标记向模型承诺「用 webpage_find 拿全部实例的 ref」，而 find 查的
    * 就是交给它的那份大纲文本 —— 底稿里少了被折叠的实例，这句承诺立刻变成谎话，
    * 折叠就等于真的丢了寻址能力。它不进模型上下文（模型看到的是 `lines`）。
+   *
+   * 为什么**不是**「所有原始行」：同名标签行与去重掉的副本行是刻意隐藏的，进了底稿就会变成
+   * 一条 ref 为空的幻影命中 —— 模型手里的大纲没有这行，find 却报出来（2026-09-18 真机实测）。
+   * 换句话说底稿 = `lines`（去掉折叠标记）+ `foldedInstances`，两者之外的行都不该被搜到。
    */
   readonly unfoldedLines: readonly OutlineLine[]
   /** 可操作元素，按出现顺序；ref 名由 `RefRegistry.publish` 分配。 */
@@ -255,6 +259,18 @@ export interface SnapshotOutline {
    * —— 它不是独立元素，只是那个控件的内部文本。所以「标记说 ×5」与「本数是 4 的整数倍」永远对得上。
    */
   readonly foldedRepeats: number
+  /**
+   * 因**与祖先链上的某行同名**而被跳过的行数（同一名字在一条祖先链上被重复印多遍，只留一条）。
+   *
+   * 与 `foldedRepeats` 是两回事：那个是「平级/跨父的重复实例」，这个是「一条链上的同名嵌套」
+   * （真实树上结果标题长成 `heading "X" > link "X" > text "X"` 三行同文）。也不进
+   * `droppedElements` —— 信息一个字没少，只是不再重复印。
+   *
+   * 口径副作用：被跳过的行会让它后面的子行在缩进上「跳层」（被隐藏的中间层不再占行）。
+   * 缩进仍然是真的树深度，不是错乱 —— 底稿（`unfoldedLines`）里那一层还在，find 的
+   * 「所属上下文」照样能报到被隐藏的 heading。
+   */
+  readonly dedupedLines: number
 }
 
 /** 折叠空白并裁剪到 `maxLength`，避免一个 `aria-label` 撑爆一行。 */
@@ -440,6 +456,7 @@ export function buildOutline(
   for (const root of roots) visit(root, 0)
 
   // ---- 祖先 / 后代关系：DFS 前序里「最近一个深度更小的前驱」就是父行 ----
+  const parentOf: (number | undefined)[] = []
   const childrenOf = new Map<number, number[]>()
   {
     const stack: number[] = []
@@ -450,6 +467,7 @@ export function buildOutline(
         stack.pop()
       }
       const parent = stack[stack.length - 1]
+      parentOf[index] = parent
       if (parent !== undefined) {
         const siblings = childrenOf.get(parent)
         if (siblings === undefined) childrenOf.set(parent, [index])
@@ -470,6 +488,63 @@ export function buildOutline(
       pending.push(...childrenOf.get(next) ?? [])
     }
     return out
+  }
+
+  // ---- 同名链去重：连续的「祖先-后代且同名」的行里只留一条 ----
+  //
+  // 真实树上一条结果标题会长成 `heading "X" > link "X" > text "X"` 三行同文（实测），
+  // 每条结果白占两行。这**不是**折叠要处理的东西：折叠管的是平级/跨父的重复实例，
+  // 这里管的是同一个名字在一条祖先链上被重复印三遍。
+  //
+  // 与「statictext 永不折叠」不冲突：那条禁的是**把区分结果的正文折掉**；这里被跳过的行
+  // 名字已经由链上保留的那行印出来了，正文一个字没少（摘要这类只属于自己的文本，
+  // 祖先链上找不到同名行，照旧打印）。
+  const chainHead: number[] = []
+  for (const [index, candidate] of candidates.entries()) {
+    const parent = parentOf[index]
+    const parentCandidate = parent === undefined ? undefined : candidates[parent]
+    chainHead[index] = candidate.name.length > 0
+      && parentCandidate !== undefined
+      && (parentCandidate as { name: string }).name === candidate.name
+      ? (chainHead[parent as number] as number)
+      : index
+  }
+
+  const chains = new Map<number, number[]>()
+  for (const index of candidates.keys()) {
+    const head = chainHead[index] as number
+    const members = chains.get(head)
+    if (members === undefined) chains.set(head, [index])
+    else members.push(index)
+  }
+
+  /**
+   * 链上留哪一行：**可操作优先**（它的 ref 是寻址能力，绝不能为了去重丢掉），
+   * 同级里再取「渲染文本最长」的那行 —— 文本越长带的信息越多（`level` / `url` / `disabled`…）。
+   * 并列时保最靠前（最浅）的那行：成员按出现顺序排，只在**严格更长**时才替换。
+   */
+  const survivorOf = (members: readonly number[]): number => {
+    const actionable = members.filter(index => (candidates[index] as { targetRow?: number }).targetRow !== undefined)
+    const pool = actionable.length > 0 ? actionable : members
+    let best = pool[0] as number
+    for (const index of pool) {
+      if ((candidates[index] as { text: string }).text.length > (candidates[best] as { text: string }).text.length) best = index
+    }
+    return best
+  }
+
+  /** 因与祖先同名而被跳过的行下标（信息已由链上保留的那行携带，不进 `foldedRepeats`）。 */
+  const redundantRows = new Set<number>()
+  for (const members of chains.values()) {
+    if (members.length < 2) continue
+    // 护栏：一条链上出现 2 个以上可操作行就不去重。去重要留谁都是猜，而丢掉的那行带着一个**可用
+    // 的 ref** —— 去重的收益只是省一行，代价是少一个能点的元素，不划算。（真实树上罕见，
+    // 但「折叠不丢寻址」这条承诺没理由在去重上破例。）
+    if (members.filter(index => (candidates[index] as { targetRow?: number }).targetRow !== undefined).length > 1) continue
+    const survivor = survivorOf(members)
+    for (const index of members) {
+      if (index !== survivor) redundantRows.add(index)
+    }
   }
 
   // ---- 折叠决策：同 (role, name) 的**可折叠**实例数 ≥ 阈值即折，只留首个 ----
@@ -530,11 +605,12 @@ export function buildOutline(
     }
   }
 
-  // ---- 第二遍：按折叠后的集合结算预算 ----
+  // ---- 第二遍：按折叠 / 去重后的集合结算预算 ----
   const lines: OutlineLine[] = []
   const unfoldedLines: OutlineLine[] = []
   let chars = 0
   let foldedRepeats = 0
+  let dedupedLines = 0
 
   for (const [index, candidate] of candidates.entries()) {
     const line: OutlineLine = {
@@ -542,10 +618,20 @@ export function buildOutline(
       text: candidate.text,
       ...candidate.targetRow !== undefined ? { targetRow: candidate.targetRow } : {},
     }
-    if (hiddenRows.has(index)) {
-      // 折叠行不占行额、不占字符额，也不算 droppedElements —— 它没丢，只是没打印。
-      unfoldedLines.push(line)
-      if (foldedInstances.has(index)) foldedRepeats += 1
+    const foldedAway = hiddenRows.has(index)
+    if (foldedAway || redundantRows.has(index)) {
+      // 被折叠 / 被去重的行不占行额、不占字符额，也不算 droppedElements —— 它们没丢，只是没打印。
+      //
+      // 但**底稿只收被折叠掉的实例行**，不收「同名标签行」和「被去重掉的副本行」：
+      // 底稿存在的唯一理由是「让 webpage_find 拿回折叠实例的 ref」，凡是本来就不该被看见的副本，
+      // 进了底稿就变成一条 ref 为空的幻影命中 —— 模型看到的大纲里没有这行，find 却报出来，
+      // 看起来就是坏了。(2026-09-18 真机全链路实测：翻页按钮的同名标签行全成了幻影命中)
+      if (foldedInstances.has(index)) {
+        unfoldedLines.push(line)
+        foldedRepeats += 1
+      } else if (!foldedAway) {
+        dedupedLines += 1
+      }
       continue
     }
     if (lines.length >= limits.maxLines || chars >= limits.maxOutlineChars) {
@@ -565,7 +651,37 @@ export function buildOutline(
     chars += marker.length + candidate.depth * 2 + 3
   }
 
-  return { lines, unfoldedLines, rows, truncated, droppedElements, foldedRepeats }
+  return {
+    lines: normalizeDepths(lines),
+    unfoldedLines: normalizeDepths(unfoldedLines),
+    rows,
+    truncated,
+    droppedElements,
+    foldedRepeats,
+    dedupedLines,
+  }
+}
+
+/**
+ * 把一串行的缩进按**保留下来的行**重新归一：第 n 层 = 「它上面共有几个保留的祖先」。
+ *
+ * 为什么必须做：删掉中间层（去重、折叠）之后，照抄真实深度会出现「孙子行比它后面的叔叔行
+ * 深两级」这种看着像 bug 的豁口（真实树上 `listitem > heading > link` 去掉 heading 后，
+ * link 停在 depth 4，而同一张卡片里的兄弟 `text` 在 depth 3）。归一后每一行都恰好比它最近的
+ * 保留祖先深一层 —— 这才是读大纲的人（模型）期望的结构。
+ *
+ * 两个视图各归一各的：底稿里被去重的行还在，所以它的归一结果与打印视图**本就不该相同**。
+ * 各自内部自洽即可 —— 每个视图里「最近一个更浅的前驱就是父」这条性质都被保留
+ * （归一是一致单调的重标号），`webpage_find` 的祖先反推照样成立。
+ */
+function normalizeDepths(rows: readonly OutlineLine[]): OutlineLine[] {
+  const ancestors: number[] = []
+  return rows.map((line) => {
+    while (ancestors.length > 0 && (ancestors[ancestors.length - 1] as number) >= line.depth) ancestors.pop()
+    ancestors.push(line.depth)
+    const depth = ancestors.length - 1
+    return depth === line.depth ? line : { ...line, depth }
+  })
 }
 
 /** {@link renderOutline} 的可选项。 */

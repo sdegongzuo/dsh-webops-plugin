@@ -988,6 +988,7 @@ export class CdpBrowserProvider implements BrowserProvider {
       outlineLines: outline.lines.length,
       ...outline.truncated ? { droppedElements: outline.droppedElements } : {},
       ...outline.foldedRepeats > 0 ? { foldedRepeats: outline.foldedRepeats } : {},
+      ...outline.dedupedLines > 0 ? { dedupedLines: outline.dedupedLines } : {},
       // 人工接管只加提示，**不动 epoch** —— 开合 DevTools 不该作废模型的 ref（[V31]）。
       ...session.takeover ? { takeover: true } : {},
     }

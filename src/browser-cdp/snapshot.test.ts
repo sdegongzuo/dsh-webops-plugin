@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { buildOutline, DEFAULT_SNAPSHOT_LIMITS, MAX_SNAPSHOT_LINES, renderOutline, resolveSnapshotLimits } from './snapshot.ts'
-import type { AxNode } from './snapshot.ts'
+import type { AxNode, OutlineLine } from './snapshot.ts'
 import { RefRegistry } from './refs.ts'
 
 /** 造一个 AX 节点；省略的字段保持缺省。 */
@@ -163,6 +163,7 @@ describe('buildOutline', () => {
       truncated: false,
       droppedElements: 0,
       foldedRepeats: 0,
+      dedupedLines: 0,
     })
   })
 
@@ -312,8 +313,11 @@ describe('buildOutline：重复折叠（2026-09-18 任务 1）', () => {
 
     expect(text).not.toContain('text "翻译此页"')
     expect(outline.foldedRepeats).toBe(33)
-    // 底稿里（find 的那份）实例一行不少。
-    expect(outline.unfoldedLines.map(line => line.text).filter(t => t === 'text "翻译此页"')).toHaveLength(12)
+    // 底稿里**实例**一行不少（find 要靠它拿 ref）……
+    expect(outline.unfoldedLines.map(line => line.text).filter(t => t.startsWith('button "翻译此页"'))).toHaveLength(12)
+    // ……但同名标签行一行都不能进：它们是刻意隐藏的副本，进了底稿就是一条 ref 为空的幻影命中
+    // （模型手里的大纲没有这行，find 却报出来）。2026-09-18 真机全链路套出来的。
+    expect(outline.unfoldedLines.map(line => line.text).filter(t => t === 'text "翻译此页"')).toHaveLength(0)
   })
 
   it('never folds a line whose subtree carries content other than its own label, so nothing is swallowed', () => {
@@ -386,5 +390,181 @@ describe('buildOutline：重复折叠（2026-09-18 任务 1）', () => {
     // 折掉的 33 行换来的正是这 17 条正文链接（`lines` 里尚未回填 ref，那一步在 renderOutline）。
     expect(text).toContain('link "尾部 16"')
     expect(text).not.toContain('link "尾部 17"')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// 同名链去重：一条祖先链上同一个名字只印一次
+// ---------------------------------------------------------------------------
+
+describe('buildOutline：同名链去重（2026-09-18）', () => {
+  /** 真实树上的一条结果标题：`heading "X" > link "X" > text "X"` 三行同文。 */
+  function titleChain(name: string): AxNode[] {
+    return [
+      node({ nodeId: 'li', role: { value: 'listitem' }, childIds: ['h'] }),
+      node({
+        nodeId: 'h',
+        role: { value: 'heading' },
+        name: { value: name },
+        childIds: ['a'],
+        properties: [{ name: 'level', value: { value: 3 } }],
+      }),
+      node({
+        nodeId: 'a',
+        role: { value: 'link' },
+        name: { value: name },
+        childIds: ['t'],
+        backendDOMNodeId: 7,
+      }),
+      node({ nodeId: 't', role: { value: 'StaticText' }, name: { value: name } }),
+    ]
+  }
+
+  it('keeps exactly one row of a same-name ancestor chain, and it is the actionable one', () => {
+    const outline = buildOutline(titleChain('Rust 官方文档'))
+    const text = outline.lines.map(line => line.text).join('\n')
+
+    // 三行同文只留一行（`listitem` 是结构行，本来就在），留下的必须是**带 ref 的那行**
+    // —— 留 heading 会把寻址能力删掉。
+    expect(outline.lines.map(line => line.text)).toEqual(['listitem', 'link "Rust 官方文档"'])
+    expect(outline.lines[1]?.targetRow).toBe(0)
+    expect(outline.dedupedLines).toBe(2)
+    // 去重不是截断、也不是折叠，三套计数互不串味。
+    expect(outline.truncated).toBe(false)
+    expect(outline.droppedElements).toBe(0)
+    expect(outline.foldedRepeats).toBe(0)
+    // ref 照旧分配（去重只影响打印）。
+    expect(outline.rows).toEqual([{ role: 'link', name: 'Rust 官方文档', backendNodeId: 7 }])
+  })
+
+  it('keeps every folded instance in the find outline, and nothing else', () => {
+    const outline = buildOutline(titleChain('Rust 官方文档'))
+    const registry = new RefRegistry()
+    const publication = registry.publish(outline.rows, outline.truncated)
+
+    const full = renderOutline(outline, publication.refs, { unfoldRepeats: true })
+    // 底稿 = 打印行 ∪ 被折叠的实例行。这里没有折叠，所以底稿就是打印的那两行 ——
+    // 被去重掉的 `heading` / `text` **不进底稿**：它们已经从 `link` 那行读到了同样的名字，
+    // 留在底稿里只会让 webpage_find 多报两条 ref 为空的幻影命中。
+    expect(full.split('\n')).toHaveLength(2)
+    expect(full).not.toContain('(folded)')
+    expect(full).toContain('link "Rust 官方文档" [ref=e1]')
+    expect(full).not.toContain('heading "Rust 官方文档"')
+    expect(full).not.toContain('text "Rust 官方文档"')
+  })
+
+  it('prefers the richer non-actionable row when no row in the chain is actionable', () => {
+    // heading `level=3` 比裸 text 多一个属性，留它。
+    const outline = buildOutline([
+      node({
+        nodeId: 'h',
+        role: { value: 'heading' },
+        name: { value: '搜索结果' },
+        childIds: ['t'],
+        properties: [{ name: 'level', value: { value: 1 } }],
+      }),
+      node({ nodeId: 't', role: { value: 'StaticText' }, name: { value: '搜索结果' } }),
+    ])
+    expect(outline.lines.map(line => line.text)).toEqual(['heading "搜索结果" level=1'])
+    expect(outline.dedupedLines).toBe(1)
+  })
+
+  it('never dedupes siblings or unrelated duplicates — only a real ancestor chain', () => {
+    // 两条结果各有一段**不同**的摘要，另外两条同名的兄弟 text 也不能互相吃掉。
+    const outline = buildOutline([
+      node({ nodeId: 'root', role: { value: 'list' }, childIds: ['a', 'b'] }),
+      node({ nodeId: 'a', role: { value: 'listitem' }, childIds: ['a1'] }),
+      node({ nodeId: 'a1', role: { value: 'StaticText' }, name: { value: '同一句' } }),
+      node({ nodeId: 'b', role: { value: 'listitem' }, childIds: ['b1'] }),
+      node({ nodeId: 'b1', role: { value: 'StaticText' }, name: { value: '同一句' } }),
+    ])
+    expect(outline.lines.map(line => line.text).filter(text => text === 'text "同一句"')).toHaveLength(2)
+    expect(outline.dedupedLines).toBe(0)
+  })
+
+  it('never eats text that belongs to a single result, even under a same-name wrapper', () => {
+    const outline = buildOutline([
+      node({ nodeId: 'li', role: { value: 'listitem' }, childIds: ['a', 's'] }),
+      node({ nodeId: 'a', role: { value: 'link' }, name: { value: '结果 A' }, childIds: ['t'], backendDOMNodeId: 1 }),
+      node({ nodeId: 't', role: { value: 'StaticText' }, name: { value: '结果 A' } }),
+      // 摘要挂在 listitem 下，祖先链上没有同名行 → 必须照旧打印。
+      node({ nodeId: 's', role: { value: 'StaticText' }, name: { value: '这是 A 的摘要' } }),
+    ])
+    expect(outline.lines.map(line => line.text)).toEqual([
+      'listitem',
+      'link "结果 A"',
+      'text "这是 A 的摘要"',
+    ])
+    expect(outline.dedupedLines).toBe(1)
+  })
+
+  it('survives a chain of 4 identical rows and still leaves one', () => {
+    const outline = buildOutline([
+      node({ nodeId: '1', role: { value: 'listitem' }, childIds: ['2'] }),
+      node({ nodeId: '2', role: { value: 'heading' }, name: { value: 'X' }, childIds: ['3'] }),
+      node({ nodeId: '3', role: { value: 'link' }, name: { value: 'X' }, childIds: ['4'], backendDOMNodeId: 3 }),
+      node({ nodeId: '4', role: { value: 'StaticText' }, name: { value: 'X' }, childIds: ['5'] }),
+      node({ nodeId: '5', role: { value: 'StaticText' }, name: { value: 'X' } }),
+    ])
+    expect(outline.lines.map(line => line.text).filter(text => text.includes('"X"'))).toHaveLength(1)
+    expect(outline.dedupedLines).toBe(3)
+    expect(outline.rows).toHaveLength(1)
+  })
+
+  it('re-normalizes indentation after removing a middle layer, so siblings stay aligned', () => {
+    // 真机实测的坑（2026-09-18）：抽掉 `heading` 之后，留下的 `link` 还顶着一层空缩进 ——
+    // 后面那条摘要却是浅一级，两份同属一个 listitem 的行看起来像大纲坏了。
+    // 所以保留行的 depth 要按「保留行里还有几层祖先」重算，而不是照抄原始 depth。
+    const outline = buildOutline([
+      node({ nodeId: 'li', role: { value: 'listitem' }, childIds: ['h', 's'] }),
+      node({
+        nodeId: 'h',
+        role: { value: 'heading' },
+        name: { value: '结果 A' },
+        childIds: ['a'],
+        properties: [{ name: 'level', value: { value: 3 } }],
+      }),
+      node({
+        nodeId: 'a',
+        role: { value: 'link' },
+        name: { value: '结果 A' },
+        childIds: ['t'],
+        backendDOMNodeId: 1,
+      }),
+      node({ nodeId: 't', role: { value: 'StaticText' }, name: { value: '结果 A' } }),
+      node({ nodeId: 's', role: { value: 'StaticText' }, name: { value: '结果 A 的摘要' } }),
+    ])
+
+    expect(outline.lines.map(line => [line.depth, line.text])).toEqual([
+      [0, 'listitem'],
+      [1, 'link "结果 A"'],
+      [1, 'text "结果 A 的摘要"'],
+    ])
+    // 通用不变量：任何一行最多比上一行深一级 —— 去掉中间层后不许出现缩进断层。
+    outline.lines.forEach((line, index) => {
+      if (index === 0) return
+      const previous = outline.lines[index - 1] as OutlineLine
+      expect(line.depth).toBeLessThanOrEqual(previous.depth + 1)
+    })
+    // 底稿 = 打印行 ∪ 折叠实例（这里没有折叠），所以与上面同构；被去重的两行不在里面。
+    expect(outline.unfoldedLines.map(line => [line.depth, line.text])).toEqual([
+      [0, 'listitem'],
+      [1, 'link "结果 A"'],
+      [1, 'text "结果 A 的摘要"'],
+    ])
+  })
+
+  it('never dedupes a chain that carries more than one actionable row', () => {
+    // 护栏：去重要留谁都是猜，而丢掉的那行带着一个可用的 ref —— 省一行的收益换不来少一个能点的元素。
+    const outline = buildOutline([
+      node({ nodeId: 'li', role: { value: 'listitem' }, childIds: ['a'] }),
+      node({ nodeId: 'a', role: { value: 'link' }, name: { value: '同名' }, childIds: ['b'], backendDOMNodeId: 1 }),
+      node({ nodeId: 'b', role: { value: 'link' }, name: { value: '同名' }, backendDOMNodeId: 2 }),
+    ])
+
+    expect(outline.lines.map(line => line.text)).toEqual(['listitem', 'link "同名"', 'link "同名"'])
+    expect(outline.dedupedLines).toBe(0)
+    // 两个 ref 都还在，两个都能点。
+    expect(outline.rows).toHaveLength(2)
   })
 })
