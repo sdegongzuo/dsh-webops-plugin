@@ -15,6 +15,8 @@ coverage/
 .env
 .env.*
 !.env.example
+.credentials.yaml
+**/.credentials.yaml
 .desktop-shot.png
 .smoke-*.png
 .probe-*

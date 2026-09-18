@@ -264,6 +264,20 @@ describe('便携版使用说明（scripts/package-desktop-portable.mjs）', () =
     expect(script).toContain('· 双击根目录的「启动.cmd」')
     expect(script).toContain('· 直接双击 app 目录里的')
   })
+
+  it('不把本机 .credentials.yaml 拷进便携包', () => {
+    expect(script, '打包脚本不能 cpSync 凭据文件').not.toMatch(/cpSync\([^)]*credentials/u)
+    expect(script).not.toMatch(/writeFileSync\([^)]*\.credentials\.yaml/u)
+  })
+})
+
+describe('出厂 settings 不含真实 key', () => {
+  const settings = readRepoFile('scripts/portable-home-settings.yaml')
+
+  it('只写凭据引用名 apiKeyEnv，正文里没有 sk- 形态的 secret', () => {
+    expect(settings).toContain('apiKeyEnv: UNISOUND_API_KEY')
+    expect(settings, '出厂 YAML 混进了 sk- 开头的 key').not.toMatch(/sk-[A-Za-z0-9]{8,}/u)
+  })
 })
 
 describe('alpha.2 宿主入口（desktop-host 不再导出 runDesktopHost）', () => {

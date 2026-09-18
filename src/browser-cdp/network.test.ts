@@ -70,6 +70,25 @@ function responseEvent(requestId: string, url: string, status: number, mimeType?
 }
 
 describe('NetworkCollector', () => {
+  it('tracks inflight: requestWillBeSent +1, loadingFinished/loadingFailed −1, never negative', () => {
+    const socket = new EventSocket()
+    const collector = new NetworkCollector(new CdpConnection(socket))
+    expect(collector.inflight).toBe(0)
+
+    socket.emit('Network.requestWillBeSent', requestEvent('a', 'GET', 'https://example.com/sse'))
+    socket.emit('Network.requestWillBeSent', requestEvent('b', 'GET', 'https://example.com/img'))
+    expect(collector.inflight).toBe(2)
+
+    socket.emit('Network.loadingFinished', { requestId: 'b' })
+    expect(collector.inflight).toBe(1)
+
+    socket.emit('Network.loadingFailed', { requestId: 'a', errorText: 'net::ERR_ABORTED' })
+    expect(collector.inflight).toBe(0)
+
+    socket.emit('Network.loadingFinished', { requestId: 'ghost' })
+    expect(collector.inflight).toBe(0)
+  })
+
   it('collects request, response and failure events into a newest-first table', () => {
     const socket = new EventSocket()
     const collector = new NetworkCollector(new CdpConnection(socket))

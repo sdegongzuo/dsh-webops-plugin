@@ -60,6 +60,8 @@ class FakeChrome {
   elementConnected = true
   /** P1：wait-text 里页面文本是否包含目标串。 */
   waitTextFound = true
+  /** `until: 'stable'`：每次读 DOM 探针返回的增量（0 = 本窗口安静）。 */
+  domMutationDelta = 0
   /**
    * P2：设置后**所有**命令都抛这条消息 —— 模拟 detach 期间 `webContents.debugger` 的
    * 同步失败（`No target available`，`[V16]`）。
@@ -80,6 +82,19 @@ class FakeChrome {
    * 真实现里由页面内的 `isContentEditable` 判定，provider 据此改走 `Input.insertText`。
    */
   fillEditable = false
+  /** 主 frame 文档身份；`Page.getFrameTree` 按需读取。 */
+  loaderId = 'loader-1'
+  /** `DOM.resolveNode` 对这些 backendNodeId 返回空对象（节点已死）。 */
+  missingBackendNodeIds = new Set<number>()
+  /**
+   * `DOMSnapshot.captureSnapshot` 的布局盒。默认把 PAGE_TREE 里的节点都放进视口，
+   * 区域测试会改成「一个在屏内、一个在屏外」。
+   */
+  layoutBoxes: { backendNodeId: number; bounds: number[] }[] = [
+    { backendNodeId: 7, bounds: [0, 0, 200, 40] },
+    { backendNodeId: 8, bounds: [0, 50, 200, 30] },
+    { backendNodeId: 9, bounds: [0, 90, 200, 30] },
+  ]
 
   /** 记录一条命令并给出它的结果。 */
   handle(socket: FakeSocket, method: string, params: Record<string, unknown>): unknown {
@@ -120,6 +135,12 @@ class FakeChrome {
         if (expression.includes('readyState')) {
           return { result: { value: this.readyStateComplete } }
         }
+        if (expression.includes('__dsh_mut_installed')) {
+          return { result: { value: true } }
+        }
+        if (expression.includes('__dsh_mut_count')) {
+          return { result: { value: this.domMutationDelta } }
+        }
         // 读页面元信息：先按 `titleEmptyReads` 把标题报成空串，再给真实值。
         if (this.titleEmptyReads > 0) {
           this.titleEmptyReads -= 1
@@ -152,6 +173,52 @@ class FakeChrome {
       }
       case 'Accessibility.getFullAXTree':
         return { nodes: this.axeNodes }
+      case 'Accessibility.getPartialAXTree': {
+        const backend = Number(params['backendNodeId'])
+        const start = this.axeNodes.find(node => node.backendDOMNodeId === backend)
+        if (start === undefined) return { nodes: [] }
+        const byId = new Map(this.axeNodes.map(node => [node.nodeId, node]))
+        const collected: AxNode[] = []
+        const walk = (node: AxNode): void => {
+          collected.push(node)
+          for (const childId of node.childIds ?? []) {
+            const child = byId.get(childId)
+            if (child !== undefined) walk(child)
+          }
+        }
+        walk(start)
+        return { nodes: collected }
+      }
+      case 'Page.getFrameTree':
+        return { frameTree: { frame: { id: 'frame-1', loaderId: this.loaderId, url: this.page.url } } }
+      case 'Page.getLayoutMetrics':
+        return {
+          visualViewport: {
+            pageX: 0,
+            pageY: 0,
+            clientWidth: this.viewport.width,
+            clientHeight: this.viewport.height,
+            offsetX: 0,
+            offsetY: 0,
+            scale: 1,
+          },
+          layoutViewport: {
+            pageX: 0,
+            pageY: 0,
+            clientWidth: this.viewport.width,
+            clientHeight: this.viewport.height,
+          },
+        }
+      case 'DOMSnapshot.captureSnapshot':
+        return {
+          documents: [{
+            nodes: { backendNodeId: this.layoutBoxes.map(entry => entry.backendNodeId) },
+            layout: {
+              nodeIndex: this.layoutBoxes.map((_, index) => index),
+              bounds: this.layoutBoxes.map(entry => entry.bounds),
+            },
+          }],
+        }
       case 'Network.getResponseBody':
         return { body: this.responseBody, base64Encoded: false }
       case 'Page.navigate':
@@ -161,6 +228,7 @@ class FakeChrome {
         return { data: Buffer.from(this.png).toString('base64') }
       case 'DOM.resolveNode':
         if (this.resolveNodeError !== undefined) throw new Error(this.resolveNodeError)
+        if (this.missingBackendNodeIds.has(Number(params['backendNodeId']))) return {}
         return params['backendNodeId'] === 0 ? {} : { object: { objectId: 'obj-1' } }
       case 'DOM.getBoxModel':
         return this.boxModel === undefined ? {} : { model: { border: [...this.boxModel] } }
@@ -384,6 +452,126 @@ describe('CdpBrowserProvider', () => {
     expect(snapshot.outline).toContain('button "Submit" [ref=e2]')
     expect(snapshot.url).toBe('https://example.com/')
     expect(snapshot.truncated).toBe(false)
+  })
+
+  it('region.ref snapshot adopts into the current epoch so earlier refs stay usable', async () => {
+    await provider.open({})
+    const full = await provider.observe({ kind: 'snapshot', sessionId: 'tab-1' })
+    if (full.kind !== 'snapshot') throw new Error('expected a snapshot')
+    const first = full.refs[0]?.ref as string
+    const epoch = full.epoch
+
+    const regional = await provider.observe({
+      kind: 'snapshot',
+      sessionId: 'tab-1',
+      region: { ref: first },
+    })
+    if (regional.kind !== 'snapshot') throw new Error('expected a snapshot')
+    expect(regional.epoch).toBe(epoch)
+    expect(regional.outsideRegion).toBeGreaterThanOrEqual(0)
+    const later = await provider.observe({ kind: 'screenshot', sessionId: 'tab-1', ref: first })
+    expect(later.kind).toBe('screenshot')
+  })
+
+  it('revalidates a stale ref onto the same number when the document and identity still match', async () => {
+    await provider.open({})
+    const first = await provider.observe({ kind: 'snapshot', sessionId: 'tab-1' })
+    if (first.kind !== 'snapshot') throw new Error('expected a snapshot')
+    const stale = first.refs[0]?.ref as string
+    const second = await provider.observe({ kind: 'snapshot', sessionId: 'tab-1' })
+    if (second.kind !== 'snapshot') throw new Error('expected a snapshot')
+    await expect(provider.observe({ kind: 'screenshot', sessionId: 'tab-1', ref: stale }))
+      .rejects.toThrow(expect.objectContaining({ code: 'BROWSER_STALE_REF' }))
+
+    const result = await provider.revalidate({ sessionId: 'tab-1', refs: [stale] })
+    expect(result.epoch).toBe(second.epoch)
+    expect(result.restored.map(entry => entry.ref)).toEqual([stale])
+    expect(result.failed).toEqual([])
+    const shot = await provider.observe({ kind: 'screenshot', sessionId: 'tab-1', ref: stale })
+    expect(shot.kind).toBe('screenshot')
+  })
+
+  it('refuses to bind when the document loaderId changed (反向：跳过文档校验会误绑)', async () => {
+    await provider.open({})
+    const first = await provider.observe({ kind: 'snapshot', sessionId: 'tab-1' })
+    if (first.kind !== 'snapshot') throw new Error('expected a snapshot')
+    const stale = first.refs[0]?.ref as string
+    chrome.loaderId = 'loader-2'
+    await provider.observe({ kind: 'snapshot', sessionId: 'tab-1' })
+
+    const result = await provider.revalidate({ sessionId: 'tab-1', refs: [stale] })
+    expect(result.restored).toEqual([])
+    expect(result.failed).toEqual([{ ref: stale, reason: 'document_changed' }])
+    await expect(provider.observe({ kind: 'screenshot', sessionId: 'tab-1', ref: stale }))
+      .rejects.toThrow(expect.objectContaining({ code: 'BROWSER_STALE_REF' }))
+    expect(chrome.calls.some(call => call.method === 'DOM.resolveNode' && call.params['backendNodeId'] === 8)).toBe(false)
+  })
+
+  it('reports node_gone when resolveNode cannot bind the archived backend id', async () => {
+    await provider.open({})
+    const first = await provider.observe({ kind: 'snapshot', sessionId: 'tab-1' })
+    if (first.kind !== 'snapshot') throw new Error('expected a snapshot')
+    const stale = first.refs[0]?.ref as string
+    await provider.observe({ kind: 'snapshot', sessionId: 'tab-1' })
+    chrome.missingBackendNodeIds.add(8)
+
+    const result = await provider.revalidate({ sessionId: 'tab-1', refs: [stale] })
+    expect(result.failed).toEqual([{ ref: stale, reason: 'node_gone' }])
+    await expect(provider.observe({ kind: 'screenshot', sessionId: 'tab-1', ref: stale }))
+      .rejects.toThrow(expect.objectContaining({ code: 'BROWSER_STALE_REF' }))
+  })
+
+  it('reports identity_mismatch when the live role or name no longer match the archive', async () => {
+    await provider.open({})
+    const first = await provider.observe({ kind: 'snapshot', sessionId: 'tab-1' })
+    if (first.kind !== 'snapshot') throw new Error('expected a snapshot')
+    const stale = first.refs.find(entry => entry.role === 'button')?.ref as string
+    await provider.observe({ kind: 'snapshot', sessionId: 'tab-1' })
+    chrome.axeNodes = chrome.axeNodes.map(node =>
+      node.backendDOMNodeId === 9 ? { ...node, name: { value: 'Go' } } : node)
+
+    const result = await provider.revalidate({ sessionId: 'tab-1', refs: [stale] })
+    expect(result.failed).toEqual([{ ref: stale, reason: 'identity_mismatch' }])
+  })
+
+  it('keeps old refs usable after a viewport region snapshot', async () => {
+    await provider.open({})
+    const full = await provider.observe({ kind: 'snapshot', sessionId: 'tab-1' })
+    if (full.kind !== 'snapshot') throw new Error('expected a snapshot')
+    chrome.layoutBoxes = [
+      { backendNodeId: 8, bounds: [0, 50, 200, 30] },
+      { backendNodeId: 9, bounds: [0, 2000, 200, 30] },
+    ]
+    const regional = await provider.observe({
+      kind: 'snapshot',
+      sessionId: 'tab-1',
+      region: { viewport: true },
+    })
+    if (regional.kind !== 'snapshot') throw new Error('expected a snapshot')
+    expect(regional.epoch).toBe(full.epoch)
+    expect(regional.outline).toContain('Email')
+    expect(regional.outline).not.toContain('Submit')
+    expect(regional.outsideRegion).toBe(1)
+    const shot = await provider.observe({ kind: 'screenshot', sessionId: 'tab-1', ref: full.refs[0]?.ref as string })
+    expect(shot.kind).toBe('screenshot')
+  })
+
+  it('snapshots only elements intersecting region.box', async () => {
+    await provider.open({})
+    await provider.observe({ kind: 'snapshot', sessionId: 'tab-1' })
+    chrome.layoutBoxes = [
+      { backendNodeId: 8, bounds: [0, 50, 200, 30] },
+      { backendNodeId: 9, bounds: [0, 800, 200, 30] },
+    ]
+    const regional = await provider.observe({
+      kind: 'snapshot',
+      sessionId: 'tab-1',
+      region: { box: { x: 0, y: 780, width: 400, height: 80 } },
+    })
+    if (regional.kind !== 'snapshot') throw new Error('expected a snapshot')
+    expect(regional.refs.some(entry => entry.name === 'Submit')).toBe(true)
+    expect(regional.outline).not.toContain('Email')
+    expect(regional.outsideRegion).toBe(1)
   })
 
   it('increments the epoch on every snapshot so earlier refs go stale', async () => {
@@ -958,6 +1146,45 @@ describe('CdpBrowserProvider.mutate (P1)', () => {
     await expect(timeoutProvider.mutate({ kind: 'wait', sessionId: 'tab-1', timeMs: 100, text: 'x' }))
       .rejects.toThrow(expect.objectContaining({ code: 'BROWSER_PROTOCOL_ERROR' }))
     await expect(timeoutProvider.mutate({ kind: 'wait', sessionId: 'tab-1', timeMs: 40_000 }))
+      .rejects.toThrow(expect.objectContaining({ code: 'BROWSER_PROTOCOL_ERROR' }))
+  })
+
+  it('waits until the page is stable when DOM and network stay quiet', async () => {
+    chrome.readyStateComplete = true
+    chrome.domMutationDelta = 0
+    const stableProvider = new CdpBrowserProvider({
+      navigationTimeoutMs: 200,
+      stableQuietWindowMs: 20,
+      stableNetworkGraceMs: 50,
+    }, chrome.transport())
+    await stableProvider.open({})
+
+    const result = await stableProvider.mutate({ kind: 'wait', sessionId: 'tab-1', until: 'stable', timeoutMs: 400 })
+    expect(result).toMatchObject({
+      action: 'wait',
+      satisfied: true,
+      signals: { readyState: 'complete', dom: 'quiet', network: 'quiet' },
+    })
+  })
+
+  it('times out on a heartbeat page and reports which signals stayed busy', async () => {
+    chrome.readyStateComplete = true
+    chrome.domMutationDelta = 3
+    const stableProvider = new CdpBrowserProvider({
+      navigationTimeoutMs: 200,
+      stableQuietWindowMs: 20,
+      stableNetworkGraceMs: 50,
+    }, chrome.transport())
+    await stableProvider.open({})
+
+    const result = await stableProvider.mutate({ kind: 'wait', sessionId: 'tab-1', until: 'stable', timeoutMs: 80 })
+    expect(result.satisfied).toBe(false)
+    expect(result.signals).toEqual({ readyState: 'complete', dom: 'busy', network: 'quiet' })
+  })
+
+  it('rejects mixing until:stable with time_ms / text / ref', async () => {
+    await provider.open({})
+    await expect(provider.mutate({ kind: 'wait', sessionId: 'tab-1', until: 'stable', timeMs: 10 }))
       .rejects.toThrow(expect.objectContaining({ code: 'BROWSER_PROTOCOL_ERROR' }))
   })
 })

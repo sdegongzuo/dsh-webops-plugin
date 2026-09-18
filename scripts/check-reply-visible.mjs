@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // 只读检查：连渲染进程 CDP，读聊天 DOM 最后一段 assistant 回复文本，
-// 确认 fake-llm 动态证据收尾（热搜第五条 + 详情页 + 正文摘录）是否可见。
+// 确认 fake-llm 动态证据收尾（打开谷歌 → AI 模式 → 提问）是否可见。
 import { writeFileSync } from 'node:fs'
 
 const PORT = process.env.RENDERER_PORT ?? 9222
@@ -39,21 +39,19 @@ const text = String(result?.value ?? '')
 writeFileSync('scripts/.last-chat-dom.txt', text)
 console.log('DOM 全文长度:', text.length)
 
-// 热搜榜是实时数据，标题不能写死（写死必然 false）——从回复里现抽那一行。
-const fifthLine = /热搜第五条：([^\n]+)/u.exec(text)?.[1]?.trim() ?? ''
-const hasFifth = fifthLine.length > 0
-const hasDetailUrl = /baidu\.com\/s\?wd=/u.test(text)
-const hasExcerptMarker = text.includes('正文摘录')
-const hasEvidenceHeader = text.includes('已完成「打开百度')
+const questionLine = /问题：([^\n]+)/u.exec(text)?.[1]?.trim() ?? ''
+const hasQuestion = questionLine.length > 0 || text.includes('为什么天空是蓝色的')
+const hasGoogle = /google\./i.test(text)
+const hasExcerptMarker = text.includes('页面摘录')
+const hasEvidenceHeader = text.includes('已完成「打开谷歌')
 console.log('证据检查：')
-console.log('  第五条标题出现:', hasFifth, hasFifth ? `（${fifthLine}）` : '（回复里没有「热搜第五条：」行）')
-console.log('  详情页 URL 出现:', hasDetailUrl)
-console.log('  「正文摘录」标记出现:', hasExcerptMarker)
+console.log('  谷歌地址出现:', hasGoogle)
+console.log('  问题出现:', hasQuestion, hasQuestion && questionLine !== '' ? `（${questionLine}）` : '')
+console.log('  「页面摘录」标记出现:', hasExcerptMarker)
 console.log('  证据收尾开头出现:', hasEvidenceHeader)
 
-// 把含证据的片段打出来
-if (hasFifth || hasExcerptMarker) {
-  const idx = Math.max(text.lastIndexOf('热搜第五条'), text.lastIndexOf('正文摘录'))
+if (hasQuestion || hasExcerptMarker) {
+  const idx = Math.max(text.lastIndexOf('问题：'), text.lastIndexOf('页面摘录'))
   console.log('\n--- 证据片段（前后各 600 字）---')
   console.log(text.slice(Math.max(0, idx - 600), idx + 600))
 } else {

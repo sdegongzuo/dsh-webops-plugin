@@ -34,6 +34,9 @@ import type {
   BrowserObserveRequest,
   BrowserOpenRequest,
   BrowserProvider,
+  BrowserRevalidateFailure,
+  BrowserRevalidateRequest,
+  BrowserRevalidateResult,
   BrowserSession,
   BrowserScreenshot,
   BrowserSnapshot,
@@ -43,8 +46,16 @@ import type {
 } from '../browser/types.ts'
 import { RefRegistry } from './refs.ts'
 import type { RefTarget } from './refs.ts'
-import { buildOutline, DEFAULT_SNAPSHOT_LIMITS, renderOutline, resolveSnapshotLimits } from './snapshot.ts'
-import type { AxNode, SnapshotLimits } from './snapshot.ts'
+import {
+  boundsToBox,
+  boxesIntersect,
+  buildOutline,
+  DEFAULT_SNAPSHOT_LIMITS,
+  filterAxTreeByBackendIds,
+  renderOutline,
+  resolveSnapshotLimits,
+} from './snapshot.ts'
+import type { AxNode, BoxRect, SnapshotLimits } from './snapshot.ts'
 import { HttpCdpTransport } from './protocol.ts'
 import type { CdpConnection, CdpTarget, CdpTransport } from './protocol.ts'
 import { ConsoleCollector, CONSOLE_RING_CAPACITY } from './console.ts'
@@ -74,6 +85,10 @@ export interface CdpProviderConfig {
   readonly snapshotLimits?: SnapshotLimits
   /** `wait` 类操作里 text / hidden 条件的默认超时（毫秒）。 */
   readonly waitTimeoutMs?: number
+  /** `until: 'stable'` 的 DOM/网络安静窗口（毫秒）。默认 500。 */
+  readonly stableQuietWindowMs?: number
+  /** `until: 'stable'` 网络忙宽限期（毫秒）。默认 3000。 */
+  readonly stableNetworkGraceMs?: number
 }
 
 /** 配置补齐默认值之后的样子。 */
@@ -85,6 +100,8 @@ interface ResolvedConfig {
   readonly probeTtlMs: number
   readonly snapshotLimits: SnapshotLimits
   readonly waitTimeoutMs: number
+  readonly stableQuietWindowMs: number
+  readonly stableNetworkGraceMs: number
 }
 
 const DEFAULT_CONFIG: ResolvedConfig = {
@@ -95,10 +112,15 @@ const DEFAULT_CONFIG: ResolvedConfig = {
   probeTtlMs: 1_000,
   snapshotLimits: DEFAULT_SNAPSHOT_LIMITS,
   waitTimeoutMs: 10_000,
+  stableQuietWindowMs: 500,
+  stableNetworkGraceMs: 3_000,
 }
 
-/** `wait` 的纯等待上限（毫秒）；再长就是部署配错了。 */
+/** `wait` 的纯等待上限（毫秒）；再长就是部署配错了。`until: 'stable'` 默认也用这个。 */
 export const MAX_WAIT_TIME_MS = 30_000
+
+/** `until: 'stable'` 连续安静窗口数（每个窗口 {@link ResolvedConfig.stableQuietWindowMs}）。 */
+const STABLE_QUIET_WINDOWS = 2
 
 /** click / press 落地后探测「地址是否变了」的窗口（毫秒）。 */
 export const MUTATION_NAVIGATION_POLL_MS = 800
@@ -204,6 +226,37 @@ interface AxTreeResult {
   readonly nodes?: readonly AxNode[]
 }
 
+/** `Page.getFrameTree` 的返回体；只要主 frame 的 `loaderId`。 */
+interface FrameTreeResult {
+  readonly frameTree?: { readonly frame?: { readonly loaderId?: string } }
+}
+
+/** `Page.getLayoutMetrics` 的视口矩形。 */
+interface LayoutViewportMetrics {
+  readonly pageX?: number
+  readonly pageY?: number
+  readonly clientWidth?: number
+  readonly clientHeight?: number
+}
+
+interface LayoutMetricsResult {
+  readonly visualViewport?: LayoutViewportMetrics
+  readonly cssVisualViewport?: LayoutViewportMetrics
+  readonly layoutViewport?: LayoutViewportMetrics
+  readonly cssLayoutViewport?: LayoutViewportMetrics
+}
+
+/** `DOMSnapshot.captureSnapshot` 的布局树。 */
+interface CaptureSnapshotResult {
+  readonly documents?: readonly {
+    readonly nodes?: { readonly backendNodeId?: readonly number[] }
+    readonly layout?: {
+      readonly nodeIndex?: readonly number[]
+      readonly bounds?: readonly (readonly number[])[]
+    }
+  }[]
+}
+
 /** `DOM.resolveNode` 的返回体。 */
 interface ResolveNodeResult {
   readonly object?: { readonly objectId?: string }
@@ -254,6 +307,8 @@ export class CdpBrowserProvider implements BrowserProvider {
       probeTtlMs: config.probeTtlMs ?? DEFAULT_CONFIG.probeTtlMs,
       snapshotLimits: config.snapshotLimits ?? DEFAULT_CONFIG.snapshotLimits,
       waitTimeoutMs: config.waitTimeoutMs ?? DEFAULT_CONFIG.waitTimeoutMs,
+      stableQuietWindowMs: config.stableQuietWindowMs ?? DEFAULT_CONFIG.stableQuietWindowMs,
+      stableNetworkGraceMs: config.stableNetworkGraceMs ?? DEFAULT_CONFIG.stableNetworkGraceMs,
     }
     this.transport = transport ?? new HttpCdpTransport(this.config.endpoint, {
       requestTimeoutMs: this.config.requestTimeoutMs,
@@ -463,8 +518,46 @@ export class CdpBrowserProvider implements BrowserProvider {
   async observe(request: BrowserObserveRequest, signal?: AbortSignal): Promise<BrowserObservation> {
     const session = this.require(request.sessionId)
     return request.kind === 'snapshot'
-      ? this.snapshot(session, signal, request.maxLines)
+      ? this.snapshot(session, signal, request.maxLines, request.region)
       : this.screenshot(session, request.ref, request.fullPage ?? false, signal)
+  }
+
+  /**
+   * 把旧纪元的 ref 精确装回当前纪元。
+   *
+   * 顺序不能乱：先比对归档 `loaderId` 与当前主 frame `loaderId`，对不上直接拒绝、
+   * **不**发 `DOM.resolveNode` —— 导航后 backendNodeId 会重新编号，对上号再核对
+   * role/name 仍可能静默命中新文档里的另一个「下一页」按钮。
+   */
+  async revalidate(request: BrowserRevalidateRequest, signal?: AbortSignal): Promise<BrowserRevalidateResult> {
+    const session = this.require(request.sessionId)
+    if (!session.refs.observed) {
+      throw new BrowserError(
+        'this session has never been observed; run webpage_snapshot first',
+        'BROWSER_SNAPSHOT_REQUIRED',
+      )
+    }
+    const loaderId = await this.readMainLoaderId(session, signal)
+    const restored: { ref: string; role: string; name: string }[] = []
+    const failed: BrowserRevalidateFailure[] = []
+    const pending: RefTarget[] = []
+    for (const ref of request.refs) {
+      const outcome = await this.revalidateOne(session, ref, loaderId, signal)
+      if (outcome.ok) {
+        restored.push({ ref: outcome.target.ref, role: outcome.target.role, name: outcome.target.name })
+        if (outcome.restore) pending.push(outcome.target)
+      } else {
+        failed.push({ ref, reason: outcome.reason })
+      }
+    }
+    if (pending.length > 0) session.refs.restore(pending)
+    return {
+      kind: 'revalidate',
+      sessionId: session.targetId,
+      epoch: session.refs.currentEpoch,
+      restored,
+      failed,
+    }
   }
 
   /** @inheritdoc */
@@ -959,15 +1052,56 @@ export class CdpBrowserProvider implements BrowserProvider {
    * 预算一起抬，否则只抬一半会「我调大了还是截断」。长文页默认 800 行必截，这是报告 S3 的
    * 原始问题 —— 现在模型可以自己要求多看几屏）。
    */
-  private async snapshot(session: SessionState, signal?: AbortSignal, maxLines?: number): Promise<BrowserSnapshot> {
-    const tree = await session.connection.send<AxTreeResult>(
-      'Accessibility.getFullAXTree',
-      {},
-      { signal, timeoutMs: this.config.commandTimeoutMs },
-    )
-    const outline = buildOutline(tree.nodes ?? [], resolveSnapshotLimits(this.config.snapshotLimits, maxLines))
-    // publish 会把纪元推进一格：上一次 snapshot 的 ref 从此作废。
-    const publication = session.refs.publish(outline.rows, outline.truncated)
+  private async snapshot(
+    session: SessionState,
+    signal?: AbortSignal,
+    maxLines?: number,
+    region?: Extract<BrowserObserveRequest, { kind: 'snapshot' }>['region'],
+  ): Promise<BrowserSnapshot> {
+    const options = { signal, timeoutMs: this.config.commandTimeoutMs }
+    const regionKinds = [
+      region?.ref !== undefined,
+      region?.viewport === true,
+      region?.box !== undefined,
+    ].filter(Boolean).length
+    if (regionKinds > 1) {
+      throw new BrowserError(
+        'region.ref, region.viewport and region.box are mutually exclusive; pass exactly one',
+        'BROWSER_PROTOCOL_ERROR',
+      )
+    }
+    const regional = regionKinds === 1
+    let nodes: readonly AxNode[]
+    let outsideRegion: number | undefined
+    if (region?.ref !== undefined) {
+      const target = session.refs.resolve(region.ref)
+      const partial = await session.connection.send<AxTreeResult>(
+        'Accessibility.getPartialAXTree',
+        { backendNodeId: target.backendNodeId },
+        options,
+      )
+      nodes = partial.nodes ?? []
+      const full = await session.connection.send<AxTreeResult>('Accessibility.getFullAXTree', {}, options)
+      const fullRows = buildOutline(full.nodes ?? [], resolveSnapshotLimits(this.config.snapshotLimits, maxLines)).rows.length
+      const partRows = buildOutline(nodes, resolveSnapshotLimits(this.config.snapshotLimits, maxLines)).rows.length
+      outsideRegion = Math.max(0, fullRows - partRows)
+    } else if (region?.viewport === true || region?.box !== undefined) {
+      const full = await session.connection.send<AxTreeResult>('Accessibility.getFullAXTree', {}, options)
+      const keep = await this.backendIdsInRegion(session, region, signal)
+      nodes = filterAxTreeByBackendIds(full.nodes ?? [], keep)
+      const limits = resolveSnapshotLimits(this.config.snapshotLimits, maxLines)
+      const fullRows = buildOutline(full.nodes ?? [], limits).rows.length
+      const partRows = buildOutline(nodes, limits).rows.length
+      outsideRegion = Math.max(0, fullRows - partRows)
+    } else {
+      const tree = await session.connection.send<AxTreeResult>('Accessibility.getFullAXTree', {}, options)
+      nodes = tree.nodes ?? []
+    }
+    const outline = buildOutline(nodes, resolveSnapshotLimits(this.config.snapshotLimits, maxLines))
+    const loaderId = regional ? undefined : await this.readMainLoaderId(session, signal)
+    const publication = regional
+      ? session.refs.adopt(outline.rows)
+      : session.refs.publish(outline.rows, outline.truncated, loaderId)
     const meta = await this.readPageMeta(session.connection, signal)
     if (meta !== undefined) {
       session.url = meta.url
@@ -989,6 +1123,7 @@ export class CdpBrowserProvider implements BrowserProvider {
       ...outline.truncated ? { droppedElements: outline.droppedElements } : {},
       ...outline.foldedRepeats > 0 ? { foldedRepeats: outline.foldedRepeats } : {},
       ...outline.dedupedLines > 0 ? { dedupedLines: outline.dedupedLines } : {},
+      ...outsideRegion !== undefined ? { outsideRegion } : {},
       // 人工接管只加提示，**不动 epoch** —— 开合 DevTools 不该作废模型的 ref（[V31]）。
       ...session.takeover ? { takeover: true } : {},
     }
@@ -1084,6 +1219,122 @@ export class CdpBrowserProvider implements BrowserProvider {
    * 节点已销毁时 Chrome 回 CDP 错误（原样上抛，由调用方决定映射）；返回体里缺
    * `objectId` 时返回 `undefined` —— 两种「拿不到句柄」的形态要分开处理。
    */
+  /** 按需读主 frame `loaderId`；读不到就当身份未知，revalidate 会拒绝而不是误绑。 */
+  private async readMainLoaderId(session: SessionState, signal?: AbortSignal): Promise<string | undefined> {
+    try {
+      const tree = await session.connection.send<FrameTreeResult>(
+        'Page.getFrameTree',
+        {},
+        { signal, timeoutMs: this.config.commandTimeoutMs },
+      )
+      const loaderId = tree.frameTree?.frame?.loaderId
+      return typeof loaderId === 'string' && loaderId.length > 0 ? loaderId : undefined
+    } catch (error: unknown) {
+      if (error instanceof BrowserError
+        && (error.code === 'BROWSER_DEBUGGER_DETACHED' || error.code === 'BROWSER_CONNECTION_LOST')) {
+        throw error
+      }
+      return undefined
+    }
+  }
+
+  /**
+   * 恢复一条 ref。当前表命中直接算成功；归档命中才走 loaderId → resolveNode → role/name。
+   */
+  private async revalidateOne(
+    session: SessionState,
+    ref: string,
+    loaderId: string | undefined,
+    signal?: AbortSignal,
+  ): Promise<
+    | { ok: true; target: RefTarget; restore: boolean }
+    | { ok: false; reason: BrowserRevalidateFailure['reason'] }
+  > {
+    try {
+      const current = session.refs.resolve(ref)
+      return { ok: true, target: current, restore: false }
+    } catch (error: unknown) {
+      if (error instanceof BrowserError && error.code === 'BROWSER_SNAPSHOT_REQUIRED') throw error
+      if (!(error instanceof BrowserError) || error.code !== 'BROWSER_STALE_REF') throw error
+    }
+    const archived = session.refs.archived(ref)
+    if (archived === undefined) return { ok: false, reason: 'not_archived' }
+    // 文档身份是第一道门：对不上就停，不看 backendNodeId。
+    if (archived.loaderId === undefined || loaderId === undefined || archived.loaderId !== loaderId) {
+      return { ok: false, reason: 'document_changed' }
+    }
+    const options = { signal, timeoutMs: this.config.commandTimeoutMs }
+    let objectId: string | undefined
+    try {
+      objectId = await this.resolveNodeObjectId(session, archived.target.backendNodeId, signal)
+    } catch (error: unknown) {
+      if (error instanceof BrowserError
+        && (error.code === 'BROWSER_DEBUGGER_DETACHED' || error.code === 'BROWSER_CONNECTION_LOST')) {
+        throw error
+      }
+      return { ok: false, reason: 'node_gone' }
+    }
+    if (objectId === undefined) return { ok: false, reason: 'node_gone' }
+    try {
+      const connected = await session.connection.send<EvaluateResult>(
+        'Runtime.callFunctionOn',
+        { objectId, functionDeclaration: 'function () { return this.isConnected; }', returnByValue: true },
+        options,
+      )
+      if (connected.result?.value !== true) return { ok: false, reason: 'node_gone' }
+    } finally {
+      this.releaseObject(session, objectId, signal)
+    }
+    const partial = await session.connection.send<AxTreeResult>(
+      'Accessibility.getPartialAXTree',
+      { backendNodeId: archived.target.backendNodeId },
+      options,
+    )
+    const live = axIdentity(partial.nodes ?? [], archived.target.backendNodeId)
+    if (live === undefined
+      || live.role !== archived.target.role
+      || live.name !== archived.target.name) {
+      return { ok: false, reason: 'identity_mismatch' }
+    }
+    return { ok: true, target: archived.target, restore: true }
+  }
+
+  /** 视口 / 几何矩形：用一次 captureSnapshot 的布局盒与区域求交，得到 backendNodeId 集合。 */
+  private async backendIdsInRegion(
+    session: SessionState,
+    region: { readonly viewport?: boolean; readonly box?: BoxRect },
+    signal?: AbortSignal,
+  ): Promise<Set<number>> {
+    const options = { signal, timeoutMs: this.config.commandTimeoutMs }
+    let area: BoxRect | undefined = region.box
+    if (area === undefined) {
+      const metrics = await session.connection.send<LayoutMetricsResult>('Page.getLayoutMetrics', {}, options)
+      area = viewportBoxFromMetrics(metrics)
+    }
+    if (area === undefined) return new Set()
+    const captured = await session.connection.send<CaptureSnapshotResult>(
+      'DOMSnapshot.captureSnapshot',
+      { computedStyles: [] },
+      options,
+    )
+    const keep = new Set<number>()
+    for (const document of captured.documents ?? []) {
+      const ids = document.nodes?.backendNodeId ?? []
+      const indexes = document.layout?.nodeIndex ?? []
+      const bounds = document.layout?.bounds ?? []
+      for (let index = 0; index < indexes.length; index += 1) {
+        const nodeIndex = indexes[index]
+        const raw = bounds[index]
+        const box = raw === undefined ? undefined : boundsToBox(raw)
+        if (nodeIndex === undefined || box === undefined) continue
+        if (!boxesIntersect(area, box)) continue
+        const backend = ids[nodeIndex]
+        if (typeof backend === 'number') keep.add(backend)
+      }
+    }
+    return keep
+  }
+
   private async resolveNodeObjectId(
     session: SessionState,
     backendNodeId: number,
@@ -1380,7 +1631,7 @@ export class CdpBrowserProvider implements BrowserProvider {
     return { x: Math.round(size.width / 2), y: Math.round(size.height / 2) }
   }
 
-  /** 等待：timeMs（纯等待）/ text（页面出现某文本）/ ref（元素从文档里消失）三选一。 */
+  /** 等待：timeMs / text / ref / until:stable 四选一。 */
   private async wait(
     session: SessionState,
     request: Extract<BrowserMutationRequest, { kind: 'wait' }>,
@@ -1389,15 +1640,21 @@ export class CdpBrowserProvider implements BrowserProvider {
     const wantsTime = request.timeMs !== undefined
     const wantsText = request.text !== undefined && request.text.length > 0
     const wantsRef = request.ref !== undefined
-    if ([wantsTime, wantsText, wantsRef].filter(chosen => chosen).length !== 1) {
+    const wantsStable = request.until === 'stable'
+    if ([wantsTime, wantsText, wantsRef, wantsStable].filter(chosen => chosen).length !== 1) {
       throw new BrowserError(
-        'webpage_wait needs exactly one of time_ms, text, or ref',
+        'webpage_wait needs exactly one of time_ms, text, ref, or until',
         'BROWSER_PROTOCOL_ERROR',
       )
     }
     const beforeUrl = session.url
     let satisfied = true
-    if (request.timeMs !== undefined) {
+    let signals: BrowserMutationResult['signals']
+    if (wantsStable) {
+      const outcome = await this.waitUntilStable(session, request.timeoutMs, signal)
+      satisfied = outcome.satisfied
+      signals = outcome.signals
+    } else if (request.timeMs !== undefined) {
       if (!(request.timeMs > 0) || request.timeMs > MAX_WAIT_TIME_MS) {
         throw new BrowserError(
           `webpage_wait time_ms must be between 1 and ${String(MAX_WAIT_TIME_MS)}`,
@@ -1441,7 +1698,92 @@ export class CdpBrowserProvider implements BrowserProvider {
       }
     }
     const result = await this.settleMutation(session, 'wait', beforeUrl, false, signal)
-    return { ...result, satisfied }
+    return { ...result, satisfied, ...signals !== undefined ? { signals } : {} }
+  }
+
+  /**
+   * `until: 'stable'`：readyState complete 是前置，DOM 连续两个安静窗口，
+   * 网络 inflight==0 或已忙过宽限期。超时如实报 signals，不把慢页谎成稳定。
+   */
+  private async waitUntilStable(
+    session: SessionState,
+    timeoutMs: number | undefined,
+    signal?: AbortSignal,
+  ): Promise<{ satisfied: boolean; signals: NonNullable<BrowserMutationResult['signals']> }> {
+    const deadlineMs = timeoutMs ?? MAX_WAIT_TIME_MS
+    if (!(deadlineMs > 0) || deadlineMs > MAX_WAIT_TIME_MS) {
+      throw new BrowserError(
+        `webpage_wait timeout_ms must be between 1 and ${String(MAX_WAIT_TIME_MS)}`,
+        'BROWSER_PROTOCOL_ERROR',
+      )
+    }
+    const windowMs = this.config.stableQuietWindowMs
+    const graceMs = this.config.stableNetworkGraceMs
+    await this.evaluateDomQuietInstall(session, signal)
+    let quietStreak = 0
+    let networkBusySince: number | undefined
+    let signals: NonNullable<BrowserMutationResult['signals']> = {
+      readyState: 'loading',
+      dom: 'busy',
+      network: 'busy',
+    }
+    const deadline = Date.now() + deadlineMs
+    for (;;) {
+      const ready = await this.evaluateReadyComplete(session, signal)
+      const mutations = await this.evaluateDomQuietRead(session, signal)
+      if (mutations === 0) quietStreak += 1
+      else quietStreak = 0
+      const inflight = session.networkCollector.inflight
+      if (inflight > 0) networkBusySince ??= Date.now()
+      else networkBusySince = undefined
+      const networkQuiet = inflight === 0
+      const networkOk = networkQuiet
+        || (networkBusySince !== undefined && Date.now() - networkBusySince >= graceMs)
+      signals = {
+        readyState: ready ? 'complete' : 'loading',
+        dom: quietStreak >= STABLE_QUIET_WINDOWS ? 'quiet' : 'busy',
+        network: networkQuiet ? 'quiet' : 'busy',
+      }
+      if (ready && quietStreak >= STABLE_QUIET_WINDOWS && networkOk) {
+        return { satisfied: true, signals }
+      }
+      const remaining = deadline - Date.now()
+      if (remaining <= 0) return { satisfied: false, signals }
+      await delay(Math.min(windowMs, remaining), signal)
+    }
+  }
+
+  private async evaluateReadyComplete(session: SessionState, signal?: AbortSignal): Promise<boolean> {
+    const evaluated = await session.connection.send<EvaluateResult>(
+      'Runtime.evaluate',
+      { expression: 'document.readyState === "complete"', returnByValue: true },
+      { signal, timeoutMs: this.config.commandTimeoutMs },
+    )
+    return evaluated.result?.value === true
+  }
+
+  private async evaluateDomQuietInstall(session: SessionState, signal?: AbortSignal): Promise<void> {
+    await session.connection.send<EvaluateResult>(
+      'Runtime.evaluate',
+      {
+        expression: '(() => { const g = globalThis; if (g.__dsh_mut_installed === true) return true; try { g.__dsh_mut_count = 0; new MutationObserver(() => { g.__dsh_mut_count = (g.__dsh_mut_count ?? 0) + 1 }).observe(document.documentElement || document, { subtree: true, childList: true, attributes: true, characterData: true }); g.__dsh_mut_installed = true; return true } catch { return false } })()',
+        returnByValue: true,
+      },
+      { signal, timeoutMs: this.config.commandTimeoutMs },
+    )
+  }
+
+  private async evaluateDomQuietRead(session: SessionState, signal?: AbortSignal): Promise<number> {
+    const evaluated = await session.connection.send<EvaluateResult>(
+      'Runtime.evaluate',
+      {
+        expression: '(() => { const g = globalThis; const n = Number(g.__dsh_mut_count ?? 0); g.__dsh_mut_count = 0; return n })()',
+        returnByValue: true,
+      },
+      { signal, timeoutMs: this.config.commandTimeoutMs },
+    )
+    const value = evaluated.result?.value
+    return typeof value === 'number' && Number.isFinite(value) ? value : 0
   }
 
   /**
@@ -1895,6 +2237,35 @@ function delay(ms: number, signal?: AbortSignal): Promise<void> {
     }
     signal.addEventListener('abort', onAbort, { once: true })
   })
+}
+
+/** 从 AX 节点读出与 snapshot 同一口径的 role/name，供 revalidate 核对。 */
+function axIdentity(nodes: readonly AxNode[], backendNodeId: number): { role: string; name: string } | undefined {
+  const node = nodes.find(item => item.backendDOMNodeId === backendNodeId) ?? nodes[0]
+  if (node === undefined) return undefined
+  const roleRaw = node.role?.value
+  const role = (typeof roleRaw === 'string' ? roleRaw : 'generic').toLowerCase()
+  const nameRaw = node.name?.value
+  const name = typeof nameRaw === 'string' ? clipObservedName(nameRaw) : ''
+  return { role, name }
+}
+
+function clipObservedName(raw: string): string {
+  const text = raw.replace(/\s+/gu, ' ').trim()
+  const max = DEFAULT_SNAPSHOT_LIMITS.maxTextLength
+  return text.length <= max ? text : `${text.slice(0, max - 1)}…`
+}
+
+function viewportBoxFromMetrics(metrics: LayoutMetricsResult): BoxRect | undefined {
+  const view = metrics.cssVisualViewport
+    ?? metrics.visualViewport
+    ?? metrics.cssLayoutViewport
+    ?? metrics.layoutViewport
+  if (view === undefined) return undefined
+  const width = view.clientWidth
+  const height = view.clientHeight
+  if (typeof width !== 'number' || typeof height !== 'number') return undefined
+  return { x: view.pageX ?? 0, y: view.pageY ?? 0, width, height }
 }
 
 /**

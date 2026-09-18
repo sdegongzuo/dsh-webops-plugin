@@ -6,7 +6,7 @@
 
 `dsh-webops-plugin` 的浏览器工具链（webpage_open / snapshot / execute / find / click / tabs）在**真实网页**上跑通「弹窗转标签收编」全链路：
 
-1. fake-llm（脚本回放，不花钱）驱动 agent 打开百度 → 读热搜榜 → **点击第五条**（target=_blank → 弹窗）
+1. fake-llm（脚本回放，不花钱）驱动 agent 打开**谷歌首页** → **点击 AI 模式** → **提问「为什么天空是蓝色的」**
 2. 宿主 host.cjs 把弹窗转成新标签（t2），dom-ready 后发 `{type:'opened'}` 通报
 3. provider `adoptSession` 收编 t2 进会话注册表 → `webpage_tabs list` 必须列出 `t2 [foreground]`
 4. 在 t2 上读正文 → fake-llm 收尾轮从轨迹抽证据（第五条标题 / 详情页 URL / 正文摘录）拼成**可见回复**
@@ -30,7 +30,7 @@ for i in $(seq 1 24); do curl -s --max-time 2 http://127.0.0.1:9222/json/version
 #    就绪后再 sleep 15（等插件装配完成）
 
 # ⑤ 跑端到端验证：
-VERIFY_MESSAGE="打开百度，点击热搜榜第五条，读取详情内容" pnpm run verify:card
+VERIFY_MESSAGE="打开谷歌首页，点击 AI 模式，问：为什么天空是蓝色的" pnpm run verify:card
 ```
 
 ## 3. 判定标准（什么算 PASS）
@@ -38,7 +38,7 @@ VERIFY_MESSAGE="打开百度，点击热搜榜第五条，读取详情内容" pn
 verify:card 输出依次要看到：
 
 ```
-verify-card: 工具卡片 webpage_open → state=ok url=https://www.baidu.com/   ← URL 必须是 baidu
+verify-card: 工具卡片 webpage_open → state=ok url=https://www.google.com/…  ← URL 必须是 google
 verify-card: 工具卡片 webpage_snapshot → state=ok
 verify-card: 工具卡片 webpage_execute → state=ok
 verify-card: 工具卡片 webpage_find → state=ok                              ← 本轮应 >0 matches
@@ -74,7 +74,7 @@ verify-card: PASS —— ...
 | 文件 | 作用 |
 |---|---|
 | `scripts/verify-card.mjs` | 端到端验证脚本（新会话→注入→轮询卡片→t2 断言→截图） |
-| `src/fake-llm/index.ts` | 脚本化模型回放：8 轮真实任务流 + detailDigest 动态收尾 + digest 失败打点。**`apply` 有 `DSH_FAKE_LLM=1` 闸门，默认哑**；patch 行在开发专用 `cordis.fake-llm.patch.yml` |
+| `src/fake-llm/index.ts` | 脚本化模型回放：打开谷歌 → 点 AI 模式 → fill 提问 + `googleDigest` 动态收尾。**`apply` 有 `DSH_FAKE_LLM=1` 闸门，默认哑**；patch 行在开发专用 `cordis.fake-llm.patch.yml` |
 | `src/browser-electron/host.cjs` | 弹窗 `openTab(url, undefined, { announce: true })` → opened 通报 |
 | `src/browser-electron/bridge.ts` | `onTabOpened` 通报分发（无 command id 的 `{type:'opened'}` 分支） |
 | `src/browser-electron/provider.ts` | `adoptSession` 收编（先登记后等加载，防 click→tabs 竞态） |

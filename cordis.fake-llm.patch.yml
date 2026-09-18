@@ -15,7 +15,8 @@
 #     - id: fake-llm
 #       name: 'dsh-webops-plugin/fake-llm'
 #       config:
-#         url: 'https://example.com/'
+#         url: 'https://www.google.com/?hl=zh-CN'
+#         question: '为什么天空是蓝色的'
 #         fallbackText: '（脚本走完，这是兜底回复。）'
 
 - insert:

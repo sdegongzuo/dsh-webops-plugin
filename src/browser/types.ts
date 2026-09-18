@@ -184,6 +184,8 @@ export interface BrowserSnapshot {
    * 缺省 = 未知 / 无接管；直连外部 Chrome 的 provider 不实现这条通道，恒为 `undefined`。
    */
   readonly takeover?: boolean
+  /** 区域快照：区域外还有几个可操作元素。与 foldedRepeats 口径独立。 */
+  readonly outsideRegion?: number
 }
 
 /** 截图。字节落盘走 `ctx.attachments.saveImage`，消息里只留引用。 */
@@ -210,6 +212,15 @@ export type BrowserObserveRequest =
      * 长文页默认会被截断，调大它可以多看几屏 —— 代价是上下文预算。
      */
     readonly maxLines?: number
+    /**
+     * 区域快照。三种形态互斥：`ref` 子树 / `viewport: true` / `box`。
+     * 区域快照走 adopt（不换表），全页快照仍走 publish。
+     */
+    readonly region?: {
+      readonly ref?: string
+      readonly viewport?: boolean
+      readonly box?: { readonly x: number; readonly y: number; readonly width: number; readonly height: number }
+    }
   }
   | {
     readonly kind: 'screenshot'
@@ -253,6 +264,13 @@ export type BrowserMutationRequest =
     readonly text?: string
     /** 等该 ref 的元素从文档里消失（spinner 消失之类）。 */
     readonly ref?: string
+    /**
+     * 等页面安静（readyState complete + DOM 静默 + 网络静默或已超宽限期）。
+     * 与 time_ms / text / ref 四选一；`timeoutMs` 只覆盖本模式的 deadline。
+     */
+    readonly until?: 'stable'
+    /** `until: 'stable'` 的 deadline（毫秒）；默认与 `MAX_WAIT_TIME_MS` 对齐。 */
+    readonly timeoutMs?: number
   }
 
 /** 一次页面操作的结果。 */
@@ -271,6 +289,15 @@ export interface BrowserMutationResult {
   readonly navigated: boolean
   /** wait 独有：条件是否在超时前成立（超时为 false，不是错误）。 */
   readonly satisfied?: boolean
+  /**
+   * `until: 'stable'` 独有：各信号是否安静。超时也如实报，不把慢页面谎成稳定。
+   * 不暴露页面探针的全局名。
+   */
+  readonly signals?: {
+    readonly readyState: 'complete' | 'loading'
+    readonly dom: 'quiet' | 'busy'
+    readonly network: 'quiet' | 'busy'
+  }
   /**
    * 本次操作**新接管**的标签页：页面自己开了新窗口（`target=_blank` 链接、`window.open`），
    * 宿主把它收编成了同窗口里的新受控会话。
@@ -452,6 +479,34 @@ export interface BrowserLocateRequest {
   readonly scroll?: boolean
 }
 
+/** `webpage_revalidate`：把旧纪元的 ref 精确装回当前纪元。 */
+export interface BrowserRevalidateRequest {
+  readonly sessionId: string
+  /** 要恢复的 ref；单个 ref 做成一元素数组。 */
+  readonly refs: readonly string[]
+}
+
+/** 一条没能精确恢复的 ref。 */
+export type BrowserRevalidateFailureReason =
+  | 'not_archived'
+  | 'document_changed'
+  | 'node_gone'
+  | 'identity_mismatch'
+
+export interface BrowserRevalidateFailure {
+  readonly ref: string
+  readonly reason: BrowserRevalidateFailureReason
+}
+
+/** `webpage_revalidate` 的结果：成功的同号装回，失败的按条说明原因。 */
+export interface BrowserRevalidateResult {
+  readonly kind: 'revalidate'
+  readonly sessionId: string
+  readonly epoch: number
+  readonly restored: readonly BrowserRef[]
+  readonly failed: readonly BrowserRevalidateFailure[]
+}
+
 /** `webpage_locate` 的结果：视口坐标（语义与 click 的落点计算一致）。 */
 export interface BrowserLocateResult {
   readonly kind: 'locate'
@@ -498,6 +553,11 @@ export interface BrowserProvider {
    * （方案 4.4 的硬要求）—— 「现算」配合 `isConnected` 守卫才是 ref 失效的真正兜底。
    */
   locate(request: BrowserLocateRequest, signal?: AbortSignal): Promise<BrowserLocateResult>
+  /**
+   * 把旧纪元的 ref 精确装回当前纪元（同一文档、同一 backendNodeId、role/name 仍一致）。
+   * `resolve` 仍然对旧号报 stale；成功的号与 snapshot 当时相同。
+   */
+  revalidate(request: BrowserRevalidateRequest, signal?: AbortSignal): Promise<BrowserRevalidateResult>
   /** 归还一个会话：关闭它的标签页并释放连接。 */
   close(sessionId: string): Promise<void>
   /** 释放 provider 持有的全部资源（连接、标签页、进程）。可省略。 */

@@ -33,6 +33,7 @@ import { cpSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } fr
 import { createRequire } from 'node:module'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
+import { applyLocalLlmKey } from '../src/local-llm-credentials.ts'
 
 const PLUGIN_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const REPO_ROOT = resolve(PLUGIN_ROOT, '..', 'deepseek-harness')
@@ -173,6 +174,16 @@ async function main() {
   // 宿主注入的 ELECTRON_RUN_AS_NODE 会让 electron.exe 退化成纯 Node，窗口起不来。
   delete environment.ELECTRON_RUN_AS_NODE
   environment.DSH_HOME = resolve(process.env.DSH_HOME ?? join(DEVELOPMENT_ROOT, 'home'))
+  // 复用便携版 app 同级 home\.credentials.yaml 里已经填过的 key
+  // （DSH_PORTABLE_ROOT=<解压根>，或 DSH_HOME 本身就是那个 home）。
+  // 只注入子进程 env，不写进开发态 home，更不写进发版包。不读 ~/.dsh。
+  const localKey = applyLocalLlmKey(environment)
+  if (localKey !== undefined) {
+    const where = localKey.source === 'env' ? '环境变量' : 'app 同级 home'
+    console.log(`dev-desktop: 复用 ${localKey.name}（${where}，不进发版包）`)
+  } else {
+    console.log('dev-desktop: 便携 home 里没有 LLM key，keyless 验证走 fake-llm')
+  }
   environment.DSH_DESKTOP_HOST_INSPECT_PORT = String(PORTS.host)
   environment.DSH_DESKTOP_NODE_BINARY = process.execPath
   environment.DSH_DESKTOP_OPEN_DEVTOOLS ??= '0'

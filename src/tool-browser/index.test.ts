@@ -185,6 +185,16 @@ function mount(): Harness {
           inViewport: true,
         })
       },
+      revalidate: (args: { sessionId: string; refs: string[] }) => {
+        browserCalls.push({ method: 'revalidate', args })
+        return Promise.resolve({
+          kind: 'revalidate',
+          sessionId: args.sessionId,
+          epoch: 4,
+          restored: args.refs.map(ref => ({ ref, role: 'button', name: 'Submit' })),
+          failed: [],
+        })
+      },
       // P2 三工具的桩：返回最小合法结果，让转发与 schema 校验有东西可断言。
       console: (args: unknown) => {
         browserCalls.push({ method: 'console', args })
@@ -279,6 +289,7 @@ describe('registration', () => {
       'webpage_network',
       'webpage_open',
       'webpage_press',
+      'webpage_revalidate',
       'webpage_screenshot',
       'webpage_scroll',
       'webpage_snapshot',
@@ -301,6 +312,7 @@ describe('registration', () => {
       // P3：find 是纯本地检索；locate 只观察（scrollIntoView 是观察辅助，不是页面操作）。
       webpage_find: 'read',
       webpage_locate: 'read',
+      webpage_revalidate: 'read',
       webpage_tabs: 'mutate',
       webpage_click: 'mutate',
       webpage_fill: 'mutate',
@@ -327,6 +339,7 @@ describe('registration', () => {
     expect(text).toContain('untrusted')
     expect(text).toContain('BROWSER_STALE_REF')
     expect(text).toContain('webpage_snapshot')
+    expect(text).toContain('webpage_revalidate')
   })
 
   it('contributes nothing to the prompt when the tools are not visible in that scope', () => {
@@ -345,7 +358,7 @@ describe('registration', () => {
     apply(ctx, {
       snapshot: false, screenshot: false, tabs: false,
       click: false, fill: false, press: false, scroll: false, wait: false,
-      console: false, network: false, execute: false, find: false, locate: false,
+      console: false, network: false, execute: false, find: false, locate: false, revalidate: false,
     })
 
     expect([...tools.keys()].sort()).toEqual(['webpage_navigate', 'webpage_open'])
@@ -413,6 +426,46 @@ describe('argument and output contracts', () => {
     expect(text).toContain('valid only for this epoch')
     expect(text).toContain('untrusted')
   })
+
+  it('forwards webpage_revalidate refs and returns restored numbers', async () => {
+    const value = await tool(harness, 'webpage_revalidate').execute(
+      { session_id: 's1', refs: ['e1', 'e2'] },
+      exec(),
+    )
+    expect(harness.browserCalls).toEqual([
+      { method: 'revalidate', args: { sessionId: 's1', refs: ['e1', 'e2'] } },
+    ])
+    expect(value).toEqual({
+      session_id: 's1',
+      epoch: 4,
+      restored: [
+        { ref: 'e1', role: 'button', name: 'Submit' },
+        { ref: 'e2', role: 'button', name: 'Submit' },
+      ],
+      failed: [],
+    })
+  })
+
+  it('rejects combining region_ref with region_viewport', async () => {
+    await expect(tool(harness, 'webpage_snapshot').execute(
+      { session_id: 's1', region_ref: 'e1', region_viewport: true },
+      exec(),
+    )).rejects.toThrow(/mutually exclusive/u)
+  })
+
+  it('forwards region_viewport to observe', async () => {
+    await tool(harness, 'webpage_snapshot').execute(
+      { session_id: 's1', region_viewport: true },
+      exec(),
+    )
+    expect(harness.browserCalls).toEqual([
+      { method: 'observe', args: { kind: 'snapshot', sessionId: 's1', region: { viewport: true } } },
+    ])
+  })
+
+  it('tells click to recover via revalidate before a fresh snapshot', () => {
+    expect(String(tool(harness, 'webpage_click').description)).toContain('webpage_revalidate')
+  })
 })
 
 describe('webpage_tabs and the P1 mutation tools', () => {
@@ -477,6 +530,14 @@ describe('webpage_tabs and the P1 mutation tools', () => {
     const value = await tool(harness, 'webpage_wait').execute({ session_id: 's1', time_ms: 5 }, exec())
     expect(value).toMatchObject({ action: 'wait', satisfied: true })
     expect(harness.browserCalls).toEqual([{ method: 'mutate', args: { kind: 'wait', sessionId: 's1', timeMs: 5 } }])
+  })
+
+  it('wait until=stable forwards until and timeout_ms', async () => {
+    await tool(harness, 'webpage_wait').execute({ session_id: 's1', until: 'stable', timeout_ms: 20_000 }, exec())
+    expect(harness.browserCalls).toEqual([{
+      method: 'mutate',
+      args: { kind: 'wait', sessionId: 's1', until: 'stable', timeoutMs: 20_000 },
+    }])
   })
 
   it('renders a navigated mutation with the re-snapshot instruction', async () => {

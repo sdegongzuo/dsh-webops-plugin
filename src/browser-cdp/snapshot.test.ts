@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { buildOutline, DEFAULT_SNAPSHOT_LIMITS, MAX_SNAPSHOT_LINES, renderOutline, resolveSnapshotLimits } from './snapshot.ts'
+import { boundsToBox, boxesIntersect, buildOutline, DEFAULT_SNAPSHOT_LIMITS, filterAxTreeByBackendIds, MAX_SNAPSHOT_LINES, renderOutline, resolveSnapshotLimits } from './snapshot.ts'
 import type { AxNode, OutlineLine } from './snapshot.ts'
 import { RefRegistry } from './refs.ts'
 
@@ -40,11 +40,20 @@ describe('buildOutline', () => {
     expect(outline.lines.every(line => line.depth === 0)).toBe(true)
   })
 
+  it('skips transparent and timestamp-like ancestors on the semanticKey path', () => {
+    const outline = buildOutline([
+      node({ nodeId: 'g', role: { value: 'generic' }, childIds: ['dyn'] }),
+      node({ nodeId: 'dyn', role: { value: 'group' }, name: { value: '1710000000abc' }, childIds: ['b'] }),
+      node({ nodeId: 'b', role: { value: 'button' }, name: { value: 'Go' }, backendDOMNodeId: 1 }),
+    ])
+    expect(outline.rows).toEqual([{ role: 'button', name: 'Go', backendNodeId: 1, ancestorPath: '' }])
+  })
+
   it('assigns refs to actionable roles only', () => {
     const outline = buildOutline(PAGE)
     expect(outline.rows).toEqual([
-      { role: 'textbox', name: 'Email', backendNodeId: 4 },
-      { role: 'button', name: 'Sign in', backendNodeId: 5 },
+      { role: 'textbox', name: 'Email', backendNodeId: 4, ancestorPath: '' },
+      { role: 'button', name: 'Sign in', backendNodeId: 5, ancestorPath: '' },
     ])
   })
 
@@ -281,6 +290,19 @@ describe('buildOutline：重复折叠（2026-09-18 任务 1）', () => {
     expect(outline.unfoldedLines.map(line => line.text).filter(t => t.startsWith('button "翻译此页"'))).toHaveLength(12)
   })
 
+  it('semanticKey match-rate is 1.0 on two publishes of the same SERP tree (Step 1, write-only)', () => {
+    const outline = buildOutline(serp(5))
+    const keysA = new RefRegistry().publish(outline.rows, false).refs.map(row => row.semanticKey)
+    const keysB = new RefRegistry().publish(outline.rows, false).refs.map(row => row.semanticKey)
+    expect(keysA).toEqual(keysB)
+    expect(keysA.length).toBeGreaterThan(0)
+    // 5 条 SERP × 重复按钮：无名 listitem 被收成同一段祖先路径，所以「翻译此页」会共享 key。
+    // Step 1 只观测，不要求 unique === length。
+    const unique = new Set(keysA).size
+    expect(unique).toBeGreaterThan(0)
+    expect(unique).toBeLessThan(keysA.length)
+  })
+
   it('never folds statictext, even when the text repeats verbatim', () => {
     const nodes: AxNode[] = Array.from({ length: 8 }, (_unused, index) =>
       node({ nodeId: String(index), role: { value: 'StaticText' }, name: { value: '重复正文' } }))
@@ -434,7 +456,12 @@ describe('buildOutline：同名链去重（2026-09-18）', () => {
     expect(outline.droppedElements).toBe(0)
     expect(outline.foldedRepeats).toBe(0)
     // ref 照旧分配（去重只影响打印）。
-    expect(outline.rows).toEqual([{ role: 'link', name: 'Rust 官方文档', backendNodeId: 7 }])
+    expect(outline.rows).toEqual([{
+      role: 'link',
+      name: 'Rust 官方文档',
+      backendNodeId: 7,
+      ancestorPath: 'listitem>heading:Rust 官方文档',
+    }])
   })
 
   it('keeps every folded instance in the find outline, and nothing else', () => {
@@ -566,5 +593,33 @@ describe('buildOutline：同名链去重（2026-09-18）', () => {
     expect(outline.dedupedLines).toBe(0)
     // 两个 ref 都还在，两个都能点。
     expect(outline.rows).toHaveLength(2)
+  })
+})
+
+describe('geometry region helpers', () => {
+  it('turns a width/height bounds array and a quad into the same AABB', () => {
+    expect(boundsToBox([10, 20, 30, 40])).toEqual({ x: 10, y: 20, width: 30, height: 40 })
+    expect(boundsToBox([10, 20, 40, 20, 40, 60, 10, 60])).toEqual({ x: 10, y: 20, width: 30, height: 40 })
+  })
+
+  it('treats partial overlap as intersection and separated boxes as outside', () => {
+    const viewport = { x: 0, y: 0, width: 100, height: 100 }
+    expect(boxesIntersect(viewport, { x: 90, y: 90, width: 20, height: 20 })).toBe(true)
+    expect(boxesIntersect(viewport, { x: 100, y: 0, width: 10, height: 10 })).toBe(false)
+    expect(boxesIntersect(viewport, { x: -10, y: 40, width: 20, height: 20 })).toBe(true)
+  })
+
+  it('keeps in-region nodes and their ancestors, dropping out-of-region siblings', () => {
+    const tree: AxNode[] = [
+      node({ nodeId: '1', role: { value: 'RootWebArea' }, childIds: ['2'] }),
+      node({ nodeId: '2', role: { value: 'generic' }, childIds: ['3', '4'], backendDOMNodeId: 2 }),
+      node({ nodeId: '3', role: { value: 'button' }, name: { value: 'In' }, backendDOMNodeId: 8 }),
+      node({ nodeId: '4', role: { value: 'button' }, name: { value: 'Out' }, backendDOMNodeId: 9 }),
+    ]
+    const filtered = filterAxTreeByBackendIds(tree, new Set([8]))
+    expect(filtered.map(item => item.nodeId)).toEqual(['1', '2', '3'])
+    expect(filtered.find(item => item.nodeId === '2')?.childIds).toEqual(['3'])
+    const outline = buildOutline(filtered)
+    expect(outline.rows.map(row => row.name)).toEqual(['In'])
   })
 })

@@ -29,6 +29,8 @@ import type {
   BrowserObserveRequest,
   BrowserOpenRequest,
   BrowserProvider,
+  BrowserRevalidateRequest,
+  BrowserRevalidateResult,
   BrowserSession,
   BrowserTabsRequest,
   BrowserTabsResult,
@@ -55,6 +57,10 @@ export type {
   BrowserOpenRequest,
   BrowserProvider,
   BrowserRef,
+  BrowserRevalidateFailure,
+  BrowserRevalidateFailureReason,
+  BrowserRevalidateRequest,
+  BrowserRevalidateResult,
   BrowserScreenshot,
   BrowserSession,
   BrowserSnapshot,
@@ -201,6 +207,13 @@ export class BrowserRuntime extends Service {
    */
   async locate(request: BrowserLocateRequest, signal?: AbortSignal): Promise<BrowserLocateResult> {
     return this.resolve().locate(request, signal)
+  }
+
+  /**
+   * 把旧纪元的 ref 精确装回当前纪元。文档身份对不上或节点变了就按条拒绝，绝不误绑。
+   */
+  async revalidate(request: BrowserRevalidateRequest, signal?: AbortSignal): Promise<BrowserRevalidateResult> {
+    return this.resolve().revalidate(request, signal)
   }
 
   /**

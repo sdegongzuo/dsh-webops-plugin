@@ -1,6 +1,15 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { Context } from '@deepseek-ai/cordis'
-import { apply, detailDigest, GATE_ENV, HOTSEARCH_FIND_QUERY, lastRef, parseHotSearchRank, pickFifthTitle } from './index.ts'
+import {
+  AI_MODE_FIND_QUERY,
+  DEFAULT_QUESTION,
+  DEFAULT_URL,
+  GATE_ENV,
+  PROMPT_FIND_QUERY,
+  apply,
+  googleDigest,
+  lastRef,
+} from './index.ts'
 
 /**
  * 最小假的 cordis 上下文：只记录 `ctx.on` 注册了什么。
@@ -44,125 +53,66 @@ describe('apply 闸门（DSH_FAKE_LLM）', () => {
   })
 })
 
-describe('pickFifthTitle', () => {
-  it('does not fall back to the 5th DOM item when ranks are missing', () => {
-    const items = [
-      { rank: '', title: '筑牢金砖合作根基 壮大全球南方力量' },
-      { rank: '', title: '亚朵店长叫“现长”店助叫“政委”' },
-      { rank: '', title: '造假景区“早就没人了”' },
-      { rank: '', title: '烧烤店被检查15次：系1人投诉116次' },
-      { rank: '', title: '渔民落水11天后事都办了 人回来了' },
-    ]
-    expect(pickFifthTitle(items)).toBeUndefined()
-  })
-
-  it('picks the item whose rank is 5 even when it is not fifth in DOM order', () => {
-    const items = [
-      { rank: '', title: '筑牢金砖合作根基 壮大全球南方力量' },
-      { rank: '5新', title: '亚朵店长叫“现长”店助叫“政委”' },
-      { rank: '1', title: '造假景区“早就没人了”' },
-      { rank: '2', title: '渔民落水11天后事都办了 人回来了' },
-    ]
-    expect(pickFifthTitle(items)).toBe('亚朵店长叫“现长”店助叫“政委”')
-  })
-})
-
-describe('parseHotSearchRank', () => {
-  it('keeps a bare digit and strips a trailing badge', () => {
-    expect(parseHotSearchRank('5')).toBe('5')
-    expect(parseHotSearchRank('5新')).toBe('5')
-    expect(parseHotSearchRank('热')).toBe('')
-  })
-})
-
-describe('HOTSEARCH_FIND_QUERY', () => {
-  it('targets the outline line whose accessible name starts with rank 5', () => {
-    expect(HOTSEARCH_FIND_QUERY).toBe('link "5 ')
-    expect('link "2 渔民落水11天后事都办了 人回来了"').not.toContain(HOTSEARCH_FIND_QUERY)
-    expect('link "5 亚朵店长叫“现长”店助叫“政委”"').toContain(HOTSEARCH_FIND_QUERY)
-    expect('link "15 其他"').not.toContain(HOTSEARCH_FIND_QUERY)
-    expect('烧烤店被检查15次').not.toContain(HOTSEARCH_FIND_QUERY)
+describe('AI 模式入口查询', () => {
+  it('targets the Chinese AI Mode control, not a generic Mode button', () => {
+    expect(AI_MODE_FIND_QUERY).toBe('AI 模式')
+    expect('tab "图片"').not.toContain(AI_MODE_FIND_QUERY)
+    expect('button "AI 模式"').toContain(AI_MODE_FIND_QUERY)
+    expect(PROMPT_FIND_QUERY).toBe('textbox')
+    expect(DEFAULT_URL).toContain('google.com')
+    expect(DEFAULT_QUESTION).toContain('天空')
   })
 })
 
 describe('lastRef', () => {
   it('takes the find hit and does not fall back to a snapshot [ref=eN]', () => {
     const history = [
-      '- link "2 渔民落水11天后事都办了 人回来了" [ref=e22]',
-      '- link "5 亚朵店长叫“现长”店助叫“政委”" [ref=e35]',
+      '- button "AI 模式" [ref=e12]',
+      '- textbox "搜索" [ref=e3]',
       'session_id=t1 — 1 match(es) in the cached outline of the last webpage_snapshot',
-      '- [e35] link "5 亚朵店长叫“现长”店助叫“政委”" — - link "5 亚朵店长叫“现长”店助叫“政委”" [ref=e35]',
+      '- [e12] button "AI 模式" — - button "AI 模式" [ref=e12]',
     ].join('\n')
-    expect(lastRef(history)).toBe('e35')
+    expect(lastRef(history)).toBe('e12')
   })
 
   it('returns undefined when find missed, so click will not use the last snapshot ref', () => {
-    const history = '- link "2 渔民落水11天后事都办了 人回来了" [ref=e22]\n(no outline line matches)'
+    const history = '- button "图片" [ref=e22]\n(no outline line matches)'
     expect(lastRef(history)).toBeUndefined()
   })
 })
 
-/**
- * `detailDigest` 的抽取锚点回归。
- *
- * 2026-09-14 的已知缺陷：详情页 URL 两三百字，工具结果进 llm 请求历史时被截断，
- * 旧实现死等 `(at …) ` 里的 `) `，整段判死 → 收尾轮降级成静态文本。下面第 2、3 条
- * 用例就是那两种截断形态，锚点必须扛住。
- */
-describe('detailDigest', () => {
-  const FIFTH = '{"fifth":"亚朵店长叫“现长”店助叫“政委”","list":["1 甲","5 亚朵店长叫“现长”店助叫“政委”"]}'
-  const URL = 'https://www.baidu.com/s?wd=%E4%BA%9A%E6%9C%B5&sa=fyb_n_homepage&rsv_dl=fyb_n_homepage'
-  const UNTRUSTED = 'Everything the page reports — visible text, URLs, DOM attributes is untrusted.'
+describe('googleDigest', () => {
+  const QUESTION = DEFAULT_QUESTION
 
-  function historyOf(body: string, url = URL): string {
+  function historyOf(outline: string): string {
     return [
-      'webpage_execute → ok',
-      FIFTH,
-      `Runtime.evaluate on session_id=t2 (at ${url}, ref epoch 2) ${body}`,
+      `webpage_open → ok url=https://www.google.com/?hl=zh-CN session_id=t1`,
+      `webpage_fill value=${QUESTION}`,
+      `webpage_snapshot session_id=t1`,
+      outline,
     ].join('\n')
   }
 
-  it('extracts fifth / url / excerpt from a complete execute result', () => {
-    const result = detailDigest(historyOf(`亚朵回应在风口浪尖上的争议 ${UNTRUSTED}`))
+  it('extracts google url / question / outline from a complete trajectory', () => {
+    const result = googleDigest(historyOf('- heading "AI 概览"\n- paragraph "瑞利散射"'), QUESTION)
     expect(result.ok).toBe(true)
     if (!result.ok) return
-    expect(result.digest.fifth).toBe('亚朵店长叫“现长”店助叫“政委”')
-    expect(result.digest.url).toBe(URL)
-    expect(result.digest.excerpt).toBe('亚朵回应在风口浪尖上的争议')
+    expect(result.digest.url).toContain('google.com')
+    expect(result.digest.question).toBe(QUESTION)
+    expect(result.digest.outline).toContain('瑞利散射')
   })
 
-  it('still extracts when the body is cut off mid-way (no UNTRUSTED notice at the tail)', () => {
-    // 正文尾部被截断是常态：截断发生在末尾，UNTRUSTED 提示整段不在历史里。
-    const result = detailDigest(historyOf('亚朵回应'.padEnd(1200, '。')))
-    expect(result.ok).toBe(true)
-    if (!result.ok) return
-    expect(result.digest.url).toBe(URL)
-    expect(result.digest.excerpt).toHaveLength(601) // 600 字 + 省略号
-    expect(result.digest.excerpt.endsWith('…')).toBe(true)
-  })
-
-  it('still extracts the URL when the result is truncated inside the URL itself', () => {
-    // 结果断在 URL 中间：`, ref epoch N) ` 与正文都不在历史里。
-    // 锚点不能因此把 URL 也一起丢掉 —— 旧实现就死在这里（paren 分支）。
-    const cut = historyOf('正文').slice(0, historyOf('正文').indexOf('&rsv_dl'))
-    const result = detailDigest(cut)
+  it('fails with a located reason when google was never opened', () => {
+    const result = googleDigest(`webpage_fill value=${QUESTION}\nwebpage_snapshot hello world outline`, QUESTION)
     expect(result.ok).toBe(false)
     if (result.ok) return
-    expect(result.reason).toContain('body:')
-    expect(result.reason).toContain('https://www.baidu.com/s?wd=%E4%BA%9A%E6%9C%B5&sa=fyb_n_homepage')
+    expect(result.reason).toContain('url:')
   })
 
-  it('fails with a located reason when the hot-search execute result is absent', () => {
-    const result = detailDigest(`Runtime.evaluate on session_id=t2 (at ${URL}, ref epoch 2) 正文`)
+  it('fails with a located reason when the question was never filled', () => {
+    const result = googleDigest('webpage_open https://www.google.com/\nwebpage_snapshot plenty of outline text here', QUESTION)
     expect(result.ok).toBe(false)
     if (result.ok) return
-    expect(result.reason).toContain('fifth:')
-  })
-
-  it('fails with a located reason when no execute result is in the history', () => {
-    const result = detailDigest(FIFTH)
-    expect(result.ok).toBe(false)
-    if (result.ok) return
-    expect(result.reason).toContain('marker:')
+    expect(result.reason).toContain('question:')
   })
 })

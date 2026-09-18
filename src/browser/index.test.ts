@@ -11,6 +11,7 @@ import type {
   BrowserObserveRequest,
   BrowserOpenRequest,
   BrowserProvider,
+  BrowserRevalidateRequest,
   BrowserTabsRequest,
 } from './index.ts'
 
@@ -82,6 +83,13 @@ function makeProvider(id: string, available: boolean): BrowserProvider {
       height: 40,
       centered: request.scroll ?? false,
       inViewport: true,
+    }),
+    revalidate: (request: BrowserRevalidateRequest) => Promise.resolve({
+      kind: 'revalidate' as const,
+      sessionId: request.sessionId,
+      epoch: SESSION.epoch,
+      restored: request.refs.map(ref => ({ ref, role: 'button', name: 'Save' })),
+      failed: [],
     }),
   }
 }
@@ -192,6 +200,14 @@ describe('BrowserRuntime forwarding', () => {
 
     await expect(browser.locate({ sessionId: 's1', ref: 'e1' }))
       .resolves.toMatchObject({ kind: 'locate', sessionId: 's1', ref: 'e1', centered: false })
+  })
+
+  it('forwards revalidate to the selected provider', async () => {
+    const browser = await mountBrowser()
+    browser.registerProvider(makeProvider('cdp', true))
+
+    await expect(browser.revalidate({ sessionId: 's1', refs: ['e1'] }))
+      .resolves.toMatchObject({ kind: 'revalidate', sessionId: 's1', restored: [{ ref: 'e1' }] })
   })
 
   it('ignores providers without a dispose hook and reports the ones that fail', async () => {

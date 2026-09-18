@@ -164,15 +164,26 @@ function readString(source: Record<string, unknown>, key: string): string | unde
   private readonly unsubscribes: (() => void)[] = []
   /** 当前文档序号（0 起）；provider 每次观察到导航就 +1。 */
   private document = 0
+  /**
+   * 尚未 `loadingFinished` / `loadingFailed` 的请求 id。
+   * `until: 'stable'` 用它当「网络是否安静」：inflight === 0 才算 quiet。
+   */
+  private readonly inflightIds = new Set<string>()
 
   /**
-   * @param connection - 该会话的 CDP 连接；构造时立即订阅三个事件。
+   * @param connection - 该会话的 CDP 连接；构造时立即订阅请求生命周期事件。
    */
   constructor(connection: CdpConnection) {
     this.connection = connection
     this.unsubscribes.push(connection.on('Network.requestWillBeSent', params => this.onRequest(params)))
     this.unsubscribes.push(connection.on('Network.responseReceived', params => this.onResponse(params)))
+    this.unsubscribes.push(connection.on('Network.loadingFinished', params => this.onFinished(params)))
     this.unsubscribes.push(connection.on('Network.loadingFailed', params => this.onFailed(params)))
+  }
+
+  /** 当前未完成的请求数（SSE 在连接关闭前会一直占 1）。 */
+  get inflight(): number {
+    return this.inflightIds.size
   }
 
   /** 当前请求表里的条目数。 */
@@ -278,7 +289,7 @@ function readString(source: Record<string, unknown>, key: string): string | unde
     }
   }
 
-  /** 退订三个事件；会话关闭时调用。 */
+  /** 退订事件；会话关闭时调用。 */
   dispose(): void {
     for (const off of this.unsubscribes) off()
     this.unsubscribes.length = 0
@@ -327,6 +338,15 @@ function readString(source: Record<string, unknown>, key: string): string | unde
       url: readString(requestRecord, 'url') ?? '',
       ...method !== undefined ? { method } : {},
     })
+    this.inflightIds.add(requestId)
+  }
+
+  /** `loadingFinished`：请求结束，inflight −1。 */
+  private onFinished(params: unknown): void {
+    if (typeof params !== 'object' || params === null) return
+    const requestId = readString(params as Record<string, unknown>, 'requestId')
+    if (requestId === undefined) return
+    this.inflightIds.delete(requestId)
   }
 
   /** `responseReceived`：更新已有记录；找不到就建降级记录（`[V40]`，半截记录）。 */
@@ -376,5 +396,6 @@ function readString(source: Record<string, unknown>, key: string): string | unde
     this.put(existing === undefined
       ? { requestId, url: '', errorText, partial: true, reason: 'request-headers-missing' }
       : { ...existing, requestId, errorText })
+    this.inflightIds.delete(requestId)
   }
 }

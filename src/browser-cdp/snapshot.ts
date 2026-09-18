@@ -16,7 +16,7 @@
  * @module dsh-webops-plugin/browser-cdp/snapshot
  */
 
-import type { RefTarget } from './refs.ts'
+import type { RefPublishRow, RefTarget } from './refs.ts'
 
 /** AX 树里的一个值包装（`{ type, value }`）。 */
 interface AxValue {
@@ -235,7 +235,7 @@ export interface SnapshotOutline {
    */
   readonly unfoldedLines: readonly OutlineLine[]
   /** 可操作元素，按出现顺序；ref 名由 `RefRegistry.publish` 分配。 */
-  readonly rows: readonly Omit<RefTarget, 'ref'>[]
+  readonly rows: readonly RefPublishRow[]
   readonly truncated: boolean
   /**
    * 因预算耗尽而**没有**输出的节点数（含因 `maxDepth` 被砍掉的子树根）。
@@ -401,12 +401,12 @@ export function buildOutline(
 
   // ---- 第一遍：全量走树，产出候选行（不结算预算）----
   const candidates: { depth: number; text: string; role: string; name: string; targetRow?: number; foldKey?: string }[] = []
-  const rows: Omit<RefTarget, 'ref'>[] = []
+  const rows: RefPublishRow[] = []
   const visited = new Set<string>()
   let truncated = false
   let droppedElements = 0
 
-  const visit = (node: AxNode, depth: number): void => {
+  const visit = (node: AxNode, depth: number, ancestors: readonly string[]): void => {
     if (visited.has(node.nodeId)) return
     visited.add(node.nodeId)
 
@@ -419,7 +419,12 @@ export function buildOutline(
     const text = transparent ? undefined : renderLine(node, role, name, limits.maxTextLength, actionable)
     if (text !== undefined) {
       const targetRow = actionable && typeof node.backendDOMNodeId === 'number'
-        ? rows.push({ role, name, backendNodeId: node.backendDOMNodeId }) - 1
+        ? rows.push({
+          role,
+          name,
+          backendNodeId: node.backendDOMNodeId,
+          ancestorPath: ancestors.join('>'),
+        }) - 1
         : undefined
       // 只有「可操作 + 有名字 + 不是 statictext」的行才可能被折叠：
       // - 可操作：折叠是给重复**控件**去噪的，正文与结构行不在此列；
@@ -446,14 +451,17 @@ export function buildOutline(
       }
       return
     }
+    const nextAncestors = (transparent || isUnstableAncestor(node, role, name))
+      ? ancestors
+      : [...ancestors, name.length > 0 ? `${role}:${name}` : role]
     for (const childId of node.childIds ?? []) {
       const child = byId.get(childId)
       if (child === undefined) continue
-      visit(child, childDepth)
+      visit(child, childDepth, nextAncestors)
     }
   }
 
-  for (const root of roots) visit(root, 0)
+  for (const root of roots) visit(root, 0, [])
 
   // ---- 祖先 / 后代关系：DFS 前序里「最近一个深度更小的前驱」就是父行 ----
   const parentOf: (number | undefined)[] = []
@@ -674,6 +682,15 @@ export function buildOutline(
  * 各自内部自洽即可 —— 每个视图里「最近一个更浅的前驱就是父」这条性质都被保留
  * （归一是一致单调的重标号），`webpage_find` 的祖先反推照样成立。
  */
+function isUnstableAncestor(node: AxNode, role: string, name: string): boolean {
+  if (node.ignored === true) return true
+  if (TRANSPARENT_ROLES.has(role)) return true
+  const trimmed = name.trim()
+  if (/^[0-9a-f]{8,}$/iu.test(trimmed)) return true
+  if (/\d{10,}/u.test(trimmed)) return true
+  return false
+}
+
 function normalizeDepths(rows: readonly OutlineLine[]): OutlineLine[] {
   const ancestors: number[] = []
   return rows.map((line) => {
@@ -715,4 +732,75 @@ export function renderOutline(
       return target === undefined ? `${indent}- ${line.text}` : `${indent}- ${line.text} [ref=${target.ref}]`
     })
     .join('\n')
+}
+
+/** 文档坐标下的轴对齐矩形。 */
+export interface BoxRect {
+  readonly x: number
+  readonly y: number
+  readonly width: number
+  readonly height: number
+}
+
+/**
+ * 把 `DOMSnapshot` 的 bounds 收成 AABB。
+ * 4 个数当 `[x, y, width, height]`；8 个数当四角 quad，取 min/max。
+ */
+export function boundsToBox(bounds: readonly number[]): BoxRect | undefined {
+  if (bounds.length >= 8) {
+    const xs = [bounds[0], bounds[2], bounds[4], bounds[6]].filter((value): value is number => typeof value === 'number')
+    const ys = [bounds[1], bounds[3], bounds[5], bounds[7]].filter((value): value is number => typeof value === 'number')
+    if (xs.length < 4 || ys.length < 4) return undefined
+    const x = Math.min(...xs)
+    const y = Math.min(...ys)
+    return { x, y, width: Math.max(...xs) - x, height: Math.max(...ys) - y }
+  }
+  if (bounds.length >= 4) {
+    const x = bounds[0]
+    const y = bounds[1]
+    const width = bounds[2]
+    const height = bounds[3]
+    if (x === undefined || y === undefined || width === undefined || height === undefined) return undefined
+    return { x, y, width, height }
+  }
+  return undefined
+}
+
+/** 两个矩形有交集（含边贴边）即算可见；部分入屏的元素不该丢。 */
+export function boxesIntersect(left: BoxRect, right: BoxRect): boolean {
+  return left.x < right.x + right.width
+    && left.x + left.width > right.x
+    && left.y < right.y + right.height
+    && left.y + left.height > right.y
+}
+
+/**
+ * 只保留 backendNodeId 落在区域内的节点，以及它们的祖先（撑住大纲结构）。
+ * 区域外的兄弟不进结果。
+ */
+export function filterAxTreeByBackendIds(
+  nodes: readonly AxNode[],
+  keepBackend: ReadonlySet<number>,
+): AxNode[] {
+  const byId = new Map<string, AxNode>()
+  const parentOf = new Map<string, string>()
+  for (const node of nodes) {
+    byId.set(node.nodeId, node)
+    for (const childId of node.childIds ?? []) parentOf.set(childId, node.nodeId)
+  }
+  const keep = new Set<string>()
+  for (const node of nodes) {
+    if (typeof node.backendDOMNodeId !== 'number' || !keepBackend.has(node.backendDOMNodeId)) continue
+    let current: string | undefined = node.nodeId
+    while (current !== undefined && !keep.has(current)) {
+      keep.add(current)
+      current = parentOf.get(current)
+    }
+  }
+  return nodes
+    .filter(node => keep.has(node.nodeId))
+    .map((node) => {
+      if (node.childIds === undefined) return node
+      return { ...node, childIds: node.childIds.filter(id => keep.has(id)) }
+    })
 }

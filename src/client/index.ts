@@ -41,6 +41,7 @@ export const BROWSER_TOOLS = [
   'webpage_execute',
   'webpage_find',
   'webpage_locate',
+  'webpage_revalidate',
 ] as const
 
 /**

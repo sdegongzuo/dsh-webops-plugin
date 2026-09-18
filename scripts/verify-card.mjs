@@ -19,7 +19,7 @@ import { writeFileSync } from 'node:fs'
 const PORT = Number(process.env.RENDERER_PORT ?? 9222)
 const DEADLINE_MS = Number(process.env.VERIFY_DEADLINE_MS ?? 120_000)
 const SHOT_OUT = process.env.VERIFY_SHOT_OUT ?? '.verify-card.png'
-const MESSAGE = process.env.VERIFY_MESSAGE ?? '打开 example.com'
+const MESSAGE = process.env.VERIFY_MESSAGE ?? '打开谷歌首页，点击 AI 模式，问：为什么天空是蓝色的'
 
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms))
 
@@ -145,9 +145,8 @@ async function main() {
     })()`)
     console.log(`verify-card: 消息已发送（${sent}）`)
 
-    // 4) 轮询工具卡片：P0 的 open 卡片 + P1 的 snapshot / tabs / click + P2 的 execute
-    //    + P3 的 find（fake-llm 脚本 2026-09-13 起走弹窗转标签页全链路）。
-    const EXPECTED_ROWS = ['webpage_open', 'webpage_snapshot', 'webpage_execute', 'webpage_find', 'webpage_tabs', 'webpage_click']
+    // 4) 轮询工具卡片：打开谷歌 → 点 AI 模式 → fill 提问 → Enter。
+    const EXPECTED_ROWS = ['webpage_open', 'webpage_snapshot', 'webpage_find', 'webpage_click', 'webpage_fill', 'webpage_press', 'webpage_wait']
     /** row → { state, url, text }，出现即记录。 */
     const cards = new Map()
     while (Date.now() < deadline && cards.size < EXPECTED_ROWS.length) {
@@ -211,26 +210,21 @@ async function main() {
     if (bad.length > 0) {
       throw new Error(`工具卡片执行失败 → ${bad.map(name => `${name}: ${cards.get(name).state}`).join(', ')}`)
     }
-    // 5) 真实任务流的硬证据：热搜第五条是 target=_blank 链接，点击后弹窗被 host 转成
-    //    新标签、provider 经 opened 通报收编进会话注册表 —— tabs(list) 的结果必须
-    //    列出第二个标签（session_id=t2，且 [foreground] 在前台上）。
-    const tabsText = cards.get('webpage_tabs').text === '(from trajectory)'
-      ? (await evaluate(call, 'document.body.innerText'))
-      : cards.get('webpage_tabs').text
-    if (!/session_id=t2\b/.test(tabsText) || !tabsText.includes('[foreground]')) {
-      throw new Error(`弹窗标签没进 tabs 清单：webpage_tabs 结果里没有前台 t2 → ${tabsText.slice(0, 300)}`)
+    const openText = `${cards.get('webpage_open').url ?? ''} ${cards.get('webpage_open').text}`
+    if (!/google\./i.test(openText)) {
+      throw new Error(`没打开谷歌：webpage_open 结果里没有 google. → ${openText.slice(0, 300)}`)
     }
-    console.log('verify-card: 弹窗标签已进 tabs 清单（结果含前台 t2）')
+    console.log('verify-card: webpage_open 落到了 google')
 
-    // 第五条 = 大纲里带数字 5 的那条（`link "5 …"`），不是 DOM 第 5 个。
-    // 2026-09-13 实测 find 拿了第五个 DOM 标题，点到了第二条。
     const findText = cards.get('webpage_find').text === '(from trajectory)'
       ? (await evaluate(call, 'document.body.innerText'))
       : cards.get('webpage_find').text
-    if (!/link "5 /.test(findText)) {
-      throw new Error(`没按榜单序号 5 定位：webpage_find 结果里没有 link "5 …" → ${findText.slice(0, 300)}`)
+    if (!/AI 模式/.test(findText)) {
+      throw new Error(`没定位到 AI 模式：webpage_find 结果里没有「AI 模式」→ ${findText.slice(0, 300)}`)
     }
-    console.log('verify-card: find 命中榜单序号 5（大纲含 link "5 ）')
+    console.log('verify-card: find 命中「AI 模式」')
+
+    console.log('verify-card: fill / press 卡片已渲染（提问走 webpage_fill + Enter）')
 
     // 5) 整页截图（锦上添花）：截图失败不影响验证结论 —— 功能证据在上面几步已齐。
     await delay(1_500)
@@ -241,8 +235,8 @@ async function main() {
     } catch (error) {
       console.log(`verify-card: 截图跳过（${error instanceof Error ? error.message : String(error)}）——不影响 PASS 判定`)
     }
-    console.log('verify-card: PASS —— webpage_open / snapshot / tabs / click 真执行、'
-      + `四张工具卡片真渲染且 state=ok（${EXPECTED_ROWS.map(name => `${name}=${cards.get(name).state}`).join(', ')}）`)
+    console.log('verify-card: PASS —— 打开谷歌 → 点 AI 模式 → fill 提问真执行、'
+      + `工具卡片 state=ok（${EXPECTED_ROWS.map(name => `${name}=${cards.get(name).state}`).join(', ')}）`)
   })
 }
 
