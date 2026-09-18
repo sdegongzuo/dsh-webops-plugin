@@ -64,7 +64,8 @@
 # `@deepseek-ai/dsh-ptc-runtime-node` 给子进程构造环境时会把那个变量删掉
 # （只留 PATH/PATHEXT/SYSTEMROOT/WINDIR/TEMP/TMP），于是 Electron 不再进 node 模式、
 # 控制协议永远建不起来，`run_code` 挂到超时。桌面 shell 在主 exe 起步时把
-# `DSH_PTC_NODE` 指向包内的真 node（`resources\runtime\node`），这里读它。
+# `DSH_PTC_NODE` 指向包内的真 node
+# （`resources\runtime\primary-runtime\dependencies\node\bin`），这里读它。
 #
 # 非桌面端没有这个变量 → 落到 `process.execPath`（那本来就是 node），**与上游默认值完全等价**。
 # 也就是说这一条不改变任何 CLI / TUI / headless 场景的行为，也不装新插件，只是给桌面端

@@ -38,6 +38,64 @@ function yamlBody(text: string): string {
   return text.split('\n').filter(line => !line.trimStart().startsWith('#')).join('\n')
 }
 
+/**
+ * 取出 `near` 附近那个 `join(...)` 里的字符串字面量参数。
+ *
+ * 只认引号段、不认注释：注释里写 `primary-runtime` 不能让这条变绿。
+ * 优先取锚点**之后**的 join（赋值即 join 的写法）；没有再回看锚点之前
+ * （join 赋给临时变量、再写 `DSH_PTC_NODE = existsSync(...)` 的写法）。
+ */
+function joinStringArgs(source: string, near: string): string[] {
+  const at = source.indexOf(near)
+  if (at === -1) return []
+  const forward = source.slice(at, at + 800)
+  const backward = source.slice(Math.max(0, at - 800), at)
+  // 补丁文件每行带 `+` 前缀，剥掉再找 join，否则 `,` 和引号被 `+` 隔开。
+  const window = (/join\s*\(/.test(forward) ? forward : backward).replace(/^\+/gm, '')
+  const joinAt = window.search(/join\s*\(/)
+  if (joinAt === -1) return []
+  let depth = 0
+  let end = joinAt
+  for (let i = joinAt; i < window.length; i++) {
+    if (window[i] === '(') depth += 1
+    else if (window[i] === ')') {
+      depth -= 1
+      if (depth === 0) {
+        end = i
+        break
+      }
+    }
+  }
+  const body = window.slice(joinAt, end + 1)
+  // 只收 join 的参数位（前面是 `,` 或 `(`），丢掉 ternary 里的 `'win32'` / `'node.exe'`。
+  return [...body.matchAll(/[,(]\s*'([^']+)'/g)].flatMap(match => match[1] === undefined ? [] : [match[1]])
+}
+
+function joinCallBody(source: string, near: string): string {
+  const at = source.indexOf(near)
+  if (at === -1) return ''
+  const forward = source.slice(at, at + 800)
+  const backward = source.slice(Math.max(0, at - 800), at)
+  const window = (/join\s*\(/.test(forward) ? forward : backward).replace(/^\+/gm, '')
+  const joinAt = window.search(/join\s*\(/)
+  if (joinAt === -1) return ''
+  let depth = 0
+  for (let i = joinAt; i < window.length; i++) {
+    if (window[i] === '(') depth += 1
+    else if (window[i] === ')') {
+      depth -= 1
+      if (depth === 0) return window.slice(joinAt, i + 1)
+    }
+  }
+  return ''
+}
+
+function sliceAround(source: string, near: string, radius = 700): string {
+  const at = source.indexOf(near)
+  if (at === -1) return ''
+  return source.slice(Math.max(0, at - radius), at + radius)
+}
+
 /** 某一行是否存在于 YAML 有效内容里（整行匹配，避免 `id: browser` 命中 `id: browser-cdp`）。 */
 function hasRow(body: string, id: string): boolean {
   return body.split('\n').some(line => line.trim().replace(/^-\s+/u, '') === `id: ${id}`)
@@ -120,11 +178,33 @@ describe('harness 补丁与插件之间的变量名约定', () => {
   it('补丁注入的 PTC node 路径，出货 patch 用同一个名字去读', () => {
     // 这一对横跨两个文件（harness 侧 main.ts 写、我们的 cordis.patch.yml 读），
     // 任何一半掉了都是静默失效：run_code 起不来，但没有任何报错指向这里。
-    expect(patch, '补丁没注入 DSH_PTC_NODE').toContain('process.env.DSH_PTC_NODE = join(')
-    expect(patch, '补丁没把 DSH_PTC_NODE 指向包内自带的 node（resources/runtime/node）')
-      .toContain("'runtime',")
+    expect(patch, '补丁没注入 DSH_PTC_NODE').toContain('process.env.DSH_PTC_NODE =')
+    // 断言的是 join 的**参数段**，不是注释里的路径词：alpha.2 把实体从
+    // resources/runtime/node 搬到 primary-runtime/dependencies/node/bin。
+    // 旧 join（runtime + node）会让这条转红；改指 runtime/bin/node.cmd 那个
+    // shim 也会（shim 依赖被 PTC 子进程清掉的两个环境变量）。
+    expect(
+      joinStringArgs(patch, 'process.env.DSH_PTC_NODE'),
+      'DSH_PTC_NODE 的 join 没指向 primary-runtime 下的真 node',
+    ).toEqual(['runtime', 'primary-runtime', 'dependencies', 'node', 'bin'])
+    const ptcRegion = sliceAround(patch, 'process.env.DSH_PTC_NODE')
+    expect(ptcRegion, '打包态缺文件时必须回落 process.execPath').toContain('existsSync')
+    expect(joinCallBody(patch, 'process.env.DSH_PTC_NODE'), '不能改指 runtime/bin/node.cmd 那个 shim')
+      .not.toContain('node.cmd')
     expect(yamlBody(readRepoFile('cordis.patch.yml')), '出货 patch 没读 DSH_PTC_NODE')
       .toContain('process.env.DSH_PTC_NODE ?? process.execPath')
+  })
+
+  it('沙箱 runnerExecutable 与 PTC 注入走同一份包内真 node', () => {
+    expect(
+      joinStringArgs(patch, 'function runnerExecutable'),
+      'runnerExecutable 的 join 没指向 primary-runtime 下的真 node',
+    ).toEqual(['runtime', 'primary-runtime', 'dependencies', 'node', 'bin'])
+    const region = sliceAround(patch, 'function runnerExecutable')
+    expect(region, '打包态缺文件时必须回落 process.execPath').toContain('existsSync')
+    expect(region, '回落丢了，开发态会指到一个不存在的路径').toContain('process.execPath')
+    expect(joinCallBody(patch, 'function runnerExecutable'), '不能改指 runtime/bin/node.cmd 那个 shim')
+      .not.toContain('node.cmd')
   })
 
   it('两个变量名都不能带 DSH_DESKTOP_ 前缀', () => {
@@ -183,6 +263,41 @@ describe('便携版使用说明（scripts/package-desktop-portable.mjs）', () =
   it('说明里两种启动方式都写了（脚本 + 直接双击 exe）', () => {
     expect(script).toContain('· 双击根目录的「启动.cmd」')
     expect(script).toContain('· 直接双击 app 目录里的')
+  })
+})
+
+describe('alpha.2 宿主入口（desktop-host 不再导出 runDesktopHost）', () => {
+  const scripts = [
+    'scripts/verify-portable.mjs',
+    'scripts/verify-ptc.mjs',
+    'scripts/verify-settings.mjs',
+  ]
+
+  it('自检走 packaged desktop-host 的 IPC 启动，不再 import 已删除的 runDesktopHost', () => {
+    const helper = readRepoFile('scripts/run-packaged-host.mjs')
+    expect(helper, 'helper 没 spawn packaged desktop-host').toContain('dsh-desktop-host')
+    expect(helper, 'helper 没走 IPC').toContain("'ipc'")
+    expect(helper, 'argv 里必须把 profileResolution 传成 runtime').toContain("\n    'runtime',\n")
+    expect(helper).not.toContain('await runDesktopHost(')
+    for (const file of scripts) {
+      const body = readRepoFile(file)
+      expect(body, `${file} 还在调用已删除的 runDesktopHost`).not.toContain('await runDesktopHost(')
+      expect(body, `${file} 还在 destructure 已删除的 runDesktopHost`).not.toContain('{ runDesktopHost }')
+      expect(body, `${file} 没改走 startPackagedDesktopHost`).toContain('startPackagedDesktopHost')
+    }
+  })
+})
+
+describe('verify-ptc 的包内真 node 探针', () => {
+  const script = readRepoFile('scripts/verify-ptc.mjs')
+
+  it('[1/4] 按 primary-runtime 布局找 node，而不是已搬家的 runtime/node', () => {
+    expect(
+      joinStringArgs(script, 'const nodePath'),
+      'verify-ptc [1/4] 还在旧路径 resources/runtime/node 上找',
+    ).toEqual(['resources', 'runtime', 'primary-runtime', 'dependencies', 'node', 'bin'])
+    expect(joinCallBody(script, 'const nodePath'), '不能改指 runtime/bin/node.cmd 那个 shim')
+      .not.toContain('node.cmd')
   })
 })
 

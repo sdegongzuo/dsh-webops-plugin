@@ -15,8 +15,9 @@
  * （开发态 `process.execPath` 本来就是 node，所以本地开发永远看不到）。
  *
  * 修复：shell 在 `main.ts` 顶层把 `DSH_PTC_NODE` 指向包内自带的真 node
- * （`resources\runtime\node\node.exe`），再由一份 composition patch 把它写进
- * `ptc-runtime` 行的 `nodeExecutable`。
+ * （alpha.2 起是 `resources\runtime\primary-runtime\dependencies\node\bin\node.exe`，
+ * 不是已搬家的 `resources\runtime\node`，也不是 `runtime\bin\node.cmd` 那个 shim），
+ * 再由一份 composition patch 把它写进 `ptc-runtime` 行的 `nodeExecutable`。
  *
  * ## 2026-09-18：这份 composition patch 搬家了（适配 dsh 0.1.6-alpha.2）
  *
@@ -85,6 +86,7 @@ import { tmpdir } from 'node:os'
 import { basename, join, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { materializeRuntimeDir } from './desktop-runtime.mjs'
+import { startPackagedDesktopHost } from './run-packaged-host.mjs'
 
 const args = process.argv.slice(2)
 const readArg = (name) => {
@@ -149,12 +151,21 @@ const require = createRequire(join(runtimeDir, 'package.json'))
 
 // 真 node 必须随包进来 —— 修复完全依赖它。
 const nodeName = process.platform === 'win32' ? 'node.exe' : 'node'
-const nodePath = join(appRoot, 'resources', 'runtime', 'node', nodeName)
+const nodePath = join(
+  appRoot,
+  'resources',
+  'runtime',
+  'primary-runtime',
+  'dependencies',
+  'node',
+  'bin',
+  nodeName,
+)
 let nodeOk = false
 try {
   nodeOk = readFileSync(nodePath).byteLength > 0
 } catch { nodeOk = false }
-check(nodeOk, `包内自带真 node：app/resources/runtime/node/${nodeName}`)
+check(nodeOk, `包内自带真 node：app/resources/runtime/primary-runtime/dependencies/node/bin/${nodeName}`)
 
 /**
  * 找出货包里那份插件补丁。
@@ -336,18 +347,21 @@ process.env.DSH_TOOLS_MODE = 'ptc'
 // 这一条正是 main.ts 在打包态注入的东西；模拟它是为了让本脚本能在开发机上验生产行为。
 process.env.DSH_PTC_NODE = nodePath
 
-const { runDesktopHost } = await import(pathToFileURL(require.resolve('@deepseek-ai/dsh-desktop-host')).href)
-
-let host
+const host = startPackagedDesktopHost({
+  runtimeDir,
+  profileDir,
+  env: process.env,
+})
+let ready
 try {
-  host = await runDesktopHost(runtimeDir, profileDir, async () => {}, { allowLinkedPackages: true })
-  check(true, `宿主启动成功（dsh ${host.dshVersion}）`)
+  ready = await host.ready
+  check(true, `宿主启动成功（${ready.url}）`)
 } catch (error) {
   check(false, `宿主启动：${error instanceof Error ? error.message : String(error)}`)
 }
 
 let report
-if (host !== undefined) {
+if (ready !== undefined) {
   // 两段都要等：第一段（无沙箱）先落地就退出的话，沙箱那段的结果永远读不到。
   // PTC 子进程要真起两次 node，还要在沙箱那条链上建 ACL 授权、给足冷启动时间。
   const settled = () => (
@@ -423,7 +437,7 @@ if (report?.threw !== undefined) check(false, `PTC 程序抛异常：${report.th
 if (report?.confinedError !== undefined) check(false, `受限 PTC 程序报错：${report.confinedError}`)
 if (report?.confinedThrew !== undefined) check(false, `受限 PTC 程序抛异常：${report.confinedThrew}`)
 
-if (host !== undefined) await host.dispose()
+await host.stop()
 materialized.cleanup()
 rmSync(home, { recursive: true, force: true })
 

@@ -20,28 +20,24 @@
  *
  * ## 它到底做了什么
  *
- * 不起 GUI、不需要 Electron。桌面端宿主的入口 `@deepseek-ai/dsh-desktop-host` 导出了
- * `runDesktopHost()`，可以直接调用 —— Electron 壳做了三件事：给宿主 fd3/fd4 管道、
- * 把 `dsh-app://app/*` 的请求转过去、把渲染进程开起来。本脚本只复刻前两件，
- * 拿到的 `/index.html` 与真启动**同源**（同一个 `assetHandler`、同一个 `clientModules`）。
+ * 不起 GUI。0.1.6-alpha.2 起 `@deepseek-ai/dsh-desktop-host` **不再导出** `runDesktopHost()`
+ * （入口是 `import.meta.main` + IPC `{ type: 'ready', url }`）。本脚本按 Electron 壳
+ * `host-process.ts` 的同一条 spawn 把 packaged 宿主拉起来，再 HTTP 拉 `/index.html` ——
+ * 与真启动同源（同一个 `webServer`、同一个 `clientModules`）。
  *
  * 真启动前还会用 **harness 的真代码**（不是本脚本的复刻）走一遍桌面端的准备阶段：
- * `readDesktopRuntime` → `desktopRuntimeId` → `verifyDesktopRuntime` →
- * `linkDesktopHostPackages` → `validateDesktopPluginGraph`。这几步在 Electron 里
- * 由 `applyRelease()` 串起来，跳过任何一步都可能漏掉真实的启动失败。
+ * `readDesktopRuntime` → `verifyDesktopRuntime` →（在 profile 副本上跑真 `applyRelease()`）。
+ * 这几步在 Electron 里就是启动路径本身，跳过任何一步都可能漏掉真实的启动失败。
  *
  * 断言（任一不过即退出码 1）：
  *   1. 运行时树（0.1.5 是 `app/resources/dsh`，0.1.6 起在 `app/resources/app.asar` 里）
  *      全量 sha256 与 `desktop-runtime.json` 的 `files` 清单一致
  *      （挡住解压损坏 / 打包截断，这是「包到底好不好」的唯一硬证据）；
- *   2. `desktop-runtime-state.json` 的 `runtimeId` 与本包 runtime 一致
- *      （不一致会被 `assertProfileRuntime` 在起宿主之前拦下），且
- *      `nodeVersion` / `platform` / `arch` 一致（不一致会触发
- *      `pnpm install --frozen-lockfile` 重建 node_modules，而插件不在 registry → 必然失败）；
- *   3. 在 profile 的工作副本上复刻 `prepareProfile`：能建出全部宿主链接、且
- *      `validateDesktopPluginGraph` 通过（插件依赖本地化 + 共享宿主实例 + peer 版本满足）；
+ *   2. 包里**没有**遗留的 `desktop-runtime-state.json`（alpha.2 起该文件退役，见 [1/5] 的说明）；
+ *   3. 在 profile 的工作副本上跑真 `applyRelease(true)`，然后断言插件登记（`dependencies` +
+ *      `bundles`）与 `node_modules` 下的插件文件**都还在** —— 这是「插件被静默抹掉」的回归护栏
+ *      （0.1.5 / alpha.1 时代它会把 package.json 重写成空依赖，靠我们写状态文件才躲过去）；
  *   4. 出货 patch 里没有 `llm/stream` 劫持行；profile 里没有越权的 overlay；
- *      `desktop-runtime-state.json` 在位（少了它插件会被静默抹掉）；
  *   5. `__DSH_BOOT__` 里存在插件的客户端行，且它的 bundle 能 200 拉下来、内容是合法模块；
  *   6. `--browser` 给了 Chrome 时，再验客户端半边真的在浏览器里注册成功
  *      （`<html>` 上的信标：`dshBrowserPlugin` / `Dock` / `ToolViews`）；
@@ -82,12 +78,12 @@
  */
 import { spawn } from 'node:child_process'
 import { createServer } from 'node:http'
-import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs'
-import { createRequire } from 'node:module'
+import { cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { materializeRuntimeDir } from './desktop-runtime.mjs'
+import { fetchHostPath, startPackagedDesktopHost } from './run-packaged-host.mjs'
 
 /* ---------- 参数 ---------- */
 
@@ -208,7 +204,11 @@ function check(ok, message) {
 
 const { tsImport } = await import('tsx/esm/api')
 const runtimeTree = await tsImport(pathToFileURL(join(harnessDesktopSrc, 'runtime-tree.ts')).href, import.meta.url)
-const profilePackages = await tsImport(pathToFileURL(join(harnessDesktopSrc, 'profile-packages.ts')).href, import.meta.url)
+// 这里原先还 import 了 `profile-packages.ts`（用它的 recordDesktopRuntimeProfile /
+// readDesktopProfileState / linkDesktopHostPackages / validateDesktopPluginGraph 复刻
+// 「prepareProfile」）。2026-09-18 适配 alpha.2 时全部删掉：那四个函数**在上游不存在了**
+// （profile-packages.ts 现在只剩一个一次性迁移函数），而「profile 是怎么被准备的」现在
+// 跑 `project-manager.ts` 的 `applyRelease()` 就是——见 [2/5]，直接跑真代码，不再复刻。
 const desktopPaths = await tsImport(pathToFileURL(join(harnessDesktopSrc, 'paths.ts')).href, import.meta.url)
 
 /* ---------- 1. 产物完整性 + runtime 身份 ---------- */
@@ -216,7 +216,6 @@ const desktopPaths = await tsImport(pathToFileURL(join(harnessDesktopSrc, 'paths
 console.log(`\n[1/5] 产物完整性 + runtime 身份（桌面端真代码，harness=${harnessDesktopSrc})`)
 
 const runtime = runtimeTree.readDesktopRuntime(runtimeDir)
-const runtimeId = runtimeTree.desktopRuntimeId(runtime)
 console.log(`      runtime ${runtime.release.version} / node ${runtime.release.nodeVersion} / ${runtime.platform}/${runtime.arch}` +
   ` / ${String(runtime.sharedPackages.length)} 个共享包 / ${String(runtime.files.length)} 个受校验文件`)
 
@@ -246,18 +245,19 @@ try {
   }
 }
 
-const statePath = join(profileDir, 'desktop-runtime-state.json')
-if (check(existsSync(statePath), 'desktop-runtime-state.json 在位（缺了它插件登记会被静默抹掉）')) {
-  const state = profilePackages.readDesktopProfileState(profileDir)
-  check(state.runtimeId === runtimeId, 'state.runtimeId 与本包 runtime 一致（assertProfileRuntime 会放行）')
-  // reconcileProfile 的 rebuild 触发器：任一不一致就删 node_modules 跑
-  // `pnpm install --frozen-lockfile --ignore-scripts`，而插件不在 registry 里 → 用户机器上必然失败。
-  check(state.nodeVersion === runtime.release.nodeVersion,
-    `state.nodeVersion=${state.nodeVersion} 与 runtime 一致（否则触发 pnpm install 重建）`)
-  check(state.platform === runtime.platform, `state.platform=${state.platform} 与 runtime 一致`)
-  check(state.arch === runtime.arch, `state.arch=${state.arch} 与 runtime 一致`)
-  check(!existsSync(join(profileDir, 'desktop-packages-pending')), '没有遗留 desktop-packages-pending（否则启动即报「准备未完成」）')
-}
+// `desktop-runtime-state.json` 是**遗留文件**，2026-09-18 起反过来断言它不该在包里。
+//
+// 0.1.6-alpha.2 把整套「link 模式 + 状态文件」退役了：`apps/desktop/src/profile-packages.ts`
+// 现在只剩一个一次性迁移函数 `migrateDesktopProfileLinks()`（在 `applyRelease()` 里调用），
+// 它的作用就是**把这个文件删掉**；而插件登记之所以还能保住，是因为 `createPluginProfile()`
+// 落到的 `initProfile()` 是「不存在才写」（`packages/boot/app-boot/src/profile.ts:203`）——
+// 也就是说，那个最隐蔽的坑「状态文件缺失 → package.json 被重写成空依赖 → 插件静默消失」
+// **上游自己修掉了**。我们此前写这个文件的理由（见 `package-desktop-portable.mjs` 的历史注释）
+// 随之作废；继续写它不但没用（启动即被删），还会让人以为绕法仍然必需。
+const legacyStatePath = join(profileDir, 'desktop-runtime-state.json')
+check(!existsSync(legacyStatePath),
+  '包里没有遗留的 desktop-runtime-state.json（alpha.2 起该文件退役；插件登记由 initProfile 的「不存在才写」保住）')
+check(!existsSync(join(profileDir, 'desktop-packages-pending')), '没有遗留 desktop-packages-pending（否则启动即报「准备未完成」）')
 
 // fail fast：完整性 / runtime 身份不过，说明**这棵树本身就是坏的**。
 // 后面四步读的是同一棵树，继续跑只会把同一个结论重复四遍，还把真正的失败项淹在后面。
@@ -267,18 +267,24 @@ if (failures.length > 0) {
   process.exit(1)
 }
 
-/* ---------- 2. 复刻桌面端 prepareProfile ---------- */
+/* ---------- 2. 复刻桌面端启动时的 profile 准备（applyRelease） ---------- */
 
-console.log('\n[2/5] 复刻桌面端 prepareProfile（建链 + 依赖图校验）')
+console.log('\n[2/5] 复刻桌面端 applyRelease（用真代码跑一遍首次启动那条路）')
 
 const BUILTIN_BUNDLES = ['@deepseek-ai/dsh-base', '@deepseek-ai/dsh-web-app']
 const scratchBase = mkdtempSync(join(tmpdir(), 'dsh-verify-profile-'))
 const workProfileDir = join(scratchBase, options.profile)
 
-let activePlugins = []
+// 打包态把 profileResolution 传成 runtime 这件事仍然重要（app-boot 的 `runProfile` 按它决定
+// 从哪里解析宿主包），但它**不再从 profile 的内容上看得出来** —— link 模式那套记账
+// （`linkDesktopHostPackages`）已被上游整个删除，profile 在两种模式下长得一样。
+// 所以它只能按源码判据断言，这也成了 `detectResolutionMode` 如今唯一的用途。
+check(resolutionMode === 'runtime',
+  'main.ts 的打包态把 profileResolution 传成 runtime（源码判据，见 detectResolutionMode）')
+
 if (existsSync(profileDir)) {
-  // 在副本上做：link 模式下 `linkDesktopHostPackages` 会往 node_modules 写几百条 junction 并重写 state，
-  // 不该污染 `--dir` 里那份。副本也从「出厂态」开始，正好验证首次启动那条路径。
+  // 在副本上做：applyRelease 会加锁、会清理 core 包、还会让 initProfile 补写缺的文件，
+  // 不该污染 `--dir` 里那份。副本从「出厂态」开始，正好验证首次启动那条路径。
   cpSync(profileDir, workProfileDir, { recursive: true })
 
   const manifest = JSON.parse(readFileSync(join(workProfileDir, 'package.json'), 'utf8'))
@@ -286,46 +292,44 @@ if (existsSync(profileDir)) {
   check(BUILTIN_BUNDLES.every((bundle, index) => bundles[index] === bundle),
     'profile 的 bundles 以两个内置 bundle 正确开头（profilePluginNames 的前置校验）')
   check(new Set(bundles).size === bundles.length, 'profile bundles 无重复')
-  activePlugins = bundles.slice(BUILTIN_BUNDLES.length)
+  const activePlugins = bundles.slice(BUILTIN_BUNDLES.length)
   check(activePlugins.includes('dsh-webops-plugin'), `本插件在 activePlugins 里：${JSON.stringify(activePlugins)}`)
 
   const nmDir = join(profileDir, 'node_modules')
   const shipped = existsSync(nmDir) ? readdirSync(nmDir) : []
-  // 括号不能省：`A + b === 'runtime' ? X : Y` 求值为 `(A + b) === 'runtime' ? X : Y`，
-  // 恒取 Y —— 2026-09-17 之前 runtime 模式一直在打印「会建链接」的错误说明。
   notes.push(`出厂态 profile/node_modules 只有 ${String(shipped.length)} 个条目（${shipped.join(', ')}）——`
-    + (resolutionMode === 'runtime'
-      ? `${String(runtime.sharedPackages.length)} 个宿主包由运行时目录直接供给（runtime 模式不建链），这是设计如此`
-      : `${String(runtime.sharedPackages.length)} 条宿主链接由桌面端首次启动时建立，不在 zip 里，这是设计如此`))
+    + `${String(runtime.sharedPackages.length)} 个宿主包由运行时目录直接供给（不建链），这是设计如此`)
 
+  // 真代码跑一遍启动时真正动 profile 的那一步。**这一步才是「插件会不会静默消失」的真凭据**：
+  // 0.1.5 / 0.1.6-alpha.1 时代它会把 package.json 整个重写成空依赖，靠我们随包写的
+  // `desktop-runtime-state.json` 才躲过去；alpha.2 起落到「不存在才写」的 `initProfile()`，
+  // 出厂 profile 原样保留。这条断言就是那次行为变更的回归护栏 —— 它比「复刻一遍内部记账」
+  // 更贴近真机，因为跑的就是启动路径上那个函数。
   try {
-    if (resolutionMode === 'runtime') {
-      // dsh 0.1.6 起打包态不再建 junction：宿主包由 `app.asar\dsh` 直接供给
-      // （宿主进程改成本 exe + ELECTRON_RUN_AS_NODE，能读 asar）。`prepareProfile`
-      // 因此只记状态，而 `applyRelease` 的快速返回分支也**不检查 links**。
-      // 这里照抄它，顺带断言「不建链」这件事本身 —— 若哪天上游改回 link 模式，
-      // 这一条会先转红，提示下面的分支该换回来了。
-      profilePackages.recordDesktopRuntimeProfile(workProfileDir, runtime)
-      const recorded = profilePackages.readDesktopProfileState(workProfileDir)
-      check(recorded.runtimeId === runtimeId,
-        'runtime 模式只记状态（recordDesktopRuntimeProfile 写回 runtimeId）')
-      check(recorded.links.length === 0,
-        `runtime 模式不建宿主链接（links=${String(recorded.links.length)}），宿主包由 runtime 目录直接解析`)
-      profilePackages.validateDesktopPluginGraph(workProfileDir, runtimeDir, runtime, activePlugins, 'runtime')
-      check(true, `依赖图校验通过（runtime 模式：${String(runtime.sharedPackages.length)} 个宿主包由 runtime 目录供给 + peer 版本满足）`)
-    } else {
-      // 目前走不到这里：`detectResolutionMode` 只会返回 runtime，认不出就抛错（见其注释）。
-      // 留着是因为它是**唯一**一处把「link 模式的期望」写下来的地方（建链条数 + 不带
-      // 'runtime' 参数的依赖图校验）；上游若真改回 link，改判据时这半立刻可用。
-      profilePackages.linkDesktopHostPackages(workProfileDir, runtimeDir, runtime)
-      const linked = profilePackages.readDesktopProfileState(workProfileDir)
-      check(linked.links.length === runtime.sharedPackages.length,
-        `建链 ${String(linked.links.length)}/${String(runtime.sharedPackages.length)} 条宿主包链接`)
-      profilePackages.validateDesktopPluginGraph(workProfileDir, runtimeDir, runtime, activePlugins)
-      check(true, '依赖图校验通过（插件依赖本地化 + 共享宿主实例 + peer 版本满足）')
-    }
+    const projectManager = await tsImport(pathToFileURL(join(harnessDesktopSrc, 'project-manager.ts')).href, import.meta.url)
+    const manager = new projectManager.DesktopProjectManager(
+      { profile: workProfileDir, lock: join(workProfileDir, 'lock') },
+      { dsh: runtimeDir },
+    )
+    await manager.applyRelease(true)
+    check(true, 'applyRelease(true) 在出货 profile 上跑通（跑的是桌面端真代码，不是复刻）')
+
+    const after = JSON.parse(readFileSync(join(workProfileDir, 'package.json'), 'utf8'))
+    check(after.dependencies?.['dsh-webops-plugin'] !== undefined,
+      'applyRelease 之后插件仍在 dependencies 里（这就是「静默抹掉」的回归护栏）')
+    check((after.dsh?.profile?.bundles ?? []).includes('dsh-webops-plugin'), 'applyRelease 之后插件仍在 bundles 里')
+
+    const pluginDirInCopy = join(workProfileDir, 'node_modules', 'dsh-webops-plugin')
+    const entry = lstatSync(pluginDirInCopy)
+    // 必须是**真目录**：老版桌面端见 symlink 直接拒（`validateDesktopPluginGraph`，该函数已被
+    // 上游删除，但这条要求在用户机器上更硬 —— 那边没有本机 checkout 可以指过去）。
+    check(entry.isDirectory() && !entry.isSymbolicLink(),
+      '插件是真实目录（不是 symlink：用户机器上没有本机 checkout 可指）')
+    check(existsSync(join(pluginDirInCopy, 'cordis.patch.yml')), '插件的 cordis.patch.yml 还在（ptc-runtime 覆盖靠它）')
+    check(existsSync(join(pluginDirInCopy, 'lib', 'index.js')), '插件的 lib/index.js 还在（package.json 的入口）')
+    check(!existsSync(join(workProfileDir, 'desktop-runtime-state.json')), 'applyRelease 之后也没冒出遗留状态文件')
   } catch (error) {
-    check(false, `prepareProfile 失败：${error.message}`)
+    check(false, `applyRelease 失败：${error instanceof Error ? error.message : String(error)}`)
   }
 }
 
@@ -448,9 +452,6 @@ if (options.home === undefined && existsSync(packagedHome)) {
   }
 }
 
-const require = createRequire(join(runtimeDir, 'package.json'))
-const { runDesktopHost } = await import(pathToFileURL(require.resolve('@deepseek-ai/dsh-desktop-host')).href)
-
 // 必须把 DSH_HOME 指到一次性 home：`loadLayeredEnv` 在 boot 时读它，不设就会落到
 // 开发机自己的 `~/.dsh`（那份可能有正在运行的实例持有 .credentials.yaml.lock，
 // 表现为 boot 挂在 writer lock 上而不是报错）。
@@ -458,92 +459,25 @@ process.env.DSH_HOME = scratchHome
 // 上一次跑到一半被杀留下的锁会让下一次 boot 直接超时，先清掉。
 rmSync(join(scratchHome, '.credentials.yaml.lock'), { force: true })
 
-const FRAME_MAGIC = 1146308659
-const FRAME_HEADER_BYTES = 13
-const STREAM_START = 1
-const STREAM_DATA = 2
-const STREAM_END = 3
-const STREAM_ERROR = 4
-/** 每个 streamId 一个响应槽：start / data / end / error。 */
-const sinks = new Map()
-let decoderBuffer = Buffer.alloc(0)
-
-/** 增量解码宿主响应管道（与 Electron 壳的 DesktopHostResponseDecoder 同协议）。 */
-function feedResponsePipe(chunk) {
-  decoderBuffer = decoderBuffer.byteLength === 0
-    ? Buffer.from(chunk)
-    : Buffer.concat([decoderBuffer, Buffer.from(chunk)])
-  for (;;) {
-    if (decoderBuffer.byteLength < FRAME_HEADER_BYTES) return
-    if (decoderBuffer.readUInt32BE(0) !== FRAME_MAGIC) throw new Error('响应帧标记不对（宿主协议版本不匹配？）')
-    const type = decoderBuffer.readUInt8(4)
-    const streamId = decoderBuffer.readUInt32BE(5)
-    const length = decoderBuffer.readUInt32BE(9)
-    if (decoderBuffer.byteLength < FRAME_HEADER_BYTES + length) return
-    const payload = decoderBuffer.subarray(FRAME_HEADER_BYTES, FRAME_HEADER_BYTES + length)
-    decoderBuffer = decoderBuffer.subarray(FRAME_HEADER_BYTES + length)
-    const sink = sinks.get(streamId)
-    if (sink === undefined) continue
-    if (type === STREAM_START) sink.start(JSON.parse(payload.toString('utf8')))
-    else if (type === STREAM_DATA) sink.data(payload)
-    else if (type === STREAM_END) { sinks.delete(streamId); sink.end() }
-    else if (type === STREAM_ERROR) { sinks.delete(streamId); sink.error(JSON.parse(payload.toString('utf8')).message) }
-  }
+const host = startPackagedDesktopHost({
+  runtimeDir,
+  profileDir: workProfileDir,
+  env: process.env,
+})
+let ready
+try {
+  ready = await host.ready
+  check(true, `宿主启动成功（${ready.url}）`)
+} catch (error) {
+  check(false, `宿主启动：${error instanceof Error ? error.message : String(error)}`)
 }
 
-const host = await runDesktopHost(runtimeDir, workProfileDir, async (frame) => feedResponsePipe(frame), {
-  allowLinkedPackages: true,
-})
+const ORIGIN = ready === undefined ? `http://127.0.0.1:${String(options.port)}` : new URL(ready.url).origin
 
-// 宿主只认 URL 的 pathname，给个绝对 URL 即可。
-const ORIGIN = `http://127.0.0.1:${String(options.port)}`
-let nextStreamId = 1
-
-/**
- * 宿主 fetch 的等待上限。
- *
- * 以前这里没有超时：宿主起了但**不回**这条流，`done` 永远不 settle，脚本就一直挂着 ——
- * CI 上表现为「这一步跑了一小时」，看日志只知道卡住，不知道卡在等谁。
- */
-// env 传进来的是字符串，拼错就是 NaN —— 那样 setTimeout 会立刻触发，
-// 报成「宿主 0ms 没回」，把人往完全错误的方向引。
-const configuredFetchTimeout = Number(process.env.VERIFY_HOST_FETCH_TIMEOUT_MS)
-const HOST_FETCH_TIMEOUT_MS = Number.isFinite(configuredFetchTimeout) && configuredFetchTimeout > 0
-  ? configuredFetchTimeout
-  : 20_000
-
-/** 走宿主的 fetch 通道取一个路径，把响应缓冲成完整 body。 */
+/** 走宿主 HTTP 通道取一个路径（带 ready URL 上的认证 query）。 */
 async function hostFetch(pathname) {
-  const streamId = nextStreamId++
-  const chunks = []
-  let status = 0
-  const done = new Promise((resolvePromise, rejectPromise) => {
-    sinks.set(streamId, {
-      start: (meta) => { status = meta.status },
-      data: (payload) => chunks.push(payload),
-      end: () => resolvePromise({ status, body: Buffer.concat(chunks) }),
-      error: (message) => rejectPromise(new Error(message)),
-    })
-  })
-  let timer
-  const timeout = new Promise((_resolve, rejectPromise) => {
-    timer = setTimeout(() => {
-      rejectPromise(new Error(`宿主 ${String(HOST_FETCH_TIMEOUT_MS)}ms 没回 ${pathname} —— 宿主起了但通道没通（不是包坏了）`))
-    }, HOST_FETCH_TIMEOUT_MS)
-  })
-  await host.fetch({ streamId, request: { url: `${ORIGIN}${pathname}`, method: 'GET', headers: [] } }, null)
-  try {
-    return await Promise.race([done, timeout])
-  } catch (error) {
-    // 超时 / 出错后这条流的 sink 不会被 end 收走，留在表里就是泄漏。
-    sinks.delete(streamId)
-    // `done` 可能在超时之后才 reject；没接管的话 Node 会把它当成未处理的 Promise 拒绝，
-    // 于是「宿主没回」这个本来能读懂的错，变成一个看不懂的崩溃。
-    void done.catch(() => undefined)
-    throw error
-  } finally {
-    clearTimeout(timer)
-  }
+  if (ready === undefined) throw new Error('宿主没起来，没法 fetch')
+  return fetchHostPath(ready.url, pathname)
 }
 
 const index = await hostFetch('/index.html')
@@ -678,7 +612,7 @@ if (options.browser === undefined) {
 
 /* ---------- 收尾 ---------- */
 
-await host.dispose()
+await host.stop()
 // workProfileDir 是 profile 的工作副本（含脚本建出的 241 条 junction），连同它的父目录一起清掉。
 try {
   rmSync(scratchBase, { recursive: true, force: true })

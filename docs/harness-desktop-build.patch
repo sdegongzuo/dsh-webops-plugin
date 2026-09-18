@@ -44,18 +44,20 @@ index e5c789c165..820be9081e 100644
      const targetName = resolveDesktopBuildTarget()
      const target = { platform: process.platform, arch: targetName.endsWith('arm64') ? 'arm64' : 'x64' }
 diff --git a/apps/desktop/src/main.ts b/apps/desktop/src/main.ts
-index d5bfb1e0b3..a387693c05 100644
+index d5bfb1e0b3..e390d4a1c9 100644
 --- a/apps/desktop/src/main.ts
 +++ b/apps/desktop/src/main.ts
-@@ -2,6 +2,7 @@ import { WINDOWS_TITLEBAR_HEIGHT } from './windows-layout.ts'
+@@ -1,7 +1,9 @@
+ import { WINDOWS_TITLEBAR_HEIGHT } from './windows-layout.ts'
  /** Electron shell: desktop project ownership, custom protocol, windows, and lifecycle. */
  
++import { existsSync } from 'node:fs'
  import { readFile, writeFile } from 'node:fs/promises'
 +import { createRequire } from 'node:module'
  import { join } from 'node:path'
  import { fileURLToPath } from 'node:url'
  import {
-@@ -18,7 +19,7 @@ import {
+@@ -18,7 +20,7 @@ import {
    type IpcMainInvokeEvent,
    type MenuItemConstructorOptions,
  } from 'electron'
@@ -64,7 +66,7 @@ index d5bfb1e0b3..a387693c05 100644
  import { DesktopProjectManager } from './project-manager.ts'
  import { DesktopHostProcess, DesktopHostUncleanExitError } from './host-process.ts'
  import { installDesktopDirectoryPicker } from './directory-picker.ts'
-@@ -40,6 +41,60 @@ import { DesktopPolicyTestAuth } from './policy-test-auth.ts'
+@@ -40,6 +42,69 @@ import { DesktopPolicyTestAuth } from './policy-test-auth.ts'
  import { DesktopUpdateDialog, type UpdateDialogOptions } from './update-dialog.ts'
  import { readDesktopRuntime } from './runtime-tree.ts'
  
@@ -99,17 +101,26 @@ index d5bfb1e0b3..a387693c05 100644
 +// 进入 node 模式，stdin/stdout 上的控制协议永远建立不起来，`run_code` 挂到超时 —— 症状
 +// 就是「ptc 模式下工具起不来」。
 +//
-+// 便携包自带一份真 node（`resources\runtime\node\node.exe`，打包时随 runtime 目录进来），
-+// 指过去即可；开发态回落到 execPath 本身（那本来就是 node）。读这个变量的是**我们自己的**
-+// `cordis.patch.yml` 里那条 `ptc-runtime` config 覆盖 —— 0.1.6-alpha.2 起上游删掉了
-+// `desktop-host/config/desktop.cordis.patch.yml`（`patchFiles: []`），桌面 profile 的
-+// 补丁挂载点没了，索性收进随包出货的那份补丁文件里，顺带少维护一个补丁目标。
-+process.env.DSH_PTC_NODE = join(
++// 便携包自带一份真 node（alpha.2 起在
++// `resources\runtime\primary-runtime\dependencies\node\bin\node.exe`，
++// 不再是 `resources\runtime\node`）。指过去即可；文件不在（开发态 / 未打包）
++// 回落到 execPath 本身（那本来就是 node）。不要改指 `runtime\bin\node.cmd`：
++// 那个 shim 依赖 `ELECTRON_RUN_AS_NODE` 和 `DSH_DESKTOP_NODE_EXECUTABLE`，
++// 两者都会被 PTC 子进程环境白名单清掉。
++// 读这个变量的是**我们自己的** `cordis.patch.yml` 里那条 `ptc-runtime` config
++// 覆盖 —— 0.1.6-alpha.2 起上游删掉了 `desktop-host/config/desktop.cordis.patch.yml`
++// （`patchFiles: []`），桌面 profile 的补丁挂载点没了，索性收进随包出货的那份
++// 补丁文件里，顺带少维护一个补丁目标。
++const bundledPtcNode = join(
 +  process.resourcesPath,
 +  'runtime',
++  'primary-runtime',
++  'dependencies',
 +  'node',
++  'bin',
 +  process.platform === 'win32' ? 'node.exe' : 'node',
 +)
++process.env.DSH_PTC_NODE = existsSync(bundledPtcNode) ? bundledPtcNode : process.execPath
 +
 +// 便携模式：主 exe 的上一级如果存在 `home\`，就把这份安装当成便携版，把它认作 $DSH_HOME。
 +// 便携版的布局是 `<root>\app\<exe>` + `<root>\home`，于是**双击 exe 本体**也能自带配置
@@ -125,7 +136,7 @@ index d5bfb1e0b3..a387693c05 100644
  let focusPrimaryWindow = (): void => {}
  let stopForRecovery = async (): Promise<void> => {}
  let shuttingDown = false
-@@ -93,8 +148,18 @@ function runtimeResources(): RuntimeResources {
+@@ -93,8 +158,18 @@ function runtimeResources(): RuntimeResources {
    const pnpm = (development ? process.env.DSH_DESKTOP_PNPM_ENTRY : undefined)
      ?? (development ? join(app.getAppPath(), 'node_modules', 'pnpm', 'bin', 'pnpm.mjs')
        : join(process.resourcesPath, 'runtime', 'pnpm', 'bin', 'pnpm.mjs'))
@@ -145,7 +156,7 @@ index d5bfb1e0b3..a387693c05 100644
    return { node, nodeBin, pnpm, dsh }
  }
  
-@@ -771,17 +836,29 @@ async function main(): Promise<void> {
+@@ -771,17 +846,29 @@ async function main(): Promise<void> {
    publishUpdate(updateState)
  }
  
@@ -234,10 +245,10 @@ index 246dcbcfdf..8d7d3df13e 100644
    DesktopProjectManager: class {
      readonly applyRelease = harness.applyRelease
 diff --git a/packages/sandbox/sandbox-local/src/index.ts b/packages/sandbox/sandbox-local/src/index.ts
-index 037dc90079..298b438fd0 100644
+index 037dc90079..f09a2ee5d3 100644
 --- a/packages/sandbox/sandbox-local/src/index.ts
 +++ b/packages/sandbox/sandbox-local/src/index.ts
-@@ -147,6 +147,30 @@ interface AclTempCapability {
+@@ -147,6 +147,41 @@ interface AclTempCapability {
    grant: AclWriteGrant
  }
  
@@ -254,21 +265,32 @@ index 037dc90079..298b438fd0 100644
 + * `worker-exit: Node process exited before completing (0)` with no output.
 + *
 + * The desktop package ships a real node for this purpose
-+ * (`resources/runtime/node`), so use it whenever we ARE the Electron runtime and
-+ * it is present. Dev, CLI and test runs keep `process.execPath` unchanged.
++ * (`resources/runtime/primary-runtime/dependencies/node/bin`), so use it
++ * whenever we ARE the Electron runtime and it is present. Do not point at
++ * `resources/runtime/bin/node.cmd`: that shim needs ELECTRON_RUN_AS_NODE and
++ * DSH_DESKTOP_NODE_EXECUTABLE, both stripped from the PTC child env.
++ * Dev, CLI and test runs keep `process.execPath` unchanged.
 + */
 +function runnerExecutable(): string {
 +  if (process.versions.electron === undefined) return process.execPath
 +  const resources = (process as unknown as { resourcesPath?: string }).resourcesPath
 +  if (resources === undefined || resources.length === 0) return process.execPath
-+  const bundled = join(resources, 'runtime', 'node', process.platform === 'win32' ? 'node.exe' : 'node')
++  const bundled = join(
++    resources,
++    'runtime',
++    'primary-runtime',
++    'dependencies',
++    'node',
++    'bin',
++    process.platform === 'win32' ? 'node.exe' : 'node',
++  )
 +  return existsSync(bundled) ? bundled : process.execPath
 +}
 +
  /**
   * The runner chain per platform — selection is BY PLATFORM first, probes
   * second: a platform's chain is probed in preference order only when it has
-@@ -557,13 +581,15 @@ export class LocalSandboxProvider extends SandboxProvider {
+@@ -557,13 +592,15 @@ export class LocalSandboxProvider extends SandboxProvider {
     * Pin the source loader and TypeScript paths to this installation, independently
     * of target cwd or environment overrides.
     * The prefix stays `[node, runner, ...]` — a future native-exe runner keeps

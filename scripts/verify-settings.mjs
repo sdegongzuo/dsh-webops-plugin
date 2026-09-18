@@ -24,12 +24,11 @@
  * 退出码 0 = 通过，1 = 失败。
  */
 
-import { createRequire } from 'node:module'
 import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
-import { pathToFileURL } from 'node:url'
 import { materializeRuntimeDir } from './desktop-runtime.mjs'
+import { startPackagedDesktopHost } from './run-packaged-host.mjs'
 
 const args = process.argv.slice(2)
 const readArg = (name) => {
@@ -191,19 +190,21 @@ writeFileSync(join(profileDir, 'package.json'), `${JSON.stringify({
 
 process.env.DSH_HOME = home
 
-const require = createRequire(join(runtimeDir, 'package.json'))
-const { runDesktopHost } = await import(pathToFileURL(require.resolve('@deepseek-ai/dsh-desktop-host')).href)
-
-let host
+const host = startPackagedDesktopHost({
+  runtimeDir,
+  profileDir,
+  env: process.env,
+})
+let ready
 try {
-  host = await runDesktopHost(runtimeDir, profileDir, async () => {}, { allowLinkedPackages: true })
-  check(true, `宿主启动成功（dsh ${host.dshVersion}）`)
+  ready = await host.ready
+  check(true, `宿主启动成功（${ready.url}）`)
 } catch (error) {
   check(false, `宿主启动：${error instanceof Error ? error.message : String(error)}`)
 }
 
 let report
-if (host !== undefined) {
+if (ready !== undefined) {
   const deadline = Date.now() + 90_000
   for (;;) {
     try {
@@ -254,7 +255,7 @@ check(
   `默认模型 = ${route}/${modelId}（实际 ${JSON.stringify(report?.defaultSelection)}）`,
 )
 
-if (host !== undefined) await host.dispose()
+await host.stop()
 materialized.cleanup()
 rmSync(home, { recursive: true, force: true })
 

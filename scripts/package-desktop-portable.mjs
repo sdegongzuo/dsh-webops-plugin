@@ -28,7 +28,8 @@
  *
  * **但光写 package.json 不够**：`applyRelease()` 在 `previous === undefined` 时会调
  * `createPluginProfile()` 把 package.json 重写成空插件列表 —— 登记的插件被静默冲掉。
- * 所以还必须写 `desktop-runtime-state.json`（见下面 2.5 节的详细理由）。
+ * **2026-09-18（dsh 0.1.6-alpha.2）起这条绕法作废、已删除**：上游把 `createPluginProfile()`
+ * 换成了「不存在才写」的 `initProfile()`，并且**主动删除**这份状态文件（见下面 2.5 节的理由）。
  * 这个坑 2026-09-14 才被发现：v0.1.0 和 v0.2.0 的包都因此启动后没有任何插件。
  */
 
@@ -208,32 +209,25 @@ writeFileSync(
 writeFileSync(join(profileDir, 'pnpm-workspace.yaml'), WORKSPACE_SETTINGS)
 console.log('  + home/profiles/desktop/package.json')
 
-// 2.5) 桌面端认可的 profile 状态文件。**少了它，上面登记的插件会被静默抹掉。**
+// 2.5) **不再写** `desktop-runtime-state.json`（2026-09-18，适配 dsh 0.1.6-alpha.2）。
 //
-// `DesktopProjectManager.applyRelease()`（project-manager.ts:306）的流程是：
-//   previous = readDesktopProfileState(profile)          // 读 desktop-runtime-state.json
-//   if (previous === undefined) createPluginProfile()    // ← 这里
-// 而 `createPluginProfile()`（project-manager.ts:604）会把 package.json **整个重写**成
-// `dependencies: {}` + `bundles: [dsh-base, dsh-web-app]` —— 我们刚写进去的
-// `dsh-webops-plugin` 被冲掉，随后 `prepareProfile` 拿空的 activePlugins 去校验，
-// 直接 `return`，**不报错、不提示**，启动后什么插件都没有。
+// 历史（v0.1.0 / v0.2.0 两个包就栽在这）：0.1.5 / 0.1.6-alpha.1 的 `applyRelease()` 在
+// `readDesktopProfileState()` 返回 undefined 时会调 `createPluginProfile()`，而那个版本
+// **把 package.json 整个重写成 `dependencies: {}`** —— 我们刚登记的 `dsh-webops-plugin`
+// 被静默冲掉。当时的绕法是随包写一份状态文件，让 previous !== undefined。
 //
-// 所以必须让 previous !== undefined。三个字段的取值有硬约束：
-//   · nodeVersion / platform / arch 必须与 app 内 runtime 完全一致 —— 不一致会让
-//     `reconcileProfile` 判定 rebuild=true，**删掉整个 node_modules** 再跑
-//     `pnpm install --frozen-lockfile`（我们的插件不在 registry，必挂）。
-//   · runtimeId 是 `sha256(JSON.stringify(descriptor))`（runtime-tree.ts:220），
-//     descriptor 由 `readDesktopRuntime`（runtime-tree.ts:150）按固定键序重建；
-//     这里照抄那个键序算出同值，好让第二次启动能走 applyRelease 的快速返回分支。
-//   · links 给空数组：真实 junction 的 target 是**用户机器上的绝对路径**，打包时
-//     不可能知道；给空数组让 host 那步重新建链并回写正确值。代价只是首次启动多跑
-//     一次 prepareProfile（幂等）。
-//   · lockHash 必须等于 `desktopPluginLockHash()` 在「没有 pnpm-lock.yaml」时的值，
-//     即空串的 sha256。
+// alpha.2 把整套「link 模式 + 状态文件」退役了：
+//   · `profile-packages.ts` 现在只剩一个一次性迁移函数 `migrateDesktopProfileLinks()`
+//     （在 `applyRelease()` 里被调用），它干的事就是**把这个文件删掉**；
+//   · 插件登记之所以保得住，是因为 `createPluginProfile()` 落到了 `initProfile()` 的
+//     「不存在才写」（`packages/boot/app-boot/src/profile.ts:203`：`if (!existsSync(manifestPath))`）。
+// 也就是说那个坑**上游自己修掉了**。继续写这个文件从「必要」变成「误导」—— 所以删掉，
+// 并改由自检反向守住：`verify:portable` 的 [1/5] 断言「包里不该有它」，[2/5] 真跑一遍
+// `applyRelease()` 断言插件登记与文件都还在。
 //
-// 清单在哪棵树里取决于 dsh 版本：0.1.5 及更早是 `resources\dsh\` 真目录，0.1.6 起
-// 打进了 `resources\app.asar`（详见 `desktop-runtime.mjs` 的文件头）。两种都认，
-// 换 harness 版本不至于把这一步搞挂。
+// 下面仍然读一次 descriptor：它不再是给状态文件用的，而是「这个 app 目录是不是完整的
+// win-unpacked」的第一手判据 —— 读不到清单说明布局不对（或上游又改了布局），
+// 要在这里就说清楚，别拖到整包打完之后。
 let runtime
 try {
   runtime = readRuntimeDescriptor(appDir).descriptor
@@ -241,28 +235,9 @@ try {
   console.error(`package-desktop-portable: ${error.message}`)
   process.exit(1)
 }
-const descriptor = {
-  schemaVersion: runtime.schemaVersion,
-  release: runtime.release,
-  platform: runtime.platform,
-  arch: runtime.arch,
-  sharedPackages: runtime.sharedPackages,
-  files: runtime.files,
-}
-writeFileSync(
-  join(profileDir, 'desktop-runtime-state.json'),
-  `${JSON.stringify({
-    schemaVersion: 1,
-    runtimeId: createHash('sha256').update(JSON.stringify(descriptor)).digest('hex'),
-    version: runtime.release.version,
-    nodeVersion: runtime.release.nodeVersion,
-    platform: runtime.platform,
-    arch: runtime.arch,
-    lockHash: createHash('sha256').update('').digest('hex'),
-    links: [],
-  }, undefined, 2)}\n`,
-)
-console.log(`  + home/profiles/desktop/desktop-runtime-state.json (node ${runtime.release.nodeVersion}, ${runtime.platform}/${runtime.arch})`)
+console.log(`  · app 内的 dsh 运行时：${runtime.release.version}`
+  + `（node ${runtime.release.nodeVersion}, ${runtime.platform}/${runtime.arch}）`
+  + ' —— 不写 profile 状态文件（alpha.2 起该文件已退役）')
 
 // 2.7) 出厂 settings.yaml：预置模型接入。便携版的 home\ 是全新的一份，不写这里的话
 //      用户开箱只有 dsh 自带的默认路由、且没有凭据，等于没有可用模型。
