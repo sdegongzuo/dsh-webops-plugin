@@ -296,6 +296,18 @@ describe('HttpCdpTransport', () => {
     await expect(new HttpCdpTransport(base).closeTarget('gone')).resolves.toBeUndefined()
   })
 
+  it('close 对 404 之外的错误状态码照抛（403 不被吞成「target 已没了」）', async () => {
+    respondJson({ message: 'Forbidden' }, 403)
+    await expect(new HttpCdpTransport(base).closeTarget('locked'))
+      .rejects.toThrow(expect.objectContaining({ code: 'BROWSER_PROTOCOL_ERROR', status: 403 }))
+  })
+
+  it('activate 同样只吞 404（500 照抛）', async () => {
+    respondJson({ message: 'Internal error' }, 500)
+    await expect(new HttpCdpTransport(base).activateTarget('broken'))
+      .rejects.toThrow(expect.objectContaining({ code: 'BROWSER_PROTOCOL_ERROR', status: 500 }))
+  })
+
   it('reports an unreachable endpoint as BROWSER_ENDPOINT_UNREACHABLE', async () => {
     await new Promise<void>(resolve => server.close(() => { resolve() }))
     await expect(new HttpCdpTransport(base).version())

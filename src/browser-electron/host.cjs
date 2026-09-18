@@ -414,9 +414,11 @@ function closeTab(id) {
  * 详见 `toggleDevTools`。
  *
  * ⚠ **re-attach 不保证之前 enable 过的 domain 还在**（实测：每次 attach 后要重新
- * `Runtime.enable` 才能收到 console 事件）。当前工具面不依赖任何 enable 过的 domain，
- * 所以这里没做额外的事；P2 的 console / network 采集器一旦接上，**必须在这里补一次
- * re-enable**，否则人工开关一次 DevTools 就会漏消息。
+ * `Runtime.enable` 才能收到 console 事件）。P2 的 console / network 采集器上线后，
+ * 这个缺口**没有**在宿主侧补：缓解落在父进程侧 —— 采集器每次 read 前都重新
+ * `enable`（见 `browser-cdp/provider.ts` 的 `console()` 与 `NetworkCollector.refresh`），
+ * 这比 host 侧维护 enable 清单更稳。detach 窗口内已完成的事件仍然永久丢失，
+ * 那是文档写明接受的能力边界（`browser-cdp/network.ts` 文件头），宿主侧不再处理。
  */
 function attachDebugger(entry) {
   if (entry.debuggerAttached) return
@@ -669,6 +671,12 @@ app.whenReady().then(() => {
   ]))
 
   const server = net.createServer((socket) => {
+    // 只认第一个连接（父进程）。第二个连接一律拒绝：本机任意进程探测一下端口
+    // 就能顶掉真父进程、甚至「连上再断开」直接触发下面的 app.quit() 杀死宿主。
+    if (connection !== undefined && !connection.destroyed) {
+      socket.destroy()
+      return
+    }
     connection = socket
     socket.setEncoding('utf8')
     let buffer = ''
@@ -690,8 +698,11 @@ app.whenReady().then(() => {
         void handle(command)
       }
     })
-    socket.on('error', () => { connection = undefined })
+    socket.on('error', () => {
+      if (connection === socket) connection = undefined
+    })
     socket.on('close', () => {
+      if (connection !== socket) return
       connection = undefined
       // 父进程走了。keepAlive 时把窗口留给用户，否则这个宿主没有存在意义了。
       if (!keepAlive) app.quit()

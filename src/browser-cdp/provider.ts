@@ -523,6 +523,11 @@ export class CdpBrowserProvider implements BrowserProvider {
     const beforeIds = new Set(this.sessions.keys())
     const watchUntil = Date.now() + TAB_OPEN_WATCH_MS
     const result = await this.dispatchMutation(session, request, signal)
+    // fill / scroll 不监视弹窗：输入与滚动不触发 window.open，等在这里纯属白付
+    // TAB_OPEN_WATCH_MS（250ms）—— 每次操作都付。真有怪页面在 input/scroll 里开窗，
+    // 通报链路（electron 侧 adoptSession）照常收编，代价只是这次结果不带 opened_tabs。
+    // click / press / wait 保留监视：它们才可能真的开窗（或与开窗的定时器赛跑）。
+    if (request.kind === 'fill' || request.kind === 'scroll') return result
     const openedTabs = await this.collectOpenedTabs(beforeIds, watchUntil, signal)
     return openedTabs.length === 0 ? result : { ...result, openedTabs }
   }
@@ -549,6 +554,12 @@ export class CdpBrowserProvider implements BrowserProvider {
 
   /**
    * 取「本次操作新接管的标签页」：动作前会话 id 的集合与此刻台账的差集。
+   *
+   * ⚠ 只对 electron provider 生效：差集依赖「宿主弹窗 → `{type:'opened'}` 通报 →
+   * provider `adoptSession`」这条链路，而 cdp provider 没有通报源（会话只在 `open()`
+   * 里登记），页面自己 `window.open` 的弹窗对差集不可见 —— `opened_tabs` 在 cdp
+   * provider 下恒为空，这是**静默的能力缺口**而非 bug。要补上需要 watch `/json/list`
+   * 的目标差集，目前没做。
    *
    * 通报延迟（中位 152ms）在两条路径上的待遇不同，所以才需要 `watchUntil` 这个截止点：
    *

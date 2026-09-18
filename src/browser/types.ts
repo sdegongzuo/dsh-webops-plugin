@@ -72,11 +72,14 @@ export type BrowserErrorCode =
 /** 能力缝隙与 provider 唯一抛出的错误类型。 */
 export class BrowserError extends Error {
   readonly code: BrowserErrorCode
+  /** HTTP 状态码；仅当错误源自一次真实的 HTTP 响应时才有值（如 DevTools 端点回 404/403）。 */
+  readonly status: number | undefined
 
-  constructor(message: string, code: BrowserErrorCode, options?: { cause?: unknown }) {
+  constructor(message: string, code: BrowserErrorCode, options?: { cause?: unknown; status?: number }) {
     super(message, options)
     this.name = 'BrowserError'
     this.code = code
+    this.status = options?.status
   }
 }
 

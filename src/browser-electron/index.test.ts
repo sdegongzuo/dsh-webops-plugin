@@ -9,7 +9,10 @@
 import { describe, expect, it, vi } from 'vitest'
 import Module from 'node:module'
 import { createRequire } from 'node:module'
+import type { ChildProcess } from 'node:child_process'
+import { connect, createServer, type Socket as NetSocket } from 'node:net'
 import { CdpConnection } from '../browser-cdp/protocol.ts'
+import { ElectronWindowBridge } from './bridge.ts'
 import type { BridgeDevTools, BridgeTab, BridgeTabBar, EventListener, TabHostChannel, TakeoverListener, TabOpenedListener } from './bridge.ts'
 import { resolveHostLaunch } from './bridge.ts'
 import { ElectronBrowserProvider } from './provider.ts'
@@ -57,12 +60,14 @@ class FakeHost implements TabHostChannel {
   private readonly closeListeners = new Set<() => void>()
 
   open(url: string): Promise<BridgeTab> {
+    if (this.isClosed) return Promise.reject(new Error('the window host channel closed'))
     const id = `t${String(this.opened.length + 1)}`
     this.opened.push(url)
     return Promise.resolve({ id, url, title: '', active: true })
   }
 
   list(): Promise<readonly BridgeTab[]> {
+    if (this.isClosed) return Promise.reject(new Error('the window host channel closed'))
     const last = this.opened.length
     return Promise.resolve(this.opened.map((url, index) => ({
       id: `t${String(index + 1)}`,
@@ -223,6 +228,108 @@ describe('ElectronWindowTransport', () => {
 
     expect(targets.map(target => target.id)).toEqual(['t1'])
     expect(targets[0]?.webSocketDebuggerUrl).toBe('electron-tab://t1')
+  })
+
+  it('宿主死后缓存失效，下一次调用重新起桥', async () => {
+    const first = new FakeHost()
+    const second = new FakeHost()
+    let count = 0
+    const transport = new ElectronWindowTransport(
+      { electronPath: 'ignored', hostScript: 'ignored' },
+      () => { count += 1; return Promise.resolve(count === 1 ? first : second) },
+    )
+    await transport.newTab('https://example.com/1')
+    expect(count).toBe(1)
+
+    first.breakChannel()
+    await transport.newTab('https://example.com/2')
+    expect(count).toBe(2)
+    expect(second.opened).toEqual(['https://example.com/2'])
+  })
+
+  it('桥死了但 onClose 没触发时，isClosed 兜底也让下一次调用重新起桥', async () => {
+    const first = new FakeHost()
+    const second = new FakeHost()
+    let count = 0
+    const transport = new ElectronWindowTransport(
+      { electronPath: 'ignored', hostScript: 'ignored' },
+      () => { count += 1; return Promise.resolve(count === 1 ? first : second) },
+    )
+    await transport.newTab('https://example.com/1')
+    // 只翻状态位、不走 breakChannel：模拟「断开发生了但订阅没赶上」。
+    first.isClosed = true
+    await transport.newTab('https://example.com/2')
+    expect(count).toBe(2)
+    expect(second.opened).toEqual(['https://example.com/2'])
+  })
+
+  describe('ElectronWindowBridge（socket 级回包解析）', () => {
+    /**
+     * 造一对本机 socket：server 侧可编程回包，client 侧交给真桥。
+     * 回包 handler 必须在连接发生**之前**就位（传给 createServer）——
+     * Node 的 'connection' 事件不排队，事后挂监听会静默丢连接。
+     */
+    async function socketPair(
+      onConnection: (socket: NetSocket) => void,
+    ): Promise<{ server: ReturnType<typeof createServer>; client: NetSocket }> {
+      const server = createServer(onConnection)
+      await new Promise<void>(resolve => { server.listen(0, '127.0.0.1', resolve) })
+      const address = server.address() as { port: number }
+      const client = connect({ port: address.port, host: '127.0.0.1' })
+      client.setEncoding('utf8')
+      await new Promise<void>(resolve => { client.once('connect', resolve) })
+      return { server, client }
+    }
+
+    /** 只会 kill 的假子进程：构造桥够用。 */
+    function fakeChild(): ChildProcess {
+      return { kill: () => {}, once: () => {} } as unknown as ChildProcess
+    }
+
+    async function teardown(client: NetSocket, server: ReturnType<typeof createServer>): Promise<void> {
+      client.destroy()
+      await new Promise<void>(resolve => { server.close(() => { resolve() }) })
+    }
+
+    it('宿主按命令回错误（unknown op）时命令 reject，而不是被当成功 resolve', async () => {
+      const { server, client } = await socketPair((socket) => {
+        socket.setEncoding('utf8')
+        socket.on('data', (chunk: string) => {
+          for (const line of chunk.split('\n')) {
+            if (line.trim() === '') continue
+            const command = JSON.parse(line) as { id: number; op: string }
+            // host.cjs 对未知 op 的真实回包形状：错误放在 message 字段，不放 error。
+            socket.write(`${JSON.stringify({ type: 'error', id: command.id, message: `unknown op ${command.op}` })}\n`)
+          }
+        })
+      })
+      const bridge = ElectronWindowBridge.forTesting(fakeChild(), client, { electronPath: 'x', hostScript: 'y' })
+      await expect(bridge.list()).rejects.toThrow(expect.objectContaining({
+        name: 'BridgeError',
+        code: 'BRIDGE_COMMAND_FAILED',
+        message: expect.stringContaining('unknown op list'),
+      }))
+      await teardown(client, server)
+    })
+
+    it('不带 id 的宿主状态告警既不炸桥也不污染在途命令', async () => {
+      const { server, client } = await socketPair((socket) => {
+        socket.setEncoding('utf8')
+        socket.on('data', (chunk: string) => {
+          for (const line of chunk.split('\n')) {
+            if (line.trim() === '') continue
+            const command = JSON.parse(line) as { id: number }
+            // 先推一条无 id 的告警（render-process-gone 的真实形状），再回正常应答。
+            socket.write(`${JSON.stringify({ type: 'error', tabId: 't1', message: 'renderer gone: {}' })}\n`)
+            socket.write(`${JSON.stringify({ type: 'list', id: command.id, tabs: [] })}\n`)
+          }
+        })
+      })
+      const bridge = ElectronWindowBridge.forTesting(fakeChild(), client, { electronPath: 'x', hostScript: 'y' })
+      await expect(bridge.list()).resolves.toEqual([])
+      expect(bridge.isClosed).toBe(false)
+      await teardown(client, server)
+    })
   })
 
   it('version 报告 Electron 版本，用来证明宿主起得来', async () => {

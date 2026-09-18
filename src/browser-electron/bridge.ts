@@ -296,9 +296,15 @@ export class ElectronWindowBridge implements TabHostChannel {
       windowsHide: false,
     })
 
+    // stderr 只保留尾部：宿主与页面都可能整生命周期地往 stderr 刷，无界累积就是慢性内存泄漏。
+    // 这里只用于启动失败时的诊断，尾部（崩溃现场就在最后）足够。
+    const STDERR_TAIL_LIMIT = 64 * 1024
     let stderr = ''
     child.stderr?.setEncoding('utf8')
-    child.stderr?.on('data', (chunk: string) => { stderr += chunk })
+    child.stderr?.on('data', (chunk: string) => {
+      stderr += chunk
+      if (stderr.length > STDERR_TAIL_LIMIT) stderr = stderr.slice(-STDERR_TAIL_LIMIT)
+    })
 
     const port = await readAnnouncedPort(child, options.handshakeTimeoutMs ?? DEFAULT_BRIDGE_HANDSHAKE_TIMEOUT_MS)
       .catch((error: unknown) => {
@@ -310,19 +316,44 @@ export class ElectronWindowBridge implements TabHostChannel {
         )
       })
 
+    // TCP connect 也要有超时：connect 对「宿主进程挂着但 accept 队列满」这类情况会无限挂起。
+    // 超时与失败都必须把子进程一起收掉 —— 否则起不来的宿主就成僵尸 Electron。
     const socket = connect({ host: '127.0.0.1', port })
-    await new Promise<void>((resolve, reject) => {
-      socket.once('connect', resolve)
-      socket.once('error', (error: Error) => reject(new BridgeError(
-        `cannot connect to the Electron window host on 127.0.0.1:${String(port)}: ${error.message}`,
+    const connectTimeoutMs = options.handshakeTimeoutMs ?? DEFAULT_BRIDGE_HANDSHAKE_TIMEOUT_MS
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(() => {
+          reject(new Error(`connect timeout after ${String(connectTimeoutMs)}ms`))
+        }, connectTimeoutMs)
+        socket.once('connect', () => { clearTimeout(timer); resolve() })
+        socket.once('error', (error: Error) => { clearTimeout(timer); reject(error) })
+      })
+    } catch (error: unknown) {
+      socket.destroy()
+      child.kill()
+      const detail = stderr.trim() === '' ? '' : `; host stderr:\n${stderr.trim()}`
+      throw new BridgeError(
+        `cannot connect to the Electron window host on 127.0.0.1:${String(port)}: ${
+          error instanceof Error ? error.message : String(error)
+        }${detail}`,
         'BRIDGE_START_FAILED',
-      )))
-    })
+      )
+    }
 
     const bridge = new ElectronWindowBridge(child, socket, options)
     // 宿主自己死了（崩了、被杀了）时，把它当成一次断连，别让调用方永远等下去。
     child.once('exit', () => { bridge.handleClosed() })
     return bridge
+  }
+
+  /**
+   * @internal 仅供单测：用现成的 socket 造桥，不走 spawn / 握手。
+   *
+   * 宿主回包的解析（`dispatch`）是真出过 bug 的地方（错误回包被当成功 resolve、
+   * 状态告警丢成死信），必须能不依赖真 Electron 就在 socket 级钉住。
+   */
+  static forTesting(child: ChildProcess, socket: Socket, options: BridgeOptions): ElectronWindowBridge {
+    return new ElectronWindowBridge(child, socket, options)
   }
 
   /** 通道是否已经断开。 */
@@ -568,6 +599,28 @@ export class ElectronWindowBridge implements TabHostChannel {
       for (const listener of [...this.listeners.get(tabId) ?? []]) {
         listener('Inspector.detached', { reason: 'tab closed by the user' })
       }
+      return
+    }
+
+    if (type === 'error') {
+      // 宿主报的错误（`host.cjs` 统一放在 `message` 字段，不放 `error`）：
+      // 带 id 的是某条命令的失败回包，必须 reject —— 否则会落进下面的 pending
+      // 成功路径被当成功 resolve（曾经的真实 bug：unknown op 静默成功）；
+      // 不带 id 的是宿主状态告警（render-process-gone / debugger.attach 失败），
+      // 只能记日志，但绝不能丢成死信。
+      const detail = typeof message['message'] === 'string'
+        ? message['message']
+        : 'window host reported an error'
+      if (typeof id === 'number') {
+        const entry = this.pending.get(id)
+        if (entry !== undefined) {
+          this.pending.delete(id)
+          clearTimeout(entry.timer)
+          entry.reject(new BridgeError(detail, 'BRIDGE_COMMAND_FAILED'))
+        }
+        return
+      }
+      noteLoaded('browser-electron', `bridge: host error: ${detail}`)
       return
     }
 

@@ -324,6 +324,16 @@ function mapCdpError(error: CdpErrorPayload): BrowserError {
   )
 }
 
+/**
+ * 判断一个错误是不是「target 已经不存在」（DevTools 端点回 404）。
+ * 只有 404 配得上幂等成功；403 / 500 之类是真错，必须照抛。
+ */
+function isTargetGone(error: unknown): boolean {
+  return error instanceof BrowserError
+    && error.code === 'BROWSER_PROTOCOL_ERROR'
+    && error.status === 404
+}
+
 /** 把 fetch 的网络层失败翻译成能力错误码。 */
 function transportError(what: string, error: unknown): BrowserError {
   return new BrowserError(
@@ -412,8 +422,9 @@ export class HttpCdpTransport implements CdpTransport {
     try {
       await this.request(`/json/close/${encodeURIComponent(targetId)}`, signal, 'PUT')
     } catch (error: unknown) {
-      // target 已经不存在时 Chrome 会回 404 —— 那正是我们想要的结果。
-      if (error instanceof BrowserError && error.code === 'BROWSER_PROTOCOL_ERROR') return
+      // target 已经不存在时 Chrome 会回 404 —— 那正是我们想要的结果（幂等成功）。
+      // 其它状态码（403 / 500…）是真错，必须照抛 —— 只看错误 code 一刀切的话会把它们一起吞掉。
+      if (isTargetGone(error)) return
       throw error
     }
   }
@@ -423,8 +434,8 @@ export class HttpCdpTransport implements CdpTransport {
     try {
       await this.request(`/json/activate/${encodeURIComponent(targetId)}`, signal, 'GET')
     } catch (error: unknown) {
-      // target 已经不存在时 Chrome 会回 404 —— 幂等成功。
-      if (error instanceof BrowserError && error.code === 'BROWSER_PROTOCOL_ERROR') return
+      // target 已经不存在时 Chrome 会回 404 —— 幂等成功。同上，只吞 404。
+      if (isTargetGone(error)) return
       throw error
     }
   }
@@ -492,6 +503,7 @@ export class HttpCdpTransport implements CdpTransport {
       throw new BrowserError(
         `DevTools endpoint ${path} responded ${response.status}`,
         'BROWSER_PROTOCOL_ERROR',
+        { status: response.status },
       )
     }
     const text = await response.text()

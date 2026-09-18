@@ -198,12 +198,32 @@ export class ElectronWindowTransport implements CdpTransport {
     await bridge?.dispose()
   }
 
-  /** 拿桥；没起来就起来，起来了但失败了就把缓存清掉好让下次重试。 */
+  /**
+   * 拿桥；没起来就起来，起来了但失败了就把缓存清掉好让下次重试。
+   *
+   * 缓存失效有两条路：① 订阅 `onClose` —— 宿主进程死了立刻清，让下一次调用重新起桥；
+   * ② 取桥时查 `isClosed` 兜底。只靠 ① 的话，「死了但订阅没赶上」的死桥会被缓存到
+   * 天荒地老，之后所有动作永远 `BRIDGE_CLOSED`（曾经的真实 bug）。
+   */
   private requireBridge(): Promise<TabHostChannel> {
-    this.bridge ??= this.startBridge().catch((error: unknown) => {
-      this.bridge = undefined
+    const cached = this.bridge
+    if (cached !== undefined) {
+      return cached.then(async (bridge) => {
+        if (!bridge.isClosed) return bridge
+        if (this.bridge === cached) this.bridge = undefined
+        return this.requireBridge()
+      })
+    }
+    const started = this.startBridge().then((bridge) => {
+      bridge.onClose(() => {
+        if (this.bridge === started) this.bridge = undefined
+      })
+      return bridge
+    }, (error: unknown) => {
+      if (this.bridge === started) this.bridge = undefined
       throw error
     })
-    return this.bridge
+    this.bridge = started
+    return started
   }
 }
