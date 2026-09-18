@@ -75,6 +75,11 @@ class FakeChrome {
   resolveNodeError: string | undefined
   /** P2：设置后，含 `throw` 的表达式返回 `exceptionDetails`（异常文本）。 */
   evaluateThrows: string | undefined
+  /**
+   * `webpage_fill` 的目标是不是 `contenteditable`（模拟 AI 问答页的富文本输入框）。
+   * 真实现里由页面内的 `isContentEditable` 判定，provider 据此改走 `Input.insertText`。
+   */
+  fillEditable = false
 
   /** 记录一条命令并给出它的结果。 */
   handle(socket: FakeSocket, method: string, params: Record<string, unknown>): unknown {
@@ -135,6 +140,10 @@ class FakeChrome {
           // locate 的守卫判据：true = 元素还连在文档上。
           return { result: { value: this.elementConnected } }
         }
+        if (fn.includes('isContentEditable')) {
+          // fill 的分支判定：'editable' = 富文本（调用方随后发 Input.insertText）。
+          return { result: { value: this.fillEditable ? 'editable' : 'value' } }
+        }
         if (fn.includes('dispatchEvent')) {
           return { result: { value: true } }
         }
@@ -185,6 +194,8 @@ class FakeChrome {
           this.href = 'https://zh.wikipedia.org/w/index.php?search=Electron'
           this.page = { url: this.href, title: 'Electron (software) - 维基百科，自由的百科全书' }
         }
+        return {}
+      case 'Input.insertText':
         return {}
       default:
         throw new Error(`unscripted method ${method}`)
@@ -816,6 +827,52 @@ describe('CdpBrowserProvider.mutate (P1)', () => {
     expect(down?.params).toMatchObject({ key: 'a', text: 'a' })
   })
 
+  it('accepts both "Space" and " " as the space key ([2026-09-18]: the advertised name was rejected)', async () => {
+    const ref = await firstRef()
+
+    // 工具描述与错误文案都把 `Space` 当命名键宣传 —— 它必须真的能用，否则模型照描述写就被拒。
+    const named = await provider.mutate({ kind: 'press', sessionId: 'tab-1', ref, key: 'Space' })
+    expect(named).toMatchObject({ action: 'press' })
+    const down = chrome.calls.find(call =>
+      call.method === 'Input.dispatchKeyEvent' && call.params['type'] === 'keyDown')
+    // `text` 不能少：CDP 的 keyDown 不带 text 不会合成字符插入（聚焦输入框按空格收不到东西）。
+    expect(down?.params).toMatchObject({ key: ' ', code: 'Space', windowsVirtualKeyCode: 32, text: ' ' })
+
+    // 单字符写法等价（两个名字共用同一份键参数）。
+    chrome.calls.length = 0
+    await provider.mutate({ kind: 'press', sessionId: 'tab-1', ref, key: ' ' })
+    const spaced = chrome.calls.find(call =>
+      call.method === 'Input.dispatchKeyEvent' && call.params['type'] === 'keyDown')
+    expect(spaced?.params).toMatchObject({ key: ' ', code: 'Space', text: ' ' })
+
+    // 反向验证：不在这张表里、也不是单字符的键名照样拒。
+    await expect(provider.mutate({ kind: 'press', sessionId: 'tab-1', ref, key: 'Meta' }))
+      .rejects.toThrow(expect.objectContaining({ code: 'BROWSER_PROTOCOL_ERROR' }))
+  })
+
+  it('fills a contenteditable through the browser input pipeline so beforeinput fires', async () => {
+    const ref = await firstRef()
+    chrome.fillEditable = true
+
+    await provider.mutate({ kind: 'fill', sessionId: 'tab-1', ref, value: '帮我写个总结' })
+
+    // 页面内那一步只做「聚焦 + 全选」：`Input.insertText` 是「在选区处插入」，
+    // 不先全选就会把新值拼到旧内容后面。
+    const probe = chrome.calls.find(call => call.method === 'Runtime.callFunctionOn')
+    expect(String(probe?.params['functionDeclaration'])).toContain('selectNodeContents')
+    // 真正的写入走原生输入管线 —— 否则 Lexical / ProseMirror 收不到 beforeinput，状态不更新。
+    const insert = chrome.calls.find(call => call.method === 'Input.insertText')
+    expect(insert?.params).toEqual({ text: '帮我写个总结' })
+  })
+
+  it('never calls Input.insertText for a plain input (反向验证)', async () => {
+    const ref = await firstRef()
+
+    await provider.mutate({ kind: 'fill', sessionId: 'tab-1', ref, value: 'me@example.com' })
+
+    expect(chrome.calls.some(call => call.method === 'Input.insertText')).toBe(false)
+  })
+
   it('scrolls with a wheel event at the element center and refuses zero deltas', async () => {
     const ref = await firstRef()
 
@@ -936,6 +993,23 @@ describe('P2: console / network / execute', () => {
     // 2026-09-14：Promise 必须被 await —— 否则 `fetch(...).then(...)` 只会回一个没有 value
     // 的 Promise，被当成「不可序列化」拒掉（报告 S5，而副作用其实已经发生）。
     expect(call?.params['awaitPromise']).toBe(true)
+  })
+
+  it('runs Runtime.evaluate with a user gesture so activation-gated APIs work (2026-09-18)', async () => {
+    await provider.open({})
+
+    await provider.execute({
+      sessionId: 'tab-1',
+      method: 'Runtime.evaluate',
+      params: { expression: 'navigator.clipboard.writeText("x")' },
+    })
+
+    const call = chrome.calls.filter(entry => entry.method === 'Runtime.evaluate')
+      .find(entry => String(entry.params['expression']).includes('clipboard'))
+    // 不带 user gesture 时，clipboard / requestFullscreen / window.open / 媒体自动播放一律被
+    // 页面拒成 `NotAllowedError: Transient user activation is required` —— 模型看到的就是
+    // 「JS 执行不了」。
+    expect(call?.params['userGesture']).toBe(true)
   })
 
   it('reports navigated=true when the evaluated expression changed the URL (2026-09-17)', async () => {

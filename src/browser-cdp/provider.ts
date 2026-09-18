@@ -701,6 +701,12 @@ export class CdpBrowserProvider implements BrowserProvider {
       // **已经跑完并产生了副作用**（报告 S5：network 里那条 GET 明明已经 200）。等它落定，
       // 返回兑现值才是调用方要的东西。
       params['awaitPromise'] = true
+      // 强制带 user gesture（2026-09-18 修）：不带的话，需要 transient activation 的 API
+      // 一律被页面拒 —— `navigator.clipboard.writeText`、`requestFullscreen`、`window.open`、
+      // 媒体自动播放都报 `NotAllowedError: Transient user activation is required`，模型看到的
+      // 就是「JS 执行不了」。这个逃生舱的契约本来就是「在页面里跑真代码」，而 click 本身也会
+      // 授予激活，两者保持一致。
+      params['userGesture'] = true
     }
     let raw: unknown
     try {
@@ -1265,26 +1271,19 @@ export class CdpBrowserProvider implements BrowserProvider {
     const beforeUrl = session.url
     const objectId = await this.resolveObjectId(session, ref, signal)
     try {
-      await session.connection.send<EvaluateResult>(
+      const outcome = await session.connection.send<EvaluateResult>(
         'Runtime.callFunctionOn',
-        {
-          objectId,
-          functionDeclaration:
-            'function (value) {'
-            + ' const element = this;'
-            + ' if (element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement) {'
-            + '   const prototype = element instanceof HTMLInputElement ? HTMLInputElement.prototype : HTMLTextAreaElement.prototype;'
-            + '   const descriptor = Object.getOwnPropertyDescriptor(prototype, "value");'
-            + '   if (descriptor && descriptor.set) { descriptor.set.call(element, value); } else { element.value = value; }'
-            + ' } else { element.textContent = value; }'
-            + ' element.dispatchEvent(new Event("input", { bubbles: true }));'
-            + ' element.dispatchEvent(new Event("change", { bubbles: true }));'
-            + ' return true; }',
-          arguments: [{ value }],
-          returnByValue: true,
-        },
+        { objectId, functionDeclaration: FILL_FUNCTION, arguments: [{ value }], returnByValue: true },
         { signal, timeoutMs: this.config.commandTimeoutMs },
       )
+      if (outcome.result?.value === 'editable') {
+        // 上一步已聚焦 + 全选，这里由浏览器原生输入管线写入（理由见 FILL_FUNCTION 注释）。
+        await session.connection.send(
+          'Input.insertText',
+          { text: value },
+          { signal, timeoutMs: this.config.commandTimeoutMs },
+        )
+      }
     } finally {
       this.releaseObject(session, objectId, signal)
     }
@@ -1728,6 +1727,60 @@ export class CdpBrowserProvider implements BrowserProvider {
   }
 }
 
+/**
+ * 空格键的键参数。
+ *
+ * 两个名字共用一份描述：`' '`（单字符写法）与 `Space`（命名键写法，Playwright 风格）。
+ * `Space` 这个别名不是可有可无的 —— 错误文案与 `webpage_press` 的工具描述都把 `Space`
+ * 当作命名键宣传，表里却只有 `' '`，于是模型照描述写 `key: "Space"` 会被判成
+ * 「unsupported key」（2026-09-18 修）。**宣传的名字必须真的能用。**
+ *
+ * `text: ' '` 也不是装饰：`Input.dispatchKeyEvent` 的 keyDown **只有带 text 才会合成字符
+ * 插入**（keypress/input 事件链），不带 text 时聚焦输入框按空格不产生任何字符。
+ */
+const SPACE_KEY = { key: ' ', code: 'Space', virtualKeyCode: 32, text: ' ' }
+
+/**
+ * `webpage_fill` 在页面里执行的填值函数；返回值告诉调用方走了哪条分支。
+ *
+ * - `'value'`：`input` / `textarea` —— 原生 setter + `input`/`change`，本框架听得懂。
+ * - `'editable'`：`contenteditable` —— **只聚焦 + 全选**，真正的写入交给调用方随后发的
+ *   `Input.insertText`。
+ * - `'text'`：其它元素 —— 保持既有的 `textContent` 行为。
+ *
+ * 为什么 `contenteditable` 不能直接写 `textContent`（2026-09-18 修）：Lexical / ProseMirror /
+ * Slate 这类富文本框架（AI 问答页输入框的主流实现）监听的是 `beforeinput`，赋值 `textContent`
+ * 不会触发它 —— 框架内部状态不更新、发送按钮不亮，模型以为填好了其实没填进去。
+ * `Input.insertText` 走浏览器原生输入管线（与真人键入同一条路），会派发 `beforeinput`/`input`，
+ * 框架才认。它的语义是「在选区处插入」而不是「设为」，所以必须先把已有内容全选，否则新值会被
+ * 拼接到旧内容后面。
+ */
+const FILL_FUNCTION = 'function (value) {'
+  + ' const element = this;'
+  + ' if (element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement) {'
+  + '   const prototype = element instanceof HTMLInputElement ? HTMLInputElement.prototype : HTMLTextAreaElement.prototype;'
+  + '   const descriptor = Object.getOwnPropertyDescriptor(prototype, "value");'
+  + '   if (descriptor && descriptor.set) { descriptor.set.call(element, value); } else { element.value = value; }'
+  + '   element.dispatchEvent(new Event("input", { bubbles: true }));'
+  + '   element.dispatchEvent(new Event("change", { bubbles: true }));'
+  + '   return "value";'
+  + ' }'
+  + ' if (element.isContentEditable === true) {'
+  + '   element.focus();'
+  + '   const selection = window.getSelection();'
+  + '   if (selection) {'
+  + '     const range = document.createRange();'
+  + '     range.selectNodeContents(element);'
+  + '     selection.removeAllRanges();'
+  + '     selection.addRange(range);'
+  + '   }'
+  + '   return "editable";'
+  + ' }'
+  + ' element.textContent = value;'
+  + ' element.dispatchEvent(new Event("input", { bubbles: true }));'
+  + ' element.dispatchEvent(new Event("change", { bubbles: true }));'
+  + ' return "text"; }'
+
 /** `webpage_press` 认得的键：名字 → CDP 键参数。 */
 const KNOWN_KEYS: ReadonlyMap<string, { key: string; code: string; virtualKeyCode: number; text?: string }> = new Map([
   ['Enter', { key: 'Enter', code: 'Enter', virtualKeyCode: 13, text: '\r' }],
@@ -1743,7 +1796,10 @@ const KNOWN_KEYS: ReadonlyMap<string, { key: string; code: string; virtualKeyCod
   ['End', { key: 'End', code: 'End', virtualKeyCode: 35 }],
   ['PageUp', { key: 'PageUp', code: 'PageUp', virtualKeyCode: 33 }],
   ['PageDown', { key: 'PageDown', code: 'PageDown', virtualKeyCode: 34 }],
-  [' ', { key: ' ', code: 'Space', virtualKeyCode: 32, text: ' ' }],
+  [' ', SPACE_KEY],
+  // 命名键别名：工具描述与错误文案都写的是 `Space`，必须真的收 —— 否则模型照描述写
+  // `key: "Space"` 会被判成 unsupported key，看起来就是「这个插件按不了空格」。
+  ['Space', SPACE_KEY],
 ])
 
 /**

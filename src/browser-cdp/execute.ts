@@ -72,7 +72,7 @@ const DENIED_PREFIXES: readonly { readonly prefix: string; readonly reason: stri
   { prefix: 'Emulation.', reason: 'Emulation.* writes target-level state shared across clients [V6][V9]' },
   { prefix: 'Fetch.', reason: 'Fetch.enable intercepts and can rewrite requests across clients' },
   { prefix: 'Overlay.', reason: 'Overlay.* is a visible side effect for the human eye: it pollutes screenshots and the human DevTools highlight, and highlightRect tints the whole viewport [V32]' },
-  { prefix: 'Input.', reason: 'Input.* bypasses the P1 read/mutate capability grading' },
+  { prefix: 'Input.', reason: 'Input.* bypasses the P1 read/mutate capability grading; to simulate keys, typing or scrolling, use webpage_press / webpage_fill / webpage_scroll instead' },
 ]
 
 /** 单条命令一律拒绝的理由。 */
@@ -198,8 +198,14 @@ export function extractEvaluateValue(result: unknown): unknown {
         + '(the expression itself has already run and may have had side effects)',
       )
     }
-    if (subtype === 'node' || value === undefined || isEmptyObject(value)) {
-      throw unserializable('the expression returned a DOM node or an object that serialized to an empty value')
+    if (subtype === 'node') {
+      throw unserializable(
+        'the expression returned a DOM node, which CDP serializes to an empty object; return a JSON string '
+        + 'of the fields you need instead (for example JSON.stringify({ text: el.textContent, href: el.href }))',
+      )
+    }
+    if (value === undefined || isEmptyObject(value)) {
+      throw emptyObjectValue()
     }
   } else if (value === undefined && type !== 'undefined') {
     // function / symbol 之类没有可返回值。
@@ -229,6 +235,25 @@ function unserializable(detail: string): BrowserError {
     + 'The expression itself has already run in the page, so any side effect it had is NOT rolled back. '
     + 'Return a primitive value or a JSON string (for example JSON.stringify(...)) instead of a DOM node, '
     + 'a cyclic object, a function, a Symbol, or an unawaited Promise.',
+    'BROWSER_EXECUTE_RESULT_UNSERIALIZABLE',
+  )
+}
+
+/**
+ * 造一条「返回了空对象」的错误。
+ *
+ * 为什么是拒绝而不是放行（2026-09-18 review 结论）：`document.body` 这类 DOM 节点在
+ * `returnByValue` 下会**静默**变成 `{}`（`[V22]` 实测），它与调用方真心返回的空对象在
+ * 序列化结果上**完全无法区分**（subtype 也不是 `node`）。一旦放行，模型就会拿到一个看着
+ * 有值、其实是垃圾的 `{}` 并当成成功 —— 比拒掉更危险。所以维持拒绝，只把话说清楚。
+ */
+function emptyObjectValue(): BrowserError {
+  return new BrowserError(
+    'the expression returned an object that serialized to an empty value ({}), which is what CDP does with '
+    + 'DOM nodes and some host objects — so this is most likely not the value you meant. '
+    + 'Return a JSON string of the fields you need instead (for example JSON.stringify({ text: el.textContent })); '
+    + 'if you really want an empty object, return JSON.stringify({}). '
+    + 'The expression itself has already run in the page, so any side effect it had is NOT rolled back.',
     'BROWSER_EXECUTE_RESULT_UNSERIALIZABLE',
   )
 }

@@ -42,7 +42,22 @@ describe('assertExecuteAllowed', () => {
     }
   })
 
+  it('points Input.* denials at the dedicated tools instead of leaving the model stuck (2026-09-18)', () => {
+    // 模型想绕过分级去发 Input.insertText / Input.dispatchKeyEvent 时，必须知道该用什么，
+    // 否则会以为「这个插件不能模拟按键」。
+    try {
+      assertExecuteAllowed('Input.insertText')
+      throw new Error('expected Input.insertText to be rejected')
+    } catch (error: unknown) {
+      if (!(error instanceof BrowserError)) throw error
+      expect(error.code).toBe('BROWSER_EXECUTE_NOT_ALLOWED')
+      expect(error.message).toContain('webpage_press')
+      expect(error.message).toContain('webpage_fill')
+    }
+  })
+
   it('accepts exactly the allow-listed commands and nothing else', () => {
+
     for (const method of BROWSER_EXECUTE_ALLOWED) {
       expect(() => assertExecuteAllowed(method), method).not.toThrow()
     }
@@ -76,6 +91,31 @@ describe('extractEvaluateValue', () => {
     expect(extractEvaluateValue({ result: { type: 'object', value: [1, 2] } })).toEqual([1, 2])
     expect(extractEvaluateValue({ result: { type: 'undefined' } })).toBeUndefined()
     expect(extractEvaluateValue({ result: { type: 'boolean', value: null } })).toBeNull()
+  })
+
+  it('stays a rejection for an empty object, but says what to do about it (2026-09-18)', () => {
+    // 为什么不是放行：`document.body` 在 returnByValue 下静默变成 `{}`，与真心返回的空对象
+    // **无法区分** —— 放行会让模型拿到一个看着有值、其实是垃圾的 `{}` 并当成成功。
+    // 所以维持拒绝，只把出路写清楚。
+    try {
+      extractEvaluateValue({ result: { type: 'object', value: {} } })
+      throw new Error('expected a rejection for an empty object')
+    } catch (error: unknown) {
+      if (!(error instanceof BrowserError)) throw error
+      expect(error.code).toBe('BROWSER_EXECUTE_RESULT_UNSERIALIZABLE')
+      expect(error.message).toContain('JSON.stringify({})')
+      expect(error.message).toContain('JSON string')
+      expect(error.message).toContain('NOT rolled back')
+    }
+    // DOM 节点走的是另一条更有针对性的文案（它本来就不该被 returnByValue 返回）。
+    try {
+      extractEvaluateValue({ result: { type: 'object', subtype: 'node' } })
+      throw new Error('expected a rejection for a DOM node')
+    } catch (error: unknown) {
+      if (!(error instanceof BrowserError)) throw error
+      expect(error.message).toContain('DOM node')
+      expect(error.message).toContain('JSON string')
+    }
   })
 
   it('rejects function and symbol results that cannot cross the CDP boundary', () => {
