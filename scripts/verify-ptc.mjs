@@ -15,8 +15,26 @@
  * （开发态 `process.execPath` 本来就是 node，所以本地开发永远看不到）。
  *
  * 修复：shell 在 `main.ts` 顶层把 `DSH_PTC_NODE` 指向包内自带的真 node
- * （`resources\runtime\node\node.exe`），desktop-host 的 composition patch 把它写进
- * `ptc-runtime` 行的 `nodeExecutable`（见 `docs/harness-desktop-build.patch`）。
+ * （`resources\runtime\node\node.exe`），再由一份 composition patch 把它写进
+ * `ptc-runtime` 行的 `nodeExecutable`。
+ *
+ * ## 2026-09-18：这份 composition patch 搬家了（适配 dsh 0.1.6-alpha.2）
+ *
+ * 原来它挂在上游的 `apps/desktop-host/config/desktop.cordis.patch.yml`；alpha.2 把那个
+ * 目录整个删掉（desktop-host 现在 `patchFiles: []`），桌面 profile 的补丁挂载点没有了。
+ * 现在这条覆盖收进**我们插件自己的** `cordis.patch.yml`，随包落在
+ * `home/profiles/desktop/node_modules/<插件名>/cordis.patch.yml`，由 profile 的
+ * `dsh.profile.bundles` 当正常 bundle 层加载。
+ *
+ * 于是本脚本 [1/4] 那两条断言也跟着换了判据 —— 而且是**升级**：原来的实现是 grep
+ * 「补丁文件里有没有 `ptc-runtime` 这行字」，那只证得了文本存在，证不了：
+ *   · 它能不能**命中** base bundle 里那条 `ptc-runtime`（层的目标行不存在时 dsh 只
+ *     记一条 Loader 警告，**不抛错** —— 文件写错了照样全绿）；
+ *   · 表达式的取值对不对。
+ * 所以现在用**包内运行时自带的那套 patch 引擎**（`@deepseek-ai/cordis-plugin-include`
+ * + `js-yaml` 的 `entryListSchema`）把「base bundle 层 → 出货插件层」真 compose 一遍，
+ * 直接读回 `ptc-runtime` 行的 `nodeExecutable` 并求值断言。这一条才是「链真的接上了」
+ * 的凭据（反面：把这行从插件补丁里删掉 → 转红）。
  *
  * 本脚本在**真产物的生产路径**上把这条链走一遍：起宿主 → 让 ptc 真跑一段 TS 程序 →
  * 断言返回值。只验「服务存在」不够 —— 服务一直在，挂的是子进程本身。
@@ -40,6 +58,18 @@
  *      所以新增一段：用包内主 exe + `ELECTRON_RUN_AS_NODE=1` 把宿主跑在**真 Electron
  *      运行时**里，直接问沙箱「你要用哪个程序起 runner」，断言它不是主 exe。
  *      —— 这一段是那个坑的唯一真凭据，删了它这个 bug 会再次静默复发。
+ *
+ * ## 四段各自证什么（免得下次误以为某段覆盖了另一段）
+ *
+ *   [1/4] 前置件（真 node 在包里）+ **patch 链真命中**（base 层 → 出货插件层 compose，
+ *         `ptc-runtime.nodeExecutable` 求值 = 包内真 node）—— PTC 子进程那条链的真凭据。
+ *   [2/4] PTC 机制在生产路径上真跑得起来（宿主 + ptc 运行时 + 沙箱各跑一段程序）。
+ *         注意它**不是** [1/4] 那条链的判据：这里宿主由普通 node 起，`process.execPath`
+ *         本来就是 node，覆盖丢了也照样绿。（没法用它当判据：要在打包态暴露这个问题，
+ *         得把整个桌面 host 塞进 Electron 运行时跑，代价远大于收益 —— 那件事由 [1/4] 的
+ *         求值断言和 [3/4] 承担。）
+ *   [3/4] 沙箱 runner 的 node 程序（另一条链、另一处修复，见上）—— 唯一判据。
+ *   [4/4] 上面几段的结论汇总。
  *
  * 用法：
  *   node scripts/verify-ptc.mjs --dir <解压后的便携包根目录>
@@ -113,7 +143,9 @@ try {
 writeFileSync(out, JSON.stringify(report, null, 2))
 `.trim() + '\n'
 
-console.log(`\n[1/4] 修复所需的前置文件（runtime=${materialized.layout}）`)
+console.log(`\n[1/4] 修复链的前置件（runtime=${materialized.layout}）`)
+
+const require = createRequire(join(runtimeDir, 'package.json'))
 
 // 真 node 必须随包进来 —— 修复完全依赖它。
 const nodeName = process.platform === 'win32' ? 'node.exe' : 'node'
@@ -124,12 +156,78 @@ try {
 } catch { nodeOk = false }
 check(nodeOk, `包内自带真 node：app/resources/runtime/node/${nodeName}`)
 
-// desktop-host 的 composition patch 必须真的覆盖了 ptc-runtime 行。
-const overlayPath = join(runtimeDir, 'node_modules', '@deepseek-ai', 'dsh-desktop-host', 'config', 'desktop.cordis.patch.yml')
-let overlay = ''
-try { overlay = readFileSync(overlayPath, 'utf8') } catch { overlay = '' }
-check(/id:\s*ptc-runtime/u.test(overlay), 'desktop-host patch 里有 ptc-runtime 覆盖行')
-check(/DSH_PTC_NODE/u.test(overlay), 'desktop-host patch 读 DSH_PTC_NODE')
+/**
+ * 找出货包里那份插件补丁。
+ *
+ * 不写死包名：profile 的 `dependencies` 里登记的就是随包插件（打包脚本按 package.json
+ * 的 name 生成），这里只认「登记了 + 目录真在 + 有 cordis.patch.yml」的那一个。
+ */
+function findShippedPluginPatch(profile) {
+  let dependencies = {}
+  try {
+    dependencies = JSON.parse(readFileSync(join(profile, 'package.json'), 'utf8')).dependencies ?? {}
+  } catch { return undefined }
+  for (const name of Object.keys(dependencies)) {
+    const file = join(profile, 'node_modules', name, 'cordis.patch.yml')
+    if (existsSync(file)) return { name, file }
+  }
+  return undefined
+}
+
+/**
+ * 把「base bundle 层 → 出货插件层」真 compose 一遍，读回 `ptc-runtime` 的覆盖。
+ *
+ * 与 `composeEntries()` 的调用形态一致：从空根起，按层序把各层拍平后依次应用；
+ * 第二个参数是 dsh 记「目标行不存在」警告用的格式化回调（**不抛错**，所以必须自己收）。
+ */
+async function composePtcRuntimeRow(runtimeDir, pluginPatchFile) {
+  const include = await import(pathToFileURL(require.resolve('@deepseek-ai/cordis-plugin-include')).href)
+  const yaml = await import(pathToFileURL(require.resolve('js-yaml')).href)
+  const basePatch = join(runtimeDir, 'node_modules', '@deepseek-ai', 'dsh-base', 'cordis.patch.yml')
+  const load = file => yaml.load(readFileSync(file, 'utf8'), { schema: include.entryListSchema })
+  const skipped = []
+  const rows = include.applyEntryPatches([], [...load(basePatch), ...load(pluginPatchFile)], (message, ...args) => {
+    let index = 0
+    skipped.push(String(message).replace(/%C/g, () => JSON.stringify(args[index++])))
+  })
+  const row = rows.find(item => item?.id === 'ptc-runtime')
+  const raw = row?.config?.nodeExecutable
+  return { skipped, raw, expr: raw !== null && typeof raw === 'object' ? raw.__jsExpr : undefined }
+}
+
+const shipped = findShippedPluginPatch(join(packageRoot, 'home', 'profiles', 'desktop'))
+check(shipped !== undefined, `出货插件补丁在 profile 里（${shipped?.name ?? '没找到'}）`)
+
+if (shipped !== undefined) {
+  let composed
+  try {
+    composed = await composePtcRuntimeRow(runtimeDir, shipped.file)
+  } catch (error) {
+    composed = { error: error instanceof Error ? error.message : String(error) }
+  }
+  if (composed.error !== undefined) {
+    check(false, `用包内 patch 引擎 compose 出货补丁：${composed.error}`)
+  } else {
+    check(
+      !composed.skipped.some(message => message.includes('ptc-runtime')),
+      `ptc-runtime 的覆盖命中了 base 那一行（被跳过的 entry：${composed.skipped.length === 0 ? '无' : composed.skipped.join(' | ')}）`,
+    )
+    check(
+      composed.expr !== undefined,
+      `nodeExecutable 是 !!js 表达式（随环境变量取值），实际 ${JSON.stringify(composed.raw)}`,
+    )
+    if (typeof composed.expr === 'string') {
+      // 求值口径与 dsh Loader 一致：表达式串直接在当前进程求值。
+      const evaluate = () => Function(`return (${composed.expr})`)()
+      process.env.DSH_PTC_NODE = nodePath
+      const resolved = String(evaluate())
+      delete process.env.DSH_PTC_NODE
+      const fallback = String(evaluate())
+      check(resolved === nodePath, `DSH_PTC_NODE 已设 → nodeExecutable = 包内真 node（实际 ${resolved}）`)
+      check(fallback === process.execPath, `未设 DSH_PTC_NODE → 回落到 process.execPath（实际 ${fallback}）`)
+    }
+  }
+}
 
 // ptc 运行时包本体（0.1.6 起才有）。
 let runtimeJson = {}
@@ -232,7 +330,6 @@ process.env.DSH_TOOLS_MODE = 'ptc'
 // 这一条正是 main.ts 在打包态注入的东西；模拟它是为了让本脚本能在开发机上验生产行为。
 process.env.DSH_PTC_NODE = nodePath
 
-const require = createRequire(join(runtimeDir, 'package.json'))
 const { runDesktopHost } = await import(pathToFileURL(require.resolve('@deepseek-ai/dsh-desktop-host')).href)
 
 let host

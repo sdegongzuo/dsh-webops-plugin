@@ -1,28 +1,9 @@
-diff --git a/apps/desktop-host/config/desktop.cordis.patch.yml b/apps/desktop-host/config/desktop.cordis.patch.yml
-index 92f4df6ddf..d19b0008cb 100644
---- a/apps/desktop-host/config/desktop.cordis.patch.yml
-+++ b/apps/desktop-host/config/desktop.cordis.patch.yml
-@@ -32,3 +32,14 @@
- 
-     - id: ui-directory-picker-native
-       name: '@deepseek-ai/dsh-client-ui-directory-picker-native'
-+
-+# PTC（`run_code`）子进程的 node 可执行文件。
-+#
-+# 默认值是 `process.execPath`，打包态那是 Electron 主 exe —— ptc-runtime-node 构造子进程
-+# 环境时会删掉 `ELECTRON_RUN_AS_NODE`，Electron 于是不会进入 node 模式，子进程永远不回应，
-+# `run_code` 挂到超时。shell 在 main.ts 顶层注入 DSH_PTC_NODE 指向包内的真 node
-+# （`resources\runtime\node`），这里读它；开发态没有该变量，回落到 execPath 本身
-+# —— 开发者直接跑 node，那本来就是对的。
-+- id: ptc-runtime
-+  config:
-+    nodeExecutable: !!js process.env.DSH_PTC_NODE ?? process.execPath
-diff --git a/apps/desktop/electron-builder.config.mjs b/apps/desktop/electron-builder.config.mjs
-index 752a3c4134..b745e522cb 100644
---- a/apps/desktop/electron-builder.config.mjs
-+++ b/apps/desktop/electron-builder.config.mjs
-@@ -63,9 +63,6 @@ export function createElectronBuilderConfig(
-       'lib/*.cjs',
+diff --git a/apps/desktop/scripts/electron-builder-config.mjs b/apps/desktop/scripts/electron-builder-config.mjs
+index ea33c60b2a..cd420fd598 100644
+--- a/apps/desktop/scripts/electron-builder-config.mjs
++++ b/apps/desktop/scripts/electron-builder-config.mjs
+@@ -104,9 +104,6 @@ export function createElectronBuilderConfig(
+       'lib/preload-update-dialog.cjs',
        'renderer/**/*',
        'package.json',
 -      { from: buildPaths.dsh, to: 'dsh', filter: ['**/*'] },
@@ -31,60 +12,69 @@ index 752a3c4134..b745e522cb 100644
      ],
      asarUnpack: [
        '**/*.{node,dylib,dll,so,exe}',
-@@ -75,6 +72,9 @@ export function createElectronBuilderConfig(
+@@ -116,6 +113,13 @@ export function createElectronBuilderConfig(
      ],
      extraResources: [
        { from: buildPaths.runtime, to: 'runtime' },
++      // dsh 运行时**必须**在 extraResources，不能进 files（app.asar）：
++      // 进了 app 目录就会被 electron-builder 当生产依赖剪裁（实测 239 个包的 package.json
++      // 字节被改小），`desktop-runtime.json` 的 files 清单随之对不上，发版自检的完整性校验
++      // 必然失败。配套的 `main.ts` 里 `runtimeResources()` 打包态也指向 `resources\dsh`。
 +      { from: buildPaths.dsh, to: 'dsh' },
 +      // electron-builder excludes a source directory's root node_modules.
 +      { from: join(buildPaths.dsh, 'node_modules'), to: 'dsh/node_modules' },
+       { from: fileURLToPath(new URL('../resources/icon-windows.png', import.meta.url)), to: 'icon.png' },
      ],
      mac: {
-       category: 'public.app-category.developer-tools',
 diff --git a/apps/desktop/scripts/prepare-dsh.ts b/apps/desktop/scripts/prepare-dsh.ts
-index d3f9dae8a3..f83a0923ed 100644
+index e5c789c165..820be9081e 100644
 --- a/apps/desktop/scripts/prepare-dsh.ts
 +++ b/apps/desktop/scripts/prepare-dsh.ts
-@@ -114,7 +114,10 @@ async function main(): Promise<void> {
+@@ -119,7 +119,11 @@ async function main(): Promise<void> {
        readFileSync(join(BUILD_ROOT, 'pnpm-lock.yaml'), 'utf8'),
        readDesktopCorePackageSet(BUILD_ROOT, release.version),
      )
 -    await runPnpm(['install', '--prod', '--frozen-lockfile', '--trust-lockfile'])
 +    // 去掉 --frozen-lockfile / --trust-lockfile：这两个标志下 pnpm 会卡在
 +    // 「added 241/507」且 download 恒为 0，与 registry 无关（换源也不动），
-+    // 同一项目去掉后 21.5 秒装完。构建目录是一次性的，不复用 lockfile 校验。
++    // 同一项目去掉后 21.5 秒装完。构建目录是一次性的，且上面刚做过
++    // verifyDesktopCoreLockfile 校验，此处不再复用 pnpm 自身的 lockfile 闸门。
 +    await runPnpm(['install', '--prod'])
      const packageSet = readDesktopCorePackageSet(BUILD_ROOT, release.version)
      const targetName = resolveDesktopBuildTarget()
      const target = { platform: process.platform, arch: targetName.endsWith('arm64') ? 'arm64' : 'x64' }
 diff --git a/apps/desktop/src/main.ts b/apps/desktop/src/main.ts
-index e63e21588a..d3efad6e57 100644
+index d5bfb1e0b3..a387693c05 100644
 --- a/apps/desktop/src/main.ts
 +++ b/apps/desktop/src/main.ts
-@@ -1,6 +1,7 @@
+@@ -2,6 +2,7 @@ import { WINDOWS_TITLEBAR_HEIGHT } from './windows-layout.ts'
  /** Electron shell: desktop project ownership, custom protocol, windows, and lifecycle. */
  
  import { readFile, writeFile } from 'node:fs/promises'
 +import { createRequire } from 'node:module'
- import { extname, join, normalize, resolve, sep } from 'node:path'
+ import { join } from 'node:path'
  import { fileURLToPath } from 'node:url'
  import {
-@@ -12,7 +13,7 @@ import {
-   protocol,
+@@ -18,7 +19,7 @@ import {
    type IpcMainInvokeEvent,
+   type MenuItemConstructorOptions,
  } from 'electron'
 -import { resolveDesktopPaths } from './paths.ts'
 +import { resolveDesktopPaths, resolvePortableDshHome } from './paths.ts'
- import { DesktopProjectManager, type DesktopProjectHooks } from './project-manager.ts'
- import { DesktopHostProcess } from './host-process.ts'
- import { DesktopBackendController, type DesktopBackendState } from './backend-controller.ts'
-@@ -23,6 +24,53 @@ import { DesktopUpdateCoordinator } from './update-coordinator.ts'
- import { desktopErrorState } from './startup-error.ts'
- import { startupFailureDocument } from './startup-document.ts'
+ import { DesktopProjectManager } from './project-manager.ts'
+ import { DesktopHostProcess, DesktopHostUncleanExitError } from './host-process.ts'
+ import { installDesktopDirectoryPicker } from './directory-picker.ts'
+@@ -40,6 +41,60 @@ import { DesktopPolicyTestAuth } from './policy-test-auth.ts'
+ import { DesktopUpdateDialog, type UpdateDialogOptions } from './update-dialog.ts'
+ import { readDesktopRuntime } from './runtime-tree.ts'
  
 +// 让 host 子进程（以及跑在里面的插件）知道 shell 主 exe 在哪 —— 便携版没有独立的
 +// electron.exe，browser-electron 的窗口宿主只能用这个 exe 起第二个实例。
-+// 注意**不能**用 `DSH_DESKTOP_` 前缀：`host-process.ts` 会把那个前缀的变量全部过滤掉。
++//
++// 前缀刻意不叫 `DSH_DESKTOP_*`：0.1.5 / 0.1.6-alpha.1 的 `host-process.ts` 会把
++// `DSH_DESKTOP_` 前缀的变量整批过滤掉（那时子进程环境是白名单拼的），所以当年只能绕开。
++// 0.1.6-alpha.2 起环境改成 `{...environment}` 全量继承（见 `node-environment.ts`），
++// 这条限制没有了 —— 但名字保持不变：插件侧读的就是 `DSH_APP_EXECUTABLE`，改它没有收益。
 +process.env.DSH_APP_EXECUTABLE = process.execPath
 +
 +// 浏览器 provider 的默认选择：桌面端里 `cdp` 与 `electron` 会**同时**「可用」——
@@ -105,13 +95,15 @@ index e63e21588a..d3efad6e57 100644
 +// 打包态的 `process.execPath` 是 Electron 主 exe，host 子进程靠 `ELECTRON_RUN_AS_NODE=1`
 +// 才以 node 模式运行；而 `@deepseek-ai/dsh-ptc-runtime-node` 给 PTC 子进程构造环境时
 +// 会把 `ELECTRON_RUN_AS_NODE` 一起删掉（它只保留 PATH/PATHEXT/SYSTEMROOT/WINDIR/TEMP/TMP，
-+// 再按 `pkg` 打包标记补自己的变量，而 Electron 没有那个标记）。于是 Electron exe 不再
++// 见 `packages/ptc-runtime/ptc-runtime-node/src/environment.ts`）。于是 Electron exe 不再
 +// 进入 node 模式，stdin/stdout 上的控制协议永远建立不起来，`run_code` 挂到超时 —— 症状
 +// 就是「ptc 模式下工具起不来」。
 +//
 +// 便携包自带一份真 node（`resources\runtime\node\node.exe`，打包时随 runtime 目录进来），
-+// 指过去即可；开发态回落到 execPath 本身（那本来就是 node）。由 desktop-host 的
-+// composition patch 读这个变量写进 `ptc-runtime` 行的 `nodeExecutable`。
++// 指过去即可；开发态回落到 execPath 本身（那本来就是 node）。读这个变量的是**我们自己的**
++// `cordis.patch.yml` 里那条 `ptc-runtime` config 覆盖 —— 0.1.6-alpha.2 起上游删掉了
++// `desktop-host/config/desktop.cordis.patch.yml`（`patchFiles: []`），桌面 profile 的
++// 补丁挂载点没了，索性收进随包出货的那份补丁文件里，顺带少维护一个补丁目标。
 +process.env.DSH_PTC_NODE = join(
 +  process.resourcesPath,
 +  'runtime',
@@ -123,42 +115,42 @@ index e63e21588a..d3efad6e57 100644
 +// 便携版的布局是 `<root>\app\<exe>` + `<root>\home`，于是**双击 exe 本体**也能自带配置
 +// 与插件，不必再走 `启动.cmd`。只在 `$DSH_HOME` 为空时兜底 —— 显式设置（`启动.cmd`、
 +// `scripts/dev-desktop.mjs`、CI）永远优先，空值/纯空白与 `resolveDshHome()` 的口径一致。
-+// 必须在任何 `resolveDesktopPaths()` 之前执行：全仓只在 `main()` 里调用它。
++// 必须在任何 `resolveDesktopPaths()` 之前执行：`main()` 里构造 DesktopProjectManager 时
++// 就会用到，恢复流程的 `disablePlugins` 回调里也用（那条是懒执行，不构成新的时序约束）。
 +if ((process.env.DSH_HOME ?? '').trim() === '') {
 +  const portableHome = resolvePortableDshHome(process.execPath)
 +  if (portableHome !== undefined) process.env.DSH_HOME = portableHome
 +}
 +
- const SCHEME = 'dsh-app'
  let focusPrimaryWindow = (): void => {}
- type RecoveryAction = 'restart' | 'plugins' | 'reset'
-@@ -76,8 +124,11 @@ function runtimeResources(): RuntimeResources {
-     : process.execPath
+ let stopForRecovery = async (): Promise<void> => {}
+ let shuttingDown = false
+@@ -93,8 +148,18 @@ function runtimeResources(): RuntimeResources {
    const pnpm = (development ? process.env.DSH_DESKTOP_PNPM_ENTRY : undefined)
-     ?? join(process.resourcesPath, 'runtime', 'pnpm', 'bin', 'pnpm.mjs')
--  const dsh = (development ? process.env.DSH_DESKTOP_DSH_DIR : undefined)
--    ?? (development ? join(process.resourcesPath, 'dsh') : join(app.getAppPath(), 'dsh'))
+     ?? (development ? join(app.getAppPath(), 'node_modules', 'pnpm', 'bin', 'pnpm.mjs')
+       : join(process.resourcesPath, 'runtime', 'pnpm', 'bin', 'pnpm.mjs'))
 +  // 便携版把 dsh 运行时留在 `resources\dsh` 真目录，不跟着上游塞进 app.asar：
 +  // 进了 app 目录就会被 electron-builder 当生产依赖剪裁（实测 239 个包的
 +  // package.json 字节被改小），`desktop-runtime.json` 的 files 清单随之对不上，
 +  // 发版自检的完整性校验必然失败。0.1.5 及更早就是这条 extraResources 路径。
-+  const dsh = (development ? process.env.DSH_DESKTOP_DSH_DIR : undefined) ?? join(process.resourcesPath, 'dsh')
-   return { node, pnpm, dsh, ...(development ? {} : { profileResolution: 'runtime' }) }
++  // 只动打包态那半：开发态上游已改成 `.desktop-build/development/project`（语义是
++  // 备好的 profile 工程，不是运行时），照原样保留。
++  // 配套的 `profileResolution` 在构造 host 时按打包态内联传入（开发态 link、打包态 runtime），
++  // 与布局无关 —— 布局 flat、解析 runtime，这个组合是刻意的。
++  // 注：校验脚本 `verify-portable` 会按**调用点那行**的字面量判定解析模式，所以这句话刻意
++  // 不写出那个三元表达式的原文，免得正文注释被当成判据命中。
+   const dsh = (development ? process.env.DSH_DESKTOP_DSH_DIR : undefined)
+-    ?? (development ? join(app.getAppPath(), '.desktop-build', 'development', 'project') : join(app.getAppPath(), 'dsh'))
++    ?? (development ? join(app.getAppPath(), '.desktop-build', 'development', 'project') : join(process.resourcesPath, 'dsh'))
+   return { node, nodeBin, pnpm, dsh }
  }
  
-@@ -507,19 +558,31 @@ async function main(): Promise<void> {
-   setTimeout(() => { void checkAndPrompt(false) }, 10_000)
+@@ -771,17 +836,29 @@ async function main(): Promise<void> {
+   publishUpdate(updateState)
  }
  
 -const ownsDesktopInstance = claimDesktopSingleInstance(app, () => { focusPrimaryWindow() })
-+// 窗口宿主模式：便携版里 browser-electron 用主 exe 起第二个实例来开浏览器窗口，
-+// 靠 `DSH_BROWSER_ELECTRON_HOST` 把宿主脚本的绝对路径传进来
-+// （「Exe host.cjs」在打包应用上不成立 —— app 路径固定在 asar 里，argv 里的脚本会被忽略）。
-+//
-+// 必须在 `claimDesktopSingleInstance` **之前**接管：先抢了单实例锁的话第二个实例会直接退出。
-+// 宿主只管开窗口，不碰 profile、也不开主窗口。
-+const browserHostScript = process.env.DSH_BROWSER_ELECTRON_HOST
- 
+-
 -if (ownsDesktopInstance) void app.whenReady().then(main).catch(async (error: unknown) => {
 -  const message = error instanceof Error ? error.message : String(error)
 -  console.error(error)
@@ -166,13 +158,19 @@ index e63e21588a..d3efad6e57 100644
 -  if (diagnosticFile !== undefined) {
 -    await writeFile(diagnosticFile, `${error instanceof Error ? error.stack ?? message : message}\n`).catch(() => undefined)
 -  }
--  const window = BrowserWindow.getAllWindows()[0] ?? createWindow(fileURLToPath(new URL('./preload-app.cjs', import.meta.url)), true)
--  window.once('closed', () => { app.quit() })
--  await showEmergencyDocument(window, message)
+-  reportFatal(error)
 -}).catch((error: unknown) => {
 -  console.error(error)
 -  app.exit(1)
 -})
++// 窗口宿主模式：便携版里 browser-electron 用主 exe 起第二个实例来开浏览器窗口，
++// 靠 `DSH_BROWSER_ELECTRON_HOST` 把宿主脚本的绝对路径传进来
++// （「Exe host.cjs」在打包应用上不成立 —— app 路径固定在 asar 里，argv 里的脚本会被忽略）。
++//
++// 必须在 `claimDesktopSingleInstance` **之前**接管：先抢了单实例锁的话第二个实例会直接退出。
++// 宿主只管开窗口，不碰 profile、也不开主窗口。
++const browserHostScript = process.env.DSH_BROWSER_ELECTRON_HOST
++
 +if (browserHostScript !== undefined && browserHostScript !== '') {
 +  createRequire(import.meta.url)(browserHostScript)
 +} else {
@@ -185,16 +183,14 @@ index e63e21588a..d3efad6e57 100644
 +    if (diagnosticFile !== undefined) {
 +      await writeFile(diagnosticFile, `${error instanceof Error ? error.stack ?? message : message}\n`).catch(() => undefined)
 +    }
-+    const window = BrowserWindow.getAllWindows()[0] ?? createWindow(fileURLToPath(new URL('./preload-app.cjs', import.meta.url)), true)
-+    window.once('closed', () => { app.quit() })
-+    await showEmergencyDocument(window, message)
++    reportFatal(error)
 +  }).catch((error: unknown) => {
 +    console.error(error)
 +    app.exit(1)
 +  })
 +}
 diff --git a/apps/desktop/src/paths.ts b/apps/desktop/src/paths.ts
-index 5727e5c013..0f8bee120b 100644
+index cf03e38c36..878122bcd6 100644
 --- a/apps/desktop/src/paths.ts
 +++ b/apps/desktop/src/paths.ts
 @@ -1,6 +1,7 @@
@@ -206,8 +202,8 @@ index 5727e5c013..0f8bee120b 100644
  import { resolveDshHome } from '@deepseek-ai/dsh-home-paths'
  
  /** Stable desktop installation paths under the shared Harness home. */
-@@ -40,3 +41,17 @@ export function resolveDesktopPaths(dshHome: string = resolveDshHome()): Desktop
-     },
+@@ -20,3 +21,17 @@ export function resolveDesktopPaths(dshHome: string = resolveDshHome()): Desktop
+     lock: join(dshHome, 'profiles', 'desktop', 'lock'),
    }
  }
 +
@@ -224,23 +220,19 @@ index 5727e5c013..0f8bee120b 100644
 +  const portableHome = resolve(dirname(executablePath), '..', 'home')
 +  return existsSync(portableHome) ? portableHome : undefined
 +}
-diff --git a/apps/desktop/tests/fixtures/runtime-payload-smoke.mjs b/apps/desktop/tests/fixtures/runtime-payload-smoke.mjs
-index da2d5c478d..df8381a4d5 100644
---- a/apps/desktop/tests/fixtures/runtime-payload-smoke.mjs
-+++ b/apps/desktop/tests/fixtures/runtime-payload-smoke.mjs
-@@ -121,7 +121,11 @@ function checkHtml() {
- }
- 
- try {
--  checkFsExt()
-+  // skip checkFsExt()：fs-ext 不在当前版本的依赖树里 —— 518 个 dsh/vendor/landlock
-+  // tarball、harness lockfile、产物 node_modules 全都没有它，require 必然 MODULE_NOT_FOUND。
-+  // 即「不是编译失败，是根本没被安装」；而 project-manager.ts 生成的 workspace 已
-+  // allowBuilds: fs-ext: true，说明上游自己也把它当可选依赖。故此项不作为构建门槛。
-+  // checkFsExt()
-   checkKoffi()
-   await checkSharp()
-   checkHtml()
+diff --git a/apps/desktop/tests/main-startup.spec.ts b/apps/desktop/tests/main-startup.spec.ts
+index 246dcbcfdf..8d7d3df13e 100644
+--- a/apps/desktop/tests/main-startup.spec.ts
++++ b/apps/desktop/tests/main-startup.spec.ts
+@@ -220,7 +220,7 @@ vi.mock('node:fs/promises', async (importOriginal) => {
+   }) }
+ })
+ vi.mock('../src/runtime-tree.ts', () => ({ readDesktopRuntime: () => ({ release: { version: '1.0.0' } }) }))
+-vi.mock('../src/paths.ts', () => ({ resolveDesktopPaths: () => ({ profile: 'desktop-test-profile' }) }))
++vi.mock('../src/paths.ts', () => ({ resolveDesktopPaths: () => ({ profile: 'desktop-test-profile' }), resolvePortableDshHome: () => undefined }))
+ vi.mock('../src/project-manager.ts', () => ({
+   DesktopProjectManager: class {
+     readonly applyRelease = harness.applyRelease
 diff --git a/packages/sandbox/sandbox-local/src/index.ts b/packages/sandbox/sandbox-local/src/index.ts
 index 037dc90079..298b438fd0 100644
 --- a/packages/sandbox/sandbox-local/src/index.ts

@@ -85,6 +85,20 @@ describe('出货 patch（cordis.patch.yml）', () => {
     expect(block, '少了 appMode: true，窗口宿主起不来')
       .toContain('appMode: true')
   })
+
+  it('ptc-runtime 那行必须把 nodeExecutable 指到 DSH_PTC_NODE，并保留 process.execPath 兜底', () => {
+    // 2026-09-18 的教训：这条原本写在 harness 的 `desktop-host/config/desktop.cordis.patch.yml` 里，
+    // 0.1.6-alpha.2 把那个目录整个删掉之后，**没有任何源码再设置或读取 DSH_PTC_NODE** ——
+    // `run_code` 会在打包态静默挂到超时（PTC 子进程被 Electron 当 GUI 起）。搬进本文件后，
+    // 这条断言就是「下次它再被删掉」时的唯一警报。
+    // 它必须留在**顶层**（不是 insert 里）：这是对 base bundle 已有那一行的 config 覆盖。
+    expect(hasRow(body, 'ptc-runtime'), '出货 patch 少了 ptc-runtime 的 config 覆盖').toBe(true)
+    const block = rowBlock(body, 'ptc-runtime')
+    expect(block, '覆盖丢了，桌面端 run_code 会起不来').toContain('nodeExecutable:')
+    // 兜底也必须留着：非桌面端没有这个变量，必须回落到 process.execPath（那本来就是 node）。
+    expect(block, '少了 process.execPath 兜底，非桌面端会被写进一个不存在的路径')
+      .toContain('process.env.DSH_PTC_NODE ?? process.execPath')
+  })
 })
 
 describe('harness 补丁与插件之间的变量名约定', () => {
@@ -103,7 +117,22 @@ describe('harness 补丁与插件之间的变量名约定', () => {
       .toContain("'DSH_BROWSER_ELECTRON_HOST'")
   })
 
-  it('两个变量名都不能带 DSH_DESKTOP_ 前缀（host 子进程会把该前缀全部过滤掉）', () => {
+  it('补丁注入的 PTC node 路径，出货 patch 用同一个名字去读', () => {
+    // 这一对横跨两个文件（harness 侧 main.ts 写、我们的 cordis.patch.yml 读），
+    // 任何一半掉了都是静默失效：run_code 起不来，但没有任何报错指向这里。
+    expect(patch, '补丁没注入 DSH_PTC_NODE').toContain('process.env.DSH_PTC_NODE = join(')
+    expect(patch, '补丁没把 DSH_PTC_NODE 指向包内自带的 node（resources/runtime/node）')
+      .toContain("'runtime',")
+    expect(yamlBody(readRepoFile('cordis.patch.yml')), '出货 patch 没读 DSH_PTC_NODE')
+      .toContain('process.env.DSH_PTC_NODE ?? process.execPath')
+  })
+
+  it('两个变量名都不能带 DSH_DESKTOP_ 前缀', () => {
+    // 名字本身要继续守（插件读的就是这两个名字），但**理由已经变了**：
+    // 0.1.5 / 0.1.6-alpha.1 的 `host-process.ts` 会把 `DSH_DESKTOP_` 前缀整批过滤掉，
+    // 当年是被迫绕开；0.1.6-alpha.2 起子进程环境改成 `{...environment}` 全量继承
+    // （`apps/desktop/src/node-environment.ts`），这条限制没有了。保持不改名只是
+    // 「插件侧读的也是这个名字」——重新命名没有任何收益。
     expect(patch).not.toContain('DSH_DESKTOP_APP_EXECUTABLE =')
     expect(readRepoFile('src/browser-electron/index.ts')).not.toContain("'DSH_DESKTOP_APP_EXECUTABLE'")
   })

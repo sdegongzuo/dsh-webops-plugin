@@ -2,14 +2,20 @@
  * 定位 dsh 桌面端的「不可变运行时目录」（就是放 `desktop-runtime.json` 的那棵树）。
  *
  * 这套东西有两代布局，必须两种都认：
- *   · 0.1.5 及更早：`dsh` 是 electron-builder 的 extraResources，产物里
- *     `resources\dsh\` 就是真目录，直接读就行。
- *   · 0.1.6 起：上游把它塞进 `files`（`electron-builder.config.mjs` 的
- *     `{ from: buildPaths.dsh, to: 'dsh' }`），于是运行时落在 **app.asar 归档里**，
- *     磁盘上只有 `resources\app.asar` 一个文件，外加 `resources\app.asar.unpacked\dsh\`
- *     里那些被 `asarUnpack` 挑出来的 `.node/.dll/.exe`。
- *     打包态的桌面端读它靠 `app.getAppPath()/dsh`（main.ts:80），Electron 自己能读
- *     asar，所以上游跑得通 —— 但我们的 Node 脚本读不了，得先解出来。
+ *   · flat（0.1.5 及更早，以及**我们打补丁之后的所有版本**）：`dsh` 是 electron-builder 的
+ *     extraResources，产物里 `resources\dsh\` 就是真目录，直接读就行。
+ *   · asar（0.1.6 起的**上游原样**）：上游把它挪进 `files`（当时在
+ *     `apps/desktop/electron-builder.config.mjs`，0.1.6-alpha.2 起该文件变成 5 行 shim、
+ *     真配置在 `apps/desktop/scripts/electron-builder-config.mjs`），于是运行时落在
+ *     **app.asar 归档里**，磁盘上只有 `resources\app.asar` 一个文件，外加
+ *     `resources\app.asar.unpacked\dsh\` 里那些被 `asarUnpack` 挑出来的 `.node/.dll/.exe`。
+ *     Electron 自己能读 asar，所以上游跑得通 —— 但我们的 Node 脚本读不了，得先解出来。
+ *
+ * 我们出货的包**永远是 flat**：出桌面补丁把这两条 `{from: dsh...}` 从 `files` 挪回
+ * `extraResources`（进了 app 目录会被 electron-builder 当生产依赖剪裁，`desktop-runtime.json`
+ * 的 files 清单随之对不上）。保留 asar 分支是为了**上游升级后的第一次自检**能给出可读诊断，
+ * 而不是让我们跑 asar。
+ * 注意：布局与解析模式（`profileResolution`）是两件事，别混 —— 见 `verify-portable.mjs`。
  *
  * 上层两个消费者：
  *   · `package-desktop-portable.mjs` 只要 descriptor（一个 JSON，用 extractFile 取，很便宜）；

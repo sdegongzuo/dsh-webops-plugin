@@ -161,16 +161,33 @@ for (const file of ['runtime-tree.ts', 'profile-packages.ts', 'paths.ts']) {
 /**
  * 桌面端用什么方式把宿主包给到插件：**只能问 harness 源码，不能拿布局猜。**
  *
- * `main.ts` 在打包态返回 `profileResolution: 'runtime'`，于是 `prepareProfile` 走
- * `recordDesktopRuntimeProfile`（只记状态、不建链）；0.1.5 及更早没有这个字段，走
- * `linkDesktopHostPackages`（建几百条 junction）。
+ * 判据是「打包态解析模式是否为 runtime」：
+ * - 0.1.5 / 0.1.6-alpha.1：`runtimeResources()` 返回 `profileResolution: 'runtime'`；
+ * - 0.1.6-alpha.2 起：字段被删掉了，改在构造 host 那行的**实参位置**内联三元
+ *   `development ? 'link' : 'runtime', resources)`（见 `new DesktopHostProcess(...)`）。
  *
- * 这两件事与「dsh 放在 `resources\dsh` 还是 app.asar 里」**彼此独立**：0.1.6 上游
- * 把它们绑在一起改，但我们打补丁把 dsh 挪回了 extraResources，于是出现了
- * 「布局是 flat、解析却是 runtime」的组合。按布局推断就会跑错分支。
+ * 为何非查源码不可：runtime 模式走 `recordDesktopRuntimeProfile`（只记状态、不建链），
+ * link 模式走 `linkDesktopHostPackages`（建几百条 junction）；两条路产物完全不同。
+ * 而它**与布局彼此独立** —— 0.1.6 上游把两件事绑在一起改，我们打补丁把 dsh 挪回了
+ * extraResources，于是出现「布局 flat、解析 runtime」的组合，按布局推断必然跑错分支。
+ *
+ * 判据锚在**实参位置**（`'link' : 'runtime', resources)`），不全文扫 `'runtime'`：
+ * `runtimeResources()` 里到处是 `resourcesPath, 'runtime', ...` 这类路径片段，全文扫必误判。
+ * 两种形态都不认得就直接报错 —— 宁可自检挂掉，也不要静默走错分支出一个假绿。
+ * @param source - `apps/desktop/src/main.ts` 的源码。
+ * @returns `runtime` 或 `link`。
  */
-const resolutionMode = /profileResolution:\s*'runtime'/u.test(readFileSync(join(harnessDesktopSrc, 'main.ts'), 'utf8'))
-  ? 'runtime' : 'link'
+function detectResolutionMode(source) {
+  if (/'link'\s*:\s*'runtime'\s*,\s*resources\s*\)/u.test(source)) return 'runtime'
+  if (/profileResolution:\s*'runtime'/u.test(source)) return 'runtime'
+  if (/profileResolution:\s*'link'/u.test(source)) return 'link'
+  throw new Error(
+    'verify-portable: 在 main.ts 里找不到 resolutionMode 判据（既没有实参位置的三元，'
+    + "也没有 profileResolution 字段）—— 上游大概又改了桌面壳，先看本函数的注释再动判据",
+  )
+}
+
+const resolutionMode = detectResolutionMode(readFileSync(join(harnessDesktopSrc, 'main.ts'), 'utf8'))
 
 const failures = []
 const notes = []

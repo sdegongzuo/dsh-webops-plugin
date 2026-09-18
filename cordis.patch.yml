@@ -54,3 +54,27 @@
 
     - id: browser-plugin
       name: 'dsh-webops-plugin'
+
+# 下面这条是**顶层** entry（不在 `insert:` 里），语义是「覆盖已存在的某行的 config」
+# —— `ptc-runtime` 行由 dsh 自己的 base bundle 定义
+# （`packages/bundle/base/cordis.patch.yml` 的 `- id: ptc-runtime`），所有 surface 都有。
+#
+# 为什么需要它：PTC 子进程（`run_code` 的实际执行体）默认用 `process.execPath` 启动，
+# 而打包态那是 Electron 主 exe，靠 `ELECTRON_RUN_AS_NODE=1` 才进 node 模式；
+# `@deepseek-ai/dsh-ptc-runtime-node` 给子进程构造环境时会把那个变量删掉
+# （只留 PATH/PATHEXT/SYSTEMROOT/WINDIR/TEMP/TMP），于是 Electron 不再进 node 模式、
+# 控制协议永远建不起来，`run_code` 挂到超时。桌面 shell 在主 exe 起步时把
+# `DSH_PTC_NODE` 指向包内的真 node（`resources\runtime\node`），这里读它。
+#
+# 非桌面端没有这个变量 → 落到 `process.execPath`（那本来就是 node），**与上游默认值完全等价**。
+# 也就是说这一条不改变任何 CLI / TUI / headless 场景的行为，也不装新插件，只是给桌面端
+# 留一个可注入的入口。
+#
+# 历史：这条原本写在 harness 的 `apps/desktop-host/config/desktop.cordis.patch.yml` 里，
+# 由 `runProfile({ patchFiles: [...] })` 挂载。0.1.6-alpha.2 把那个文件连同 `config/`
+# 目录整个删掉、`patchFiles` 变成 `[]`，桌面补丁挂载点没了 —— 索性收进这份随包出货的
+# 补丁文件（插件包是 append 到 `dsh.profile.bundles`，层序在 base 之后，目标行必然已存在），
+# 少维护一个每次上游改桌面壳都会失配的补丁目标。
+- id: ptc-runtime
+  config:
+    nodeExecutable: !!js process.env.DSH_PTC_NODE ?? process.execPath
