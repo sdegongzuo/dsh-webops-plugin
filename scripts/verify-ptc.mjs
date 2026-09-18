@@ -161,6 +161,8 @@ check(nodeOk, `包内自带真 node：app/resources/runtime/node/${nodeName}`)
  *
  * 不写死包名：profile 的 `dependencies` 里登记的就是随包插件（打包脚本按 package.json
  * 的 name 生成），这里只认「登记了 + 目录真在 + 有 cordis.patch.yml」的那一个。
+ * @param profile - 便携包里的 `home/profiles/desktop`。
+ * @returns `{ name, file }`；profile 的 package.json 读不到、或没有任何登记项带补丁文件时为 undefined。
  */
 function findShippedPluginPatch(profile) {
   let dependencies = {}
@@ -179,6 +181,10 @@ function findShippedPluginPatch(profile) {
  *
  * 与 `composeEntries()` 的调用形态一致：从空根起，按层序把各层拍平后依次应用；
  * 第二个参数是 dsh 记「目标行不存在」警告用的格式化回调（**不抛错**，所以必须自己收）。
+ * @param runtimeDir - 包内 dsh 运行时目录（patch 引擎与 base bundle 都从这里解析）。
+ * @param pluginPatchFile - 出货插件的 `cordis.patch.yml` 绝对路径。
+ * @returns `{ skipped, raw, expr }`：dsh 记下的跳过警告（已成文的字符串）、`ptc-runtime` 行的
+ *   `config.nodeExecutable` 原值、以及它的 `!!js` 表达式串（不是表达式节点时为 undefined）。
  */
 async function composePtcRuntimeRow(runtimeDir, pluginPatchFile) {
   const include = await import(pathToFileURL(require.resolve('@deepseek-ai/cordis-plugin-include')).href)

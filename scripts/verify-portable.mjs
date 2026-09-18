@@ -174,13 +174,19 @@ for (const file of ['runtime-tree.ts', 'profile-packages.ts', 'paths.ts']) {
  * 判据锚在**实参位置**（`'link' : 'runtime', resources)`），不全文扫 `'runtime'`：
  * `runtimeResources()` 里到处是 `resourcesPath, 'runtime', ...` 这类路径片段，全文扫必误判。
  * 两种形态都不认得就直接报错 —— 宁可自检挂掉，也不要静默走错分支出一个假绿。
+ *
+ * **为什么没有「link」那一种形态**（2026-09-18 review 后删掉了原先预留的那支）：查过上游
+ * `main.ts` 的历史，`profileResolution` 这个字段**只出现过 `'runtime'` 一个字面量** ——
+ * 上游的写法始终是 `...(development ? {} : { profileResolution: 'runtime' })`，开发态
+ * 干脆不带这个字段，任何版本都不会产出字面量 `'link'`。所以那一支是凭空的猜测：它一旦命中，
+ * 只可能是「有人把字段硬写成 link」这种异常，而猜成 link 会让本脚本去跑 link 那套期望 ——
+ * 正是本函数注释里说的「静默走错分支」。认不出就抛错。
  * @param source - `apps/desktop/src/main.ts` 的源码。
- * @returns `runtime` 或 `link`。
+ * @returns 打包态的解析模式，目前只可能是 `'runtime'`（见上）；认不出判据则抛错。
  */
 function detectResolutionMode(source) {
   if (/'link'\s*:\s*'runtime'\s*,\s*resources\s*\)/u.test(source)) return 'runtime'
   if (/profileResolution:\s*'runtime'/u.test(source)) return 'runtime'
-  if (/profileResolution:\s*'link'/u.test(source)) return 'link'
   throw new Error(
     'verify-portable: 在 main.ts 里找不到 resolutionMode 判据（既没有实参位置的三元，'
     + "也没有 profileResolution 字段）—— 上游大概又改了桌面壳，先看本函数的注释再动判据",
@@ -308,6 +314,9 @@ if (existsSync(profileDir)) {
       profilePackages.validateDesktopPluginGraph(workProfileDir, runtimeDir, runtime, activePlugins, 'runtime')
       check(true, `依赖图校验通过（runtime 模式：${String(runtime.sharedPackages.length)} 个宿主包由 runtime 目录供给 + peer 版本满足）`)
     } else {
+      // 目前走不到这里：`detectResolutionMode` 只会返回 runtime，认不出就抛错（见其注释）。
+      // 留着是因为它是**唯一**一处把「link 模式的期望」写下来的地方（建链条数 + 不带
+      // 'runtime' 参数的依赖图校验）；上游若真改回 link，改判据时这半立刻可用。
       profilePackages.linkDesktopHostPackages(workProfileDir, runtimeDir, runtime)
       const linked = profilePackages.readDesktopProfileState(workProfileDir)
       check(linked.links.length === runtime.sharedPackages.length,

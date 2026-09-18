@@ -135,6 +135,9 @@ describe('harness 补丁与插件之间的变量名约定', () => {
     // 「插件侧读的也是这个名字」——重新命名没有任何收益。
     expect(patch).not.toContain('DSH_DESKTOP_APP_EXECUTABLE =')
     expect(readRepoFile('src/browser-electron/index.ts')).not.toContain("'DSH_DESKTOP_APP_EXECUTABLE'")
+    // 标题说的是「两个变量名」，那第二个也得真断言 —— 否则标题比断言宽，读者会以为守住了一对。
+    expect(patch).not.toContain('DSH_DESKTOP_BROWSER_ELECTRON_HOST =')
+    expect(readRepoFile('src/browser-electron/bridge.ts')).not.toContain("'DSH_DESKTOP_BROWSER_ELECTRON_HOST'")
   })
 })
 
