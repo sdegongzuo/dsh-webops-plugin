@@ -44,7 +44,7 @@ index e5c789c165..820be9081e 100644
      const targetName = resolveDesktopBuildTarget()
      const target = { platform: process.platform, arch: targetName.endsWith('arm64') ? 'arm64' : 'x64' }
 diff --git a/apps/desktop/src/main.ts b/apps/desktop/src/main.ts
-index d5bfb1e0b3..e390d4a1c9 100644
+index d5bfb1e0b3..1a9102c200 100644
 --- a/apps/desktop/src/main.ts
 +++ b/apps/desktop/src/main.ts
 @@ -1,7 +1,9 @@
@@ -156,7 +156,24 @@ index d5bfb1e0b3..e390d4a1c9 100644
    return { node, nodeBin, pnpm, dsh }
  }
  
-@@ -771,17 +846,29 @@ async function main(): Promise<void> {
+@@ -407,6 +482,16 @@ async function main(): Promise<void> {
+       }
+       return forwardWebRequest(request, hostUrl, hostCookie)
+     }
++    // Shell-owned documents (update confirmation, mandatory update, policy-login placeholder)
++    // load from `dsh-app://shell/<file>`: their preload bridges gate on the exact
++    // `location.href`, and DesktopUpdateDialog.owned() also compares `senderFrame.url`
++    // against that literal. So they cannot be served from a `file:` path instead —
++    // without this branch the URL falls through to 404, the window still shows as a
++    // blank, transparent, main-window-sized overlay and swallows every mouse event.
++    // The files ship inside this app directory (`renderer/`), next to `lib/`.
++    if (url.hostname === 'shell') {
++      return serveWebDocument(request, join(app.getAppPath(), 'renderer'))
++    }
+     return Promise.resolve(new Response(null, { status: 404 }))
+   })
+ 
+@@ -771,17 +856,29 @@ async function main(): Promise<void> {
    publishUpdate(updateState)
  }
  
