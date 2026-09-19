@@ -986,6 +986,45 @@ describe('CdpBrowserProvider.mutate (P1)', () => {
     expect(retry).toContain('Input.dispatchMouseEvent')
   })
 
+  it('blocks the action when DOM.resolveNode itself throws for a reused ref (解析失败 · 节点已消失)', async () => {
+    const ref = await firstRef()
+    // CDP 对**已消失**的节点是抛 -32000 协议错误，不是「成功返回但缺 objectId」。
+    // 这条路径以前只有 `locate` 兜住了（它自己写了一份映射），mutate 与元素截图都漏：
+    // 模型收到的是裸的 `CDP error: No node with given id found` —— 既不知道页面变了，
+    // 也没有「重拍快照」的指引。真机坐实：`scripts/probe-stale-node.ts`
+    //（同 URL 整页刷新后再用旧 ref，同一处代码路径）。
+    chrome.resolveNodeError = 'No node with given id found'
+
+    const before = chrome.calls.length
+    await expect(provider.mutate({ kind: 'fill', sessionId: 'tab-1', ref, value: 'x' })).rejects.toThrow(
+      expect.objectContaining({
+        code: 'BROWSER_STALE_REF',
+        message: 'the element for ref "e1" is gone from the document; run webpage_snapshot again',
+      }),
+    )
+    // 「动作没发出」：一条输入事件都没派发。
+    expect(chrome.calls.slice(before).map(call => call.method)).not.toContain('Input.insertText')
+  })
+
+  it('keeps a session-level failure distinct from a stale ref on the mutate path too', async () => {
+    const ref = await firstRef()
+    // detach（[V16]）是会话级状态，不是 ref 失效 —— 让模型「重拍快照」是错的指引。
+    // 与 `locate` 同一分寸：这一条不许被上面那个 catch 吞成 BROWSER_STALE_REF。
+    chrome.resolveNodeError = 'No target available'
+
+    await expect(provider.mutate({ kind: 'click', sessionId: 'tab-1', ref }))
+      .rejects.toThrow(expect.objectContaining({ code: 'BROWSER_DEBUGGER_DETACHED' }))
+  })
+
+  it('reports the same stale ref for an element screenshot whose node is gone (同一口径)', async () => {
+    const ref = await firstRef()
+    // `elementClip` 以前是**裸调** `DOM.resolveNode` 的第二处 —— 同一个洞的两份拷贝。
+    chrome.resolveNodeError = 'Node with given id does not belong to the document'
+
+    await expect(provider.observe({ kind: 'screenshot', sessionId: 'tab-1', ref }))
+      .rejects.toThrow(expect.objectContaining({ code: 'BROWSER_STALE_REF' }))
+  })
+
   it('lets an untouched page through, costing exactly one extra round-trip (零回归)', async () => {
     const ref = await firstRef()
     const before = chrome.calls.length

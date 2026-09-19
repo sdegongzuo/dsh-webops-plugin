@@ -969,20 +969,9 @@ export class CdpBrowserProvider implements BrowserProvider {
     // 纪元校验走既有 resolve 路径：从未观察 → BROWSER_SNAPSHOT_REQUIRED，旧纪元 → BROWSER_STALE_REF。
     const target = session.refs.resolve(request.ref)
     const options = { signal, timeoutMs: this.config.commandTimeoutMs }
-    let objectId: string | undefined
-    try {
-      objectId = await this.resolveNodeObjectId(session, target.backendNodeId, signal)
-    } catch (error: unknown) {
-      // detach（[V16]）与连接丢失是会话级状态，不是 ref 失效 —— 保持既有错误码原样上抛。
-      if (error instanceof BrowserError
-        && (error.code === 'BROWSER_DEBUGGER_DETACHED' || error.code === 'BROWSER_CONNECTION_LOST')) throw error
-      this.metrics.noteStale(session.targetId, 'node_gone')
-      throw new BrowserError(
-        `the element for ref "${request.ref}" is gone from the document; run webpage_snapshot again`,
-        'BROWSER_STALE_REF',
-        { cause: error, reason: 'node_gone' },
-      )
-    }
+    // 映射统一走 `resolveBackendNodeId`（detach / 连接丢失照原码上抛，其余算 ref 失效）——
+    // 这里原本自己写了一份，抽出去之后 mutate 与 elementClip 才用得上同一个口径。
+    const objectId = await this.resolveBackendNodeId(session, request.ref, target.backendNodeId, signal)
     if (objectId === undefined) {
       this.metrics.noteStale(session.targetId, 'node_gone')
       throw new BrowserError(
@@ -1273,7 +1262,7 @@ export class CdpBrowserProvider implements BrowserProvider {
     if (ref !== undefined) {
       // 解析放在发命令之前：ref 失效时应当立刻失败，而不是先截一张错的图。
       const target: RefTarget = session.refs.resolve(ref)
-      clip = await this.elementClip(session, target.backendNodeId, signal)
+      clip = await this.elementClip(session, ref, target.backendNodeId, signal)
     }
     // `fromSurface: false` 从渲染器取帧而不是合成器表面：默认的表面路径在
     // 「看不见的页面」上不出帧会**永久挂起** —— [V33] 的 show:false 窗口、以及
@@ -1310,10 +1299,16 @@ export class CdpBrowserProvider implements BrowserProvider {
   }
 
   /** 取一个元素的裁剪区域；元素已经从文档里消失时报 `BROWSER_STALE_REF`。 */
-  private async elementClip(session: SessionState, backendNodeId: number, signal?: AbortSignal): Promise<ScreenshotClip> {
+  private async elementClip(
+    session: SessionState,
+    ref: string,
+    backendNodeId: number,
+    signal?: AbortSignal,
+  ): Promise<ScreenshotClip> {
     const options = { signal, timeoutMs: this.config.commandTimeoutMs }
-    const resolved = await session.connection.send<ResolveNodeResult>('DOM.resolveNode', { backendNodeId }, options)
-    const objectId = resolved.object?.objectId
+    // 与 mutate 同一口径：`DOM.resolveNode` 对已消失的节点是**抛错**，
+    // 这里以前只兜「返回体缺 objectId」，同样会漏成裸协议错误。
+    const objectId = await this.resolveBackendNodeId(session, ref, backendNodeId, signal)
     if (objectId === undefined) {
       this.metrics.noteStale(session.targetId, 'node_gone')
       throw new BrowserError(
@@ -1502,6 +1497,44 @@ export class CdpBrowserProvider implements BrowserProvider {
   }
 
   /**
+   * 按 `backendNodeId` 取句柄，并**把「节点没了」统一映射成 `BROWSER_STALE_REF`**。
+   *
+   * 为什么需要这一步（`resolveNodeObjectId` 的契约把映射留给调用方，而三个调用方里
+   * 只有 `locate` 做了 —— 另两个漏了，于是模型收到的是一个**没有恢复指引的裸协议错误**）：
+   *
+   * - CDP 对不存在的节点走的是**抛错**，不是「成功返回但没带 `object`」。实测两种话术：
+   *   `No node with given id found`（会话 f6b89609 的 `[4.1]`）与
+   *   `Node with given id does not belong to the document`（`scripts/probe-stale-node.ts` 重放，
+   *   同 URL 整页刷新后再用旧 ref）。两条都是 `-32000`，都带 `BROWSER_PROTOCOL_ERROR`。
+   * - 所以 `resolveNodeObjectId` 里那个 `objectId === undefined` 分支**兜不住它们**，
+   *   异常直接穿透到工具层 → 模型看到 `CDP error: …`，既不知道页面变了、也不知道该重拍。
+   *   这正是 §5.1 注释里「地址不变的整页刷新已由 resolveNode 兜成 BROWSER_STALE_REF」
+   *   那句话的**反面**：当初 22/22 量的是「解析失败与否」，没量「失败翻成什么码」。
+   *
+   * **会话级失败照原码上抛**：detach（`[V16]`）与连接丢失不是 ref 失效，
+   * 让模型「重拍快照」是错的指引（`locate` 早已按这个分寸写，这里保持一致）。
+   */
+  private async resolveBackendNodeId(
+    session: SessionState,
+    ref: string,
+    backendNodeId: number,
+    signal?: AbortSignal,
+  ): Promise<string | undefined> {
+    try {
+      return await this.resolveNodeObjectId(session, backendNodeId, signal)
+    } catch (error: unknown) {
+      if (error instanceof BrowserError
+        && (error.code === 'BROWSER_DEBUGGER_DETACHED' || error.code === 'BROWSER_CONNECTION_LOST')) throw error
+      this.metrics.noteStale(session.targetId, 'node_gone')
+      throw new BrowserError(
+        `the element for ref "${ref}" is gone from the document; run webpage_snapshot again`,
+        'BROWSER_STALE_REF',
+        { cause: error, reason: 'node_gone' },
+      )
+    }
+  }
+
+  /**
    * 把 ref 解析成远端对象句柄。
    *
    * **第一步**就是查纪元表：ref 失效（或从未 snapshot）时这里直接抛
@@ -1518,7 +1551,9 @@ export class CdpBrowserProvider implements BrowserProvider {
     options?: { allowDetached?: boolean },
   ): Promise<string> {
     const target = session.refs.resolve(ref)
-    const objectId = await this.resolveNodeObjectId(session, target.backendNodeId, signal)
+    // 走 `resolveBackendNodeId` 而不是裸调 `resolveNodeObjectId`：后者把「节点没了」的
+    // 两种形态分开处理，映射交给调用方 —— 这一处以前漏了，裸协议错误会一路穿透到模型。
+    const objectId = await this.resolveBackendNodeId(session, ref, target.backendNodeId, signal)
     if (objectId === undefined) {
       this.metrics.noteStale(session.targetId, 'node_gone')
       throw new BrowserError(

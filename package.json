@@ -70,6 +70,7 @@
     "smoke:window": "tsx scripts/smoke-window.ts",
     "probe:input": "node scripts/probe-input-swallow.mjs",
     "probe:p4": "tsx scripts/probe-p4-gate.ts",
+    "probe:stale-node": "tsx scripts/probe-stale-node.ts",
     "window:desktop": "node scripts/window-in-host.mjs",
     "harness:build": "node scripts/harness-build.mjs",
     "package:portable": "node scripts/package-portable.mjs",
