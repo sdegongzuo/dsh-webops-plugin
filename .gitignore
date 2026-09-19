@@ -33,5 +33,17 @@ coverage/
 scripts/.last-*
 scripts/.kill-ports.txt
 
+# 真窗口调试用的一次性脚本与探针收发目录（2026-09-19 收口）
+# 点名而不是通配 `.*`：仓库根的 dotfile 里还有要入库的（`.gitignore` 自己、
+# `.env.local.example`），一条宽通配会把它们一起吞掉。
+#
+# ⚠️ **`.review-tmp/` 刻意不在本清单内** —— 它 2026-09-19 22:46 仍有 mtime（有人在写），
+# 且里面是 P2-P3 方案、impl、handover 一类**文档草稿**，去处该由它们的作者定。
+# AGENTS.md 的「与并行会话共存」那条也要求不替别人处置未跟踪文件。
+.list-wins.py
+.shot-win*.py
+.lock-probe/
+.tmp-lockprobe-in/
+
 # 排查用的一次性脚本（_tmp* 前缀）
 _tmp*
