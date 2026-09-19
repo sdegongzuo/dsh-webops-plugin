@@ -67,13 +67,19 @@
  * `--dir` 里 `home/` 的设置与凭据会被复制到一次性 home（`--home` 可指定、`--keep-home` 保留），
  * **不会**动包里那份；profile 的建链也在工作副本上做。
  *
- * ⚠️ **`--dir` 必须是「刚解压、还没启动过」的目录**。启动过一次的便携版，它的 profile 里
- * 已经躺着自己建好的 241 条链接，工作副本复制过去后建链会失败并报
- * `refusing to replace unowned package @deepseek-ai/cordis`；紧接着还会连锁出
- * `Cannot find package 'js-yaml'` / `plugin tree failed to load` 之类看起来吓人的错误 ——
- * **都不是包坏了**，是这份目录不再是出厂态。要复验就重新解压一份。
+ * ✅ **`--dir` 用「复用过的目录」也行 —— 包括 `portable:set-app` 维护的那个固定测试目录**
+ * （2026-09-19 实测修正，两次旧说法都被证伪）：
+ * ① 早先写「启动过的目录必报 `refusing to replace unowned package @deepseek-ai/cordis`
+ *    + `Cannot find package 'js-yaml'`」—— **已不成立**：0.1.6-alpha.2 把 link 模式**整套退役**、
+ *    宿主包改由运行时目录直接供给（profile 里**不建链**），所以这套连锁报错不会发生。
+ * ② 中间改写成「只有 `profile 里没有越权 overlay` 会假红，想全绿得另解压一份新鲜的」——
+ *    也**已修掉**：那条断言原先只看文件在不在，而宿主**首次启动**会自己在 profile 根写两个
+ *    出厂空模板（`cordis.yml` / `cordis.patch.yml`，内容只有注释 + `[]`）。现在改成按**内容**判
+ *    （见 `isStockEmptyPatch`），空模板放行、**有内容的 patch 照样红**。
+ *    → 因此：**一个固定目录就够了**，不必为它再解压第二份 1.2G。
  *
- * `--harness` 指向 deepseek-harness 源码（默认 `$DSH_HARNESS` 或 `D:/dev/cli/deepseek-harness`）。
+ * `--harness` 指向 deepseek-harness 源码（默认取 `DSH_HARNESS`，本机写在 `.env.local`；
+ * 模板见 `.env.local.example`。没配会明确报错，**不会**退回写死的 `D:/…` 路径）。
  * 前 3 条断言依赖它的 `apps/desktop/src/*.ts`，缺了就没法验真启动路径，脚本会直接报错退出。
  */
 import { spawn } from 'node:child_process'
@@ -83,6 +89,7 @@ import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { materializeRuntimeDir } from './desktop-runtime.mjs'
+import { harnessRoot } from './local-env.mjs'
 import { fetchHostPath, startPackagedDesktopHost } from './run-packaged-host.mjs'
 
 /* ---------- 参数 ---------- */
@@ -147,7 +154,13 @@ const runtimeLabel = materialized.layout === 'asar'
   : 'app/resources/dsh'
 process.on('exit', () => materialized.cleanup())
 
-const harnessDesktopSrc = join(resolve(options.harness ?? process.env.DSH_HARNESS ?? 'D:/dev/cli/deepseek-harness'), 'apps', 'desktop', 'src')
+// `--harness` 显式指定优先；否则走 `.env.local` 的 `DSH_HARNESS`。**不再退回写死的
+// `D:/dev/cli/deepseek-harness`** —— 那正是「换机器/换盘后安静地读错目录」的来源。
+// 没配就报缺哪个键（可操作的提示见 local-env.mjs 的 envOrDie）。
+const harnessDesktopSrc = join(
+  options.harness === undefined ? harnessRoot() : resolve(options.harness),
+  'apps', 'desktop', 'src',
+)
 for (const file of ['runtime-tree.ts', 'profile-packages.ts', 'paths.ts']) {
   if (!existsSync(join(harnessDesktopSrc, file))) {
     throw new Error(`verify-portable: 找不到 ${join(harnessDesktopSrc, file)} —— 用 --harness 指向 deepseek-harness 源码根目录`)
@@ -376,8 +389,29 @@ if (existsSync(shippedPluginDir)) {
     '重新可见时会补跑 layout（restore / show）')
 }
 
-check(!existsSync(join(profileDir, 'cordis.patch.yml')),
-  'profile 里没有越权 overlay（出货包不该带 profile 级 patch）')
+/**
+ * 判断一个 profile 级 patch 文件是不是**出厂空模板**。
+ *
+ * 为什么按内容判、不按存在判（2026-09-19 实测修正）：宿主**首次启动**会自己在 profile 根写下
+ * `cordis.yml` 与 `cordis.patch.yml`，内容只有注释 + 一个空数组 `[]` —— 这是**无副作用的空
+ * patch**，不是「越权 overlay」。可原断言只看文件在不在，于是它对**复用过的目录恒红**
+ * （本脚本第 [4/5] 步自己就会起宿主，跑第二次必红），害得本地只能再解压一份 1.2G 的新目录去绕。
+ * 真正要拦的是「**有人把有内容的 patch 带进了出货 profile**」—— 那必然非空，所以看内容足够。
+ * @param path - profile 根的 patch 文件路径。
+ * @returns 文件不存在、或去掉注释后只剩 `[]` / 空 → `true`。
+ */
+function isStockEmptyPatch(path) {
+  if (!existsSync(path)) return true
+  const body = readFileSync(path, 'utf8')
+    .split(/\r?\n/u)
+    .filter(line => !line.trimStart().startsWith('#'))
+    .join('')
+    .trim()
+  return body === '' || body === '[]'
+}
+
+check(isStockEmptyPatch(join(profileDir, 'cordis.patch.yml')),
+  'profile 里没有越权 overlay（出货包不该带 profile 级 patch；宿主首启写的空模板 `[]` 不算）')
 
 /* ---------- 3.6 app.asar 里必须真含 harness 补丁注入的代码 ---------- */
 
@@ -613,7 +647,7 @@ if (options.browser === undefined) {
 /* ---------- 收尾 ---------- */
 
 await host.stop()
-// workProfileDir 是 profile 的工作副本（含脚本建出的 241 条 junction），连同它的父目录一起清掉。
+// workProfileDir 是 profile 的工作副本（alpha.2 起不再建 junction，就是一份普通目录拷贝），连同它的父目录一起清掉。
 try {
   rmSync(scratchBase, { recursive: true, force: true })
 } catch { /* 临时目录，删不掉不影响结论 */ }

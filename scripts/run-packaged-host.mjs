@@ -7,9 +7,93 @@
  * `apps/desktop/src/host-process.ts` 的 spawn。自检必须走同一条路，再 import 那个
  * 已删除的函数只会得到 `is not a function`。
  */
-import { spawn } from 'node:child_process'
+import { spawn, spawnSync } from 'node:child_process'
 import { existsSync } from 'node:fs'
 import { join } from 'node:path'
+
+/**
+ * 桌面端宿主**写死**的端口（`apps/desktop-host/src/index.ts:24` 的 `--port 19387`）。
+ *
+ * 它被别的实例占着时，新宿主照样能起、照样发 ready，但插件永远上不来，报出来的是
+ * `N required plugins did not activate` —— 看着像包坏了，实际跟包一点关系没有。
+ * 2026-09-18 真踩过：一台没关的旧宿主占着它，所有自检同时转红。
+ */
+export const HOST_PORT = 19387
+
+/** 平台系统目录里的 exe —— 不靠 PATH（Node 的 cwd/PATH 可能被调用方改过）。 */
+function systemExe(name) {
+  return join(process.env.SystemRoot ?? 'C:\\Windows', 'System32', name)
+}
+
+/** 同步 sleep：预检要在同步 API 里等端口释放，不能把 startPackagedDesktopHost 改成 async。 */
+function sleepSync(ms) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms)
+}
+
+/**
+ * 查谁在 LISTEN 这个端口。只认 `netstat -ano` 的 LISTENING 行 ——
+ * 不用「绑一下试试」那套：在 Windows 上绑 `127.0.0.1:<port>` 与占用者绑 `0.0.0.0:<port>`
+ * **不冲突**，会得到「端口空闲」的假阴性（2026-09-18 实测）。
+ *
+ * @param port - 待查端口。
+ * @returns `{ pid?, name? }`；没人监听则 `undefined`。非 Windows 一律返回 `undefined`。
+ */
+export function findPortListener(port = HOST_PORT) {
+  if (process.platform !== 'win32') return undefined
+  const netstat = spawnSync(systemExe('netstat.exe'), ['-ano'], { encoding: 'utf8', windowsHide: true })
+  if (netstat.error !== undefined || netstat.stdout === null) return undefined
+  for (const line of String(netstat.stdout).split(/\r?\n/)) {
+    if (!/\bLISTENING\b/iu.test(line)) continue
+    // 字段固定为：Proto / 本地地址 / 外部地址 / 状态 / PID。
+    const fields = line.trim().split(/\s+/u)
+    if (fields.length < 4) continue
+    if (!fields[1].endsWith(`:${String(port)}`)) continue
+    const pid = Number.parseInt(fields[fields.length - 1], 10)
+    if (Number.isNaN(pid)) return {}
+    const tasklist = spawnSync(systemExe('tasklist.exe'), ['/FI', `PID eq ${String(pid)}`, '/FO', 'CSV', '/NH'], {
+      encoding: 'utf8',
+      windowsHide: true,
+    })
+    // CSV 里第一列就是镜像名；这里在 Node 里解析，不受「grep 被 CSV 引号骗过」那个坑影响。
+    const name = String(tasklist.stdout ?? '').trim().replace(/^"/u, '').split('","', 1)[0]
+    return { pid, name: name === '' ? undefined : name }
+  }
+  return undefined
+}
+
+/**
+ * 起宿主前的端口预检：占用则抛，并把「谁占着 + 怎么清」写进消息。
+ *
+ * 给一小段重试窗口（默认 5s）：上一个宿主刚 `stop()` 完、端口还没释放是常见情形，
+ * 那种情况等一下就好了，不该报错。
+ *
+ * @param options - `port` / `timeoutMs` / `label`。
+ */
+export function assertHostPortFree(options = {}) {
+  const port = options.port ?? HOST_PORT
+  const deadline = Date.now() + (options.timeoutMs ?? 5_000)
+  const label = options.label ?? 'desktop-host'
+  for (;;) {
+    const holder = findPortListener(port)
+    if (holder === undefined) return
+    if (Date.now() >= deadline) {
+      const who = holder.pid === undefined
+        ? ''
+        : ` —— PID ${String(holder.pid)}${holder.name === undefined ? '' : `（${holder.name}）`}`
+      throw Object.assign(
+        new Error(
+          `${label}: 端口 ${String(port)} 已被占用${who}。\n`
+          + `  这个端口是桌面端宿主写死的（apps/desktop-host/src/index.ts 的 --port），被占着时\n`
+          + '  新宿主的插件永远激活不了，报出来的却是「N required plugins did not activate」，\n'
+          + '  看着像包坏了 —— 2026-09-18 就被这一条骗过一整轮。\n'
+          + `  清掉占用者：关掉那个 dsh 桌面端窗口，或 taskkill /PID ${String(holder.pid ?? '<pid>')} /F`,
+        ),
+        { code: 'EADDRINUSE' },
+      )
+    }
+    sleepSync(200)
+  }
+}
 
 /**
  * @param {object} options
@@ -19,9 +103,14 @@ import { join } from 'node:path'
  * @param {string} [options.node]
  * @param {NodeJS.ProcessEnv} [options.env]
  * @param {number} [options.timeoutMs]
+ * @param {string} [options.label] 端口被占时报告里用的调用方名字。
+ * @param {boolean} [options.skipPortCheck] 调用方自己已经等过端口释放时跳过预检。
  * @returns {{ ready: Promise<{ url: string, injections?: unknown }>, stop: () => Promise<void> }}
  */
 export function startPackagedDesktopHost(options) {
+  // 先过端口：这是「包看着好好的但插件就是不上来」的头号真凶，且在同步阶段就能诊断完，
+  // 不必先花几十秒起一个注定起不来的宿主、再从 stderr 里反推。
+  if (options.skipPortCheck !== true) assertHostPortFree({ label: options.label ?? 'desktop-host' })
   const node = options.node ?? process.execPath
   const runtimeDir = options.runtimeDir
   const profileDir = options.profileDir

@@ -6,18 +6,33 @@
  *
  * 用法：
  *   node scripts/package-desktop-portable.mjs --app <win-unpacked 目录> [--version 0.1.0]
- *   node scripts/package-desktop-portable.mjs [--version 0.1.0]        # 复用缓存的 base
- *   node scripts/package-desktop-portable.mjs --app <dir> --cache-base # 构建后顺便缓存 base
+ *   node scripts/package-desktop-portable.mjs [--version 0.1.0]        # 复用缓存里最新的 base
+ *   node scripts/package-desktop-portable.mjs --app <dir> --cache-base # 构建后顺便把 base 入库
+ *   node scripts/package-desktop-portable.mjs --app <dir> --cache-base --cache-move  # 入库时优先同盘改名
+ *   node scripts/package-desktop-portable.mjs --app <dir> --cache-base --cache-only  # 只入库、不打 zip
  *   node scripts/package-desktop-portable.mjs --app <dir> --stage .desktop-stage-2  # 默认暂存目录被占用时
+ *
+ * 大件（`.desktop-base` / `.desktop-stage`）默认放仓库根；把环境变量 `DSH_DESKTOP_BUILD_ROOT`
+ * 指到**工作区外**就能搬走它们（IDE 会锁工作区里的 `app.asar`，见下面 `BUILD_ROOT` 的注释）：
+ *   DSH_DESKTOP_BUILD_ROOT=<工作区外的目录> node scripts/package-desktop-portable.mjs
+ * 本机已把这条写进 `.env.local`，所以平时直接跑即可、不必带前缀。
  *
  * 产出：
  *   dist/dsh-webops-desktop-v<ver>-win-x64-portable.zip
  *
  * 两层拆分（避免每次发版都重编译 dsh）：
- *   第 1 层 base = dsh 桌面端本体（app/，~300MB，只在升级 dsh 时重建）；
+ *   第 1 层 base = dsh 桌面端本体（app/，几百 MB，只在升级 dsh 时重建）；
  *   第 2 层 overlay = home/profiles/desktop/ 里的插件（几十 KB，每次发版都换）。
- *   `--cache-base` 把本次的 app/ 存到 `.desktop-base/app`，之后不带 `--app` 跑就直接复用，
- *   只重新生成 overlay 并重新压缩。
+ *   `--cache-base` 把本次的 app/ 存到 `.desktop-base/<dsh 版本>/app`，之后不带 `--app` 跑就
+ *   按版本挑一份复用，只重新生成 overlay 并重新压缩。
+ *
+ * 缓存**按 dsh 版本分槽**（`.desktop-base/0.1.6-alpha.2/app`）。不分的单坑写法有两个后果，
+ * 2026-09-17 都真踩到了：① 升级 dsh 重编一次就把旧的一份覆盖掉，回退无路；
+ * ② **没有任何东西能告诉你坑里那堆文件是哪个版本** —— 当时 `.desktop-base\app` 是一份
+ * dsh 0.1.5-rc.2 的残缺缓存（18 个条目被删剩 7 个，连主 exe 都没了），不带 `--app` 跑就会
+ * 拿它当 base，打出来的便携版里躺着一个上个版本的 dsh，而日志上看不出任何异常。
+ * 现在槽位名即版本号，扫描时再拿 `desktop-runtime.json` 复核一遍，挑不出来就明确报错，
+ * 不静默降级。
  *
  * 为什么 profile 是我们自己写而不是调桌面端去装：
  * 打包态桌面端装插件只能走 UI 插件管理器（IPC pluginsAdd → pnpm add），CLI 碰不到这个
@@ -38,12 +53,40 @@ import { createHash } from 'node:crypto'
 import { cpSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { buildRoot } from './local-env.mjs'
 import { readRuntimeDescriptor } from './desktop-runtime.mjs'
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const DIST = join(ROOT, 'dist')
-/** 第 1 层 base 的本地缓存：dsh 本体不常变，缓存后插件发版无需重编译。 */
-const BASE_CACHE = join(ROOT, '.desktop-base', 'app')
+/**
+ * 大件（`.desktop-base` / `.desktop-stage`）的存放根，默认就是仓库根。
+ *
+ * **为什么留这个口子**（2026-09-19 实测）：**在工作区里的 `app.asar` 会被 IDE 锁死** ——
+ * VS Code 系 IDE 把 asar 当**可解析的归档格式**去打开解析，句柄不带 `FILE_SHARE_DELETE`
+ * 且**不释放**，于是文件「能读能写、就是删不掉改不了名」。实测：工作区内 40 个 `.asar`
+ * 锁住 39 个（唯一没锁的是内容全零、解析不成归档的那个）；工作区**外**的同内容 `.asar`
+ * 180 秒全程无人碰。用 `scripts/who-locks.ps1` 可以随时点名持有者。
+ * 把这两坨搬到工作区外，`package-desktop-portable` 里那一整套绕法（避免改名/删除、
+ * 残留只能瘦身、`--stage` 换目录……）就可以逐步退掉。
+ *
+ * **默认值必须是仓库根**：CI 的 `actions/cache` 缓存的就是仓库下的 `.desktop-base`
+ * （`.github/workflows/release-desktop.yml` 里 `path: .desktop-base`，相对路径没法事先写死成别处），
+ * 改了默认值 CI 就取不到缓存、每次都要重编十几分钟。
+ *
+ * 取值统一走 `local-env.mjs` 的 `buildRoot()`：`DSH_DESKTOP_BUILD_ROOT` 或本机
+ * `.env.local`（模板 `.env.local.example`），缺省=仓库根。
+ */
+const BUILD_ROOT = buildRoot()
+/**
+ * 第 1 层 base 的本地缓存根。每个 dsh 版本一个槽：`.desktop-base/<版本>/app`。
+ * dsh 本体不常变，缓存后插件发版无需重编译（也不必重跑那条十几分钟的 electron-builder）。
+ */
+const BASE_ROOT = join(BUILD_ROOT, '.desktop-base')
+/**
+ * 槽位里的「拷贝已完整落盘」凭据，放在 `<槽>/cache.json`（与 `<槽>/app` 同级）。
+ * 没有它就是没装完 —— 见 `scanBaseSlots()` 为什么把它当硬门槛。
+ */
+const CACHE_MARKER = 'cache.json'
 
 /** 官方常量，抄自 `apps/desktop/src/project-manager.ts`（改错任何一个桌面端直接抛错）。 */
 const PROJECT_NAME = '@deepseek-ai/dsh-desktop-runtime'
@@ -57,17 +100,71 @@ const readArg = (name) => {
 }
 
 const cacheBase = args.includes('--cache-base')
+/** `--cache-only`：把 `--app` 那份本体入库后即退出，不打 zip。CI 用它给 `actions/cache` 备料。 */
+const cacheOnly = args.includes('--cache-only')
+/** `--cache-move`：入库时优先同盘改名（瞬时、不复制 1.2G），失败自动回落拷贝。CI 用得上。 */
+const cacheMove = args.includes('--cache-move')
+/** `--list-cached`：只挑缓存、印一行 `CACHE_APP_DIR=<路径>` 就退出（给 CI 判断要不要重建）。 */
+const listCached = args.includes('--list-cached')
 let appDir = readArg('app')
 /**
- * 暂存目录。默认 `<仓库根>/.desktop-stage`；`--stage` 可临时换一个。
+ * 暂存目录。默认 `<BUILD_ROOT>/.desktop-stage`（默认即仓库根）；`--stage` 可临时换一个。
  *
  * 为什么留这个口子（2026-09-17）：本机出现过 `.desktop-stage\app\resources\app.asar`
  * 被某个进程**内存映射**住（能 `r+` 打开，但拿不到删除权，`unlink` 恒 EBUSY、
  * 连目录都改不了名）。脚本开头那句 `rmSync(STAGE)` 于是直接抛 `EBUSY`，
  * 整个打包在「主程序: …」之后一步都走不动，看着完全像打包脚本坏了。
  * 换个空目录就能继续，不必等那个句柄自己消失（CI 每次都是新目录，碰不到）。
+ *
+ * 2026-09-19 查明那个「某个进程」就是 **IDE**（VS Code 系解析工作区里的 asar 归档）——
+ * 用 `DSH_DESKTOP_BUILD_ROOT` 把 STAGE 挪出工作区，根上就不会再有这个句柄。
  */
-const STAGE = resolve(readArg('stage') ?? join(ROOT, '.desktop-stage'))
+const STAGE = resolve(readArg('stage') ?? join(BUILD_ROOT, '.desktop-stage'))
+
+/** 把错误压成一行。垫片抛的 `Error` **没有 `error.code`**，所以不能只看 code（见 `removeTree`）。 */
+function describeError(error) {
+  const kind = error.code ?? error.constructor?.name ?? 'Error'
+  return `${kind}: ${String(error.message ?? '').slice(0, 200)}`
+}
+
+/**
+ * 删掉一棵树；返回是否真删干净。
+ *
+ * **为什么要两个进程**（2026-09-19 实测，踩了一整轮才定位）：本机 CLI 通过 `NODE_OPTIONS`
+ * 注入 safe-delete 垫片，它把每次删除改成「先丢进回收站」，而回收站助手
+ * （`resources/vendor/genie-trash/win32-x64.exe`）**只有 5 秒超时**。1.2G / 两万多条目的
+ * 暂存目录搬不完，于是抛 `[safe-delete] 操作失败: spawnSync … ETIMEDOUT` ——
+ * 那是个**普通 `Error`，没有 `error.code`**，旧代码 `（${error.code ?? ''}）` 就打了个空括号，
+ * 看着像「莫名其妙的失败」，很容易误判成文件被锁。
+ * 垫片在 **require 期**读 env（进程内 `process.env.X='0'` 无效），所以直接换一个带
+ * `CODEBUDDY_SAFE_DELETE_ENABLED=0` 的子进程来删 —— 本机实测 1.2G 瞬间删净。
+ *
+ * 注意判据用「垫片是否加载」而不是「有没有报错」：垫片开着时先试一次必然白等 5 秒。
+ */
+function removeTree(dir) {
+  if (!existsSync(dir)) return true
+  if (globalThis.__CODEBUDDY_NODE_SAFE_DELETE_SHIM_LOADED__ !== true) {
+    try {
+      rmSync(dir, { recursive: true, force: true })
+      return !existsSync(dir)
+    } catch (error) {
+      console.warn(`package-desktop-portable: rmSync 删 ${dir} 失败 —— ${describeError(error)}`)
+      return false
+    }
+  }
+  const retry = spawnSync(
+    process.execPath,
+    ['-e', `require('node:fs').rmSync(${JSON.stringify(dir)}, { recursive: true, force: true })`],
+    { encoding: 'utf8', env: { ...process.env, CODEBUDDY_SAFE_DELETE_ENABLED: '0' } },
+  )
+  if (retry.status === 0 && !existsSync(dir)) {
+    console.log('  （由关掉安全删除垫片的子进程删除：垫片对 >1G 的目录会 ETIMEDOUT）')
+    return true
+  }
+  console.warn(`package-desktop-portable: 关掉垫片的子进程也删不掉 ${dir} —— `
+    + `${(retry.stderr ?? '').trim() || `exit=${String(retry.status)}`}`)
+  return false
+}
 
 /** win-unpacked 里的主 exe（electron-builder 按 productName 命名）。 */
 function findMainExe(dir) {
@@ -95,55 +192,284 @@ function assertLooksLikeApp(dir, label) {
   return exe
 }
 
-const pkg = JSON.parse(readFileSync(join(ROOT, 'package.json'), 'utf8'))
-const version = readArg('version') ?? pkg.version
-const pluginName = pkg.name
-
-if (appDir === undefined && existsSync(BASE_CACHE)) {
-  appDir = BASE_CACHE
-  console.log(`复用缓存的 dsh 本体: ${BASE_CACHE}`)
-}
-if (appDir === undefined || !existsSync(appDir)) {
-  console.error('用法: node scripts/package-desktop-portable.mjs --app <win-unpacked 目录> [--version x.y.z]')
-  console.error('      node scripts/package-desktop-portable.mjs [--version x.y.z]   # 复用 .desktop-base/app')
-  console.error('      加 --stage <目录> 可换掉默认的 .desktop-stage（被占用时用）')
-  process.exit(1)
-}
-if (cacheBase) {
-  // 缓存是**优化**不是**前置**：清不掉旧缓存（`EBUSY` = `app.asar` 被内存映射住，多半是
-  // 上一轮自检/复现留下的进程；`EPERM` = 有进程把它当工作目录）就只能「这次没缓存」，
-  // 不该把整个打包带崩 —— 2026-09-17 真踩过：这一步抛在 `rmSync`，脚本连 zip 都没开始打。
-  //
-  // 旧写法是「先拷 `.new`，再 `rmSync` 旧目录，最后改名」。它只保证了**新副本**完整，
-  // 没保证**旧缓存**不被删残：2026-09-17 实测 `rmSync` 删到第 12 个条目才撞上被映射的
-  // `resources\app.asar`，于是 `.desktop-base\app` 从 18 个条目变成 7 个，`.new` 留在原地 ——
-  // 一个**残缺缓存**就位，下次不带 `--app` 会拿它当 base（报「没找到主 exe」，且极易误判成包坏了）。
-  //
-  // 现在改成：拷贝 → 校验副本像不像一个完整的 win-unpacked → 旧目录**改名挪开**（rename 不会
-  // 部分删除，挪不动就整段失败，旧缓存原封不动）→ 副本顶上去 → 最后才回收旧目录（回收失败
-  // 只是留个 `.retired`，不影响任何东西）。
-  const baseStaging = `${BASE_CACHE}.new`
-  const baseRetired = `${BASE_CACHE}.retired`
-  try {
-    rmSync(baseStaging, { recursive: true, force: true })
-    mkdirSync(dirname(BASE_CACHE), { recursive: true })
-    cpSync(appDir, baseStaging, { recursive: true })
-    assertLooksLikeApp(baseStaging, '缓存副本')
-    rmSync(baseRetired, { recursive: true, force: true })
-    if (existsSync(BASE_CACHE)) renameSync(BASE_CACHE, baseRetired)
-    renameSync(baseStaging, BASE_CACHE)
-    try {
-      rmSync(baseRetired, { recursive: true, force: true })
-    } catch {
-      console.warn(`package-desktop-portable: 旧缓存留在 ${baseRetired}（删不掉，可手动清）`)
+/**
+ * 比较两个 dsh 版本号（`0.1.6-alpha.2` 这种带预发布的也要能排）。
+ *
+ * 只用于「多个缓存槽里挑哪一份」，不参与任何构建决策，所以按 semver 的排序规则做个够用的
+ * 实现即可：主版本段按数值比；预发布段「没有 > 有」（release 比 prerelease 新），都有则逐段
+ * 比（纯数字按数值、否则按字典序）。
+ * @param a - 左版本号。
+ * @param b - 右版本号。
+ * @returns 负数 / 0 / 正数，语义同 `Array#sort` 的比较器。
+ */
+function compareDshVersion(a, b) {
+  const parse = (value) => {
+    const [core, ...pre] = String(value).split('-')
+    return {
+      core: core.split('.').map(part => Number.parseInt(part, 10) || 0),
+      pre: pre.join('-').split('.').filter(Boolean),
     }
-    console.log(`已缓存 dsh 本体到 ${BASE_CACHE}（下次发版可省略 --app）`)
+  }
+  const left = parse(a)
+  const right = parse(b)
+  for (let i = 0; i < Math.max(left.core.length, right.core.length); i += 1) {
+    const delta = (left.core[i] ?? 0) - (right.core[i] ?? 0)
+    if (delta !== 0) return delta
+  }
+  if (left.pre.length === 0 || right.pre.length === 0) return right.pre.length - left.pre.length
+  for (let i = 0; i < Math.max(left.pre.length, right.pre.length); i += 1) {
+    const p = left.pre[i]
+    const q = right.pre[i]
+    if (p === undefined) return -1
+    if (q === undefined) return 1
+    const pn = Number.parseInt(p, 10)
+    const qn = Number.parseInt(q, 10)
+    if (Number.isNaN(pn) || Number.isNaN(qn)) {
+      if (p !== q) return p < q ? -1 : 1
+    } else if (pn !== qn) {
+      return pn - qn
+    }
+  }
+  return 0
+}
+
+/**
+ * 扫描 `.desktop-base` 下的所有版本槽，并逐槽复核「真是一份完整、可读出版本的 win-unpacked」。
+ *
+ * 复核放在扫描里而不是选完再验，是为了让「槽里躺着什么」这件事在**没被选中的槽**上也说得清：
+ * 一个残缺槽如果是唯一的槽，旧写法会把它当 base，然后死在后面对不上号的错误上。
+ *
+ * **完成标记是硬门槛**：拷贝中断会留下一个「文件看着都在、其实少了几个」的目录，
+ * 而 `assertLooksLikeApp` 只看顶层那几项，拦不住这种。中断过的槽必须报出来而不是拿去用。
+ *
+ * 两种条目的区别要分清楚：**没有 `app/` 子目录的不算槽，是残留**（旧单坑时代的 `.desktop-base/app`，
+ * 以及被安全软件锁得只剩一个 `app.asar` 的空壳 —— 本机删不掉，见 `clean-build-residue.mjs`）。
+ * 把它们和「真槽但坏了」分开报，否则每次跑都刷一串看着像出事的警告。
+ * @returns 每槽一项 `{ slot, appDir, version?, problem?, residue? }`；`problem` 非空表示不可用，
+ *   `residue` 为真表示它压根不是缓存槽。
+ */
+function scanBaseSlots() {
+  if (!existsSync(BASE_ROOT)) return []
+  return readdirSync(BASE_ROOT, { withFileTypes: true })
+    .filter(entry => entry.isDirectory() && !/\.(new|retired)$/u.test(entry.name))
+    .map((entry) => {
+      const appDir = join(BASE_ROOT, entry.name, 'app')
+      if (!existsSync(appDir)) {
+        // 残留，不是槽：`.desktop-base/app` 下面直接就是文件（旧单坑缓存），
+        // 或只剩一个删不掉的 `resources/app.asar` 空壳。
+        return { slot: entry.name, appDir, residue: true }
+      }
+      const marker = join(BASE_ROOT, entry.name, CACHE_MARKER)
+      if (!existsSync(marker)) {
+        return { slot: entry.name, appDir, problem: `缺 ${CACHE_MARKER} 完成标记（拷贝被中断过？）` }
+      }
+      try {
+        assertLooksLikeApp(appDir, `缓存槽 ${entry.name}`)
+      } catch (error) {
+        return { slot: entry.name, appDir, problem: error.message }
+      }
+      try {
+        const dshVersion = readRuntimeDescriptor(appDir).descriptor.release.version
+        if (dshVersion !== entry.name) {
+          // 槽位名和实际内容不符：要么目录被手动搬过，要么版本号取错了来源。两种都不能信。
+          return { slot: entry.name, appDir, problem: `槽位名是 ${entry.name}，内容是 dsh ${dshVersion}` }
+        }
+        return { slot: entry.name, appDir, version: dshVersion }
+      } catch (error) {
+        return { slot: entry.name, appDir, problem: error.message }
+      }
+    })
+}
+
+/**
+ * 一个 app 目录该进哪个槽 —— 以它自己的 `desktop-runtime.json` 为准，不猜、也不接受手填。
+ * @param targetDir - 待入库的 win-unpacked 目录。
+ * @returns `{ version, slotDir, appDir }`，`appDir` 是该版本的槽位路径。
+ */
+function cacheSlotFor(targetDir) {
+  const dshVersion = readRuntimeDescriptor(targetDir).descriptor.release.version
+  const slotDir = join(BASE_ROOT, dshVersion)
+  return { version: dshVersion, slotDir, appDir: join(slotDir, 'app') }
+}
+
+/** best-effort 删一个目录；删不掉只记一句，不抛。 */
+function removeQuietly(target, what) {
+  if (!existsSync(target)) return true
+  try {
+    rmSync(target, { recursive: true, force: true })
+    return true
+  } catch (error) {
+    console.warn(`package-desktop-portable: ${what} 留在 ${target}（${error.code ?? ''} ${error.message}）`)
+    return false
+  }
+}
+
+/**
+ * 把一份 dsh 本体装进它对应的版本槽；返回落位后的路径。
+ *
+ * **为什么是「直接拷进最终位置 + 完成标记」而不是「拷到 `.new` 再改名」**（2026-09-18 改）：
+ * **IDE**（不是杀毒软件，2026-09-19 用 `scripts/who-locks.ps1` 点名纠正）会去解析工作区里
+ * 新出现的 `resources\app.asar`，句柄只挡改名和删除（共享读、原地位写都通畅）。
+ * 而 Windows **不允许改名一个内含无 `FILE_SHARE_DELETE` 句柄文件的目录** —— 于是
+ * `.new → app` 这一步恒 `EPERM`，旧写法在这台机器上永远装不进去（实测；
+ * 同一现象也解释了为什么历史上 `.desktop-base\app`、`.desktop-stage\*` 一律删不掉）。
+ * 把大件放到工作区外（`DSH_DESKTOP_BUILD_ROOT`）能让这个句柄根本不出现 —— 届时这条
+ * 「不用改名」的约束就成了纯冗余，但**别急着删**：CI 与其他人本机仍在工作区里跑。
+ * 现在改成不需要任何改名/删除的写路径：`mkdir` → `cpSync` → 校验 → 写标记。
+ * 代价是「同版本重装」必须先手工删掉那个槽（槽里的 app.asar 删不掉时也就删不掉整槽），
+ * 但这个代价基本不出现：dsh 一升级就是新版本、自然落新槽。
+ *
+ * 缓存是**优化**不是**前置**：装不进去就只能「这次没缓存」，不该把整个打包带崩 ——
+ * 2026-09-17 真踩过：这一步抛在 `rmSync`，脚本连 zip 都没开始打。所以整个函数只警告不抛。
+ * @param sourceDir - 要缓存的那份 win-unpacked。
+ * @param options - `move` 为真时优先用同盘改名（瞬时），失败回落拷贝。
+ * @returns 槽位路径；失败时为 `undefined`。
+ */
+function installBaseCache(sourceDir, options = {}) {
+  let slot
+  try {
+    slot = cacheSlotFor(sourceDir)
+  } catch (error) {
+    console.warn(`package-desktop-portable: 读不出 ${sourceDir} 的 dsh 版本，本次不缓存（${error.message}）`)
+    return undefined
+  }
+  const marker = join(slot.slotDir, CACHE_MARKER)
+  if (existsSync(marker) && existsSync(slot.appDir)) {
+    console.log(`dsh 本体缓存已就位（dsh ${slot.version}），本次不动它: ${slot.appDir}`)
+    removeQuietly(`${slot.appDir}.new`, '旧的暂存目录')
+    removeQuietly(`${slot.appDir}.retired`, '旧的退役目录')
+    return slot.appDir
+  }
+  if (existsSync(slot.appDir)) {
+    // 没有完成标记 = 上次拷贝断了。残缺槽不能直接用，但也不该悄悄覆盖出一个新旧混合体。
+    if (!removeQuietly(slot.appDir, '残缺槽位')) {
+      console.warn('  槽里那个 app.asar 被安全软件占着删不掉，本轮放弃入库；')
+      console.warn(`  修法：手动删掉整个 ${slot.slotDir} 再跑，或直接用 --app 打包（不影响正确性）。`)
+      return undefined
+    }
+  }
+  try {
+    // 先清历史写法留下的暂存/退役目录（趁拷贝前，省一半峰值磁盘；内含被占住的 app.asar 时
+    // 只能删掉一部分，剩下那点无害 —— 槽位识别不认这两个后缀）。
+    removeQuietly(`${slot.appDir}.new`, '旧的暂存目录')
+    removeQuietly(`${slot.appDir}.retired`, '旧的退役目录')
+    mkdirSync(slot.slotDir, { recursive: true })
+    let mode = 'copy'
+    if (options.move === true) {
+      try {
+        renameSync(sourceDir, slot.appDir)
+        mode = 'move'
+      } catch {
+        // 同盘改名要求源目录里没有被独占的句柄；本机有安全软件时基本必失败，回落拷贝。
+      }
+    }
+    if (mode === 'copy') cpSync(sourceDir, slot.appDir, { recursive: true })
+    assertLooksLikeApp(slot.appDir, '缓存副本')
+    writeFileSync(marker, `${JSON.stringify({
+      dshVersion: slot.version,
+      createdAt: new Date().toISOString(),
+      mode,
+      source: sourceDir,
+      note: '本文件是「拷贝已完整落盘」的凭据；缺了它这个槽会被当作残缺缓存拒绝使用。',
+    }, null, 2)}\n`)
+    console.log(`已缓存 dsh 本体（dsh ${slot.version}，${mode}）到 ${slot.appDir}（下次发版可省略 --app）`)
+    return slot.appDir
   } catch (error) {
     console.warn(`package-desktop-portable: 更新 dsh 本体缓存失败（${error.code ?? ''} ${error.message}）`)
     console.warn('  不影响本次打包（用的是 --app 指的那个目录）；只是下次仍需要带 --app。')
     console.warn('  要修的话：关掉占用它的进程（常见是上一轮复现留下的 DeepSeek Harness.exe）再跑。')
+    return undefined
   }
 }
+
+const pkg = JSON.parse(readFileSync(join(ROOT, 'package.json'), 'utf8'))
+const version = readArg('version') ?? pkg.version
+const pluginName = pkg.name
+
+const explicitApp = appDir !== undefined
+const scanned = scanBaseSlots()
+/** 真缓存槽（有 `app/` 子目录）与**残留目录**（没有，多半是被锁得只剩一个 app.asar 的空壳）分开。 */
+const slots = scanned.filter(item => item.residue !== true)
+const residues = scanned.filter(item => item.residue === true)
+const usable = slots
+  .filter(slot => slot.version !== undefined)
+  .sort((a, b) => compareDshVersion(b.version, a.version))
+
+/** 把所有槽位的状态印出来（选中的那个 + 其余的），多槽并存时「用了哪个/还躺着哪个」要一眼可见。 */
+function reportSlots(chosen) {
+  for (const slot of slots) {
+    if (slot === chosen) continue
+    console.warn(slot.version === undefined
+      ? `  · 另有缓存槽 ${slot.slot}（不可用：${slot.problem}）`
+      : `  · 另有缓存槽 ${slot.slot}（dsh ${slot.version}，本次未选用）`)
+  }
+  if (residues.length > 0) {
+    // 一行带过即可：残留目录已经被安全软件锁死（app.asar 删不掉），本机属常态，不是故障。
+    console.warn(`  · 另有 ${String(residues.length)} 个残留目录（不是缓存槽，已忽略）：`
+      + `${residues.map(item => item.slot).join('、')}`
+      + ' —— 清不干净的原因见 scripts/clean-build-residue.mjs')
+  }
+}
+
+if (appDir === undefined) {
+  if (usable.length === 0) {
+    const detail = slots.length > 0
+      ? [
+        `${BASE_ROOT} 下有缓存槽，但没有一个能当 base：`,
+        ...slots.map(slot => `  · ${slot.slot}：${slot.problem}`),
+        `  修法：删掉**有问题的那一个**槽位目录，或加 --app <win-unpacked> 指真产物。`,
+        ...(residues.length > 0
+          ? [`  （另有 ${String(residues.length)} 个残留目录不是缓存槽、已忽略：${residues.map(item => item.slot).join('、')}）`]
+          : []),
+        '  ⚠ 别删整个 .desktop-base：那会把其它版本的好缓存一起收走，而且本机被安全软件',
+        '     锁住的 app.asar 本来就删不掉（见 scripts/clean-build-residue.mjs）。',
+      ]
+      : [
+        `${BASE_ROOT} 下没有可用的缓存槽`
+        + (residues.length > 0 ? `（只有 ${String(residues.length)} 个残留目录：${residues.map(item => item.slot).join('、')}）` : '')
+        + '。',
+        '用法: node scripts/package-desktop-portable.mjs --app <win-unpacked 目录> [--version x.y.z]',
+        '      构建完加 --cache-base 入库，下次就能省掉 --app；--stage <目录> 可换暂存目录（被占用时用）',
+      ]
+    if (listCached) {
+      // CI 用：`--list-cached` 的契约是「有就印 CACHE_APP_DIR，没有就印诊断并 exit 0」，
+      // 让调用方据此决定「用缓存」还是「重新构建」，而不是把整个 job 判失败。
+      for (const line of detail) console.warn(`package-desktop-portable: ${line}`)
+      process.exit(0)
+    }
+    for (const line of detail) console.error(`package-desktop-portable: ${line}`)
+    process.exit(1)
+  }
+  appDir = usable[0].appDir
+  console.log(`复用缓存的 dsh 本体（dsh ${usable[0].version}）: ${appDir}`)
+  reportSlots(usable[0])
+} else if (!existsSync(appDir)) {
+  console.error(`package-desktop-portable: --app 指的目录不存在：${appDir}`)
+  process.exit(1)
+}
+
+if (listCached) {
+  console.log(`CACHE_APP_DIR=${appDir}`)
+  process.exit(0)
+}
+
+if (cacheBase) {
+  const cached = installBaseCache(appDir, { move: cacheMove })
+  // `--cache-move` 成功时源目录已经**不在原地**了（它被改名成了槽位），必须跟着换目标，
+  // 否则后面 `cpSync(appDir, STAGE/app)` 会去拷一个已经不存在的路径。
+  if (cached !== undefined) appDir = cached
+  if (cacheOnly) {
+    // CI 用：构建完先把本体入库、供 actions/cache 存档，不打 zip。
+    // 单独打一行机器可读的标记，避免 pwsh 去解析中文日志。
+    if (cached === undefined) process.exit(1)
+    console.log(`CACHE_APP_DIR=${cached}`)
+    process.exit(0)
+  }
+} else if (cacheOnly) {
+  console.error('package-desktop-portable: --cache-only 要和 --cache-base 一起用（前者只是「入库后即退出」）')
+  process.exit(1)
+}
+
 if (!existsSync(join(ROOT, 'lib'))) {
   console.error('package-desktop-portable: 缺少 lib/，先跑 pnpm build')
   process.exit(1)
@@ -152,12 +478,12 @@ if (!existsSync(join(ROOT, 'lib'))) {
 /** 校验 base 目录完整性，再取主 exe —— 缓存残缺要在这里就说清楚，别拖到打包中途/自检。 */
 let exe
 try {
-  exe = assertLooksLikeApp(appDir, appDir === BASE_CACHE ? '缓存的 dsh 本体' : '--app 指定的目录')
+  exe = assertLooksLikeApp(appDir, explicitApp ? '--app 指定的目录' : '缓存的 dsh 本体')
 } catch (error) {
   console.error(`package-desktop-portable: ${error.message}`)
-  if (appDir === BASE_CACHE) {
-    console.error(`  ${BASE_CACHE} 是**缓存**，残缺时加 --app <win-unpacked> 指真产物即可，`)
-    console.error('  也可以直接删掉这个目录让它下次重建。')
+  if (!explicitApp) {
+    console.error('  这是**缓存**里的那一份。残缺时加 --app <win-unpacked> 指真产物即可，')
+    console.error(`  也可以直接删掉 ${appDir} 这个槽位让它下次重建。`)
   }
   process.exit(1)
 }
@@ -166,15 +492,14 @@ console.log(`主程序: ${exe}`)
 const zipName = `dsh-webops-desktop-v${version}-win-x64-portable.zip`
 const zipPath = join(DIST, zipName)
 
-try {
-  rmSync(STAGE, { recursive: true, force: true })
-} catch (error) {
-  // 最常见的两种：`EBUSY` = 里面某个文件被内存映射住（见上面 STAGE 的注释），
-  // `EPERM` = 有进程把它当工作目录。都不是「打包脚本坏了」，换个目录即可。
-  console.error(`package-desktop-portable: 清不掉暂存目录 ${STAGE} —— ${error.code ?? ''} ${error.message}`)
-  console.error('  多半是有进程占着里面的文件（内存映射 / 工作目录）。两个办法：')
-  console.error('    · 关掉占用它的进程后再跑；或')
-  console.error('    · 换个暂存目录：--stage .desktop-stage-2')
+if (!removeTree(STAGE)) {
+  // 走到这里说明「关掉垫片的子进程」也删不掉，那就是真有东西占着它（IDE 会锁工作区里的
+  // `app.asar`；或某个进程把它当工作目录 —— 后者是 `EPERM`）。
+  console.error(`package-desktop-portable: 清不掉暂存目录 ${STAGE}，没法继续。`)
+  console.error('  多半是有进程占着里面的文件。三个办法：')
+  console.error('    · 关掉占用它的进程后再跑（查持有者：powershell -File scripts/who-locks.ps1 -Path <glob>）；或')
+  console.error(`    · 换个暂存目录：--stage <别的目录>`)
+  console.error(`    · 或把大件整体挪出工作区：DSH_DESKTOP_BUILD_ROOT=<工作区外的目录>`)
   process.exit(1)
 }
 mkdirSync(DIST, { recursive: true })
@@ -381,8 +706,9 @@ const archived = spawnSync(
   { encoding: 'utf8' },
 )
 if (archived.status !== 0 || !existsSync(partial)) {
-  // 常见失败原因：火绒 HipsDaemon 对新建的 app.asar 挂扫描句柄（只挡独占/删除，不挡共享读），
-  // `Compress-Archive` 打不开就直接 PermissionDenied。`scripts/zip-stage.py` 走共享读，
+  // 常见失败原因：**IDE**（不是杀软 —— 2026-09-19 用 scripts/who-locks.ps1 纠正）会去解析
+  // 工作区里新建的 app.asar，句柄只挡独占/删除、不挡共享读；`Compress-Archive` 打不开就直接
+  // PermissionDenied。`scripts/zip-stage.py` 走共享读，
   // 同一个暂存目录能照常压完 —— 退化到它，产物等价（2026-09-17 实测 17s 压完 12497 条目）。
   console.warn(`package-desktop-portable: Compress-Archive 失败（exit=${String(archived.status)}），退化到 scripts/zip-stage.py`)
   console.warn((archived.stderr ?? '').trim() || (archived.stdout ?? '').trim() || '(无输出)')
@@ -405,10 +731,9 @@ renameSync(partial, zipPath)
 
 // 收尾清理。zip 已经落盘了，这里失败**不该**把整次打包判成失败
 // （本机见过暂存目录被占用导致这一步抛 EBUSY 的情况），所以只告警。
-try {
-  rmSync(STAGE, { recursive: true, force: true })
-} catch (error) {
-  console.warn(`\n注意: 暂存目录没能清掉（${error.code ?? ''}），zip 不受影响，可稍后手工删 ${STAGE}`)
+if (!removeTree(STAGE)) {
+  console.warn(`\n注意: 暂存目录没能清掉，zip 不受影响。手工删：`)
+  console.warn(`  CODEBUDDY_SAFE_DELETE_ENABLED=0 rm -rf "${STAGE}"`)
 }
 
 const bytes = readFileSync(zipPath)

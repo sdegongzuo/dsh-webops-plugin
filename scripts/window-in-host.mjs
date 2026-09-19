@@ -15,11 +15,14 @@
  */
 
 import { join, resolve } from 'node:path'
+import { harnessDevProject } from './local-env.mjs'
 
 const PORT = Number(process.env.HOST_INSPECT_PORT ?? 9230)
+// `DESKTOP_PROJECT_DIR` 显式指定优先；否则按 `.env.local` 的 `DSH_HARNESS` 推开发态工程目录
+// `<DSH_HARNESS>/apps/desktop/.desktop-build/development/project`。路径不写死在这里。
 const PROJECT = resolve(
   process.env.DESKTOP_PROJECT_DIR
-    ?? 'D:/dev/cli/deepseek-harness/apps/desktop/.desktop-build/development/project',
+    ?? harnessDevProject(),
 )
 const URL_TO_OPEN = process.env.SMOKE_URL ?? 'https://www.baidu.com'
 

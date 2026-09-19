@@ -23,11 +23,13 @@ import { resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { ElectronBrowserProvider } from '../src/browser-electron/provider.ts'
 import { ElectronWindowTransport } from '../src/browser-electron/transport.ts'
+import { harnessElectronBin } from './local-env.mjs'
 
-/** 默认 Electron：开发态就是桌面端自己装的那一个。 */
-const DEFAULT_ELECTRON = 'D:/dev/cli/deepseek-harness/apps/desktop/node_modules/electron/dist/electron.exe'
-
-const electronPath = process.env.DSH_BROWSER_ELECTRON_PATH ?? DEFAULT_ELECTRON
+// Electron 路径：`DSH_BROWSER_ELECTRON_PATH`（**插件运行时**的变量，桌面端 dev 态会自己设）优先；
+// 否则按 `.env.local` 的 `DSH_HARNESS` 推
+// `<DSH_HARNESS>/apps/desktop/node_modules/electron/dist/electron.exe`。
+// 路径不写死在这里 —— 换机器 / 换盘只改 `.env.local`（见 `scripts/local-env.mjs`）。
+const electronPath = process.env.DSH_BROWSER_ELECTRON_PATH ?? harnessElectronBin()
 const hostScript = fileURLToPath(new URL('../src/browser-electron/host.cjs', import.meta.url))
 const urls = (process.env.SMOKE_URLS ?? 'https://www.baidu.com,https://cn.bing.com')
   .split(',')
