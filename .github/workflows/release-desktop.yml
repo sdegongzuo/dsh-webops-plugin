@@ -68,6 +68,19 @@ jobs:
       - name: 签出插件仓
         uses: actions/checkout@v4
 
+      - name: 校验 tag 版本与 package.json 一致
+        # 放最前面（在拉 harness / 装依赖那堆几分钟的步骤之前），5 秒就能给出结论。
+        # 为什么必须有：`--version` 是**显式传**下去的，它会同时决定 zip 名、
+        # profile 里登记的插件版本、以及随包插件 package.json 的 version。
+        # 于是「tag 是 desktop-v0.2.9 而 package.json 还停在 0.2.6」不会报任何错，
+        # 只会产出一个自称 0.2.9、里面却是 0.2.6 的包 —— 用户报的版本号从此不可信。
+        shell: pwsh
+        run: |
+          $version = $env:TAG -replace '^desktop-v', ''
+          $pkg = (Get-Content package.json -Raw | ConvertFrom-Json).version
+          Write-Host "tag: $version / package.json: $pkg"
+          if ($pkg -ne $version) { throw "版本不一致：tag=$version package.json=$pkg —— 先把 package.json 的版本提上去（并推一个提交）再打 tag" }
+
       - name: 装 pnpm + Node
         uses: pnpm/action-setup@v4
         with:
@@ -168,13 +181,17 @@ jobs:
 
       - name: 恢复 dsh 桌面端本体缓存（win-unpacked）
         # 这一步原本是全 workflow 最贵的一步（实测 631s，占 61%）：electron-builder 要把
-        # 226MB / 14071 个文件解包组装成 app 目录，不是编译，纯粹是 IO。
+        # 1.2G / 14071 个文件解包组装成 app 目录，不是编译，纯粹是 IO。
         # dsh 本体只在 harness ref 变化时才需要重建，所以按 HARNESS_REF + 两处补丁内容做
         # key 缓存整个目录 —— 插件自己迭代时直接命中，跳过这一步。
+        #
+        # 缓存的是 `.desktop-base` **整个目录**而不是某一个 app 目录：本地脚本按 dsh 版本
+        # 分槽存（`.desktop-base/<版本>/app`），槽位名要构建完才知道，缓存路径没法事先写死。
+        # key 里带 HARNESS_REF，所以 harness 一换就是全新缓存条目，不会新旧混着命中。
         id: base-cache
         uses: actions/cache@v4
         with:
-          path: .desktop-base/app
+          path: .desktop-base
           key: dsh-win-unpacked-${{ runner.os }}-${{ env.HARNESS_REF }}-${{ hashFiles('docs/harness-desktop-build.patch', 'scripts/patch-electron-builder.mjs') }}
 
       - name: 构建桌面端应用目录
@@ -196,23 +213,36 @@ jobs:
         id: locate
         shell: pwsh
         run: |
-          $cache = Join-Path $env:GITHUB_WORKSPACE '.desktop-base/app'
-          # 命中缓存时直接用它；顺带验一下不是个空壳（缓存恢复出过空目录的情况）。
-          if ('${{ steps.base-cache.outputs.cache-hit }}' -eq 'true' -and (Test-Path (Join-Path $cache '*.exe'))) {
-            Write-Host "缓存命中，跳过构建：$cache"
-            Add-Content -Path $env:GITHUB_ENV -Value "WIN_UNPACKED=$cache"
-            exit 0
+          # 命中缓存时：扫 `.desktop-base/<版本>/app`，且必须是**已经装完**的槽
+          # （有 cache.json 完成标记、且真有主 exe）。判定交给脚本自己，这里只认它印的
+          # `CACHE_APP_DIR=` 那一行 —— 一行机器可读标记，胜过在这里复制一遍校验逻辑。
+          if ('${{ steps.base-cache.outputs.cache-hit }}' -eq 'true') {
+            $line = (node scripts/package-desktop-portable.mjs --list-cached 2>&1 | Select-String '^CACHE_APP_DIR=' | Select-Object -First 1)
+            if ($line) {
+              $cached = $line.Line -replace '^CACHE_APP_DIR=', ''
+              Write-Host "缓存命中，跳过构建：$cached"
+              Add-Content -Path $env:GITHUB_ENV -Value "WIN_UNPACKED=$cached"
+              exit 0
+            }
+            Write-Host "缓存目录里没有可用槽，回落重新构建"
           }
+
           $base = Join-Path (Split-Path $PWD) 'deepseek-harness\apps\desktop\.desktop-build\targets\win-x64'
-          $app = Get-ChildItem -Path $base -Recurse -Directory -Filter 'win-unpacked' -ErrorAction SilentlyContinue |
-                 Select-Object -First 1
-          if ($null -eq $app) { throw "没找到 win-unpacked（搜过 $base）" }
-          Write-Host "win-unpacked: $($app.FullName)"
-          # 搬到缓存目录：job 成功结束后 actions/cache 会把它存起来供下次复用。
-          # 同盘 Move-Item 是瞬时的，不额外花拷贝时间。
-          New-Item -ItemType Directory -Path $cache -Force | Out-Null
-          Move-Item -Path (Join-Path $app.FullName '*') -Destination $cache -Force
-          Add-Content -Path $env:GITHUB_ENV -Value "WIN_UNPACKED=$cache"
+          # 取**最新**的那个，不用 `Select-Object -First 1`：本机 .desktop-build 会留着
+          # 多次构建的 win-unpacked，目录枚举顺序不保证任何东西，取错就会打出旧本体。
+          $candidates = @(Get-ChildItem -Path $base -Recurse -Directory -Filter 'win-unpacked' -ErrorAction SilentlyContinue |
+                          Sort-Object LastWriteTime -Descending)
+          if ($candidates.Count -eq 0) { throw "没找到 win-unpacked（搜过 $base）" }
+          $app = $candidates[0]
+          Write-Host "候选 $($candidates.Count) 个，取最新：$($app.FullName)（$($app.LastWriteTime)）"
+          # 入库交给脚本：槽位名取自 app 自己的 desktop-runtime.json，这里不重复算版本号。
+          # --cache-move 让它优先同盘改名（瞬时），失败会自动回落成拷贝。
+          $out = node scripts/package-desktop-portable.mjs --app $app.FullName --cache-base --cache-move --cache-only
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $out | Write-Host
+          $cached = (($out | Select-String '^CACHE_APP_DIR=' | Select-Object -First 1).Line) -replace '^CACHE_APP_DIR=', ''
+          if (-not $cached) { throw "脚本没报出 CACHE_APP_DIR（缓存入库失败？）" }
+          Add-Content -Path $env:GITHUB_ENV -Value "WIN_UNPACKED=$cached"
 
       - name: 物化插件 profile 并打便携版 zip
         # 把插件按官方模板写进 profile，随 zip 分发；启动器用 DSH_HOME 把配置锁在包内。
@@ -222,10 +252,15 @@ jobs:
           Write-Host "version: $version"
           node scripts/package-desktop-portable.mjs --app "$env:WIN_UNPACKED" --version $version
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          $zip = Get-ChildItem dist/*.zip | Select-Object -First 1
-          Add-Content -Path $env:GITHUB_ENV -Value "ZIP_NAME=$($zip.Name)"
-          Add-Content -Path $env:GITHUB_ENV -Value "ZIP_SHA256=$((Get-FileHash $zip.FullName -Algorithm SHA256).Hash.ToLower())"
-          Add-Content -Path $env:GITHUB_ENV -Value "ZIP_MB=$([math]::Round($zip.Length / 1MB, 1))"
+          # 按**确定的文件名**取，不用 `Get-ChildItem dist/*.zip | Select-Object -First 1`：
+          # dist/ 里会同时躺着三种 zip（整包 / 插件便携包 / 增量包，本机实测有过 9 个），
+          # `-First 1` 取到哪个纯看目录枚举顺序 —— 于是 sha256 会贴到另一个文件上，
+          # 而 Release 附件还是对的，极难发现。取不到就直接失败，不静默放过。
+          $zipPath = Join-Path dist "dsh-webops-desktop-v$version-win-x64-portable.zip"
+          if (-not (Test-Path $zipPath)) { throw "没打出预期的产物：$zipPath" }
+          Add-Content -Path $env:GITHUB_ENV -Value "ZIP_NAME=$(Split-Path -Leaf $zipPath)"
+          Add-Content -Path $env:GITHUB_ENV -Value "ZIP_SHA256=$((Get-FileHash $zipPath -Algorithm SHA256).Hash.ToLower())"
+          Add-Content -Path $env:GITHUB_ENV -Value "ZIP_MB=$([math]::Round((Get-Item $zipPath).Length / 1MB, 1))"
 
       - name: 发版前自检（生产路径）
         # 前面各步只保证「能构建出来」，不保证「构建出来的东西能起来」：
