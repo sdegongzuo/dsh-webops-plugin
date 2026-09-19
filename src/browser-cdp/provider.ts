@@ -27,7 +27,9 @@ import type {
   BrowserLocateResult,
   BrowserMutationRequest,
   BrowserMutationResult,
+  BrowserMutationTarget,
   BrowserNavigateRequest,
+  BrowserOcclusion,
   BrowserNetworkRequest,
   BrowserNetworkResult,
   BrowserObservation,
@@ -57,6 +59,7 @@ import {
   resolveSnapshotLimits,
 } from './snapshot.ts'
 import type { AxNode, BoxRect, SnapshotLimits } from './snapshot.ts'
+import { renderOverlayNotice } from './snapshot.ts'
 import { HttpCdpTransport } from './protocol.ts'
 import type { CdpConnection, CdpTarget, CdpTransport } from './protocol.ts'
 import { ConsoleCollector, CONSOLE_RING_CAPACITY } from './console.ts'
@@ -154,6 +157,18 @@ export const MUTATION_NAVIGATION_SETTLE_MS = 5_000
 /** `wait` 轮询 text / hidden 条件的间隔（毫秒）。 */
 const WAIT_POLL_INTERVAL_MS = 100
 
+/**
+ * `mouseWheel` 单独用的回包等待上限（毫秒）。
+ *
+ * 为什么与 `commandTimeoutMs`（30s）脱钩：滚轮事件在 Electron / 后台标签上**可能根本不回包**，
+ * 而工具的观察超时也是 30s —— 不脱钩时一次 `webpage_scroll` 就把 agent 卡满 30s（J6）。
+ * 2s 是「够真浏览器回一次包」与「不至于让模型干等」之间的折中。
+ *
+ * **超时不是失败**：事件已经投递出去了，只是不知道页面有没有滚。回执照给，位置让模型自己去
+ * 确认（snapshot / locate），总比「工具超时、模型什么都不知道」强。
+ */
+export const WHEEL_ACK_TIMEOUT_MS = 2_000
+
 /** `webpage_console` / `webpage_network` 的默认返回条数（从最新往回）。 */
 export const DEFAULT_P2_LIMIT = 50
 
@@ -235,6 +250,12 @@ interface EvaluateResult {
 interface NavigateResult {
   readonly errorText?: string
   readonly isDownload?: boolean
+}
+
+/** `Page.getNavigationHistory` 的返回体（`back` / `forward` 要用）。 */
+interface NavigationHistoryResult {
+  readonly currentIndex?: number
+  readonly entries?: readonly { readonly id: number; readonly url?: string }[]
 }
 
 /** `Page.captureScreenshot` 的返回体。 */
@@ -524,11 +545,23 @@ export class CdpBrowserProvider implements BrowserProvider {
   async navigate(request: BrowserNavigateRequest, signal?: AbortSignal): Promise<BrowserSession> {
     const session = this.require(request.sessionId)
     this.assertWritable(session)
-    const url = validateTargetUrl(request.url)
+    // `url` 与 `history` 恰好一个：两个都给 = 矛盾（到底跳地址还是走历史），
+    // 一个都不给 = 没法猜。**静默挑一个是这里最容易犯的错**，所以一律报错。
+    const wantsUrl = typeof request.url === 'string' && request.url.length > 0
+    const wantsHistory = request.history !== undefined
+    if (wantsUrl === wantsHistory) {
+      throw new BrowserError(
+        'webpage_navigate needs exactly one of url or history (back / forward / reload)',
+        'BROWSER_PROTOCOL_ERROR',
+      )
+    }
     // 记住导航前的地址：新文档提交之前，`readyState` 仍是**旧**文档的 complete，
     // 只有「地址真的变了」才说明新页面已经顶上来。
     const previousUrl = session.url
-    const loaded = await this.navigateTo(session.connection, url, previousUrl, signal)
+    const target = wantsUrl ? validateTargetUrl(request.url as string) : request.history as string
+    const loaded = wantsHistory
+      ? await this.navigateHistory(session, request.history as 'back' | 'forward' | 'reload', previousUrl, signal)
+      : await this.navigateTo(session.connection, target, previousUrl, signal)
     // 导航无论成功与否都作废既有 ref —— 页面已经变了，旧 ref 指向的东西不再可信。
     session.refs.invalidate()
     const meta = await this.readPageMeta(session.connection, signal)
@@ -536,7 +569,8 @@ export class CdpBrowserProvider implements BrowserProvider {
       session.url = meta.url
       session.title = meta.title
     } else {
-      session.url = url
+      // 读不到元信息时（空白页 / 崩溃页）至少把「目标」写进会话地址，别让下一次判定拿到空串。
+      session.url = wantsUrl ? target : previousUrl
     }
     // 只有真的换过文档才推进采集器的文档序号：等加载超时（`loaded=false`）且地址也没变时
     // 文档可能根本没换，那时把 console / network 的旧记录遮掉反而是错的。
@@ -545,13 +579,59 @@ export class CdpBrowserProvider implements BrowserProvider {
     }
     if (!loaded) {
       throw new BrowserError(
-        `navigation to ${url} did not finish loading within ${this.config.navigationTimeoutMs} ms; the page may still be loading`,
+        `navigation to ${target} did not finish loading within ${this.config.navigationTimeoutMs} ms; the page may still be loading`,
         'BROWSER_NAVIGATION_FAILED',
       )
     }
     // 加载完成即算「新文档能用」：读到空标题说明这页面本来就没有 <title>，不必再等。
     if (session.title.length === 0) await this.settleDocument(session, signal)
     return this.toSession(session)
+  }
+
+  /**
+   * 走浏览器自己的历史栈：`back` / `forward` / `reload`（B2-b）。
+   *
+   * 为什么单独做一条路：模型要「回到上一页」时，此前唯一的手段是
+   * `webpage_execute("history.back()")` —— 逃生舱只为这个动作敞开，而它明明是个常规动作。
+   * 走 `Page.getNavigationHistory` + `Page.navigateToHistoryEntry` 同时也是**唯一能知道
+   * 历史有没有尽头**的做法：尽头时必须明确报错，绝不能静默 no-op（那样模型会以为自己已经回退了）。
+   *
+   * @returns 是否在超时前完成加载。
+   */
+  private async navigateHistory(
+    session: SessionState,
+    direction: 'back' | 'forward' | 'reload',
+    previousUrl: string,
+    signal?: AbortSignal,
+  ): Promise<boolean> {
+    const options = { signal, timeoutMs: this.config.commandTimeoutMs }
+    if (direction === 'reload') {
+      await session.connection.send('Page.reload', {}, options)
+      // 刷新**地址不变**，所以「等地址变」的判据用不上，只等文档重新 complete。
+      return this.waitForDocument(session.connection, signal, this.config.navigationTimeoutMs)
+    }
+    const history = await session.connection.send<NavigationHistoryResult>(
+      'Page.getNavigationHistory',
+      {},
+      options,
+    )
+    const entries = history.entries ?? []
+    const currentIndex = history.currentIndex ?? -1
+    const targetIndex = direction === 'back' ? currentIndex - 1 : currentIndex + 1
+    if (currentIndex < 0 || targetIndex < 0 || targetIndex >= entries.length) {
+      throw new BrowserError(
+        `cannot go ${direction}: the session is at history entry ${currentIndex + 1} of ${entries.length}`
+        + ` (session_id=${session.targetId}); there is nothing ${direction === 'back' ? 'behind' : 'ahead'} it. `
+        + 'Take a webpage_snapshot and act on the page instead of retrying.',
+        'BROWSER_NAVIGATION_FAILED',
+      )
+    }
+    const entry = entries[targetIndex]
+    if (entry === undefined) {
+      throw new BrowserError(`cannot go ${direction}: history entry ${targetIndex} is unreadable`, 'BROWSER_NAVIGATION_FAILED')
+    }
+    await session.connection.send('Page.navigateToHistoryEntry', { entryId: entry.id }, options)
+    return this.waitForNavigation(session.connection, previousUrl, signal, this.config.navigationTimeoutMs)
   }
 
   /** @inheritdoc */
@@ -1218,6 +1298,8 @@ export class CdpBrowserProvider implements BrowserProvider {
       nodes = tree.nodes ?? []
     }
     const outline = buildOutline(nodes, resolveSnapshotLimits(this.config.snapshotLimits, maxLines))
+    // 全页快照才查浮层：区域快照本来就是「只看这一块」，中心被别的块盖住不算异常。
+    const overlay = regional ? undefined : await this.detectOverlay(session, signal)
     // 地址与 `loaderId` 必须**随这一份 ref 表一起落地**、不能延后再读（粗门比的就是「发布那一刻的地址」，
     // 晚一步会把人工之间的导航记成快照状态，方案 §5.1.1）。「一起」不是「同一瞬间」：粗门是启发式不是事务。
     const meta = await this.readPageMeta(session.connection, signal)
@@ -1235,7 +1317,9 @@ export class CdpBrowserProvider implements BrowserProvider {
       epoch: publication.epoch,
       url: session.url,
       title: session.title,
-      outline: renderOutline(outline, publication.refs),
+      outline: overlay === undefined
+        ? renderOutline(outline, publication.refs)
+        : `${renderOverlayNotice(overlay)}\n${renderOutline(outline, publication.refs)}`,
       // 折叠前的完整大纲：`webpage_find` 的检索底稿。折叠标记承诺「用 find 拿全部实例的 ref」，
       // 前提是 find 手上那份底稿里一个实例都不少（`rows` 本来就是全量的，这里只是把它渲染出来）。
       fullOutline: renderOutline(outline, publication.refs, { unfoldRepeats: true }),
@@ -1248,6 +1332,40 @@ export class CdpBrowserProvider implements BrowserProvider {
       ...outsideRegion !== undefined ? { outsideRegion } : {},
       // 人工接管只加提示，**不动 epoch** —— 开合 DevTools 不该作废模型的 ref（[V31]）。
       ...session.takeover ? { takeover: true } : {},
+    }
+  }
+
+  /**
+   * 查「视口中心是不是被一层浮层盖着」（B2-d）。
+   *
+   * 为什么需要它：没有 `role=dialog` 的浮层在 AX 里排在 `<body>` **末尾**，而小 `max_lines`
+   * 会把它整段截掉 —— 于是模型拿到的第一屏看起来「页面可以直接点正文」，一点才发现点在遮罩上。
+   *
+   * 判定用「命中链上有没有一个 fixed/absolute 且盖住视口 60% 以上的祖先」而不是方案原文写的
+   * 「命中行是否在前 30 行」：后者要靠 `DOM.requestNode` + `DOM.describeNode` 把命中元素换成
+   * `backendNodeId` 再查 ref 表（多两条命令），且对**已截断**的大纲仍只能靠文本猜行号 ——
+   * 花三倍代价换一个更脆的信号，不值。定位覆盖判据是纯 CSS 事实，与大纲怎么切无关。
+   *
+   * 失败/查不出来一律当「没有浮层」：这是回执增强，不许把快照打成失败。
+   */
+  private async detectOverlay(session: SessionState, signal?: AbortSignal): Promise<OverlayProbe | undefined> {
+    try {
+      const evaluated = await session.connection.send<EvaluateResult>(
+        'Runtime.evaluate',
+        { expression: OVERLAY_PROBE_EXPRESSION, returnByValue: true },
+        { signal, timeoutMs: this.config.commandTimeoutMs },
+      )
+      const value = evaluated.result?.value as Partial<OverlayProbe> | null | undefined
+      if (value === null || typeof value !== 'object') return undefined
+      // 页面里那份脚本的返回体是**不可信数据**（页面可以改写 `elementFromPoint` 之类的东西），
+      // 字段一律按字符串收下；三项全空就当没查到。
+      const role = typeof value.role === 'string' ? value.role : ''
+      const name = typeof value.name === 'string' ? value.name : ''
+      const hint = typeof value.hint === 'string' ? value.hint : ''
+      if (role.length === 0 && name.length === 0 && hint.length === 0) return undefined
+      return { role, name, hint }
+    } catch {
+      return undefined
     }
   }
 
@@ -1772,13 +1890,22 @@ export class CdpBrowserProvider implements BrowserProvider {
     session.highlightPainted = false
   }
 
-  /** 点击：解析 ref → 滚到可视区 → 在元素中心派发真实的鼠标按下/抬起。 */
+  /**
+   * 点击：解析 ref → 滚到可视区 → **问一句落点上是谁** → 在元素中心派发真实的鼠标按下/抬起。
+   *
+   * 落点校验（B1-d）见 {@link hitTest}：浮层盖住中心时事件打在遮罩上，而旧的回执只会说
+   * `click done` + `navigated=false`，模型据此去翻 console / network 猜原因。**事件照发**，
+   * 只是回执里如实写上 `occluded_by`。
+   */
   private async click(session: SessionState, ref: string, signal?: AbortSignal): Promise<BrowserMutationResult> {
     const beforeUrl = session.url
+    const target = session.refs.resolve(ref)
     const objectId = await this.resolveObjectId(session, ref, signal)
+    let hit: HitTestOutcome | undefined
     try {
       const box = await this.elementViewportBox(session, objectId, signal)
       const point = { x: box.x + box.width / 2, y: box.y + box.height / 2 }
+      hit = await this.hitTest(session, objectId, point, signal)
       const options = { signal, timeoutMs: this.config.commandTimeoutMs }
       await session.connection.send('Input.dispatchMouseEvent', {
         type: 'mousePressed', ...point, button: 'left', clickCount: 1,
@@ -1789,7 +1916,70 @@ export class CdpBrowserProvider implements BrowserProvider {
     } finally {
       this.releaseObject(session, objectId, signal)
     }
-    return this.settleMutation(session, 'click', beforeUrl, true, signal)
+    const result = await this.settleMutation(session, 'click', beforeUrl, true, signal)
+    return this.describeClick(result, target, hit)
+  }
+
+  /**
+   * 落点命中校验：这个点上最顶层的元素是不是目标（或其子孙）。
+   *
+   * 判据用 `document.elementFromPoint` —— 它就是浏览器自己派发鼠标事件时用的那套命中测试，
+   * 比「比较 rect 有没有重叠」更贴近真实（重叠不等于遮挡：祖先、负 z-index、`pointer-events:none`
+   * 都会让重叠但**打得中**）。
+   *
+   * **失败不影响动作**：这是回执增强，不是动作本身 —— 页面在极端情况下（跨源 iframe 里的
+   * 元素、evaluate 被 CSP 拦）查不出来时，宁可少报一条遮挡，也不许把 click 打成失败。
+   */
+  private async hitTest(
+    session: SessionState,
+    objectId: string,
+    point: { x: number; y: number },
+    signal?: AbortSignal,
+  ): Promise<HitTestOutcome | undefined> {
+    try {
+      const outcome = await session.connection.send<EvaluateResult>(
+        'Runtime.callFunctionOn',
+        {
+          objectId,
+          functionDeclaration: HIT_TEST_FUNCTION,
+          arguments: [{ value: { x: point.x, y: point.y } }],
+          returnByValue: true,
+        },
+        { signal, timeoutMs: this.config.commandTimeoutMs },
+      )
+      const value = outcome.result?.value as HitTestOutcome | undefined
+      return value?.hit === undefined ? undefined : value
+    } catch {
+      return undefined
+    }
+  }
+
+  /** 把「点的是谁」和「被谁挡了」并进回执。两者都只在 click 上出现。 */
+  private describeClick(
+    result: BrowserMutationResult,
+    target: RefTarget,
+    hit: HitTestOutcome | undefined,
+  ): BrowserMutationResult {
+    const href = hit?.href
+    const usable = typeof href === 'string' && /^https?:/i.test(href) ? href : undefined
+    const identity: BrowserMutationTarget = {
+      role: target.role,
+      name: target.name,
+      ...usable !== undefined ? { href: usable } : {},
+    }
+    const node = hit?.node
+    const occluded: BrowserOcclusion | undefined = node === undefined || node === null
+      ? undefined
+      : {
+        ...node.role.length > 0 ? { role: node.role } : {},
+        ...node.name.length > 0 ? { name: node.name } : {},
+        ...node.hint.length > 0 ? { hint: node.hint } : {},
+      }
+    return {
+      ...result,
+      target: identity,
+      ...occluded !== undefined ? { occluded_by: occluded } : {},
+    }
   }
 
   /** 填写：走原型链上的原生 value setter（React 受控组件也认），再补 input/change 事件。 */
@@ -1878,6 +2068,9 @@ export class CdpBrowserProvider implements BrowserProvider {
     if (dx === 0 && dy === 0) {
       throw new BrowserError('webpage_scroll needs a non-zero deltaX or deltaY', 'BROWSER_PROTOCOL_ERROR')
     }
+    // 后台标签收不到滚轮（真实鼠标事件只送前台），先切前台；切不动就**明确拒绝**，
+    // 绝不让它干等到超时 —— 那条路径以前表现为「工具超时 30s」（J6）。
+    await this.ensureForeground(session, signal)
     const beforeUrl = session.url
     const point = ref === undefined
       ? await this.viewportCenter(session, signal)
@@ -1890,14 +2083,69 @@ export class CdpBrowserProvider implements BrowserProvider {
           this.releaseObject(session, objectId, signal)
         }
       })()
-    await session.connection.send('Input.dispatchMouseEvent', {
+    const acked = await this.dispatchWheel(session, point, dx, dy, signal)
+    const result = await this.settleMutation(session, 'scroll', beforeUrl, false, signal)
+    return acked ? result : { ...result, unconfirmed: true }
+  }
+
+  /**
+   * 后台标签：能切就切前台，切不动就**明确拒绝**（B1-e）。
+   *
+   * 滚轮事件只送给前台标签，后台标签上它既不会滚、也不报错 —— 沉默地等到超时是这个场景里
+   * 最坏的结局。transport 答不出「谁在前台」时（外部 Chrome）不折腾：那是能力缺口，不是错误。
+   */
+  private async ensureForeground(session: SessionState, signal?: AbortSignal): Promise<void> {
+    const activeTargetId = this.transport.activeTargetId
+    if (activeTargetId === undefined) return
+    const activeId = await activeTargetId.call(this.transport).catch(() => undefined)
+    if (activeId === undefined || activeId === session.targetId) return
+    const activate = this.transport.activateTarget
+    if (activate === undefined) {
+      throw new BrowserError(
+        `session_id=${session.targetId} is in the background; `
+        + 'run webpage_tabs(action=activate, session_id=...) first, then scroll again',
+        'BROWSER_NOT_IMPLEMENTED',
+      )
+    }
+    await activate.call(this.transport, session.targetId, signal)
+  }
+
+  /**
+   * 派发一次滚轮，并告诉调用方**有没有拿到回包**（B1-e）。
+   *
+   * 超时（{@link WHEEL_ACK_TIMEOUT_MS}）与真错误分得很清：
+   *
+   * - 超时 = 事件已投递、页面没回话 —— 返回 `false`，回执标 `unconfirmed`，动作不算失败。
+   * - detach / 连接丢失等真错误照原样抛 —— 它们有各自的恢复路径，不能被这条兜底吞掉。
+   */
+  private async dispatchWheel(
+    session: SessionState,
+    point: { x: number; y: number },
+    deltaX: number,
+    deltaY: number,
+    signal?: AbortSignal,
+  ): Promise<boolean> {
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const timeout = new Promise<'timeout'>((resolve) => {
+      timer = setTimeout(resolve, WHEEL_ACK_TIMEOUT_MS, 'timeout')
+    })
+    // 不给 `timeoutMs`：这条命令的 pending 由下面那把定时器接管，
+    // 再叠一个 30s 的协议超时只会让「已投递未确认」变成「工具超时」。
+    const sent = session.connection.send('Input.dispatchMouseEvent', {
       type: 'mouseWheel',
       x: point.x,
       y: point.y,
-      deltaX: dx,
-      deltaY: dy,
-    }, { signal, timeoutMs: this.config.commandTimeoutMs })
-    return this.settleMutation(session, 'scroll', beforeUrl, false, signal)
+      deltaX,
+      deltaY,
+    }, { signal }).then((): 'acked' => 'acked').catch((error: unknown) => ({ failed: error }))
+    try {
+      const outcome = await Promise.race([sent, timeout])
+      if (outcome === 'acked') return true
+      if (outcome === 'timeout') return false
+      throw outcome.failed
+    } finally {
+      if (timer !== undefined) clearTimeout(timer)
+    }
   }
 
   /** 视口中心（CSS 像素）：不带 ref 的 scroll 的落点。 */
@@ -2362,6 +2610,92 @@ export class CdpBrowserProvider implements BrowserProvider {
  * 插入**（keypress/input 事件链），不带 text 时聚焦输入框按空格不产生任何字符。
  */
 const SPACE_KEY = { key: ' ', code: 'Space', virtualKeyCode: 32, text: ' ' }
+
+/** 落点命中校验的结果（页面里算完带回来的一小坨描述，`hitTest` 的返回体）。 */
+interface HitTestOutcome {
+  /** 目标自身（或其祖先链上最近的可链接者）的绝对 href；不是链接时为 `null`。 */
+  href?: string | null
+  /** `target` = 落点上就是目标（或其子孙）；`other` = 被别人盖着；`none` = 落点不在视口内。 */
+  hit?: 'target' | 'other' | 'none'
+  /** 只在 `hit === 'other'` 时带：盖住落点的那个元素的描述。 */
+  node?: { role: string; name: string; hint: string } | null
+}
+
+/**
+ * 落点命中校验：问一句「这个视口坐标上最顶层的元素是谁」。
+ *
+ * 为什么是 `elementFromPoint` 而不是比 rect：它就是浏览器派发鼠标事件时用的那一套命中测试，
+ * 「两个盒子重叠」在 CSS 里根本不等于「挡住」（祖先、`pointer-events: none`、负 z-index
+ * 都是重叠但打得中）。用真实命中测试才不会把能点中的目标误报成被遮挡。
+ */
+const HIT_TEST_FUNCTION = 'function (point) {'
+  + ' const element = this;'
+  + ' const top = document.elementFromPoint(Math.round(point.x), Math.round(point.y));'
+  + ' let href = null;'
+  + ' try { href = (element.href && String(element.href).length > 0) ? String(element.href) : element.getAttribute("href"); } catch (e) { href = null; }'
+  // 命中判定只认「就是它」与「它的子孙」；命中**祖先**算 other —— 那时鼠标事件打不到它身上。
+  + ' const hit = top === null ? "none" : (top === element || element.contains(top) ? "target" : "other");'
+  + ' let node = null;'
+  + ' if (hit === "other" && top !== null) {'
+  + '   const role = top.getAttribute("role") || String(top.tagName || "").toLowerCase();'
+  + '   let name = top.getAttribute("aria-label") || top.getAttribute("alt") || "";'
+  + '   if (name.length === 0) name = String(top.textContent || "").trim().slice(0, 60);'
+  + '   const hint = top.id ? "#" + top.id'
+  + '     : (typeof top.className === "string" && top.className.trim().length > 0'
+  + '       ? "." + top.className.trim().split(/\\s+/)[0] : "");'
+  + '   node = { role: role, name: name, hint: hint };'
+  + ' }'
+  + ' return { href: typeof href === "string" && href.length > 0 ? href : null, hit: hit, node: node };'
+  + ' }'
+
+/** 视口中心那层浮层的描述（{@link OVERLAY_PROBE_EXPRESSION} 的返回体）。 */
+interface OverlayProbe {
+  role: string
+  name: string
+  hint: string
+}
+
+/**
+ * 视口中心浮层探测（B2-d）。
+ *
+ * 从 `elementFromPoint` 命中的那个元素往上走，找第一个「定位在浮层里」的祖先：
+ *
+ * - `position: fixed`，或
+ * - `position: absolute` **且 `z-index` 不是 auto**
+ *
+ * 并且它在视口内的可见面积 ≥ 视口的 60%。三条一起才判浮层：单看「定位」会把 SPA 里
+ * `position:absolute; inset:0` 的根容器（没有 z-index）算成遮罩，单看面积会把长页面里的
+ * 大块正文算成浮层。
+ *
+ * 命中 `role=dialog` / `aria-modal` / `<dialog>` 时用**它**的名字 —— 那才是模型能认出来的东西。
+ */
+const OVERLAY_PROBE_EXPRESSION = '(() => {'
+  + ' const vw = window.innerWidth, vh = window.innerHeight;'
+  + ' if (!vw || !vh) return null;'
+  + ' const top = document.elementFromPoint(Math.round(vw / 2), Math.round(vh / 2));'
+  + ' if (!top) return null;'
+  + ' const visible = (el) => { const r = el.getBoundingClientRect();'
+  + '   const w = Math.min(r.right, vw) - Math.max(r.left, 0);'
+  + '   const h = Math.min(r.bottom, vh) - Math.max(r.top, 0);'
+  + '   return w > 0 && h > 0 ? w * h : 0; };'
+  + ' let node = top;'
+  + ' while (node && node.nodeType === 1 && node !== document.body) {'
+  + '   const style = getComputedStyle(node);'
+  + '   const layered = style.position === "fixed" || (style.position === "absolute" && style.zIndex !== "auto");'
+  + '   if (layered && visible(node) >= 0.6 * vw * vh) break;'
+  + '   node = node.parentElement;'
+  + ' }'
+  + ' if (!node || node.nodeType !== 1 || node === document.body || node === document.documentElement) return null;'
+  + ' const dialog = node.closest(\'[role="dialog"], [aria-modal="true"], dialog\');'
+  + ' const target = dialog || node;'
+  + ' const role = target.getAttribute("role") || String(target.tagName || "").toLowerCase();'
+  + ' let name = target.getAttribute("aria-label") || "";'
+  + ' if (name.length === 0 && dialog) name = String(target.textContent || "").trim().slice(0, 60);'
+  + ' const hint = target.id ? "#" + target.id'
+  + '   : (typeof target.className === "string" && target.className.trim().length > 0'
+  + '     ? "." + target.className.trim().split(/\\s+/)[0] : "");'
+  + ' return { role: role, name: name, hint: hint };'
+  + ' })()'
 
 /**
  * `webpage_fill` 在页面里执行的填值函数；返回值告诉调用方走了哪条分支。

@@ -98,6 +98,41 @@ class FakeChrome {
   /** P2：设置后，含 `throw` 的表达式返回 `exceptionDetails`（异常文本）。 */
   evaluateThrows: string | undefined
   /**
+   * B1-d：落点命中校验（`elementFromPoint`）的返回值。
+   *
+   * 缺省是「命中目标」—— 正常页面上没有浮层盖住目标中心。改成 `other` 就是模拟登录浮层 /
+   * fixed 遮罩；设成 `undefined` 模拟**查不出来**（跨源 / CSP 拦下 evaluate），用来验
+   * 命中校验失败时**不许把 click 打成失败**。
+   */
+  hitTest: { hit: 'target' | 'other' | 'none'; href?: string | null; node?: { role: string; name: string; hint: string } | null } | undefined
+    = { hit: 'target', href: null, node: null }
+  /** B1-e：`Input.dispatchMouseEvent` 的 `mouseWheel` 是否回包（Electron 上实测不回）。 */
+  wheelAcks = true
+  /**
+   * B1-e：transport 报的「前台标签」；`undefined` = 这个 provider 答不出（外部 Chrome）。
+   *
+   * 缺省**不挂**这两个能力 —— 既有的 tabs 用例正是在验「没有 activate 能力时报
+   * `BROWSER_NOT_IMPLEMENTED`」与「答不出前台时清单不带 active」，默认挂上会把它们全打红。
+   * 要测 scroll 的前台处理，用例自己显式设。
+   */
+  activeTargetId: string | undefined = undefined
+  /** B1-e：transport 有没有把标签切到前台的能力（缺省没有，理由同上）。 */
+  canActivate = false
+  /** B1-e：被切到前台的 targetId 流水。 */
+  readonly activateCalls: string[] = []
+  /** B2-d：视口中心浮层探测的返回值；`null` = 没有浮层。 */
+  overlay: { role: string; name: string; hint: string } | null = null
+  /**
+   * B2-b：`Page.getNavigationHistory` 的返回体。
+   * 默认只有一条历史 —— 于是 `back` / `forward` 都落在尽头，测试想验成功路径要自己铺栈。
+   */
+  history: { currentIndex: number; entries: { id: number; url: string }[] } = {
+    currentIndex: 0,
+    entries: [{ id: 1, url: 'https://example.com/' }],
+  }
+  /** B2-b：`Page.reload` 被调用了几次。 */
+  reloadCount = 0
+  /**
    * `webpage_fill` 的目标是不是 `contenteditable`（模拟 AI 问答页的富文本输入框）。
    * 真实现里由页面内的 `isContentEditable` 判定，provider 据此改走 `Input.insertText`。
    */
@@ -128,6 +163,11 @@ class FakeChrome {
         return {}
       case 'Runtime.evaluate': {
         const expression = String(params['expression'])
+        // B2-d：视口中心浮层探测。判据串 `elementFromPoint` 只有这条脚本里有；
+        // 缺省 `null` = 没有浮层。
+        if (expression.includes('elementFromPoint')) {
+          return { result: { value: this.overlay } }
+        }
         // 表达式抛错 / 被 await 的 Promise reject：CDP 走 `exceptionDetails`，不是协议错误。
         if (this.evaluateThrows !== undefined && expression.includes('throw')) {
           return {
@@ -208,6 +248,11 @@ class FakeChrome {
         if (fn.includes('dispatchEvent')) {
           return { result: { value: true } }
         }
+        // B1-d：落点命中校验。判据串取 `elementFromPoint` —— 它是这条脚本独有的，
+        // 夹在 `getBoundingClientRect`（取 rect）之后、兜底之前，顺序动一下就会掉到兜底分支。
+        if (fn.includes('elementFromPoint')) {
+          return { result: { value: this.hitTest } }
+        }
         // focus() 之类没有返回值。
         return { result: { value: undefined } }
       }
@@ -268,6 +313,20 @@ class FakeChrome {
       case 'Page.navigate':
         this.href = String(params['url'])
         return this.navigateErrorText === undefined ? {} : { errorText: this.navigateErrorText }
+      // B2-b：历史栈。`navigateToHistoryEntry` 一被调用就换地址，模拟「回退真的发生了」。
+      case 'Page.getNavigationHistory':
+        return { currentIndex: this.history.currentIndex, entries: this.history.entries }
+      case 'Page.navigateToHistoryEntry': {
+        const entry = this.history.entries.find(candidate => candidate.id === Number(params['entryId']))
+        if (entry !== undefined) {
+          this.href = entry.url
+          this.page = { url: entry.url, title: 'Navigated' }
+        }
+        return {}
+      }
+      case 'Page.reload':
+        this.reloadCount += 1
+        return {}
       case 'Page.captureScreenshot':
         return { data: Buffer.from(this.png).toString('base64') }
       case 'DOM.resolveNode':
@@ -318,6 +377,19 @@ class FakeChrome {
   transport(): CdpTransport {
     const chrome = this
     return {
+      // B1-e：这两个能力**按需挂上** —— 缺省是「能答前台、也能切」，
+      // 测试把它们摘掉就是在模拟「外部 Chrome（答不出前台）」与「切不动前台的 provider」。
+      ...chrome.activeTargetId !== undefined
+        ? { activeTargetId: (): Promise<string> => Promise.resolve(chrome.activeTargetId as string) }
+        : {},
+      ...chrome.canActivate
+        ? {
+          activateTarget: (targetId: string): Promise<void> => {
+            chrome.activateCalls.push(targetId)
+            return Promise.resolve()
+          },
+        }
+        : {},
       version: (): Promise<CdpVersion> => chrome.versionError !== undefined
         ? Promise.reject(chrome.versionError)
         : Promise.resolve({ browser: 'Chrome/test', webSocketDebuggerUrl: 'ws://127.0.0.1:9222/devtools/browser/x' }),
@@ -357,6 +429,13 @@ class FakeSocket implements CdpSocket {
   send(data: string): void {
     const request = JSON.parse(data) as { id: number; method: string; params?: Record<string, unknown> }
     const params = request.params ?? {}
+    // B1-e：`wheelAcks=false` 时在**记下命令之后**故意不回包 —— 模拟 Electron / 后台标签上
+    // `mouseWheel` 石沉大海。命令必须照样记进 `calls`（断言「已投递」靠它）。
+    if (request.method === 'Input.dispatchMouseEvent' && params['type'] === 'mouseWheel'
+      && !this.chrome.wheelAcks) {
+      this.chrome.handle(this, request.method, params)
+      return
+    }
     // 用微任务回消息，保持与真实 WebSocket 一致的「先发后收」时序。
     queueMicrotask(() => {
       if (this.closed) return
@@ -496,6 +575,45 @@ describe('CdpBrowserProvider', () => {
     expect(snapshot.outline).toContain('button "Submit" [ref=e2]')
     expect(snapshot.url).toBe('https://example.com/')
     expect(snapshot.truncated).toBe(false)
+  })
+
+  it('puts an OVERLAY line on top of the outline when something covers the viewport center (B2-d · J1)', async () => {
+    await provider.open({})
+    // 没有 `role=dialog` 的浮层在 AX 里排在 body 末尾，小 max_lines 会把它整段截掉 ——
+    // 于是模型拿到的第一屏看着「可以直接点正文」。这一行就是为了让那种错觉不再可能。
+    chrome.overlay = { role: 'div', name: '登录后查看', hint: '#login-modal' }
+
+    const snapshot = await provider.observe({ kind: 'snapshot', sessionId: 'tab-1', maxLines: 60 })
+    if (snapshot.kind !== 'snapshot') throw new Error('expected a snapshot')
+    const lines = snapshot.outline.split('\n')
+    expect(lines[0]).toContain('OVERLAY at viewport center')
+    expect(lines[0]).toContain('登录后查看')
+    expect(lines[0]).toContain('#login-modal')
+    expect(lines[0]).toContain('Raise max_lines')
+    // 提示行**不进** find 的检索底稿：它不是一个可操作元素，混进去就是一条 ref 为空的幻影命中。
+    expect(snapshot.fullOutline ?? '').not.toContain('OVERLAY')
+  })
+
+  it('omits the OVERLAY line when nothing covers the center (反向验证 · 不误报)', async () => {
+    await provider.open({})
+    chrome.overlay = null
+
+    const snapshot = await provider.observe({ kind: 'snapshot', sessionId: 'tab-1' })
+    if (snapshot.kind !== 'snapshot') throw new Error('expected a snapshot')
+    // 误报会骗模型去关一个根本不存在的浮层，比漏报更糟。
+    expect(snapshot.outline).not.toContain('OVERLAY')
+  })
+
+  it('does not probe for an overlay on a regional snapshot (区域快照只看那一块)', async () => {
+    await provider.open({})
+    const full = await provider.observe({ kind: 'snapshot', sessionId: 'tab-1' })
+    if (full.kind !== 'snapshot') throw new Error('expected a snapshot')
+    const ref = full.refs[0]?.ref as string
+    chrome.overlay = { role: 'div', name: '登录后查看', hint: '#login-modal' }
+
+    const region = await provider.observe({ kind: 'snapshot', sessionId: 'tab-1', region: { ref } })
+    if (region.kind !== 'snapshot') throw new Error('expected a snapshot')
+    expect(region.outline).not.toContain('OVERLAY')
   })
 
   it('region.ref snapshot adopts into the current epoch so earlier refs stay usable', async () => {
@@ -884,6 +1002,16 @@ describe('CdpBrowserProvider.mutate (P1)', () => {
     return snapshot.refs[0]?.ref as string
   }
 
+  /** 开会话并 snapshot，返回第一个 ref **以及它的 role/name**（未导航回执要报这两个）。 */
+  async function firstRefWithIdentity(): Promise<{ ref: string; role: string; name: string }> {
+    const session = await provider.open({})
+    const snapshot = await provider.observe({ kind: 'snapshot', sessionId: session.id })
+    if (snapshot.kind !== 'snapshot') throw new Error('expected a snapshot')
+    const first = snapshot.refs[0]
+    if (first === undefined) throw new Error('快照里一个 ref 都没有')
+    return { ref: first.ref, role: first.role, name: first.name }
+  }
+
   /**
    * 这一条命令**是不是写前门**。必须按脚本内容判，不能只看方法名 ——
    * `Runtime.callFunctionOn` 在 click 路径上还用于 `locate` 的 `isConnected`、取 rect、
@@ -905,6 +1033,54 @@ describe('CdpBrowserProvider.mutate (P1)', () => {
     expect(presses[0]?.params).toMatchObject({ x: 60, y: 40, button: 'left', clickCount: 1 })
     // 远端对象句柄用完即还。
     expect(chrome.calls.map(call => call.method)).toContain('DOM.releaseObject')
+  })
+
+  it('names what was clicked, so a no-navigation result can say what to try next (B2-a · J5)', async () => {
+    const { ref, role, name } = await firstRefWithIdentity()
+    chrome.hitTest = { hit: 'target', href: 'https://example.com/go', node: null }
+
+    const result = await provider.mutate({ kind: 'click', sessionId: 'tab-1', ref })
+    // 「点了什么」必须跟着回执走：`navigated=false` 时不说目标是谁，模型只能去翻
+    // console / network 猜（方案 §6 禁止清单第四条）。
+    expect(result.target).toEqual({ role, name, href: 'https://example.com/go' })
+  })
+
+  it('reports the element covering the click point instead of a silent "click done" (B1-d · J1)', async () => {
+    const ref = await firstRef()
+    // 落点上最顶层的是浮层，不是目标 —— 真实场景：登录浮层盖住正文里的外链。
+    chrome.hitTest = {
+      hit: 'other',
+      href: 'https://example.com/go',
+      node: { role: 'dialog', name: '登录后查看', hint: '#login-modal' },
+    }
+
+    const result = await provider.mutate({ kind: 'click', sessionId: 'tab-1', ref })
+    expect(result).toMatchObject({ navigated: false })
+    expect(result.occluded_by).toEqual({ role: 'dialog', name: '登录后查看', hint: '#login-modal' })
+    // **事件照样派发**：自动 Escape、自动改点遮罩上的按钮都是误触（方案 §5），不做。
+    expect(chrome.calls.filter(call => call.method === 'Input.dispatchMouseEvent').map(call => call.params['type']))
+      .toEqual(['mousePressed', 'mouseReleased'])
+  })
+
+  it('omits occluded_by when the point really is the target (反向验证 · 不误报)', async () => {
+    const ref = await firstRef()
+    chrome.hitTest = { hit: 'target', href: null, node: null }
+
+    const result = await provider.mutate({ kind: 'click', sessionId: 'tab-1', ref })
+    // 误报遮挡比漏报更糟：模型会去关一个根本不存在的浮层。
+    expect(result.occluded_by).toBeUndefined()
+  })
+
+  it('still clicks when the hit test itself cannot answer (命中校验是回执增强，不是动作)', async () => {
+    const ref = await firstRef()
+    // 跨源 iframe / CSP 拦下 evaluate 时查不出来。这时宁可少报一条遮挡，
+    // 也不许把 click 打成失败 —— 加了新探针反而让点击不可用是最糟的回归。
+    chrome.hitTest = undefined
+
+    const result = await provider.mutate({ kind: 'click', sessionId: 'tab-1', ref })
+    expect(result).toMatchObject({ action: 'click', navigated: false })
+    expect(result.occluded_by).toBeUndefined()
+    expect(chrome.calls.filter(call => call.method === 'Input.dispatchMouseEvent')).toHaveLength(2)
   })
 
   it('fails a stale ref BEFORE any page command is issued (write-then-check is forbidden)', async () => {
@@ -984,6 +1160,68 @@ describe('CdpBrowserProvider.mutate (P1)', () => {
     // 精确到「门那一条」：`Runtime.callFunctionOn` 本身在 click 路径上有好几处，断方法名恒真。
     expect(chrome.calls.slice(afterGate).filter(isGateCall)).toHaveLength(1)
     expect(retry).toContain('Input.dispatchMouseEvent')
+  })
+
+  it('reports an unacknowledged wheel instead of blocking the tool for 30s (B1-e · J6)', async () => {
+    const ref = await firstRef()
+    // Electron 上 `Input.dispatchMouseEvent{type:'mouseWheel'}` 实测不回包；
+    // 以前它吃的是 `commandTimeoutMs`（30s），一次 scroll 就把 agent 卡满一轮工具超时。
+    chrome.wheelAcks = false
+
+    const started = Date.now()
+    const result = await provider.mutate({ kind: 'scroll', sessionId: 'tab-1', ref, deltaY: 300 })
+    const elapsed = Date.now() - started
+    expect(result).toMatchObject({ action: 'scroll', unconfirmed: true })
+    // 判据：远小于 30s 的协议超时。上限取 5s（2s 等回包 + settle 那一小段）。
+    expect(elapsed).toBeLessThan(5_000)
+    // **事件确实投递出去了** —— 「未确认」不等于「没发」。
+    expect(chrome.calls.filter(call => call.method === 'Input.dispatchMouseEvent').map(call => call.params['type']))
+      .toEqual(['mouseWheel'])
+  })
+
+  it('says nothing about being unconfirmed when the wheel does come back (反向验证 · 不误报)', async () => {
+    const ref = await firstRef()
+
+    const result = await provider.mutate({ kind: 'scroll', sessionId: 'tab-1', ref, deltaY: 300 })
+    expect(result.unconfirmed).toBeUndefined()
+  })
+
+  it('brings a background tab forward before scrolling (B1-e · 后台标签)', async () => {
+    // 前台是别的标签：滚轮只送前台，不切前台就是白滚（而且不会报错，只会沉默地没效果）。
+    chrome.activeTargetId = 'tab-2'
+    chrome.canActivate = true
+    // transport 的「有没有这个能力」在 `transport()` 那一步就定下来了，所以改完必须重建 provider。
+    provider = new AdoptableProvider({ navigationTimeoutMs: 200 }, chrome.transport())
+    const ref = await firstRef()
+
+    const result = await provider.mutate({ kind: 'scroll', sessionId: 'tab-1', ref, deltaY: 300 })
+    expect(result).toMatchObject({ action: 'scroll' })
+    expect(chrome.activateCalls).toEqual(['tab-1'])
+  })
+
+  it('refuses to scroll a background tab when the provider cannot activate (B1-e · 明确拒绝)', async () => {
+    chrome.activeTargetId = 'tab-2'
+    chrome.canActivate = false
+    provider = new AdoptableProvider({ navigationTimeoutMs: 200 }, chrome.transport())
+    const ref = await firstRef()
+
+    await expect(provider.mutate({ kind: 'scroll', sessionId: 'tab-1', ref, deltaY: 300 })).rejects.toThrow(
+      expect.objectContaining({
+        code: 'BROWSER_NOT_IMPLEMENTED',
+        message: expect.stringContaining('is in the background; run webpage_tabs(action=activate'),
+      }),
+    )
+    expect(chrome.activateCalls).toEqual([])
+  })
+
+  it('does not touch the foreground when the provider cannot tell which tab is active (B1-e · 能力缺口)', async () => {
+    const ref = await firstRef()
+    // 外部 Chrome 答不出「谁在前台」：那是能力缺口，不是错误 —— 不许因为查不出来就拒绝滚动。
+    chrome.activeTargetId = undefined
+
+    await expect(provider.mutate({ kind: 'scroll', sessionId: 'tab-1', ref, deltaY: 300 }))
+      .resolves.toMatchObject({ action: 'scroll' })
+    expect(chrome.activateCalls).toEqual([])
   })
 
   it('blocks the action when DOM.resolveNode itself throws for a reused ref (解析失败 · 节点已消失)', async () => {
@@ -1779,6 +2017,104 @@ describe('P2: console / network / execute', () => {
     expect(body).toMatchObject({ kind: 'network', action: 'body', requestId: '37668.2', body: 'pong' })
     const call = chrome.calls.filter(entry => entry.method === 'Network.getResponseBody').at(-1)
     expect(call?.params).toEqual({ requestId: '37668.2' })
+  })
+})
+
+describe('B2-b: webpage_navigate 走历史栈（back / forward / reload）', () => {
+  let chrome: FakeChrome
+  let provider: CdpBrowserProvider
+
+  beforeEach(() => {
+    chrome = new FakeChrome()
+    chrome.axeNodes = PAGE_TREE
+    provider = new CdpBrowserProvider({ navigationTimeoutMs: 200 }, chrome.transport())
+  })
+
+  it('goes back through Page.getNavigationHistory + navigateToHistoryEntry (J4)', async () => {
+    await provider.open({})
+    // 先真的跳到第二页（否则「回退」前后地址一样，等地址变就永远等不出来）。
+    // `page` 是 `readPageMeta` 的返回值源，改它才能让 provider 记住「现在在第二页」。
+    chrome.page = { url: 'https://example.com/next', title: 'Next' }
+    await provider.navigate({ sessionId: 'tab-1', url: 'https://example.com/next' })
+    // 铺一条两节的历史栈，当前停在第二节 —— 回到上一页才有意义。
+    chrome.history = {
+      currentIndex: 1,
+      entries: [{ id: 1, url: 'https://example.com/' }, { id: 2, url: 'https://example.com/next' }],
+    }
+
+    const before = chrome.calls.length
+    const session = await provider.navigate({ sessionId: 'tab-1', history: 'back' })
+    expect(session.url).toBe('https://example.com/')
+    // 只看 back 这一段：上面那次 url 跳转自然带着 `Page.navigate`。
+    const methods = chrome.calls.slice(before).map(call => call.method)
+    expect(methods).toContain('Page.getNavigationHistory')
+    expect(methods).toContain('Page.navigateToHistoryEntry')
+    expect(methods).not.toContain('Page.navigate')
+    // 回退的是**上一节**，不是随便哪一节。
+    const entryCall = chrome.calls.find(call => call.method === 'Page.navigateToHistoryEntry')
+    expect(entryCall?.params['entryId']).toBe(1)
+  })
+
+  it('refuses to go past either end of the history instead of silently no-op-ing (J4)', async () => {
+    await provider.open({})
+    // 默认只有一条历史：两头都是尽头。
+    await expect(provider.navigate({ sessionId: 'tab-1', history: 'back' })).rejects.toThrow(
+      expect.objectContaining({
+        code: 'BROWSER_NAVIGATION_FAILED',
+        message: expect.stringContaining('cannot go back'),
+      }),
+    )
+    await expect(provider.navigate({ sessionId: 'tab-1', history: 'forward' })).rejects.toThrow(
+      expect.objectContaining({
+        code: 'BROWSER_NAVIGATION_FAILED',
+        message: expect.stringContaining('cannot go forward'),
+      }),
+    )
+    // 静默 no-op 才是这里要防的：什么都没做，就不许发出任何跳转命令。
+    expect(chrome.calls.map(call => call.method)).not.toContain('Page.navigateToHistoryEntry')
+  })
+
+  it('reloads the current document without waiting for a url change', async () => {
+    await provider.open({})
+
+    const session = await provider.navigate({ sessionId: 'tab-1', history: 'reload' })
+    // reload 地址不变 —— 判据若是「等地址变」就会等到超时。这里必须成功返回。
+    expect(session.url).toBe('https://example.com/')
+    expect(chrome.reloadCount).toBe(1)
+    expect(chrome.calls.map(call => call.method)).not.toContain('Page.getNavigationHistory')
+  })
+
+  it('rejects url and history together, and rejects neither (互斥 · 不猜)', async () => {
+    await provider.open({})
+
+    await expect(provider.navigate({ sessionId: 'tab-1', url: 'https://example.com/x', history: 'back' }))
+      .rejects.toThrow(expect.objectContaining({
+        code: 'BROWSER_PROTOCOL_ERROR',
+        message: 'webpage_navigate needs exactly one of url or history (back / forward / reload)',
+      }))
+    await expect(provider.navigate({ sessionId: 'tab-1' })).rejects.toThrow(
+      expect.objectContaining({ code: 'BROWSER_PROTOCOL_ERROR' }),
+    )
+    // 被拒的请求一条命令都不许发（与写前门同一分寸）。
+    expect(chrome.calls.map(call => call.method)).not.toContain('Page.navigate')
+  })
+
+  it('invalidates the refs of the session it navigated (与 url 跳转同口径)', async () => {
+    const session = await provider.open({})
+    const snapshot = await provider.observe({ kind: 'snapshot', sessionId: session.id })
+    if (snapshot.kind !== 'snapshot') throw new Error('expected a snapshot')
+    const ref = snapshot.refs[0]?.ref as string
+    chrome.page = { url: 'https://example.com/next', title: 'Next' }
+    await provider.navigate({ sessionId: 'tab-1', url: 'https://example.com/next' })
+    chrome.history = {
+      currentIndex: 1,
+      entries: [{ id: 1, url: 'https://example.com/' }, { id: 2, url: 'https://example.com/next' }],
+    }
+
+    await provider.navigate({ sessionId: 'tab-1', history: 'back' })
+    // 历史跳转也是「换文档」：旧 ref 必须失效，否则模型会静默点到新页面上的另一个元素。
+    await expect(provider.mutate({ kind: 'click', sessionId: session.id, ref }))
+      .rejects.toThrow(expect.objectContaining({ code: 'BROWSER_STALE_REF' }))
   })
 })
 
