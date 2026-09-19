@@ -56,8 +56,23 @@ class FakeChrome {
    * （报告 S1：press 返回的 title 是空串，调用方据此误判「页没就绪」）。
    */
   titleEmptyReads = 0
+  /**
+   * 让接下来 N 次 `readPageMeta` **整个读不到**（真实现里空白页 / 已崩溃的页面就是这种情况）：
+   * provider 拿到 `undefined`，于是那一次 `publish` 没能为纪元留下粗门依据。
+   */
+  pageMetaFailReads = 0
   /** P1：wait-hidden 里元素是否还连在文档上。 */
   elementConnected = true
+  /** 写前门：元素所在**子文档**的地址（null = 元素在顶层文档）。用于验 iframe 不误伤。 */
+  frameHref: string | null = null
+  /** 写前门：true = 子 frame 跨源，顶层地址读不到（脚本抛 SecurityError → 门没证据）。 */
+  crossOriginFrame = false
+  /**
+   * `Page.getFrameTree` 里主 frame 的 url。缺省 = 与 `page.url` 一致；设成别的值就是在模拟
+   * **浏览器进程镜像比 renderer 慢一拍**（导航在飞 / 重定向 / 特权页）。回填纪元地址若误用
+   * 这一份，两条同源用例立刻红。
+   */
+  frameTreeUrl: string | undefined = undefined
   /** P1：wait-text 里页面文本是否包含目标串。 */
   waitTextFound = true
   /** `until: 'stable'`：每次读 DOM 探针返回的增量（0 = 本窗口安静）。 */
@@ -142,6 +157,11 @@ class FakeChrome {
           return { result: { value: this.domMutationDelta } }
         }
         // 读页面元信息：先按 `titleEmptyReads` 把标题报成空串，再给真实值。
+        // `readPageMeta` 是唯一读 `document.title` 的表达式，所以按它来定点失败。
+        if (this.pageMetaFailReads > 0 && expression.includes('document.title')) {
+          this.pageMetaFailReads -= 1
+          return { result: {} }
+        }
         if (this.titleEmptyReads > 0) {
           this.titleEmptyReads -= 1
           return { result: { value: { url: this.page.url, title: '' } } }
@@ -157,9 +177,20 @@ class FakeChrome {
           // wait-hidden 的判据：true = 元素已从文档移除。
           return { result: { value: !this.elementConnected } }
         }
-        if (fn.includes('location.href')) {
-          // 写前门（方案 §5.1）：一次往返同时读回「当前地址 + 元素还在不在文档里」。
-          return { result: { value: { url: this.page.url, connected: this.elementConnected } } }
+        if (fn.includes('connected:')) {
+          // 写前门（方案 §5.1）：一次往返读回「顶层文档地址 + 元素还在不在文档里」。
+          // 判据用 `connected:`（对象字面量的键，只有门的脚本里有）而不是 `location.href` ——
+          // 分支是首个命中即返回，用共用串的话重排一次就会让门拿到 boolean 而静默放行。
+          // 地址按脚本**实际读的是哪个 window** 给，三条退路都必须能变红：
+          //   · 读 `window.top` 且兜了异常 → 跨源回 null（没证据），同源回顶层地址
+          //   · 读 `window.top` 却没兜异常 → 整个调用没有返回值，两道门一起静默
+          //   · 只读 `location.href` → 拿到子文档地址，于是「iframe 误杀」一旦复发必然红
+          const readsTop = fn.includes('window.top')
+          if (this.crossOriginFrame && readsTop && !fn.includes('try')) return { result: {} }
+          const url = readsTop
+            ? (this.crossOriginFrame ? null : this.page.url)
+            : this.frameHref ?? this.page.url
+          return { result: { value: { url, connected: this.elementConnected } } }
         }
         if (fn.includes('isConnected')) {
           // locate 的守卫判据：true = 元素还连在文档上。
@@ -194,7 +225,11 @@ class FakeChrome {
         return { nodes: collected }
       }
       case 'Page.getFrameTree':
-        return { frameTree: { frame: { id: 'frame-1', loaderId: this.loaderId, url: this.page.url } } }
+        return {
+          frameTree: {
+            frame: { id: 'frame-1', loaderId: this.loaderId, url: this.frameTreeUrl ?? this.page.url },
+          },
+        }
       case 'Page.getLayoutMetrics':
         return {
           visualViewport: {
@@ -844,6 +879,16 @@ describe('CdpBrowserProvider.mutate (P1)', () => {
     return snapshot.refs[0]?.ref as string
   }
 
+  /**
+   * 这一条命令**是不是写前门**。必须按脚本内容判，不能只看方法名 ——
+   * `Runtime.callFunctionOn` 在 click 路径上还用于 `locate` 的 `isConnected`、取 rect、
+   * fill 的分支判定等（`provider.ts:941`、`:1504`、`:1635`、`:1665`），
+   * 断 `toContain('Runtime.callFunctionOn')` 等于没断。
+   */
+  const isGateCall = (call: { method: string; params: Record<string, unknown> }): boolean =>
+    call.method === 'Runtime.callFunctionOn'
+    && String(call.params['functionDeclaration']).includes('location.href')
+
   it('clicks the element center with real mouse events', async () => {
     const ref = await firstRef()
 
@@ -896,8 +941,8 @@ describe('CdpBrowserProvider.mutate (P1)', () => {
       expect.objectContaining({
         code: 'BROWSER_STALE_REF',
         message: 'ref "e1" points at a stale document: the page moved from https://example.com/ '
-          + 'to https://example.com/next since the snapshot; the action was NOT dispatched. '
-          + 'Run webpage_snapshot again.',
+          + 'to https://example.com/next since the snapshot; the action was NOT dispatched; '
+          + 'run webpage_snapshot again',
       }),
     )
     // 「动作没发出」是这道门存在的全部意义：一条输入事件都没派发。
@@ -919,12 +964,21 @@ describe('CdpBrowserProvider.mutate (P1)', () => {
       expect.objectContaining({
         code: 'BROWSER_STALE_REF',
         message: 'the element for ref "e1" was removed from the document (the page may have '
-          + 're-rendered); the action was NOT dispatched. Run webpage_snapshot again.',
+          + 're-rendered); the action was NOT dispatched; run webpage_snapshot again',
       }),
     )
     expect(chrome.calls.slice(before).map(call => call.method)).not.toContain('Input.dispatchMouseEvent')
-    // 细门不作废纪元：地址没变，页面上其余 ref 仍然可用，重拍快照不是强制要求。
-    expect(chrome.calls.slice(before).map(call => call.method)).toContain('DOM.resolveNode')
+    // 「不作废纪元」必须真被验到：地址没变，页面上其余 ref 仍然可用，所以把元素放回去之后
+    // 同一个号还能走到门并成功派发。若细门也 invalidate()，这里会是「零命令」的 stale 失败
+    // （对照上一条用例），那才是真正的判据。
+    chrome.elementConnected = true
+    const afterGate = chrome.calls.length
+    await expect(provider.mutate({ kind: 'click', sessionId: 'tab-1', ref }))
+      .resolves.toMatchObject({ action: 'click' })
+    const retry = chrome.calls.slice(afterGate).map(call => call.method)
+    // 精确到「门那一条」：`Runtime.callFunctionOn` 本身在 click 路径上有好几处，断方法名恒真。
+    expect(chrome.calls.slice(afterGate).filter(isGateCall)).toHaveLength(1)
+    expect(retry).toContain('Input.dispatchMouseEvent')
   })
 
   it('lets an untouched page through, costing exactly one extra round-trip (零回归)', async () => {
@@ -934,13 +988,10 @@ describe('CdpBrowserProvider.mutate (P1)', () => {
     const result = await provider.mutate({ kind: 'click', sessionId: 'tab-1', ref })
     expect(result).toMatchObject({ action: 'click', navigated: false })
 
-    const isGate = (call: { method: string; params: Record<string, unknown> }): boolean =>
-      call.method === 'Runtime.callFunctionOn'
-      && String(call.params['functionDeclaration']).includes('location.href')
     const trace = chrome.calls.slice(before)
     // 门必须在第一个输入事件之前，且整条路径上只此一次（+1 次往返，不是 +2/+3）。
-    expect(trace.filter(isGate)).toHaveLength(1)
-    expect(trace.findIndex(isGate)).toBeLessThan(
+    expect(trace.filter(isGateCall)).toHaveLength(1)
+    expect(trace.findIndex(isGateCall)).toBeLessThan(
       trace.findIndex(call => call.method === 'Input.dispatchMouseEvent'),
     )
   })
@@ -951,6 +1002,119 @@ describe('CdpBrowserProvider.mutate (P1)', () => {
 
     const result = await provider.mutate({ kind: 'wait', sessionId: 'tab-1', ref })
     expect(result).toMatchObject({ action: 'wait', satisfied: true })
+  })
+
+  it('still runs the coarse gate for wait-hidden — 地址变了就不该接着等', async () => {
+    const ref = await firstRef()
+    chrome.elementConnected = false
+    chrome.page = { url: 'https://example.com/next', title: 'Next' }
+
+    await expect(provider.mutate({ kind: 'wait', sessionId: 'tab-1', ref })).rejects.toThrow(
+      expect.objectContaining({
+        code: 'BROWSER_STALE_REF',
+        message: expect.stringContaining('points at a stale document') as unknown as string,
+      }),
+    )
+  })
+
+  it('compares the top document url, so refs inside an iframe are not false positives (J2 不误伤)', async () => {
+    const ref = await firstRef()
+    // 元素在 iframe 里：它自己那个文档的地址与纪元里那份完全不同。门若读 `location.href`
+    // 就会把一次正常点击判成「页面导航了」并作废整张 ref 表。
+    chrome.frameHref = 'https://child.example.com/form'
+
+    const before = chrome.calls.length
+    const result = await provider.mutate({ kind: 'click', sessionId: 'tab-1', ref })
+    expect(result).toMatchObject({ action: 'click' })
+    expect(chrome.calls.slice(before).map(call => call.method)).toContain('Input.dispatchMouseEvent')
+  })
+
+  it('lets an iframe ref through when the top document url is unreadable (跨源 · 没证据就放行)', async () => {
+    const ref = await firstRef()
+    chrome.crossOriginFrame = true
+    chrome.frameHref = 'https://child.example.com/form'
+
+    await expect(provider.mutate({ kind: 'click', sessionId: 'tab-1', ref }))
+      .resolves.toMatchObject({ action: 'click' })
+  })
+
+  it('keeps the fine gate alive inside a cross-origin iframe — 兜住异常才有 connected 可读', async () => {
+    const ref = await firstRef()
+    chrome.crossOriginFrame = true
+    chrome.frameHref = 'https://child.example.com/form'
+    chrome.elementConnected = false
+
+    // 脚本里那个 try/catch 不是为了让粗门多覆盖一档（跨源本来就读不到，照样放行），而是为了让
+    // 同一次往返**仍然带回 `isConnected`**。把 try/catch 摘掉，整次调用就没有返回值，两道门一起
+    // 静默 —— 这条用例即红。
+    await expect(provider.mutate({ kind: 'click', sessionId: 'tab-1', ref })).rejects.toThrow(
+      expect.objectContaining({ code: 'BROWSER_STALE_REF' }),
+    )
+  })
+
+  it('re-arms the coarse gate after revalidate refills the epoch url (堵住「拦一次、永久放行」)', async () => {
+    const ref = await firstRef()
+    // ① 人工在同一个文档里换路由（SPA：`loaderId` 不变，所以归档四道门放得行）。
+    chrome.page = { url: 'https://example.com/next', title: 'Next' }
+    await expect(provider.mutate({ kind: 'click', sessionId: 'tab-1', ref }))
+      .rejects.toThrow(expect.objectContaining({ code: 'BROWSER_STALE_REF' }))
+
+    // ② 模型 revalidate 把同一个号装回来。这一步必须把「恢复当下」的地址补给纪元 ——
+    //    `invalidate()` 已经把 `epochUrl` 清空了。
+    const result = await provider.revalidate({ sessionId: 'tab-1', refs: [ref] })
+    expect(result.restored.map(entry => entry.ref)).toEqual([ref])
+    expect(result.failed).toEqual([])
+
+    // ③ 再来一次人工导航：粗门必须**仍然拦得住**。少实参 / 少回填任何一环，纪元地址都是空的，
+    //    按「没证据就放行」的纪律这次 click 会直接派发 —— 那正是本用例要消灭的复发形态。
+    chrome.page = { url: 'https://example.com/third', title: 'Third' }
+    const before = chrome.calls.length
+    await expect(provider.mutate({ kind: 'click', sessionId: 'tab-1', ref })).rejects.toThrow(
+      expect.objectContaining({
+        code: 'BROWSER_STALE_REF',
+        message: expect.stringContaining('points at a stale document') as unknown as string,
+      }),
+    )
+    expect(chrome.calls.slice(before).map(call => call.method)).not.toContain('Input.dispatchMouseEvent')
+  })
+
+  it('refills the epoch url from the SAME source the gate reads, not the frame-tree mirror (J2 不误伤)', async () => {
+    const ref = await firstRef()
+    chrome.page = { url: 'https://example.com/next', title: 'Next' }
+    await expect(provider.mutate({ kind: 'click', sessionId: 'tab-1', ref }))
+      .rejects.toThrow(expect.objectContaining({ code: 'BROWSER_STALE_REF' }))
+
+    // 浏览器进程侧的 frame tree 还停在旧地址（导航在飞 / 重定向 / 特权页读到 about:blank#blocked）。
+    // provider 现在根本不读这一份，所以纪元的基线只能来自 renderer：回填之后地址没再动，
+    // 点击**必须放行**。若把回填改回 `Page.getFrameTree` 的 url，这里会变红 —— 一次完全正常的
+    // 操作被判成「页面导航了」并作废整个纪元。
+    chrome.frameTreeUrl = 'https://example.com/'
+    await provider.revalidate({ sessionId: 'tab-1', refs: [ref] })
+
+    const before = chrome.calls.length
+    await expect(provider.mutate({ kind: 'click', sessionId: 'tab-1', ref }))
+      .resolves.toMatchObject({ action: 'click' })
+    expect(chrome.calls.slice(before).map(call => call.method)).toContain('Input.dispatchMouseEvent')
+  })
+
+  it('refills the epoch url even when revalidate restores nothing (publish 没读到地址的纪元)', async () => {
+    // 开会话与那次 snapshot 的页面地址都读不到（空白页 / 已崩溃）→ 纪元里的 ref 有效，
+    // 但从来没有过粗门依据。
+    chrome.pageMetaFailReads = 2
+    const ref = await firstRef()
+
+    // revalidate 命中的是**当前表**（`pending` 为空），什么也没恢复 —— 但依据必须照样补上。
+    // 少这一环，这个纪元从此永久关掉粗门（下面那次导航会变成静默点错）。
+    await provider.revalidate({ sessionId: 'tab-1', refs: [ref] })
+    chrome.page = { url: 'https://example.com/next', title: 'Next' }
+    const before = chrome.calls.length
+    await expect(provider.mutate({ kind: 'click', sessionId: 'tab-1', ref })).rejects.toThrow(
+      expect.objectContaining({
+        code: 'BROWSER_STALE_REF',
+        message: expect.stringContaining('points at a stale document') as unknown as string,
+      }),
+    )
+    expect(chrome.calls.slice(before).map(call => call.method)).not.toContain('Input.dispatchMouseEvent')
   })
 
   it('requires a snapshot before mutating a page the model never observed', async () => {

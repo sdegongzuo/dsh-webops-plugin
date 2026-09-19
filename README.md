@@ -87,7 +87,9 @@ pnpm build         # 产出 lib/（host 半边多入口 + 包根 + 客户端 bun
 ```
 
 **基线以 [`docs/开发指南.md`](docs/开发指南.md) 为准**（那里有实测日期与跑法），当前为
-无浏览器 **413 passed / 5 skipped**、接真 Chrome **418 passed / 0 skipped**。
+无浏览器 **429 passed / 5 skipped**（2026-09-19 实测，含 P1 写前门及其三轮 review 修正的用例；
+这个数字每批都会动，以现跑 `pnpm test` 为准）、接真 Chrome
+**418 passed / 0 skipped**（该路数字是上一轮的，本轮没起重跑；live 组那 5 个用例本身没动）。
 
 `pnpm test` 里 `live.test.ts` 有 5 个用例需要 `DSH_CDP_ENDPOINT` 指向**真 Chrome**
 （端点是 Electron 时整组带原因跳过，日志里会打 `[live] skipping …`）。
@@ -136,7 +138,7 @@ src/browser-electron/        provider（桌面端自己的 Electron 窗口）
   host.cjs                     被 spawn 的 Electron 应用入口（BrowserWindow + debugger）
   socket.ts / transport.ts     把「桥上的一个窗口」包成 CdpSocket
   tabbar.html                  多标签页的标签条 UI
-src/tool-browser/            工具层：browser_* 工具 + 能力分级 + 系统提示分段
+src/tool-browser/            工具层：webpage_* 工具 + 能力分级 + 系统提示分段
 src/client/                  客户端半边（dsh.client）：input dock 状态条 + 工具卡片
 src/fake-llm/                keyless 验证夹具（脚本回放 llm/stream，有闸门默认哑）
 scripts/                     开发 / 验证 / 打包脚本（见上表）

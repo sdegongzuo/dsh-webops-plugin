@@ -367,6 +367,49 @@ describe('RefRegistry', () => {
     expect(registry.publishedUrl).toBeUndefined()
   })
 
+  it('refills the epoch url on restore, so revalidate cannot switch the coarse gate off', () => {
+    const registry = new RefRegistry()
+    registry.publish([target('button', 'Save', 11)], false, 'loader-1', 'https://example.com/a')
+    registry.invalidate()
+    const archived = registry.archived('e1')
+    if (archived === undefined) throw new Error('expected the ref to be archived')
+
+    // 写前门作废纪元之后，revalidate 恢复回来的 ref 若没有地址可比，粗门就对这一纪元永久放行。
+    registry.restore([archived.target], 'https://example.com/b')
+    expect(registry.publishedUrl).toBe('https://example.com/b')
+
+    // 已有值一律不覆盖：纪元地址的语义是「发布时刻」，后续恢复不得改写它。
+    registry.restore([archived.target], 'https://example.com/c')
+    expect(registry.publishedUrl).toBe('https://example.com/b')
+  })
+
+  it('treats a missing or empty restore url as no evidence (门宁可放行)', () => {
+    const registry = new RefRegistry()
+    registry.publish([target('button', 'Save', 11)], false, 'loader-1', 'https://example.com/a')
+    registry.invalidate()
+    const archived = registry.archived('e1')
+    if (archived === undefined) throw new Error('expected the ref to be archived')
+
+    registry.restore([archived.target])
+    expect(registry.publishedUrl).toBeUndefined()
+    registry.restore([archived.target], '')
+    expect(registry.publishedUrl).toBeUndefined()
+  })
+
+  it('normalises an empty publish url to no evidence, so restore can still refill it', () => {
+    const registry = new RefRegistry()
+    // `readPageMeta` 读不到地址时回空串（不是 undefined）。空串必须归一成「没证据」，
+    // 否则它会以「已有值」的身份挡住 restore 的回填 —— 那条链正是「被拦一次就永久关掉粗门」。
+    registry.publish([target('button', 'Save', 11)], false, 'loader-1', '')
+    expect(registry.publishedUrl).toBeUndefined()
+
+    registry.invalidate()
+    const archived = registry.archived('e1')
+    if (archived === undefined) throw new Error('expected the ref to be archived')
+    registry.restore([archived.target], 'https://example.com/b')
+    expect(registry.publishedUrl).toBe('https://example.com/b')
+  })
+
   it('drops the epoch url on hydrate (落盘锚点没有地址，写前门宁可放行)', () => {
     const registry = new RefRegistry()
     registry.publish([target('button', 'Save', 11)], false, 'loader-1', 'https://example.com/a')

@@ -141,6 +141,7 @@ export class RefRegistry {
 
   /**
    * 当前纪元的发布时刻地址；从未观察、或那次 `publish` 没读到地址时为 `undefined`。
+   * revalidate 的 `restore()` 会把「恢复当下」的地址补给一个没有地址的纪元（见该方法）。
    *
    * 写前门对 `undefined` 的处理是**不判定**（放行），与 `revalidate` 拿不到 `loaderId`
    * 就宁可拒绝（`document_changed`）**相反**：这里是「门没证据不该让一次正常操作失败」，
@@ -189,7 +190,9 @@ export class RefRegistry {
     }
     this.targets = targets
     this.loaderId = loaderId
-    this.epochUrl = url
+    // 空串一律归一成 `undefined`：`epochUrl` 只有「有证据 / 没证据」两态，让 `''` 混进来会让
+    // 粗门既比不出东西、又挡住 `restore()` 回填（判据是「没有地址才填」）。
+    this.epochUrl = url === undefined || url === '' ? undefined : url
     this.epoch += 1
     this.trimLive()
     return { epoch: this.epoch, refs, truncated }
@@ -223,11 +226,21 @@ export class RefRegistry {
    *
    * `adopt` 会继续单调编号，不能拿来做 revalidate：模型手里拿的是旧号。
    * 序号只在装回的号大于当前序列时才上推，绝不回退。
+   * @param observedUrl - 这次恢复**当下**读到的页面地址，只用来给没有地址的纪元补上
+   *   粗门依据（写前门作废过纪元 → `epochUrl` 已清空，而 revalidate 恢复的 ref 重新可用，
+   *   不回填就等于把粗门对这一纪元永久关掉）。已有值一律不覆盖 —— 全量快照那份才算「发布时刻」。
+   *   ⚠️ 调用方**必须**传与写前门同源的值（renderer 的 `location.href`，出自 `readPageMeta`）：
+   *   `Page.getFrameTree` 那份是浏览器进程镜像，两者差一拍就会把一次正常操作误判成导航。
+   *   ⚠️ `targets` 可以为空 —— 那时这一步纯粹是给纪元续依据，与恢复哪条 ref 无关；
+   *   补上的基线作用于**整个纪元**，包括这次没被恢复的其它 ref（方案 §5.1.1 认下的外溢代价）。
    */
-  restore(targets: readonly RefTarget[]): void {
+  restore(targets: readonly RefTarget[], observedUrl?: string): void {
     if (this.targets === undefined) {
       this.epoch = this.epoch === 0 ? 1 : this.epoch
       this.targets = new Map<string, RefTarget>()
+    }
+    if (this.epochUrl === undefined && observedUrl !== undefined && observedUrl !== '') {
+      this.epochUrl = observedUrl
     }
     for (const target of targets) {
       this.targets.set(target.ref, target)

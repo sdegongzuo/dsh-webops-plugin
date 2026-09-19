@@ -226,7 +226,7 @@ interface AxTreeResult {
   readonly nodes?: readonly AxNode[]
 }
 
-/** `Page.getFrameTree` 的返回体；只要主 frame 的 `loaderId`。 */
+/** `Page.getFrameTree` 的返回体；只取主 frame 的 `loaderId`（url 不同源，见 `readMainLoaderId`）。 */
 interface FrameTreeResult {
   readonly frameTree?: { readonly frame?: { readonly loaderId?: string } }
 }
@@ -537,6 +537,8 @@ export class CdpBrowserProvider implements BrowserProvider {
         'BROWSER_SNAPSHOT_REQUIRED',
       )
     }
+    // `loaderId` 出自浏览器进程侧的 `Page.getFrameTree`；下面可能要回填的纪元地址**不能**用同一
+    // 次读的返回值 —— 它必须与写前门同源，理由写在那一段。
     const loaderId = await this.readMainLoaderId(session, signal)
     const restored: { ref: string; role: string; name: string }[] = []
     const failed: BrowserRevalidateFailure[] = []
@@ -550,7 +552,16 @@ export class CdpBrowserProvider implements BrowserProvider {
         failed.push({ ref, reason: outcome.reason })
       }
     }
-    if (pending.length > 0) session.refs.restore(pending)
+    // 纪元缺粗门依据时（被写前门作废过，或那次 `publish` 根本没读到地址），补一份当下的地址。
+    // **必须与门同源**：门比的是 renderer 侧 `window.top.location.href`，而 `Page.getFrameTree`
+    // 的主 frame url 是浏览器进程的镜像 —— 导航在飞、重定向、特权页上两者会差一档，拿镜像值
+    // 当基线会把一次正常操作判成「页面导航了」并作废整个纪元（违 J2）。所以单独发一次
+    // `Runtime.evaluate`，只在缺依据时花这一趟。空 `pending` 也要补：不补就是永久关掉粗门。
+    const missingEpochUrl = session.refs.publishedUrl === undefined
+    if (missingEpochUrl || pending.length > 0) {
+      const meta = missingEpochUrl ? await this.readPageMeta(session.connection, signal) : undefined
+      session.refs.restore(pending, meta?.url)
+    }
     return {
       kind: 'revalidate',
       sessionId: session.targetId,
@@ -1098,8 +1109,8 @@ export class CdpBrowserProvider implements BrowserProvider {
       nodes = tree.nodes ?? []
     }
     const outline = buildOutline(nodes, resolveSnapshotLimits(this.config.snapshotLimits, maxLines))
-    // 地址与 `loaderId` 必须在**同一时刻**随 ref 表落地：写前门（粗门）比的就是
-    // 「发布那一刻的地址」，晚读一步会把人工在这一步之间做的导航记成快照时的状态（方案 §5.1.1）。
+    // 地址与 `loaderId` 必须**随这一份 ref 表一起落地**、不能延后再读（粗门比的就是「发布那一刻的地址」，
+    // 晚一步会把人工之间的导航记成快照状态，方案 §5.1.1）。「一起」不是「同一瞬间」：粗门是启发式不是事务。
     const meta = await this.readPageMeta(session.connection, signal)
     const loaderId = regional ? undefined : await this.readMainLoaderId(session, signal)
     const publication = regional
@@ -1216,13 +1227,17 @@ export class CdpBrowserProvider implements BrowserProvider {
   // ---------------------------------------------------------------------------
 
   /**
-   * `DOM.resolveNode({ backendNodeId })` → 远端对象句柄（`[V36]`：无需 `DOM.enable`）。
+   * 读主 frame 的文档身份（`loaderId`）。读不到当身份未知：`revalidate` 会拒绝而不是误绑。
    *
-   * 节点已销毁时 Chrome 回 CDP 错误（原样上抛，由调用方决定映射）；返回体里缺
-   * `objectId` 时返回 `undefined` —— 两种「拿不到句柄」的形态要分开处理。
+   * 这里**不**顺带返回 `frame.url`（第 3 批曾合并成一次读，第 4 批撤回）：`Page.getFrameTree`
+   * 的 url 是浏览器进程侧的镜像，而写前门比的是 renderer 的 `window.top.location.href`，
+   * 两者在导航在飞 / 重定向 / 特权页上会差一档。需要纪元地址时一律走
+   * {@link readPageMeta}，宁多一次往返也不要不同源的基线。
    */
-  /** 按需读主 frame `loaderId`；读不到就当身份未知，revalidate 会拒绝而不是误绑。 */
-  private async readMainLoaderId(session: SessionState, signal?: AbortSignal): Promise<string | undefined> {
+  private async readMainLoaderId(
+    session: SessionState,
+    signal?: AbortSignal,
+  ): Promise<string | undefined> {
     try {
       const tree = await session.connection.send<FrameTreeResult>(
         'Page.getFrameTree',
@@ -1337,6 +1352,12 @@ export class CdpBrowserProvider implements BrowserProvider {
     return keep
   }
 
+  /**
+   * `DOM.resolveNode({ backendNodeId })` → 远端对象句柄（`[V36]`：无需 `DOM.enable`）。
+   *
+   * 节点已销毁时 Chrome 回 CDP 错误（原样上抛，由调用方决定映射）；返回体里缺
+   * `objectId` 时返回 `undefined` —— 两种「拿不到句柄」的形态要分开处理。
+   */
   private async resolveNodeObjectId(
     session: SessionState,
     backendNodeId: number,
@@ -1412,7 +1433,12 @@ export class CdpBrowserProvider implements BrowserProvider {
       'Runtime.callFunctionOn',
       {
         objectId,
-        functionDeclaration: 'function () { return { url: location.href, connected: this.isConnected }; }',
+        // 比对的是「纪元记录的地址 vs 当下**顶层文档**的地址」：纪元地址出自顶层的
+        // `readPageMeta`，而 `location.href` 取的是元素自己那个文档 —— 直接比它会让 iframe 里的元素
+        // 必然「地址变了」。读 `window.top.location.href` 对同文档子 frame 仍然有效。
+        // 那个 try 不是为了让粗门多覆盖一档（跨源读不到照样放行），而是为了**同一次往返仍带回
+        // `isConnected`**：不兜住异常，跨源 frame 里连细门都会一起静默。
+        functionDeclaration: 'function () { let top = null; try { top = window.top.location.href; } catch (e) { top = null; } return { url: top, connected: this.isConnected }; }',
         returnByValue: true,
       },
       { signal, timeoutMs: this.config.commandTimeoutMs },
@@ -1421,7 +1447,8 @@ export class CdpBrowserProvider implements BrowserProvider {
     if (typeof value !== 'object' || value === null) return
     const { url, connected } = value as Record<string, unknown>
     if (
-      publishedUrl !== undefined && typeof url === 'string' && url !== '' && url !== publishedUrl
+      publishedUrl !== undefined
+      && typeof url === 'string' && url !== '' && url !== publishedUrl
     ) {
       // 文档已经换掉：整个纪元的 ref 都不该再用，作废它并让模型重拍。
       session.refs.invalidate()
@@ -1430,7 +1457,7 @@ export class CdpBrowserProvider implements BrowserProvider {
       this.releaseObject(session, objectId, signal)
       throw new BrowserError(
         `ref "${ref}" points at a stale document: the page moved from ${publishedUrl} to ${url} `
-        + 'since the snapshot; the action was NOT dispatched. Run webpage_snapshot again.',
+        + 'since the snapshot; the action was NOT dispatched; run webpage_snapshot again',
         'BROWSER_STALE_REF',
       )
     }
@@ -1438,7 +1465,7 @@ export class CdpBrowserProvider implements BrowserProvider {
       this.releaseObject(session, objectId, signal)
       throw new BrowserError(
         `the element for ref "${ref}" was removed from the document (the page may have re-rendered); `
-        + 'the action was NOT dispatched. Run webpage_snapshot again.',
+        + 'the action was NOT dispatched; run webpage_snapshot again',
         'BROWSER_STALE_REF',
       )
     }
