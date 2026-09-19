@@ -8,6 +8,8 @@ dist/
 .desktop-stage*/
 # verify:portable 用的解压副本（几百 MB，一次性；本机 safe-delete 会拦大目录删除）
 .rel-verify*/
+# 手工解压的便携版副本（同上，几百 MB）
+.unpack-*/
 coverage/
 *.tsbuildinfo
 *.log
@@ -25,9 +27,6 @@ coverage/
 # 真窗口调试脚本的临时输出（一次性的证据快照，不入库）
 scripts/.last-*
 scripts/.kill-ports.txt
-
-# 排查用的一次性脚本（_tmp* 前缀）
-_tmp*
 
 # 排查用的一次性脚本（_tmp* 前缀）
 _tmp*

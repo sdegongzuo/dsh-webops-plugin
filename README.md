@@ -13,16 +13,17 @@
 
 ## 能力
 
-共 15 个工具（`read` 级只读不改页面，`mutate` 级会动页面或标签）：
+共 16 个工具（`read` 级只读不改页面，`mutate` 级会动页面或标签）：
 
 | 工具 | 能力级 | 一句话 |
 |---|---|---|
 | `webpage_open` / `webpage_navigate` | read | 开**新**标签页 / 当前页跳转（永不接管用户已有标签） |
-| `webpage_snapshot` | read | 可访问性大纲 + ref；ref 在会话内单调不复用，旧 ref 必然失效 |
+| `webpage_snapshot` | read | 可访问性大纲 + ref；ref 在会话内单调不复用，旧 ref 必然失效。可选 `region`（`ref` / `viewport` / `box`）只出区域 |
+| `webpage_revalidate` | read | 拿旧 ref 趁新纪元还在归档里时**精确装回**（先核 `loaderId` 文档身份）；失败按条报原因 |
 | `webpage_screenshot` | read | 截图存成 attachment（可选 `ref` 只截单个元素） |
 | `webpage_tabs` | mutate | `list` / `activate` / `close`，只列、只碰本会话自己开的标签页 |
 | `webpage_click` / `fill` / `press` / `scroll` | mutate | 按 ref 操作；**写前**先查纪元，失效返回可重试的 `BROWSER_STALE_REF` |
-| `webpage_wait` | read | 等时间 / 等文本出现 / 等 ref 元素消失（不改页面） |
+| `webpage_wait` | read | 四选一：等时间 / 等文本出现 / 等 ref 元素消失 / `until:'stable'`（DOM 静默 + 网络 inflight 归零，回执带 `signals`） |
 | `webpage_find` | read | 在最近一次 snapshot 的大纲上做零状态文本检索，不发任何 CDP 命令 |
 | `webpage_locate` | read | 按 ref 现算视口坐标盒 + `in_viewport`（默认不滚视口） |
 | `webpage_console` | read | console 环形缓冲（Runtime + Log 合流、按高水位去重、默认只给当前文档） |
@@ -81,11 +82,18 @@ cd /d/dev/cli/deepseek-harness && pnpm dsh --profile browserp0
 ```bash
 pnpm install       # 工具链 + link 本地 dsh 包（不查 registry）
 pnpm typecheck     # tsc --noEmit
-pnpm test          # vitest：289 passed / 3 skipped
+pnpm test          # vitest（见下方基线）
 pnpm build         # 产出 lib/（host 半边多入口 + 包根 + 客户端 bundle + host.cjs）
 ```
 
-`pnpm test` 的 3 个 live 用例需要 `DSH_CDP_ENDPOINT` 指向**真 Chrome**（端点是 Electron 时整组带原因跳过）。
+**基线以 [`docs/开发指南.md`](docs/开发指南.md) 为准**（那里有实测日期与跑法），当前为
+无浏览器 **413 passed / 5 skipped**、接真 Chrome **418 passed / 0 skipped**。
+
+`pnpm test` 里 `live.test.ts` 有 5 个用例需要 `DSH_CDP_ENDPOINT` 指向**真 Chrome**
+（端点是 Electron 时整组带原因跳过，日志里会打 `[live] skipping …`）。
+
+> 本机别用 `pnpm test` / `pnpm run xxx` —— pnpm 11 会隐式再跑一次 install（约 10 分钟）。
+> 直接调 `node_modules/vitest/vitest.mjs`，细节见 `docs/开发指南.md` §2。
 
 常用脚本：
 
@@ -96,10 +104,11 @@ pnpm build         # 产出 lib/（host 半边多入口 + 包根 + 客户端 bun
 | `pnpm run verify:card` | keyless 端到端：假模型驱动真工具链，断言卡片真渲染 |
 | `pnpm run verify:portable` | **发版前自检**：验打包产物能不能起来（见「发版」） |
 | `pnpm run package:portable` | 本地打插件便携版 zip |
+| `pnpm run package:plugin-update` / `verify:plugin-update` | 打 / 验「插件增量更新包」（约 159KB，不必重下 472MB 整包，见 `docs/打包与发版.md` §9） |
 
 **keyless 验证**（`src/fake-llm`）不需要 `DEEPSEEK_API_KEY`：它拦下 `llm/stream` 按脚本回放，
 驱动真 agent loop 走完整条工具链。它**只在开发态挂载、且需要 `DSH_FAKE_LLM=1`**
-（`pnpm run dev:desktop` 会自动拼上）。步骤见 [`docs/keyless-测试交接.md`](docs/keyless-测试交接.md)。
+（`pnpm run dev:desktop` 会自动拼上）。步骤与铁律见 [`docs/开发指南.md`](docs/开发指南.md) 的「keyless 端到端验证」。
 
 ---
 
@@ -146,7 +155,7 @@ docs/                        二级文档（见下）
 | 链路 | tag | workflow | 产物 | CI 耗时 |
 |---|---|---|---|---|
 | 插件便携版 | `v*` | `release.yml` | 几 MB 的插件目录 zip（免构建） | ~3 分钟 |
-| 桌面端便携版 | `desktop-v*` | `release-desktop.yml` | ~226 MB 整包（含 dsh 本体） | 首次 ~16 分钟，**缓存命中 ~6.5 分钟** |
+| 桌面端便携版 | `desktop-v*` | `release-desktop.yml` | **≈451 MiB / 472 MB 十进制** 整包（含 dsh 本体） | 首次 ~16 分钟，**缓存命中 ~6.5 分钟** |
 
 ```bash
 git tag v0.2.0 && git push origin v0.2.0              # 插件便携版
@@ -154,7 +163,7 @@ git tag desktop-v0.2.0 && git push origin desktop-v0.2.0   # 桌面端便携版
 ```
 
 桌面端那条链路的耗时几乎全在 IO 上，不是编译：**不需要 MSVC**（node-pty / koffi / sharp 都是预编译）。
-631s 花在 electron-builder 把 226MB / 14071 个文件解包组装成 app 目录，294s 花在压缩。
+631s 花在 electron-builder 把 451 MiB / 21796 个条目解包组装成 app 目录，294s 花在压缩。
 所以做了两件事：用 `actions/cache` 缓存 `win-unpacked`（key 含 `HARNESS_REF` + 两处补丁的 hash，
 命中则跳过构建步骤），以及把压缩级别从 `Optimal` 降到 `Fastest`（app 里多是已压过的二进制）。
 
@@ -179,8 +188,8 @@ pnpm run verify:portable -- --dir /path/to/解压后的目录 \
 （全量 sha256 完整性、`state.runtimeId` / `nodeVersion` / `platform` / `arch` 对齐、建 241 条宿主链接 +
 依赖图校验），再真起宿主读 `__DSH_BOOT__`。CI 里也内置了这一步，跑在「发布 Release」之前。
 
-三个必读的坑（profile 状态文件 / fake-llm 随包出货 / 解压产物损坏的误判）连同完整断言清单，见
-[`docs/desktop-portable-release-notes.md`](docs/desktop-portable-release-notes.md)。
+打包四前置、profile 物化、四道自检的判据、出货 patch 红线与打包态专有坑，见
+[`docs/打包与发版.md`](docs/打包与发版.md)。
 
 > 公开仓的 Actions **完全免费**，优化 CI 时长省的是等待时间，不是额度。
 
@@ -190,13 +199,12 @@ pnpm run verify:portable -- --dir /path/to/解压后的目录 \
 
 | 文档 | 内容 |
 |---|---|
-| [`docs/keyless-测试交接.md`](docs/keyless-测试交接.md) | keyless 端到端测试怎么跑、判定标准、时序与闸门坑 |
-| [`docs/实现与踩坑.md`](docs/实现与踩坑.md) | 接进 dsh 的两条路线、桌面端硬约束与接入手法、CDP 与 ref 纪元、接线为什么在 host 平面、实测踩坑 |
-| [`docs/desktop-portable-release-notes.md`](docs/desktop-portable-release-notes.md) | 便携版发版存档 + 发版必读的三个坑 + `verify:portable` 断言清单 |
-| [`docs/交付记录.md`](docs/交付记录.md) | P1 / P2 / P3 各期交付内容、实测证据与当时的环境死角（历史归档） |
-| [`docs/P2-P3-开发方案.md`](docs/P2-P3-开发方案.md) | P2/P3 的设计方案与实施顺序 |
-| [`docs/P2-P3-状态归属与接入规范.md`](docs/P2-P3-状态归属与接入规范.md) | 新增 CDP 命令时的状态归属实测方法与规范 |
-| [`docs/browser-tools-five-scenarios.md`](docs/browser-tools-five-scenarios.md) | 五个典型场景的真机实测报告（9 条问题的来源） |
+| [`docs/开发指南.md`](docs/开发指南.md) | 环境路径、命令与基线、keyless 验证、本机环境坑、纪律红线 |
+| [`docs/架构与实现.md`](docs/架构与实现.md) | 接线为什么在 host 平面、两个 provider、ref 状态机、大纲折叠/去重、上下文预算、窗口宿主 |
+| [`docs/打包与发版.md`](docs/打包与发版.md) | 打包四前置、profile 物化、四道自检、出货 patch 红线、打包态专有坑 |
+| [`docs/CDP实测事实.md`](docs/CDP实测事实.md) | CDP 状态作用域的逐条实测结论 —— **接入新 CDP 命令前必读** |
+| [`docs/多会话防冲突-设计评估.md`](docs/多会话防冲突-设计评估.md) | **进行中的设计，尚未实施**：原三层设计的评估与更正 |
+| [`docs/多会话防冲突-实施方案.md`](docs/多会话防冲突-实施方案.md) | **进行中的设计，尚未实施**：重排后的 T1–T5 任务与验收 |
 | [`docs/portable-install.md`](docs/portable-install.md) | 插件便携版的用户安装说明（随包发出） |
 
 ---
