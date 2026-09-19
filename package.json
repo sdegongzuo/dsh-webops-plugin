@@ -68,6 +68,7 @@
     "smoke:devtools": "tsx scripts/smoke-devtools.ts",
     "smoke:p2p3": "tsx scripts/smoke-p2p3.ts",
     "smoke:window": "tsx scripts/smoke-window.ts",
+    "probe:input": "node scripts/probe-input-swallow.mjs",
     "window:desktop": "node scripts/window-in-host.mjs",
     "harness:build": "node scripts/harness-build.mjs",
     "package:portable": "node scripts/package-portable.mjs",

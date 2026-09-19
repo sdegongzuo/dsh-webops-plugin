@@ -23,7 +23,7 @@
  */
 
 import { BrowserError } from '../browser/types.ts'
-import type { BrowserRef } from '../browser/types.ts'
+import type { BrowserRef, BrowserStaleRefReason } from '../browser/types.ts'
 
 /**
  * ref 指向的页面元素。`backendNodeId` 只在**同一份文档内**稳定，用于后续
@@ -87,7 +87,24 @@ interface EpochArchive {
  * provider 内部对同一会话的操作是串行的。
  */
 export class RefRegistry {
+  /**
+   * P0 取数钩子（方案 §4，D-7=B）：`resolve` 拒绝一次就回调一次。
+   *
+   * 为什么挂在**这里**而不是 provider 的某个 catch：本类的拒绝理由只有它自己知道，
+   * 而 `revalidateOne` 会把这条错误**吞掉**当「归档恢复失败」处理 —— 挂在调用方会漏掉那一路。
+   * 不传就是完全无副作用的默认形态（`webpage_revalidate` 之外的所有既有用例都这么用）。
+   */
+  private readonly onStale: ((reason: BrowserStaleRefReason) => void) | undefined
+
   private epoch = 0
+
+  /**
+   * @param options.onStale - 拒绝一条 ref 时的回调；只为 P0 计数存在，见 {@link onStale}。
+   */
+  constructor(options?: { onStale?: (reason: BrowserStaleRefReason) => void }) {
+    this.onStale = options?.onStale
+  }
+
   /**
    * 当前纪元的 ref 表。
    * - `undefined`：本次会话从未成功 snapshot。
@@ -300,9 +317,11 @@ export class RefRegistry {
     }
     const target = targets.get(ref)
     if (target === undefined) {
+      this.onStale?.('obsolete_epoch')
       throw new BrowserError(
         `ref "${ref}" belongs to an obsolete observation epoch (current epoch ${this.epoch}); run webpage_snapshot again and use the refs it returns`,
         'BROWSER_STALE_REF',
+        { reason: 'obsolete_epoch' },
       )
     }
     return target

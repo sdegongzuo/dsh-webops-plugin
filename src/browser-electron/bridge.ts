@@ -170,6 +170,29 @@ export type EventListener = (method: string, params: unknown) => void
 export type TakeoverListener = (tabId: string, active: boolean) => void
 
 /**
+ * 一个标签页的**控制权**归属（方案 §6.5 的人工接管按钮）。
+ *
+ * ⚠ 与 {@link TakeoverListener} 的 `active` **不是一回事**，别合并：
+ * - `takeover` 是**观测**到的信号 —— 「有人开着 DevTools」；
+ * - `holder` 是**声明** —— 「人按了按钮，现在明说换我操作」。
+ *
+ * 宿主的簿记里两者分账、各自独立撤销。合并成一位的后果是「人在接管期间开一次
+ * DevTools 又关掉」会把接管一起撤掉，于是人在操作而 agent 被放行。
+ */
+export type ControlHolder = 'agent' | 'human'
+
+/** 控制权变化的监听器；`tabId` 就是 provider 的会话 id。 */
+export type ControlListener = (tabId: string, holder: ControlHolder) => void
+
+/** 宿主回报的控制权切换结果，见 {@link TabHostChannel.setControl}。 */
+export interface BridgeControl {
+  /** 被切换的标签 id。 */
+  readonly tabId: string
+  /** 切换后的持有者。 */
+  readonly holder: ControlHolder
+}
+
+/**
  * 「宿主自己开了个新标签」的通报监听：页面弹窗（setWindowOpenHandler）与标签条
  * 「+」按钮开的标签不走 `open` 命令，父进程的会话注册表看不见它们 —— 宿主在
  * dom-ready 后补发 `{ type: 'opened' }`（无 command id），从这里通知上层收编。
@@ -221,6 +244,23 @@ export interface TabHostChannel {
    * 不是 CDP 方法；混进去会让「这哪来的 CDP 事件」变成下一个人要查的问题。
    */
   onTakeover: (listener: TakeoverListener) => () => void
+  /**
+   * 切换某个标签页的控制权（方案 §6.5）。
+   *
+   * 出向命令存在的主要理由是**可验证**：按钮画在另一个 `WebContentsView` 里，端到端脚本
+   * 点不到它 —— 只能靠这条通道把「人按了接管」这个动作重放出来。这与 `toggleDevTools()`
+   * 存在的理由同源（菜单里那条也只能靠模拟按键触发，验证不了）。
+   *
+   * @param tabId - 目标标签；省略时用当前前台标签。
+   * @param holder - 切换到的持有者。
+   */
+  setControl: (tabId: string | undefined, holder: ControlHolder) => Promise<BridgeControl>
+  /**
+   * 订阅控制权变化（人在标签条上按了「接管」/「交还」）。
+   *
+   * 与 `onTakeover` 同理，**不混进 CDP 事件流** —— `{ type: 'control' }` 也是私有编排消息。
+   */
+  onControl: (listener: ControlListener) => () => void
   /** 订阅「宿主自己开的新标签」通报（页面弹窗 / 标签条「+」）。 */
   onTabOpened: (listener: TabOpenedListener) => () => void
   /** 订阅通道断开。 */
@@ -241,6 +281,7 @@ export class ElectronWindowBridge implements TabHostChannel {
   private readonly pending = new Map<number, Pending>()
   private readonly listeners = new Map<string, Set<EventListener>>()
   private readonly takeoverListeners = new Set<TakeoverListener>()
+  private readonly controlListeners = new Set<ControlListener>()
   private readonly tabOpenedListeners = new Set<TabOpenedListener>()
   private readonly closeListeners = new Set<() => void>()
   private readonly windowSize: { readonly width: number; readonly height: number } | undefined
@@ -401,6 +442,16 @@ export class ElectronWindowBridge implements TabHostChannel {
     return () => this.takeoverListeners.delete(listener)
   }
 
+  /**
+   * 订阅控制权变化（方案 §6.5）。
+   * @param listener - 每次收到 `{ type: 'control' }` 调用一次。
+   * @returns 退订函数。
+   */
+  onControl(listener: ControlListener): () => void {
+    this.controlListeners.add(listener)
+    return () => this.controlListeners.delete(listener)
+  }
+
   /** @inheritdoc */
   onTabOpened(listener: TabOpenedListener): () => void {
     this.tabOpenedListeners.add(listener)
@@ -499,6 +550,29 @@ export class ElectronWindowBridge implements TabHostChannel {
   }
 
   /**
+   * 切换某个标签页的控制权（方案 §6.5）。
+   *
+   * 宿主回的是**切换后的真实值**而不是「照单全收」：如果目标标签不存在，宿主回错误，
+   * 这里就抛 —— 一个说谎的 ack 会让「我明明按了接管」变成查不出来的悬案。
+   *
+   * @param tabId - 目标标签；省略时由宿主取当前前台标签。
+   * @param holder - 切换到的持有者。
+   */
+  async setControl(tabId: string | undefined, holder: ControlHolder): Promise<BridgeControl> {
+    const response = await this.request({
+      op: 'control',
+      ...tabId === undefined ? {} : { tabId },
+      holder,
+    })
+    return {
+      tabId: typeof response['tabId'] === 'string' ? response['tabId'] : String(tabId ?? ''),
+      // 宿主没回 `holder` 时**不替它猜** —— 拿请求值兜底等于把「宿主到底切没切」盖住。
+      // 归一成 'agent' 是保守取法：它不谎报「人工正在持有」（与 takeover 缺字段同一种风格）。
+      holder: response['holder'] === 'human' ? 'human' : 'agent',
+    }
+  }
+
+  /**
    * 关掉一个标签页。
    * @param tabId - 标签 id。
    */
@@ -582,6 +656,19 @@ export class ElectronWindowBridge implements TabHostChannel {
       return
     }
 
+    if (type === 'control') {
+      // §6.5 控制权：与 `takeover` 并列的私有编排消息，同样**不进 CDP 事件流**。
+      // `holder` 缺失或取值不认识时按 `'agent'` 处理 —— 保守方向是「不谎报人工持有」，
+      // 与上面 takeover 缺 `active` 时的取法一致。
+      //
+      // ⚠ 这条分支靠 `type` 精确匹配，所以 `setControl` 的应答必须用另一个 type
+      // （`'control-ack'`）—— 否则应答会被这里截胡，永远落不到 pending 上，命令挂死。
+      const tabId = String(message['tabId'])
+      const holder: ControlHolder = message['holder'] === 'human' ? 'human' : 'agent'
+      for (const listener of [...this.controlListeners]) listener(tabId, holder)
+      return
+    }
+
     if (type === 'opened' && typeof id !== 'number') {
       // 宿主自己开的标签（页面弹窗 / 标签条「+」）在 dom-ready 后的通报。
       // 带 command id 的 'opened' 是 open 命令的应答，走下面的 pending 关联，别截胡。
@@ -652,6 +739,7 @@ export class ElectronWindowBridge implements TabHostChannel {
     this.closeListeners.clear()
     this.listeners.clear()
     this.takeoverListeners.clear()
+    this.controlListeners.clear()
     this.tabOpenedListeners.clear()
     try {
       this.socket.destroy()

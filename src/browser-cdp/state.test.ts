@@ -117,6 +117,39 @@ describe('TargetStateRegistry', () => {
     expect(registry.claim('s1', 'Network.setExtraHTTPHeaders', { 'x-probe': 'B' }).previousUnknown).toBe(true)
   })
 
+  it('接管窗口按来源分账：关掉 DevTools 不会撤掉「人工接管」那一份（§6.5）', () => {
+    const registry = new TargetStateRegistry()
+    // 真实会发生的一串：人按了「接管」，期间顺手开了一下 DevTools 又关掉。
+    // 若两个来源合用一个布尔位，第二行的 `false` 就会把接管一起撤掉 —— 于是人在操作、
+    // agent 却被放行，正是这个功能要防的那件事。
+    registry.markTakeover('s1', true, 'human')
+    registry.markTakeover('s1', true, 'devtools')
+    registry.markTakeover('s1', false, 'devtools')
+
+    expect(registry.isTakeover('s1')).toBe(true)
+    expect(() => registry.claim('s1', 'Emulation.setUserAgentOverride', 'x'))
+      .toThrow(expect.objectContaining({ code: 'BROWSER_STATE_CONTENDED' }))
+
+    // 反向：撤 human 那一份，窗口才真的关掉。
+    registry.markTakeover('s1', false, 'human')
+    expect(registry.isTakeover('s1')).toBe(false)
+    expect(() => registry.claim('s1', 'Emulation.setUserAgentOverride', 'x')).not.toThrow()
+  })
+
+  it('省略 reason 时按 devtools 记账（既有调用方的默认）', () => {
+    const registry = new TargetStateRegistry()
+    registry.markTakeover('s1', true)
+    expect(registry.isTakeover('s1')).toBe(true)
+    // 用 devtools 撤销 —— 只有「省略即 devtools」才会被撤掉。
+    registry.markTakeover('s1', false, 'devtools')
+    expect(registry.isTakeover('s1')).toBe(false)
+
+    // 反过来：撤一个没记过账的来源，窗口不受影响（集合语义，不是布尔赋值）。
+    registry.markTakeover('s1', true)
+    registry.markTakeover('s1', false, 'human')
+    expect(registry.isTakeover('s1')).toBe(true)
+  })
+
   it('会话之间 / key 之间互不串扰', () => {
     const registry = new TargetStateRegistry()
     registry.markTakeover('s1', true)

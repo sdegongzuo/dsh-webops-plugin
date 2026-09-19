@@ -45,6 +45,7 @@ import type {
   BrowserTabsResult,
 } from '../browser/types.ts'
 import { RefRegistry } from './refs.ts'
+import { TargetStateRegistry } from './state.ts'
 import type { RefTarget } from './refs.ts'
 import {
   boundsToBox,
@@ -62,6 +63,7 @@ import { ConsoleCollector, CONSOLE_RING_CAPACITY } from './console.ts'
 import { NetworkCollector, NETWORK_TABLE_CAPACITY } from './network.ts'
 import { assertExecuteAllowed, extractEvaluateException, extractEvaluateValue, translateEvaluateError } from './execute.ts'
 import { validateEndpoint, validateTargetUrl } from './url-policy.ts'
+import { StaleRefMetrics } from './metrics.ts'
 
 /** provider 的 id，也是 `ctx.browser` 配置里 `provider` 字段要填的值。 */
 export const CDP_PROVIDER_ID = 'cdp'
@@ -175,6 +177,17 @@ export const EXECUTE_MAX_RESULT_CHARS = 20_000
  */
 const NAVIGATION_COMMANDS: ReadonlySet<string> = new Set(['Page.navigate', 'Page.reload'])
 
+/**
+ * 一个会话的**控制权**归属（方案 §6.5 的人工接管按钮）。
+ *
+ * 与 `SessionState.takeover` 是两个独立的信号，**别合并**：
+ * - `holder` 是**声明** —— 人按了按钮，明说「现在换我操作」，它决定 agent 能不能动手；
+ * - `takeover` 是**观测** —— 有人开着 DevTools，只影响 snapshot 回执里的提示。
+ *
+ * 合并的后果是真实的：「人在接管期间开一次 DevTools 又关掉」会把他自己的接管一起撤掉。
+ */
+export type BrowserHolder = 'agent' | 'human'
+
 /** 一个受控标签页的全部状态。 */
 interface SessionState {
   readonly targetId: string
@@ -192,6 +205,14 @@ interface SessionState {
    * 它只影响 snapshot 结果里的提示，**绝不推进 ref 纪元**（`[V31]`）。
    */
   takeover: boolean
+  /**
+   * §6.5 控制权：谁在操作这个页面。
+   *
+   * `'agent'`（默认）时本会话的写操作全放行；`'human'` 时（人在标签条上按了「接管」）
+   * 写操作一律拒（`BROWSER_HUMAN_HOLDING`），且 ref 纪元在**切换那一刻**就已作废 ——
+   * 所以交还之后也不能复用接管前的号，必须重拍快照（判据 J5/J6）。
+   */
+  holder: BrowserHolder
   /**
    * P3 locate 高亮状态位：本 session 是否画过一层 `Overlay.highlightNode` 高亮。
    * 用于 `highlight: false` 时决定要不要补发 `Overlay.hideHighlight`（只弹自己那层，`[V31]`）。
@@ -290,6 +311,16 @@ export class CdpBrowserProvider implements BrowserProvider {
   private readonly config: ResolvedConfig
   private readonly transport: CdpTransport
   private readonly sessions = new Map<string, SessionState>()
+  /**
+   * P0 计数（方案 §4，D-7=B）：只有设了 `DSH_BROWSER_PLUGIN_METRICS` 才活着，
+   * 否则整条路径是空的（见 {@link StaleRefMetrics}）。落盘走会话级 flush，不在事件上写。
+   */
+  private readonly metrics = new StaleRefMetrics()
+  /**
+   * §6.5：target 级状态的归属簿记（方案 2.3）。这个人接管按钮是它**第一个真实的生产者**
+   * —— 在此之前 `markTakeover` 只有单测调用（见 `state.ts` 的文件头）。
+   */
+  protected readonly stateRegistry = new TargetStateRegistry()
   private probe: { readonly at: number; readonly ok: boolean } | undefined
   private probing: Promise<boolean> | undefined
 
@@ -359,7 +390,7 @@ export class CdpBrowserProvider implements BrowserProvider {
     const session: SessionState = {
       targetId: target.id,
       connection,
-      refs: new RefRegistry(),
+      refs: new RefRegistry({ onStale: reason => { this.metrics.noteStale(target.id, reason) } }),
       // 采集器在构造时就订阅事件，所以必须在下面 `*.enable` 之前建好 —— 否则第一批
       // 重放 / 实时事件会在订阅前溜走。
       consoleCollector: new ConsoleCollector(connection),
@@ -367,6 +398,7 @@ export class CdpBrowserProvider implements BrowserProvider {
       url: target.url,
       title: target.title,
       takeover: false,
+      holder: 'agent',
       highlightPainted: false,
     }
     try {
@@ -397,7 +429,10 @@ export class CdpBrowserProvider implements BrowserProvider {
     this.sessions.set(session.targetId, session)
     // 用户自己关掉标签页时同步摘掉会话，避免留下一个永远连不上的死会话。
     connection.onClose(() => {
-      if (this.sessions.get(session.targetId) === session) this.sessions.delete(session.targetId)
+      if (this.sessions.get(session.targetId) !== session) return
+      this.sessions.delete(session.targetId)
+      // §6.5：连接断了（用户自己关了标签页）时，控制权簿记同样要清。
+      this.stateRegistry.forget(session.targetId)
     })
     return this.toSession(session)
   }
@@ -425,13 +460,14 @@ export class CdpBrowserProvider implements BrowserProvider {
     const session: SessionState = {
       targetId: target.id,
       connection,
-      refs: new RefRegistry(),
+      refs: new RefRegistry({ onStale: reason => { this.metrics.noteStale(target.id, reason) } }),
       // 与 open() 同序：采集器在构造时订阅事件，必须赶在 enable 之前建好。
       consoleCollector: new ConsoleCollector(connection),
       networkCollector: new NetworkCollector(connection),
       url: target.url,
       title: target.title,
       takeover: false,
+      holder: 'agent',
       highlightPainted: false,
     }
     await connection.send('Page.enable', {}, { signal, timeoutMs: this.config.commandTimeoutMs })
@@ -444,7 +480,10 @@ export class CdpBrowserProvider implements BrowserProvider {
     // 实测）。url/title 先用通报值顶着，页面加载完再刷成页面真实值。
     this.sessions.set(session.targetId, session)
     connection.onClose(() => {
-      if (this.sessions.get(session.targetId) === session) this.sessions.delete(session.targetId)
+      if (this.sessions.get(session.targetId) !== session) return
+      this.sessions.delete(session.targetId)
+      // §6.5：连接断了（用户自己关了标签页）时，控制权簿记同样要清。
+      this.stateRegistry.forget(session.targetId)
     })
     await this.waitForDocument(connection, signal, this.config.navigationTimeoutMs)
     const meta = await this.readPageMeta(connection, signal)
@@ -484,6 +523,7 @@ export class CdpBrowserProvider implements BrowserProvider {
   /** @inheritdoc */
   async navigate(request: BrowserNavigateRequest, signal?: AbortSignal): Promise<BrowserSession> {
     const session = this.require(request.sessionId)
+    this.assertWritable(session)
     const url = validateTargetUrl(request.url)
     // 记住导航前的地址：新文档提交之前，`readyState` 仍是**旧**文档的 complete，
     // 只有「地址真的变了」才说明新页面已经顶上来。
@@ -531,6 +571,7 @@ export class CdpBrowserProvider implements BrowserProvider {
    */
   async revalidate(request: BrowserRevalidateRequest, signal?: AbortSignal): Promise<BrowserRevalidateResult> {
     const session = this.require(request.sessionId)
+    this.metrics.noteRefCall(session.targetId)
     if (!session.refs.observed) {
       throw new BrowserError(
         'this session has never been observed; run webpage_snapshot first',
@@ -577,6 +618,10 @@ export class CdpBrowserProvider implements BrowserProvider {
     // 幂等：重复关闭不是错误。
     if (session === undefined) return
     this.sessions.delete(sessionId)
+    // §6.5：会话没了，它的控制权簿记也一并清掉，别把接管窗口留在表里。
+    this.stateRegistry.forget(sessionId)
+    // P0：会话结束就是这一份计数的收口点（「每会话一份 JSONL」，见 metrics.ts）。
+    await this.metrics.flush(sessionId, session.refs.currentEpoch)
     // 先摘采集器的订阅，再关连接：连接关闭会清掉全部监听，但显式退订让所有权更清楚。
     session.consoleCollector.dispose()
     session.networkCollector.dispose()
@@ -622,6 +667,8 @@ export class CdpBrowserProvider implements BrowserProvider {
    */
   async mutate(request: BrowserMutationRequest, signal?: AbortSignal): Promise<BrowserMutationResult> {
     const session = this.require(request.sessionId)
+    this.assertWritable(session)
+    this.metrics.noteRefCall(session.targetId)
     // **操作前**先记下已有会话；收尾时取差集就是「本次操作顺带开出来的标签页」。
     // 快照点必须在动作之前：页面可能在动作里就 adopt 出新会话（虽然实测要 150ms 级）。
     const beforeIds = new Set(this.sessions.keys())
@@ -794,6 +841,7 @@ export class CdpBrowserProvider implements BrowserProvider {
    */
   async execute(request: BrowserExecuteRequest, signal?: AbortSignal): Promise<BrowserExecuteResult> {
     const session = this.require(request.sessionId)
+    this.assertWritable(session)
     assertExecuteAllowed(request.method)
     const beforeUrl = session.url
     const params: Record<string, unknown> = { ...request.params }
@@ -917,6 +965,7 @@ export class CdpBrowserProvider implements BrowserProvider {
    */
   async locate(request: BrowserLocateRequest, signal?: AbortSignal): Promise<BrowserLocateResult> {
     const session = this.require(request.sessionId)
+    this.metrics.noteRefCall(session.targetId)
     // 纪元校验走既有 resolve 路径：从未观察 → BROWSER_SNAPSHOT_REQUIRED，旧纪元 → BROWSER_STALE_REF。
     const target = session.refs.resolve(request.ref)
     const options = { signal, timeoutMs: this.config.commandTimeoutMs }
@@ -927,16 +976,19 @@ export class CdpBrowserProvider implements BrowserProvider {
       // detach（[V16]）与连接丢失是会话级状态，不是 ref 失效 —— 保持既有错误码原样上抛。
       if (error instanceof BrowserError
         && (error.code === 'BROWSER_DEBUGGER_DETACHED' || error.code === 'BROWSER_CONNECTION_LOST')) throw error
+      this.metrics.noteStale(session.targetId, 'node_gone')
       throw new BrowserError(
         `the element for ref "${request.ref}" is gone from the document; run webpage_snapshot again`,
         'BROWSER_STALE_REF',
-        { cause: error },
+        { cause: error, reason: 'node_gone' },
       )
     }
     if (objectId === undefined) {
+      this.metrics.noteStale(session.targetId, 'node_gone')
       throw new BrowserError(
         `the element for ref "${request.ref}" is no longer attached to the document; run webpage_snapshot again`,
         'BROWSER_STALE_REF',
+        { reason: 'node_gone' },
       )
     }
     try {
@@ -947,10 +999,12 @@ export class CdpBrowserProvider implements BrowserProvider {
         options,
       )
       if (connected.result?.value !== true) {
+        this.metrics.noteStale(session.targetId, 'detached')
         throw new BrowserError(
           `the element for ref "${request.ref}" was removed from the document (the page may have `
           + 're-rendered); run webpage_snapshot again',
           'BROWSER_STALE_REF',
+          { reason: 'detached' },
         )
       }
       const scroll = request.scroll ?? false
@@ -982,6 +1036,9 @@ export class CdpBrowserProvider implements BrowserProvider {
   /** @inheritdoc */
   async dispose(): Promise<void> {
     const sessions = [...this.sessions.values()]
+    // P0：`close()` 之外还有这条路会结束会话（卸载），计数同样要收口。
+    await Promise.all(sessions.map(session =>
+      this.metrics.flush(session.targetId, session.refs.currentEpoch)))
     this.sessions.clear()
     const results = await Promise.allSettled(sessions.map(async (session) => {
       session.consoleCollector.dispose()
@@ -1016,7 +1073,70 @@ export class CdpBrowserProvider implements BrowserProvider {
    */
   protected setTakeover(sessionId: string, active: boolean): void {
     const session = this.sessions.get(sessionId)
-    if (session !== undefined) session.takeover = active
+    if (session === undefined) return
+    session.takeover = active
+    // 目标级状态的粗粒度让渡（方案 2.3.1 来源①）：人在 DevTools 里操作期间，这个会话的
+    // target 级状态整体算 human 所有。与下一条按钮的账**分开记**（reason 不同），各自撤销、
+    // 互不覆盖 —— 为什么不能合成一个布尔，见 `state.ts` 里 `takeovers` 的注释。
+    this.stateRegistry.markTakeover(sessionId, active, 'devtools')
+  }
+
+  /**
+   * 设置某个会话的**控制权**归属（§6.5）。
+   *
+   * 由 `browser-electron` 的 control 通道驱动（人在标签条上按了「接管」/「交还」）；
+   * 直连外部 Chrome 的 provider 没有这条通道，`holder` 恒为 `'agent'`。
+   *
+   * 两个方向做的事**故意不对称**：
+   * - → `'human'`：立刻作废该会话的 ref 纪元（J5 —— agent 手上的号全部失效），并把
+   *   接管窗口记进簿记（reason `'human'`，与 DevTools 那条互不干扰）；
+   * - → `'agent'`：只解除封锁，**不恢复任何 ref**（J6 —— agent 恢复可写，但必须重拍快照
+   *   才拿得到号）。「接管期间不碰别的会话」「交还不复活旧号」是这套语义的核心。
+   *
+   * 幂等：同值重复设置直接返回。宿主侧已经判过一次等，这里再判是因为通道可能重放
+   * （`invalidate()` 会推进纪元，重复调用会让 ref 表平白再翻一代）。
+   * 会话不存在时静默忽略（通知可能晚于会话关闭）。
+   *
+   * @param sessionId - 会话 id（即 target id）。
+   * @param holder - 切换到的持有者。
+   */
+  protected setHolder(sessionId: string, holder: BrowserHolder): void {
+    const session = this.sessions.get(sessionId)
+    if (session === undefined || session.holder === holder) return
+    session.holder = holder
+    if (holder === 'human') {
+      session.refs.invalidate()
+      this.stateRegistry.markTakeover(sessionId, true, 'human')
+      return
+    }
+    this.stateRegistry.markTakeover(sessionId, false, 'human')
+  }
+
+  /**
+   * 写操作的闸门（§6.5）：会话在人工手里时，一切「动页面」的操作直接拒。
+   *
+   * 与写前门同一条纪律 —— 检查排在 `require()` 之后、**任何 CDP 命令之前**，
+   * 不允许出现「先点了一下才发现不该点」的中间态。
+   *
+   * 读型操作（snapshot / screenshot / find / read）**不**走这里：人工持有期间照常放行
+   * （方案 §6.5 —— 让渡指 agent 停手 + 重新观察，不是断开连接）。
+   *
+   * 消息必须自带恢复路径：模型拿到 `BROWSER_HUMAN_HOLDING` 时唯一能做的是**等人**，
+   * 所以要写清「谁在操作、你被挡在哪、要等到什么」，而不是一句「被拒绝」。
+   *
+   * @param session - 已经 `require()` 出来的会话。
+   * @throws `BROWSER_HUMAN_HOLDING`：该会话当前由人工持有。
+   */
+  private assertWritable(session: SessionState): void {
+    if (session.holder !== 'human') return
+    throw new BrowserError(
+      `session "${session.targetId}" is under human control right now: a person pressed the `
+      + '"take over" button on the dsh tab bar and is operating this page themselves. '
+      + 'This is NOT retryable — resending the same command changes nothing while the page is theirs. '
+      + 'Wait for them to press "hand back", then take a fresh webpage_snapshot before acting again: '
+      + 'the takeover invalidated the ref epoch, so no ref you held before it is valid again.',
+      'BROWSER_HUMAN_HOLDING',
+    )
   }
 
   /** 后台刷新一次端点探测结果。 */
@@ -1195,9 +1315,11 @@ export class CdpBrowserProvider implements BrowserProvider {
     const resolved = await session.connection.send<ResolveNodeResult>('DOM.resolveNode', { backendNodeId }, options)
     const objectId = resolved.object?.objectId
     if (objectId === undefined) {
+      this.metrics.noteStale(session.targetId, 'node_gone')
       throw new BrowserError(
         'the observed element is no longer attached to the document; run webpage_snapshot again',
         'BROWSER_STALE_REF',
+        { reason: 'node_gone' },
       )
     }
     try {
@@ -1289,16 +1411,23 @@ export class CdpBrowserProvider implements BrowserProvider {
         && (error.code === 'BROWSER_DEBUGGER_DETACHED' || error.code === 'BROWSER_CONNECTION_LOST')) {
         throw error
       }
+      this.metrics.noteStale(session.targetId, 'node_gone')
       return { ok: false, reason: 'node_gone' }
     }
-    if (objectId === undefined) return { ok: false, reason: 'node_gone' }
+    if (objectId === undefined) {
+      this.metrics.noteStale(session.targetId, 'node_gone')
+      return { ok: false, reason: 'node_gone' }
+    }
     try {
       const connected = await session.connection.send<EvaluateResult>(
         'Runtime.callFunctionOn',
         { objectId, functionDeclaration: 'function () { return this.isConnected; }', returnByValue: true },
         options,
       )
-      if (connected.result?.value !== true) return { ok: false, reason: 'node_gone' }
+      if (connected.result?.value !== true) {
+        this.metrics.noteStale(session.targetId, 'detached')
+        return { ok: false, reason: 'node_gone' }
+      }
     } finally {
       this.releaseObject(session, objectId, signal)
     }
@@ -1311,6 +1440,7 @@ export class CdpBrowserProvider implements BrowserProvider {
     if (live === undefined
       || live.role !== archived.target.role
       || live.name !== archived.target.name) {
+      this.metrics.noteStale(session.targetId, 'identity_mismatch')
       return { ok: false, reason: 'identity_mismatch' }
     }
     return { ok: true, target: archived.target, restore: true }
@@ -1390,9 +1520,11 @@ export class CdpBrowserProvider implements BrowserProvider {
     const target = session.refs.resolve(ref)
     const objectId = await this.resolveNodeObjectId(session, target.backendNodeId, signal)
     if (objectId === undefined) {
+      this.metrics.noteStale(session.targetId, 'node_gone')
       throw new BrowserError(
         'the observed element is no longer attached to the document; run webpage_snapshot again',
         'BROWSER_STALE_REF',
+        { reason: 'node_gone' },
       )
     }
     await this.assertPreActionGate(session, ref, objectId, signal, options?.allowDetached === true)
@@ -1454,19 +1586,23 @@ export class CdpBrowserProvider implements BrowserProvider {
       session.refs.invalidate()
       this.noteDocumentChange(session)
       // 句柄是自己拿的，抛错前必须还 —— 调用方还没拿到 objectId，它的 finally 释放不到。
+      this.metrics.noteStale(session.targetId, 'stale_document')
       this.releaseObject(session, objectId, signal)
       throw new BrowserError(
         `ref "${ref}" points at a stale document: the page moved from ${publishedUrl} to ${url} `
         + 'since the snapshot; the action was NOT dispatched; run webpage_snapshot again',
         'BROWSER_STALE_REF',
+        { reason: 'stale_document' },
       )
     }
     if (connected === false && !allowDetached) {
+      this.metrics.noteStale(session.targetId, 'detached')
       this.releaseObject(session, objectId, signal)
       throw new BrowserError(
         `the element for ref "${ref}" was removed from the document (the page may have re-rendered); `
         + 'the action was NOT dispatched; run webpage_snapshot again',
         'BROWSER_STALE_REF',
+        { reason: 'detached' },
       )
     }
   }

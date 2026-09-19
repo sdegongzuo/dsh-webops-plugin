@@ -68,6 +68,15 @@ export type BrowserErrorCode =
    * 错误消息里带被拒的 method 全文。
    */
   | 'BROWSER_EXECUTE_NOT_ALLOWED'
+  /**
+   * §6.5：该会话当前由**人工持有**（人在标签条上按了「接管」），一切写操作拒绝。
+   *
+   * 与 `BROWSER_STATE_CONTENDED` 是两回事：那个是「一条 target 级状态被占」，这个是
+   * 「整个页面现在不归你动」。**不可重试** —— 重发一次还是被拒，状态不会自己变。
+   * 唯一恢复路径：等人按「交还」，然后**重拍一次 snapshot**（接管时纪元已作废，
+   * 交还**不**恢复任何旧 ref）。
+   */
+  | 'BROWSER_HUMAN_HOLDING'
 
 /** 能力缝隙与 provider 唯一抛出的错误类型。 */
 /**

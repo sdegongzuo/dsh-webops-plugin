@@ -40,6 +40,8 @@ export class ElectronBrowserProvider extends CdpBrowserProvider {
   private takeoverChannel: Promise<void> | undefined
   /** 「宿主自己开的新标签」通报的订阅（只挂一次，与接管通道同模式）。 */
   private tabOpenedChannel: Promise<void> | undefined
+  /** 控制权变化（§6.5 人工接管按钮）的订阅（只挂一次，与接管通道同模式）。 */
+  private controlChannel: Promise<void> | undefined
 
   /**
    * @param config - 超时与快照上限（端点无关，保留给基类）。
@@ -68,6 +70,7 @@ export class ElectronBrowserProvider extends CdpBrowserProvider {
     const session = await super.open(request, signal)
     this.ensureTakeoverChannel()
     this.ensureTabOpenedChannel()
+    this.ensureControlChannel()
     return session
   }
 
@@ -104,6 +107,24 @@ export class ElectronBrowserProvider extends CdpBrowserProvider {
     if (transport === undefined) return
     this.takeoverChannel ??= transport.onTakeover((tabId, active) => {
       this.setTakeover(tabId, active)
+    }).then(() => undefined, () => undefined)
+  }
+
+  /**
+   * 订阅控制权变化通道（只挂一次，§6.5）。
+   *
+   * 收到就交给基类 `setHolder` —— 它会**作废该会话的 ref 纪元**并拒掉后续写操作
+   * （切到 human 时），或只解除封锁、**不恢复**任何 ref（切回 agent 时）。这两条
+   * 语义都在基类里，这里只负责转发，免得两个 provider 各写一份走样的版本。
+   *
+   * 与接管通道同样的容错：宿主没起来、或不是窗口传输层时跳过；订阅失败不致命
+   * （拒写只是增强保护，不能因此让 `open()` 失败）。
+   */
+  private ensureControlChannel(): void {
+    const transport = this.windowTransport
+    if (transport === undefined) return
+    this.controlChannel ??= transport.onControl((tabId, holder) => {
+      this.setHolder(tabId, holder)
     }).then(() => undefined, () => undefined)
   }
 

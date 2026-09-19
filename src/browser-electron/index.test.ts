@@ -13,7 +13,7 @@ import type { ChildProcess } from 'node:child_process'
 import { connect, createServer, type Socket as NetSocket } from 'node:net'
 import { CdpConnection } from '../browser-cdp/protocol.ts'
 import { ElectronWindowBridge } from './bridge.ts'
-import type { BridgeDevTools, BridgeTab, BridgeTabBar, EventListener, TabHostChannel, TakeoverListener, TabOpenedListener } from './bridge.ts'
+import type { BridgeControl, BridgeDevTools, BridgeTab, BridgeTabBar, ControlHolder, ControlListener, EventListener, TabHostChannel, TakeoverListener, TabOpenedListener } from './bridge.ts'
 import { resolveHostLaunch } from './bridge.ts'
 import { ElectronBrowserProvider } from './provider.ts'
 import { WindowCdpSocket } from './socket.ts'
@@ -136,6 +136,31 @@ class FakeHost implements TabHostChannel {
   onTakeover(listener: TakeoverListener): () => void {
     this.takeoverListeners.add(listener)
     return () => { this.takeoverListeners.delete(listener) }
+  }
+
+  private readonly controlListeners = new Set<ControlListener>()
+
+  /** 控制权被程序化切换过的序列（`op: 'control'` 的重放）；供断言。 */
+  readonly controlSwitches: { tabId: string; holder: ControlHolder }[] = []
+
+  setControl(tabId: string | undefined, holder: ControlHolder): Promise<BridgeControl> {
+    // 真宿主取「省略 tabId 就用前台标签」，假宿主照做：不开标签时用 `t1` 顶上，
+    // 让「没有会话」这类断言看到的是一个不存在的 id，而不是一句 `undefined`。
+    const target = tabId ?? `t${String(Math.max(1, this.opened.length))}`
+    this.controlSwitches.push({ tabId: target, holder })
+    // 真宿主先改状态、再上报；假宿主照同一顺序，否则「切完立刻读」的断言会看到旧值。
+    this.emitControl(target, holder)
+    return Promise.resolve({ tabId: target, holder })
+  }
+
+  onControl(listener: ControlListener): () => void {
+    this.controlListeners.add(listener)
+    return () => { this.controlListeners.delete(listener) }
+  }
+
+  /** 推一条控制权通知（宿主发的是 `{ type: 'control', tabId, holder }`）。 */
+  emitControl(tabId: string, holder: ControlHolder): void {
+    for (const listener of [...this.controlListeners]) listener(tabId, holder)
   }
 
   onTabOpened(listener: TabOpenedListener): () => void {
@@ -837,5 +862,71 @@ describe('地址栏（host.cjs 内联逻辑）', () => {
     expect(() => handleNav('forward')).not.toThrow()
     expect(() => handleNav('reload')).not.toThrow()
     expect(() => handleNav('unknown')).not.toThrow()
+  })
+})
+
+describe('控制权（§6.5 人工接管按钮）通道', () => {
+  it('transport 把宿主上报的控制权分发给订阅者，退订后不再收到', async () => {
+    const host = new FakeHost()
+    const transport = transportFor(host)
+    const seen: { tabId: string; holder: string }[] = []
+    const unsubscribe = await transport.onControl((tabId, holder) => { seen.push({ tabId, holder }) })
+
+    host.emitControl('t1', 'human')
+    host.emitControl('t1', 'agent')
+    unsubscribe()
+    host.emitControl('t1', 'human')
+
+    expect(seen).toEqual([{ tabId: 't1', holder: 'human' }, { tabId: 't1', holder: 'agent' }])
+  })
+
+  it('setControl 把 op:control 打到宿主，并把宿主切换后的归属带回来', async () => {
+    const host = new FakeHost()
+    const transport = transportFor(host)
+
+    await expect(transport.setControl('t1', 'human')).resolves.toEqual({ tabId: 't1', holder: 'human' })
+    expect(host.controlSwitches).toEqual([{ tabId: 't1', holder: 'human' }])
+  })
+
+  it('省略 tabId 时由宿主取前台标签（按钮只作用于当前页）', async () => {
+    const host = new FakeHost()
+    const transport = transportFor(host)
+    await transport.newTab('https://example.com/')
+
+    await expect(transport.setControl(undefined, 'human'))
+      .resolves.toEqual({ tabId: 't1', holder: 'human' })
+  })
+
+  it('人按下「接管」→ 该会话的写操作立刻被拒（端到端，J5）', async () => {
+    const host = new FakeHost()
+    wireFakePage(host)
+    const provider = new ElectronBrowserProvider({ navigationTimeoutMs: 200 }, transportFor(host), true)
+    const session = await provider.open({})
+    // 订阅是异步挂上的（transport → bridge）；等一轮宏任务，别让测试靠时序侥幸。
+    await new Promise(resolve => setTimeout(resolve, 0))
+
+    host.emitControl(session.id, 'human')
+
+    await expect(provider.navigate({ sessionId: session.id, url: 'https://example.com/other' }))
+      .rejects.toThrow(expect.objectContaining({ code: 'BROWSER_HUMAN_HOLDING' }))
+  })
+
+  it('人按下「交还」→ 控制权交回 agent（端到端，J6 的前半）', async () => {
+    const host = new FakeHost()
+    wireFakePage(host)
+    const provider = new ElectronBrowserProvider({ navigationTimeoutMs: 200 }, transportFor(host), true)
+    const session = await provider.open({})
+    await new Promise(resolve => setTimeout(resolve, 0))
+
+    host.emitControl(session.id, 'human')
+    host.emitControl(session.id, 'agent')
+
+    // 这里只断言「不再被**控制权**挡下」：`wireFakePage` 的假页面在
+    // `navigationSettled`（要读 `document.readyState` 与 `location.href` 的快照）上过不去，
+    // 真导航走不完整 —— 那是假页面的能力边界，不是闸门的问题。
+    // 完整的 J6 语义（恢复可写 + 接管前的 ref 一律不复用）在 `provider.test.ts` 用假 Chrome 钉住。
+    const failure = await provider.navigate({ sessionId: session.id, url: 'https://example.com/other' })
+      .then(() => undefined, (error: unknown) => error as { code?: string })
+    expect(failure?.code).not.toBe('BROWSER_HUMAN_HOLDING')
   })
 })

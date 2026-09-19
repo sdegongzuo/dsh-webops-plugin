@@ -39,7 +39,7 @@ import { noteLoaded } from '../debug.ts'
 
 export { ELECTRON_PROVIDER_ID, ElectronBrowserProvider } from './provider.ts'
 export { APP_HOST_ENV, BridgeError, ElectronWindowBridge } from './bridge.ts'
-export type { BridgeDevTools, BridgeOptions, BridgeTab, BridgeTabBar, TabHostChannel, TakeoverListener } from './bridge.ts'
+export type { BridgeControl, BridgeDevTools, BridgeOptions, BridgeTab, BridgeTabBar, ControlHolder, ControlListener, TabHostChannel, TakeoverListener } from './bridge.ts'
 export { ELECTRON_TAB_SCHEME, ElectronWindowTransport, tabHandle, tabIdFromHandle } from './transport.ts'
 export { WindowCdpSocket } from './socket.ts'
 

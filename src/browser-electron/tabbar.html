@@ -95,12 +95,33 @@
     margin-left: auto; padding-right: 6px;
     color: var(--fg-dim); font-size: 12px; opacity: 0.75;
   }
+  /* —— 控制权（§6.5）——
+     状态文字与按钮都放在标签行右端。按钮**不做乐观更新**（见 preload 的注释）：
+     点完等主进程推回状态，所以这里没有任何 `:active` 之类的即时反馈样式，
+     唯一会变的是 `data-holder`，而它只由主进程的消息驱动。 */
+  #holder {
+    flex: 0 0 auto; padding: 0 8px 0 2px;
+    color: var(--fg-dim); font-size: 12px; white-space: nowrap;
+  }
+  #holder[data-holder="human"] { color: var(--accent); font-weight: 600; }
+  #control {
+    flex: 0 0 auto; height: 24px; margin-right: 6px; padding: 0 10px;
+    border: 1px solid var(--line); border-radius: 6px; cursor: pointer;
+    background: var(--bg-active); color: var(--fg); font: inherit; white-space: nowrap;
+  }
+  #control:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+  #control[data-holder="human"] {
+    border-color: var(--accent); color: var(--accent); font-weight: 600;
+  }
+  #control:disabled { opacity: 0.4; cursor: default; }
 </style>
 </head>
 <body>
   <div id="bar">
     <button id="new" title="新建标签页">+</button>
     <span id="hint"></span>
+    <span id="holder"></span>
+    <button id="control" type="button" disabled></button>
   </div>
   <div id="navbar">
     <button id="back" title="后退">←</button>
@@ -156,6 +177,40 @@
     if (document.activeElement !== urlInput) urlInput.value = state.url
     navBack.disabled = !state.canGoBack
     navForward.disabled = !state.canForward
+  })
+
+  // —— 控制权（§6.5）——
+  // J7：按钮**任何时刻**都能按 —— 它挂在独立的标签条 view 上（`host.cjs` 的 `tabBar`），
+  // 不经过 agent、也不需要它同意，所以「人永远不会被锁在外面」是结构上成立的，不靠约定。
+  //
+  // 文案只说**归属**，不出现「已隔离 / 安全」这类话（方案 §6.5 代价 3：这个按钮拦不住
+  // 人工开 DevTools 改 DOM、换浏览器、用手机操作，说了就是骗人）。
+  const holderLabel = document.getElementById('holder')
+  const controlButton = document.getElementById('control')
+  let control = { tabId: '', holder: 'agent' }
+
+  function renderControl(state) {
+    control = { tabId: state.tabId ?? '', holder: state.holder === 'human' ? 'human' : 'agent' }
+    const human = control.holder === 'human'
+    const hasTab = control.tabId !== ''
+    holderLabel.textContent = hasTab ? (human ? '现在轮到你了' : '现在由 agent 操作') : ''
+    holderLabel.dataset.holder = control.holder
+    controlButton.textContent = human ? '交还' : '接管'
+    controlButton.dataset.holder = control.holder
+    // 唯一会置灰的情形：没有前台标签，没什么可接管。
+    controlButton.disabled = !hasTab
+    controlButton.title = human
+      ? '交还：把页面还给 agent。它需要重新拍一次快照才能继续操作 —— 接管期间作废的 ref 不会恢复。'
+      : '接管：把页面交给你自己操作。当前由 agent 控制，你在页面里的键盘输入暂时不生效（鼠标不受限）。'
+  }
+
+  window.dshTabBar?.onControlState(renderControl)
+
+  controlButton.addEventListener('click', () => {
+    if (control.tabId === '') return
+    // 只发指令，**不在这里改 UI** —— 等主进程把真实状态推回来（见 preload 的注释：
+    // 乐观更新会在切换失败时让界面说谎，而「现在到底归谁」正是这个功能唯一的输出）。
+    window.dshTabBar?.control(control.holder === 'human' ? 'hand' : 'take')
   })
 
   // 回车 = 导航：trim 后不含 `://` 就补 `https://`；空串忽略；导航后让输入框失焦。

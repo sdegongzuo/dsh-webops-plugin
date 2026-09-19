@@ -38,6 +38,9 @@
  * - 主进程 `webContents.send('dsh-nav-state', state)` → tabbar 页同步地址栏
  *   （`{ url, canGoBack, canForward }`）；tabbar 页 `window.dshTabBar.nav(action, url?)`
  *   → `ipcMain.on('dsh-nav')`，`action ∈ 'back' | 'forward' | 'reload' | 'navigate'`。
+ * - 主进程 `webContents.send('dsh-control-state', { tabId, holder })` → tabbar 页同步
+ *   控制权按钮与状态条；tabbar 页 `window.dshTabBar.control(action)` →
+ *   `ipcMain.on('dsh-control')`，`action ∈ 'take' | 'hand'`（§6.5）。
  *
  * ## 通道：TCP，不是 stdio
  *
@@ -58,6 +61,7 @@
  * - `{ op: 'cdp', id, tabId, method, params }`
  * - `{ op: 'activate', id, tabId }`
  * - `{ op: 'devtools', id }`（切换活动标签的开发者工具；等状态落定才回）
+ * - `{ op: 'control', id, tabId?, holder }`（§6.5 切控制权；`tabId` 省略时用前台标签）
  * - `{ op: 'close', id, tabId }`
  * - `{ op: 'list', id }`
  * - `{ op: 'bar', id }`
@@ -77,6 +81,11 @@
  *   父进程不得据此推进会话失效）
  * - `{ type: 'takeover', tabId, active }`（人工**或** agent 开合 DevTools；`active` 是**幂等状态位**，
  *   不是计数器 —— agent 自己 toggle 也会收到，父进程无需去重。见方案 4.1.1）
+ * - `{ type: 'control', tabId, holder }`（§6.5 控制权变化：人在标签条上按了接管 / 交还。
+ *   `holder` 是**幂等状态位**。与上一条 `takeover` 是**两条独立的线** —— 那条说「有人开着
+ *   DevTools」，这条说「有人明说现在换他操作」；两条各有各的撤销，互不覆盖）
+ * - `{ type: 'control-ack', id, tabId, holder }`（`op: 'control'` 的应答；type 与上面的通知
+ *   刻意不同名，同名会让应答被通知分支截胡 —— 见 `handle` 里 `case 'control'` 的注释）
  * - `{ type: 'error', id?, message }`
  *
  * @module dsh-webops-plugin/browser-electron/host
@@ -122,6 +131,7 @@ function send(message) {
 /** 往标签条页面推当前标签列表；顺带把地址栏状态一并推过去。 */
 function sendTabBar() {
   sendNavState()
+  sendControlState()
   if (tabBar === undefined || tabBar.webContents.isDestroyed()) return
   tabBar.webContents.send('dsh-tabs', [...tabs.values()].map(tab => ({
     id: tab.id,
@@ -149,6 +159,46 @@ function sendNavState() {
     canGoBack: wc.canGoBack(),
     canForward: wc.canGoForward(),
   })
+}
+
+/**
+ * 地址栏输入的最小规范化：`trim()` 后若不含 `://` 就补 `https://` 前缀。
+ * 空串原样返回（调用方按「忽略」处理）。
+ */
+
+/**
+ * 往标签条页面推当前标签的**控制权**（§6.5）。
+ *
+ * 只推活动标签的 —— 按钮管的就是「现在这个页面上归谁」，非活动标签的归属没有展示面。
+ * 没有活动标签时推一份空快照（按钮置灰），与 `sendNavState` 同一套兜底。
+ */
+function sendControlState() {
+  if (tabBar === undefined || tabBar.webContents.isDestroyed()) return
+  const entry = activeTabId !== undefined ? tabs.get(activeTabId) : undefined
+  tabBar.webContents.send('dsh-control-state', {
+    tabId: entry === undefined ? '' : entry.id,
+    holder: entry === undefined ? 'agent' : entry.holder,
+  })
+}
+
+/**
+ * 切某个标签的持有者（§6.5）。
+ *
+ * **幂等**：同值重复设置直接返回 —— 标签条上那颗按钮会被连点，不判等就会刷屏上报。
+ * 标签不存在时静默忽略（通知可能晚于标签关闭，与 `setTakeover` 同一种容错）。
+ *
+ * 上报给父进程的那条 `{ type: 'control' }` 是**无 id 的通知**，不是命令应答 ——
+ * 父进程据此作废 ref 纪元并拒写（切 human），或只解除封锁、**不恢复**任何 ref（切 agent）。
+ *
+ * @param tabId - 标签 id。
+ * @param holder - `'agent'` 或 `'human'`。
+ */
+function setHolder(tabId, holder) {
+  const entry = tabs.get(tabId)
+  if (entry === undefined || entry.holder === holder) return
+  entry.holder = holder
+  send({ type: 'control', tabId, holder })
+  sendControlState()
 }
 
 /**
@@ -295,6 +345,10 @@ function openTab(url, size, options) {
     // 「这次 detach 是我们自己为了开 DevTools 让位」—— 见下面的监听器与 `toggleDevTools`。
     // 用状态位区分，不靠 reason（Electron 给的 reason 恒为 `target closed`）。
     lettingGo: false,
+    // §6.5 控制权：谁在操作这个页面。`agent`（默认）时吞掉人工在这个视图里的键盘输入；
+    // `human` 时放开，并且父进程侧会作废 ref 纪元、拒掉 agent 的写操作。
+    // 与 `lettingGo` 一样是**幂等状态位**，不是计数器。
+    holder: 'agent',
   }
   // 调试器的监听只注册一次（对象与 view 同生命周期），attach/detach 可反复。
   entry.debugger.on('message', (_event, method, params) => {
@@ -321,6 +375,43 @@ function openTab(url, size, options) {
     }
     return { action: 'deny' }
   })
+  // §6.5 控制权：holder 为 'agent' 时吞掉人工在这个**页面视图**里的输入。
+  //
+  // ⚠ 实测（Electron 44 / Windows，2026-09-19 探针）：`before-input-event` 是**键盘专属**
+  // —— 鼠标（人工点击走渲染进程、CDP `Input.dispatchMouseEvent` 走调试器）**一次都不触发**。
+  // 所以 A 档原本设想的「吞掉人工输入」实际只覆盖键盘，鼠标拦不住，判据 J4 据此改窄成
+  // 「键盘 + 状态条提示」。这也是**不用页面内遮罩层**兜鼠标的原因：往页面里注一层吞事件的
+  // div 会污染 AX 树与快照（方案 §6.5 探针的退路已经否掉）。
+  //
+  // 带 Ctrl / Alt / Meta 的组合**一律放行**：那些是宿主级操作（Ctrl+Shift+I 开 DevTools、
+  // Ctrl+R 刷新、Ctrl+W 关标签），不是「在页面里打字」。吞掉它们等于把人锁死在页面里，
+  // 与 J7「人永远不会被锁在外面」的立意相反。Shift 不在此列 —— 它是打字的一部分。
+  //
+  // ⚠ 这**不会**连带吞掉 agent 自己的键盘输入 —— 但**前提是只吞「按下」**，
+  // 这一条是实测逼出来的（Electron 44 / Windows，探针 v3，各变体逐个跑）：
+  //
+  //   | 注入方式                                  | 钩子收到的 type | 页面收到 keydown |
+  //   |---|---|---|
+  //   | 人工 `sendInputEvent('keyDown')`           | `keyDown`       | 被吞（正是我们要的） |
+  //   | CDP `dispatchKeyEvent('keyDown')` + text   | 只有 `keyUp`    | ✅ 照常 |
+  //   | CDP `dispatchKeyEvent('keyDown')` 命名键    | 只有 `keyUp`    | ✅ 照常 |
+  //
+  // 所以「无条件 `preventDefault()`」会连 agent 的 `keyUp` 一起吞掉，让 `webpage_press`
+  // 缺一条腿（页面里依赖 keyup 的逻辑收不到）。只吞 `keyDown` / `char` 才两全：
+  // 人按不动页面，agent 的按键完整（keydown + keyup 都到）。
+  //
+  // **已知边界（实测，不可达故不处理）**：CDP 的 `rawKeyDown` 在钩子里报的 type **就是
+  // `keyDown`**，与人工按键无法区分 —— 想吞它就得连人工的 keyDown 一起吞，没有第三条路。
+  // 它目前不可达：`webpage_execute` 明确拒绝 `Input.*`（`execute.ts:75`），而 `press`
+  // 只用 `keyDown` / `keyUp`。**哪天有人放开 `Input.*` 白名单，这条边界就会变成真缺陷。**
+  view.webContents.on('before-input-event', (event, input) => {
+    if (entry.holder !== 'agent') return
+    if (input.control || input.alt || input.meta) return
+    // 只吞「按下」与「字符」—— 这两类才是「在页面里操作」。
+    if (input.type !== 'keyDown' && input.type !== 'char') return
+    event.preventDefault()
+  })
+
   entry.ready = new Promise((resolveReady) => {
     view.webContents.once('dom-ready', () => {
       attachDebugger(entry)
@@ -588,6 +679,23 @@ async function handle(command) {
       })
       return
     }
+    case 'control': {
+      // §6.5 控制权切换。给端到端脚本与单测用：按钮画在另一个 `WebContentsView` 里，
+      // 脚本点不到它 —— 与 `devtools` 那条命令存在的理由同源（菜单里那条只能靠模拟按键）。
+      //
+      // ⚠ 应答的 type 是 `'control-ack'` 而**不是** `'control'`：`'control'` 是宿主主动
+      // 上报的通知类型，父进程的 dispatch 按 type 精确匹配，两者同名会让应答被通知分支
+      // 截胡、永远落不到 pending 上（命令挂死到超时）。
+      const tabId = typeof command.tabId === 'string' ? command.tabId : activeTabId
+      if (tabId === undefined || !tabs.has(tabId)) {
+        send({ type: 'control-ack', id: command.id, error: { message: `unknown tab ${String(tabId ?? '(none)')}` } })
+        return
+      }
+      const holder = command.holder === 'human' ? 'human' : 'agent'
+      setHolder(tabId, holder)
+      send({ type: 'control-ack', id: command.id, tabId, holder })
+      return
+    }
     case 'close': {
       closeTab(command.tabId)
       send({ type: 'closed', id: command.id, tabId: command.tabId })
@@ -648,6 +756,15 @@ app.whenReady().then(() => {
   ipcMain.on('dsh-nav', (_event, payload) => {
     const { action, url } = payload ?? {}
     handleNav(action, url)
+  })
+  // §6.5 控制权按钮。`action: 'take'` = 接管（设 human），其余（含 `'hand'`）= 交还（设 agent）。
+  // 只作用于**当前前台标签** —— 按钮画在标签条上，语义就是「这个页面现在归我」。
+  // 注意这里**不校验**发起方是谁：标签条是插件自己的 view（`sandbox: true` + 只开
+  // `dshTabBar` 一个口子），页面内容拿不到这个通道。
+  ipcMain.on('dsh-control', (_event, payload) => {
+    if (activeTabId === undefined) return
+    const { action } = payload ?? {}
+    setHolder(activeTabId, action === 'take' ? 'human' : 'agent')
   })
 
   // BaseWindow 没有 webContents，默认菜单的「切换开发者工具」打在空处。

@@ -1,6 +1,11 @@
+import { mkdtemp, readdir, readFile, rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { beforeEach, describe, expect, it } from 'vitest'
 import { BrowserError } from '../browser/types.ts'
+import { METRICS_ENV, StaleRefMetrics } from './metrics.ts'
 import { CdpBrowserProvider } from './provider.ts'
+import type { BrowserHolder } from './provider.ts'
 import { CdpConnection } from './protocol.ts'
 import type { CdpSocket, CdpTarget, CdpTransport, CdpVersion } from './protocol.ts'
 import type { AxNode } from './snapshot.ts'
@@ -1126,6 +1131,72 @@ describe('CdpBrowserProvider.mutate (P1)', () => {
     expect(chrome.calls.slice(before)).toEqual([])
   })
 
+  it('counts each stale hit into the bucket of the gate that refused it (P0 取数)', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'dsh-p0-'))
+    const saved = process.env[METRICS_ENV]
+    process.env[METRICS_ENV] = directory
+    try {
+      // 计数在 provider **构造时**读环境变量，所以这条用例必须自己建一个实例，不能借 beforeEach 那个。
+      const counted = new AdoptableProvider({ navigationTimeoutMs: 200 }, chrome.transport())
+      const session = await counted.open({})
+      const snapshot = await counted.observe({ kind: 'snapshot', sessionId: session.id })
+      if (snapshot.kind !== 'snapshot') throw new Error('expected a snapshot')
+      const ref = snapshot.refs[0]?.ref as string
+
+      // ① 人工在后台换了路由 → 粗门拒，桶是 `stale_document`。
+      chrome.page = { url: 'https://example.com/next', title: 'Next' }
+      await expect(counted.mutate({ kind: 'click', sessionId: session.id, ref }))
+        .rejects.toThrow(expect.objectContaining({ reason: 'stale_document' }))
+      // ② 纪元已被作废 → 同一个号再来一次走 `resolve` 那一档，落在**另一只**桶里 ——
+      //    「换文档导致的旧号」与「号本身过期」混在一个数里，P0 就白做了。
+      await expect(counted.mutate({ kind: 'click', sessionId: session.id, ref }))
+        .rejects.toThrow(expect.objectContaining({ reason: 'obsolete_epoch' }))
+
+      await counted.dispose()
+      const lines = (await readFile(join(directory, `${session.id}.jsonl`), 'utf8')).trim().split('\n')
+      expect(lines).toHaveLength(1)
+      expect(JSON.parse(lines[0] as string)).toMatchObject({
+        sessionId: session.id,
+        // 分母：两次 mutate（`observe` 不算，见 metrics.ts 对 refCalls 的定义）。
+        refCalls: 2,
+        stale: { stale_document: 1, obsolete_epoch: 1 },
+        staleTotal: 2,
+      })
+    } finally {
+      if (saved === undefined) delete process.env[METRICS_ENV]
+      else process.env[METRICS_ENV] = saved
+      await rm(directory, { recursive: true, force: true })
+    }
+  })
+
+  it('produces no file at all when DSH_BROWSER_PLUGIN_METRICS is unset (默认关)', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'dsh-p0-off-'))
+    const saved = process.env[METRICS_ENV]
+    delete process.env[METRICS_ENV]
+    try {
+      const quiet = new AdoptableProvider({ navigationTimeoutMs: 200 }, chrome.transport())
+      const session = await quiet.open({})
+      const snapshot = await quiet.observe({ kind: 'snapshot', sessionId: session.id })
+      if (snapshot.kind !== 'snapshot') throw new Error('expected a snapshot')
+      chrome.page = { url: 'https://example.com/next', title: 'Next' }
+      await expect(quiet.mutate({ kind: 'click', sessionId: session.id, ref: snapshot.refs[0]?.ref as string }))
+        .rejects.toThrow(expect.objectContaining({ code: 'BROWSER_STALE_REF' }))
+      await quiet.dispose()
+
+      // 两半判据缺一不可。
+      // ② 目录里**一个条目都没有**，不是「文件是空的」—— 空文件同样是 IO，也是「说好了默认关」的破例。
+      expect(await readdir(directory)).toEqual([])
+      // ① 但只有 ② 是**装饰性的**：环境变量没设时 sink 本来就不知道该写哪个目录，② 永远绿。
+      //    真正钉住「未设置 = 整条 no-op」的是这一条 —— provider 用的是无参构造，
+      //    而无参构造在环境变量缺席时必须报告「没在计数」。把构造改成写死一个默认目录，这条即红。
+      expect(new StaleRefMetrics().active).toBe(false)
+    } finally {
+      if (saved === undefined) delete process.env[METRICS_ENV]
+      else process.env[METRICS_ENV] = saved
+      await rm(directory, { recursive: true, force: true })
+    }
+  })
+
   it('reports navigated=true and invalidates the epoch when a click navigates', async () => {
     const session = await provider.open({})
     const snapshot = await provider.observe({ kind: 'snapshot', sessionId: session.id })
@@ -1821,5 +1892,114 @@ describe('P3: locate', () => {
     if (snapshot.kind !== 'snapshot') throw new Error('expected a snapshot')
     await freshProvider.locate({ sessionId: 'tab-1', ref: snapshot.refs[0]?.ref as string })
     expect(fresh.calls.some(call => call.method === 'Overlay.hideHighlight')).toBe(false)
+  })
+})
+
+describe('§6.5 控制权（人工接管按钮）', () => {
+  /**
+   * 生产上 `setHolder` 由 `browser-electron` 的 control 通道驱动（人按了标签条上的按钮）；
+   * 这里把两个 protected 入口暴露出来，等价于「人按了按钮」与「人开了 DevTools」。
+   */
+  class HolderProvider extends CdpBrowserProvider {
+    setControlHolder(sessionId: string, holder: BrowserHolder): void {
+      this.setHolder(sessionId, holder)
+    }
+
+    /** 只为断言「两条线不合并」而暴露。 */
+    setDevToolsTakeover(sessionId: string, active: boolean): void {
+      this.setTakeover(sessionId, active)
+    }
+  }
+
+  let chrome: FakeChrome
+  let provider: HolderProvider
+
+  beforeEach(() => {
+    chrome = new FakeChrome()
+    chrome.axeNodes = PAGE_TREE
+    provider = new HolderProvider({ navigationTimeoutMs: 200 }, chrome.transport())
+  })
+
+  /** 开一个会话并 snapshot；返回会话 id 与首个可用 ref。 */
+  async function openWithRef(): Promise<{ sessionId: string; ref: string }> {
+    const session = await provider.open({})
+    const snapshot = await provider.observe({ kind: 'snapshot', sessionId: session.id })
+    if (snapshot.kind !== 'snapshot') throw new Error('expected a snapshot')
+    return { sessionId: session.id, ref: snapshot.refs[0]?.ref as string }
+  }
+
+  it('切到 human 后写族全被拒（BROWSER_HUMAN_HOLDING），且一条 CDP 命令都没派发（J5）', async () => {
+    const { sessionId, ref } = await openWithRef()
+    provider.setControlHolder(sessionId, 'human')
+    const mark = chrome.calls.length
+
+    await expect(provider.mutate({ kind: 'click', sessionId, ref }))
+      .rejects.toThrow(expect.objectContaining({ code: 'BROWSER_HUMAN_HOLDING' }))
+    await expect(provider.navigate({ sessionId, url: 'https://example.com/other' }))
+      .rejects.toThrow(expect.objectContaining({ code: 'BROWSER_HUMAN_HOLDING' }))
+    await expect(provider.execute({ sessionId, method: 'Runtime.evaluate', params: { expression: '1' } }))
+      .rejects.toThrow(expect.objectContaining({ code: 'BROWSER_HUMAN_HOLDING' }))
+
+    // 这一半才是「零静默」：不是「拒是拒了、但已经点下去了」—— 与写前门同一条纪律。
+    expect(chrome.calls.slice(mark)).toEqual([])
+  })
+
+  it('human 期间读型操作照常放行 —— 让渡是「停手 + 重新观察」，不是断连', async () => {
+    const { sessionId } = await openWithRef()
+    provider.setControlHolder(sessionId, 'human')
+
+    const during = await provider.observe({ kind: 'snapshot', sessionId })
+    expect(during.kind).toBe('snapshot')
+    await expect(provider.tabs({ kind: 'list' })).resolves.toMatchObject({ action: 'list' })
+  })
+
+  it('交还后恢复可写，但接管前的 ref 一律失效 —— 必须重拍快照（J6）', async () => {
+    const { sessionId, ref } = await openWithRef()
+
+    provider.setControlHolder(sessionId, 'human')
+    provider.setControlHolder(sessionId, 'agent')
+
+    // 交还**不**复活旧号 —— 这是 J6 的核心，别期待「像什么都没发生过」。
+    await expect(provider.mutate({ kind: 'click', sessionId, ref }))
+      .rejects.toThrow(expect.objectContaining({ code: 'BROWSER_STALE_REF' }))
+
+    // 重拍之后才拿得到能用的号。
+    const fresh = await provider.observe({ kind: 'snapshot', sessionId })
+    if (fresh.kind !== 'snapshot') throw new Error('expected a snapshot')
+    await expect(provider.mutate({ kind: 'click', sessionId, ref: fresh.refs[0]?.ref as string }))
+      .resolves.toMatchObject({ action: 'click' })
+  })
+
+  it('接管只作废本会话 —— 别的会话照常可写（不误伤）', async () => {
+    const first = await openWithRef()
+    const second = await openWithRef()
+
+    provider.setControlHolder(first.sessionId, 'human')
+
+    await expect(provider.mutate({ kind: 'click', sessionId: second.sessionId, ref: second.ref }))
+      .resolves.toMatchObject({ action: 'click' })
+    await expect(provider.mutate({ kind: 'click', sessionId: first.sessionId, ref: first.ref }))
+      .rejects.toThrow(expect.objectContaining({ code: 'BROWSER_HUMAN_HOLDING' }))
+  })
+
+  it('「开着 DevTools」那条（takeover）不拒写 —— 两条线不合并（防回归）', async () => {
+    const { sessionId, ref } = await openWithRef()
+
+    // `setTakeover` 是**观测**到的信号：它只让 snapshot 回执带个提示，不该挡住 agent 动手。
+    // 哪天有人把 holder 与 takeover 合成一位，这条就会红。
+    provider.setDevToolsTakeover(sessionId, true)
+
+    await expect(provider.mutate({ kind: 'click', sessionId, ref }))
+      .resolves.toMatchObject({ action: 'click' })
+  })
+
+  it('会话关掉后，它的接管窗口与簿记一起清掉（不留悬账）', async () => {
+    const { sessionId } = await openWithRef()
+    provider.setControlHolder(sessionId, 'human')
+
+    await provider.close(sessionId)
+
+    // 会话没了，再切它的 holder 应当是静默 no-op（而不是抛「未知会话」之类的噪音）。
+    expect(() => { provider.setControlHolder(sessionId, 'agent') }).not.toThrow()
   })
 })

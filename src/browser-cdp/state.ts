@@ -38,8 +38,13 @@
  *
  * ## 现状（阶段 A）
  *
- * 当前没有任何工具真的写 target 级状态（`webpage_execute` 在阶段 B 会拒掉全部这类命令），
- * 所以这里只是**骨架 + 单测**，尚未接进运行时调用链。导出保持干净，阶段 B/C 直接复用。
+ * `webpage_execute` 在阶段 B 会拒掉全部写 target 级状态的命令，所以 {@link TargetStateRegistry.claim}
+ * 这条链仍是**骨架 + 单测**（还没有生产调用者）。
+ *
+ * 但**接管窗口已经有了第一个真实生产者**（§6.5 的人工接管按钮）：`markTakeover` 由
+ * `CdpBrowserProvider.setHolder` 驱动，`isTakeover` 已经在真实的 `claim` 判定里生效。
+ * 它的效果是「人在操作页面期间，target 级状态整体算 human 的」—— 那是目标级让渡，
+ * 与「按钮把写操作挡在外面」是两件事，别混着宣传。
  *
  * @module dsh-webops-plugin/browser-cdp/state
  */
@@ -48,6 +53,16 @@ import { BrowserError } from '../browser/types.ts'
 
 /** 一条 target 级状态记录的持有者。 */
 export type StateOwner = 'agent' | 'human'
+
+/**
+ * 「谁在让渡」——接管窗口的来源（§6.5 起有两个）。
+ *
+ * - `devtools`：有人开着 DevTools 操作这个页面（`devtools-opened` / `devtools-closed`）。
+ * - `human`：人在标签条上按了「接管」按钮，明确声明「现在换我操作」。
+ *
+ * 两者可以同时成立，且各自独立撤销：关 DevTools 不会解除按钮的接管，反之亦然。
+ */
+export type TakeoverReason = 'devtools' | 'human'
 
 /** 一条 target 级状态的记录。 */
 export interface StateRecord {
@@ -107,25 +122,43 @@ export interface StateClaim {
  */
 export class TargetStateRegistry {
   private readonly states = new Map<string, Map<string, StateRecord>>()
-  private readonly takeovers = new Set<string>()
+  /**
+   * 接管窗口的**来源分账**：一个会话可以同时被多个来源让渡（人开着 DevTools，
+   * 且人还按了「接管」按钮）。
+   *
+   * 为什么不是 `Set<string>`（一个会话一个布尔）：两条来源的生命周期完全独立 ——
+   * 共用一位的话，「人在接管期间开一次 DevTools 又关掉」那条 `devtools-closed`
+   * 会把 `human` 的位一起清掉，于是**人在操作，agent 却被放行**。那正是这个功能
+   * 存在的意义被抹掉。分账之后「谁撤谁自己的」，`isTakeover` 取并集。
+   */
+  private readonly takeovers = new Map<string, Set<TakeoverReason>>()
 
-  /** 该会话当前是否处于人工接管窗口（2.3.1 来源① 的粗粒度让渡）。 */
+  /**
+   * 该会话当前是否处于人工接管窗口（2.3.1 来源① 的粗粒度让渡）。
+   *
+   * **任一来源在让渡即为真** —— 调用方只关心「现在算不算人工的」，不关心谁让的。
+   */
   isTakeover(sessionId: string): boolean {
-    return this.takeovers.has(sessionId)
+    return (this.takeovers.get(sessionId)?.size ?? 0) > 0
   }
 
   /**
    * 开 / 关接管窗口（2.3.1 来源①）。
    *
    * `active` 是**幂等状态位**，不是计数器 —— agent 自己 toggle DevTools 时也会收到同一条
-   * 通知，不需要去重（方案 4.1.1）。
+   * 通知，不需要去重（方案 4.1.1）。幂等性由「集合语义」天然保证：重复 add / delete 同值无副作用。
    *
    * @param sessionId - 会话 id。
-   * @param active - 人工是否正在操作（DevTools 开 / 关）。
+   * @param active - 该来源是否正在让渡。
+   * @param reason - 让渡来源；省略按 `'devtools'`（唯一的既有调用方）。**来源必须传对** ——
+   *   传错会让两个来源互相撤销，见 {@link TargetStateRegistry.takeovers} 的注释。
    */
-  markTakeover(sessionId: string, active: boolean): void {
-    if (active) this.takeovers.add(sessionId)
-    else this.takeovers.delete(sessionId)
+  markTakeover(sessionId: string, active: boolean, reason: TakeoverReason = 'devtools'): void {
+    const reasons = this.takeovers.get(sessionId) ?? new Set<TakeoverReason>()
+    if (active) reasons.add(reason)
+    else reasons.delete(reason)
+    if (reasons.size === 0) this.takeovers.delete(sessionId)
+    else this.takeovers.set(sessionId, reasons)
   }
 
   /** 读一条记录（诊断与测试用）。 */
@@ -152,7 +185,7 @@ export class TargetStateRegistry {
     const force = options.force === true
 
     if (!force) {
-      if (this.takeovers.has(sessionId)) {
+      if (this.isTakeover(sessionId)) {
         throw contended(
           sessionId, key, 'human', existing?.at ?? at,
           'this session is inside a human takeover window, so every target-level state counts as human-owned',

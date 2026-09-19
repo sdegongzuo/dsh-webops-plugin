@@ -18,8 +18,8 @@
  */
 
 import { CdpConnection, type CdpTarget, type CdpTransport, type CdpVersion } from '../browser-cdp/protocol.ts'
-import { ElectronWindowBridge, type BridgeDevTools, type BridgeOptions, type BridgeTabBar, type TabHostChannel } from './bridge.ts'
-import type { TakeoverListener, TabOpenedListener } from './bridge.ts'
+import { ElectronWindowBridge, type BridgeControl, type BridgeDevTools, type BridgeOptions, type BridgeTabBar, type TabHostChannel } from './bridge.ts'
+import type { ControlHolder, ControlListener, TakeoverListener, TabOpenedListener } from './bridge.ts'
 import { DEFAULT_BRIDGE_COMMAND_TIMEOUT_MS } from './bridge.ts'
 import { WindowCdpSocket } from './socket.ts'
 
@@ -152,6 +152,32 @@ export class ElectronWindowTransport implements CdpTransport {
   async onTakeover(listener: TakeoverListener): Promise<() => void> {
     const bridge = await this.requireBridge()
     return bridge.onTakeover(listener)
+  }
+
+  /**
+   * 切换某个标签页的控制权（§6.5 人工接管按钮）。
+   *
+   * 与 `toggleDevTools()` 一样，这条通道存在的一半理由是**可验证**：按钮画在另一个
+   * `WebContentsView` 里，端到端脚本点不到它，只能靠这里把「人按了接管」重放出来。
+   *
+   * @param tabId - 目标标签；省略时用宿主当前的前台标签。
+   * @param holder - 切换到的持有者。
+   * @returns 宿主回报的、切换**之后**的真实归属。
+   */
+  async setControl(tabId: string | undefined, holder: ControlHolder): Promise<BridgeControl> {
+    const bridge = await this.requireBridge()
+    return bridge.setControl(tabId, holder)
+  }
+
+  /**
+   * 订阅控制权变化（§6.5）。与 `onTakeover` 同模式：按需启动宿主，退订函数同步返回。
+   *
+   * @param listener - 每次变化调用一次 `(tabId, holder)`。
+   * @returns 退订函数。
+   */
+  async onControl(listener: ControlListener): Promise<() => void> {
+    const bridge = await this.requireBridge()
+    return bridge.onControl(listener)
   }
 
   /**
