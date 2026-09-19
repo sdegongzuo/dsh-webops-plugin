@@ -157,6 +157,10 @@ class FakeChrome {
           // wait-hidden 的判据：true = 元素已从文档移除。
           return { result: { value: !this.elementConnected } }
         }
+        if (fn.includes('location.href')) {
+          // 写前门（方案 §5.1）：一次往返同时读回「当前地址 + 元素还在不在文档里」。
+          return { result: { value: { url: this.page.url, connected: this.elementConnected } } }
+        }
         if (fn.includes('isConnected')) {
           // locate 的守卫判据：true = 元素还连在文档上。
           return { result: { value: this.elementConnected } }
@@ -881,6 +885,74 @@ describe('CdpBrowserProvider.mutate (P1)', () => {
       .rejects.toThrow(expect.objectContaining({ code: 'BROWSER_STALE_REF' }))
   })
 
+  it('blocks the action when a human navigated the page behind our back (写前门 · 粗门)', async () => {
+    const ref = await firstRef()
+    // 关键前提：这条路由变化**没**经过 provider —— 人工在页面上点了链接，
+    // `backendNodeId` 在 SPA 里根本不重编，所以纪元表和 resolveNode 全都是绿的。
+    chrome.page = { url: 'https://example.com/next', title: 'Next' }
+
+    const before = chrome.calls.length
+    await expect(provider.mutate({ kind: 'click', sessionId: 'tab-1', ref })).rejects.toThrow(
+      expect.objectContaining({
+        code: 'BROWSER_STALE_REF',
+        message: 'ref "e1" points at a stale document: the page moved from https://example.com/ '
+          + 'to https://example.com/next since the snapshot; the action was NOT dispatched. '
+          + 'Run webpage_snapshot again.',
+      }),
+    )
+    // 「动作没发出」是这道门存在的全部意义：一条输入事件都没派发。
+    expect(chrome.calls.slice(before).map(call => call.method)).not.toContain('Input.dispatchMouseEvent')
+
+    // 整个纪元已作废：同一个 ref 再用，连一条 CDP 都不会发。
+    const afterInvalidate = chrome.calls.length
+    await expect(provider.mutate({ kind: 'click', sessionId: 'tab-1', ref }))
+      .rejects.toThrow(expect.objectContaining({ code: 'BROWSER_STALE_REF' }))
+    expect(chrome.calls.slice(afterInvalidate)).toEqual([])
+  })
+
+  it('blocks the action when the element was detached but the url is unchanged (写前门 · 细门)', async () => {
+    const ref = await firstRef()
+    chrome.elementConnected = false
+
+    const before = chrome.calls.length
+    await expect(provider.mutate({ kind: 'click', sessionId: 'tab-1', ref })).rejects.toThrow(
+      expect.objectContaining({
+        code: 'BROWSER_STALE_REF',
+        message: 'the element for ref "e1" was removed from the document (the page may have '
+          + 're-rendered); the action was NOT dispatched. Run webpage_snapshot again.',
+      }),
+    )
+    expect(chrome.calls.slice(before).map(call => call.method)).not.toContain('Input.dispatchMouseEvent')
+    // 细门不作废纪元：地址没变，页面上其余 ref 仍然可用，重拍快照不是强制要求。
+    expect(chrome.calls.slice(before).map(call => call.method)).toContain('DOM.resolveNode')
+  })
+
+  it('lets an untouched page through, costing exactly one extra round-trip (零回归)', async () => {
+    const ref = await firstRef()
+    const before = chrome.calls.length
+
+    const result = await provider.mutate({ kind: 'click', sessionId: 'tab-1', ref })
+    expect(result).toMatchObject({ action: 'click', navigated: false })
+
+    const isGate = (call: { method: string; params: Record<string, unknown> }): boolean =>
+      call.method === 'Runtime.callFunctionOn'
+      && String(call.params['functionDeclaration']).includes('location.href')
+    const trace = chrome.calls.slice(before)
+    // 门必须在第一个输入事件之前，且整条路径上只此一次（+1 次往返，不是 +2/+3）。
+    expect(trace.filter(isGate)).toHaveLength(1)
+    expect(trace.findIndex(isGate)).toBeLessThan(
+      trace.findIndex(call => call.method === 'Input.dispatchMouseEvent'),
+    )
+  })
+
+  it('does not trip the fine gate on wait-hidden — 消失正是它要等的结果 (J2 不误伤)', async () => {
+    const ref = await firstRef()
+    chrome.elementConnected = false
+
+    const result = await provider.mutate({ kind: 'wait', sessionId: 'tab-1', ref })
+    expect(result).toMatchObject({ action: 'wait', satisfied: true })
+  })
+
   it('requires a snapshot before mutating a page the model never observed', async () => {
     const session = await provider.open({})
     const before = chrome.calls.length
@@ -987,7 +1059,9 @@ describe('CdpBrowserProvider.mutate (P1)', () => {
     const result = await provider.mutate({ kind: 'fill', sessionId: 'tab-1', ref, value: 'me@example.com' })
     expect(result).toMatchObject({ action: 'fill', navigated: false })
 
-    const call = chrome.calls.find(candidate => candidate.method === 'Runtime.callFunctionOn')
+    // 按脚本内容挑，不按「第一条 callFunctionOn」挑 —— mutate 路径现在第一条是写前门。
+    const call = chrome.calls.find(candidate => candidate.method === 'Runtime.callFunctionOn'
+      && String(candidate.params['functionDeclaration']).includes('dispatchEvent'))
     expect(call?.params['arguments']).toEqual([{ value: 'me@example.com' }])
     expect(String(call?.params['functionDeclaration'])).toContain('dispatchEvent')
   })
@@ -1046,11 +1120,15 @@ describe('CdpBrowserProvider.mutate (P1)', () => {
 
     // 页面内那一步只做「聚焦 + 全选」：`Input.insertText` 是「在选区处插入」，
     // 不先全选就会把新值拼到旧内容后面。
-    const probe = chrome.calls.find(call => call.method === 'Runtime.callFunctionOn')
-    expect(String(probe?.params['functionDeclaration'])).toContain('selectNodeContents')
+    // 按脚本内容挑，并核对它排在插入之前 —— mutate 路径上现在还有写前门那条 `callFunctionOn`，
+    // 「第一条」不再是它。
+    const probeIndex = chrome.calls.findIndex(call => call.method === 'Runtime.callFunctionOn'
+      && String(call.params['functionDeclaration']).includes('selectNodeContents'))
+    const insertIndex = chrome.calls.findIndex(call => call.method === 'Input.insertText')
+    expect(probeIndex).toBeGreaterThanOrEqual(0)
+    expect(probeIndex).toBeLessThan(insertIndex)
     // 真正的写入走原生输入管线 —— 否则 Lexical / ProseMirror 收不到 beforeinput，状态不更新。
-    const insert = chrome.calls.find(call => call.method === 'Input.insertText')
-    expect(insert?.params).toEqual({ text: '帮我写个总结' })
+    expect(chrome.calls[insertIndex]?.params).toEqual({ text: '帮我写个总结' })
   })
 
   it('never calls Input.insertText for a plain input (反向验证)', async () => {

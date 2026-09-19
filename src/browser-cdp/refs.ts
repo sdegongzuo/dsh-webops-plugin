@@ -26,8 +26,9 @@ import { BrowserError } from '../browser/types.ts'
 import type { BrowserRef } from '../browser/types.ts'
 
 /**
- * ref 指向的页面元素。`backendNodeId` 是 CDP 的「跨导航稳定 id」，用于后续
- * `DOM.resolveNode` / `DOM.getBoxModel`。
+ * ref 指向的页面元素。`backendNodeId` 只在**同一份文档内**稳定，用于后续
+ * `DOM.resolveNode` / `DOM.getBoxModel`；换文档后它会重新编号（实测 22/22 解析失败），
+ * **不能当跨导航锚点** —— 跨重启的锚点是 `semanticKey`。
  */
 export interface RefTarget {
   readonly ref: string
@@ -100,6 +101,17 @@ export class RefRegistry {
   /** 当前纪元记录的文档身份（主 frame `loaderId`）。 */
   private loaderId: string | undefined
 
+  /**
+   * 当前纪元**发布时刻**的页面地址，给写前门（粗门）比对用。
+   *
+   * 按纪元存一条，不加在每条 `RefTarget` 上（方案 §5.1.1 的 D-6=B）：`exportBindings` /
+   * 软淘汰那条链已经够重，每条 ref 背一份长 url 不划算。
+   *
+   * ⚠️ 它是「**快照纪元的地址**」，不是「这个元素的地址」—— `adopt()` 不推进纪元
+   * （方案 §5.2），所以区域快照装上的 ref 共享的是更早那次全量快照写进来的 url。
+   */
+  private epochUrl: string | undefined
+
   /** 最近几个过期纪元，最旧在前。 */
   private readonly archives: EpochArchive[] = []
 
@@ -128,13 +140,31 @@ export class RefRegistry {
   }
 
   /**
+   * 当前纪元的发布时刻地址；从未观察、或那次 `publish` 没读到地址时为 `undefined`。
+   *
+   * 写前门对 `undefined` 的处理是**不判定**（放行），与 `revalidate` 拿不到 `loaderId`
+   * 就宁可拒绝（`document_changed`）**相反**：这里是「门没证据不该让一次正常操作失败」，
+   * 那里是「恢复旧 ref 是特权，没证据就不给」。两种保守方向各对一处。
+   */
+  get publishedUrl(): string | undefined {
+    return this.epochUrl
+  }
+
+  /**
    * 把新一批 ref 装入新纪元。每次调用都会推进纪元 —— 上一次 snapshot 的 ref 立即作废。
    * @param rows - 本次 snapshot 里按出现顺序排列的元素（尚未分配 ref 名）。
    * @param truncated - 大纲是否因规模上限被截断。
    * @param loaderId - 主 frame 的文档身份；revalidate 先拿这个比对，对不上就拒绝精确恢复。
+   * @param url - 发布时刻的页面地址，写前门（粗门）用；缺省表示「身份未知」，
+   *   门对此不做判定（放行），见 {@link publishedUrl}。
    * @returns 带 ref 名的完整登记结果。
    */
-  publish(rows: readonly RefPublishRow[], truncated: boolean, loaderId?: string): RefPublication {
+  publish(
+    rows: readonly RefPublishRow[],
+    truncated: boolean,
+    loaderId?: string,
+    url?: string,
+  ): RefPublication {
     this.archiveCurrent()
     this.evicted.clear()
     this.lastSeen.clear()
@@ -159,6 +189,7 @@ export class RefRegistry {
     }
     this.targets = targets
     this.loaderId = loaderId
+    this.epochUrl = url
     this.epoch += 1
     this.trimLive()
     return { epoch: this.epoch, refs, truncated }
@@ -233,6 +264,7 @@ export class RefRegistry {
     this.epoch += 1
     this.targets = new Map<string, RefTarget>()
     this.loaderId = undefined
+    this.epochUrl = undefined
     this.pendingRebind = undefined
     this.evicted.clear()
     this.lastSeen.clear()
@@ -286,6 +318,9 @@ export class RefRegistry {
    */
   hydrate(bindings: readonly SemanticBinding[]): void {
     this.loaderId = undefined
+    // 落盘锚点里没有 url（`SemanticBinding` 只有 ref + semanticKey），所以重启后的 ref
+    // 天生没有粗门可比 —— 写前门对此按「身份未知」处理，不假绿也不误伤（方案 §5.1.1）。
+    this.epochUrl = undefined
     const byKey = new Map<string, string[]>()
     for (const binding of bindings) {
       const list = byKey.get(binding.semanticKey) ?? []

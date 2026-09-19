@@ -1098,11 +1098,13 @@ export class CdpBrowserProvider implements BrowserProvider {
       nodes = tree.nodes ?? []
     }
     const outline = buildOutline(nodes, resolveSnapshotLimits(this.config.snapshotLimits, maxLines))
+    // 地址与 `loaderId` 必须在**同一时刻**随 ref 表落地：写前门（粗门）比的就是
+    // 「发布那一刻的地址」，晚读一步会把人工在这一步之间做的导航记成快照时的状态（方案 §5.1.1）。
+    const meta = await this.readPageMeta(session.connection, signal)
     const loaderId = regional ? undefined : await this.readMainLoaderId(session, signal)
     const publication = regional
       ? session.refs.adopt(outline.rows)
-      : session.refs.publish(outline.rows, outline.truncated, loaderId)
-    const meta = await this.readPageMeta(session.connection, signal)
+      : session.refs.publish(outline.rows, outline.truncated, loaderId, meta?.url)
     if (meta !== undefined) {
       session.url = meta.url
       session.title = meta.title
@@ -1354,8 +1356,16 @@ export class CdpBrowserProvider implements BrowserProvider {
    * **第一步**就是查纪元表：ref 失效（或从未 snapshot）时这里直接抛
    * `BROWSER_STALE_REF` / `BROWSER_SNAPSHOT_REQUIRED`，后面的 CDP 命令一条都
    * 不会发 —— 这就是「写前检查纪元」。
+   *
+   * `allowDetached`：`webpage_wait` 的 hidden 分支**以「元素消失」为成功条件**，
+   * 细门在这里不能拦（否则永远等不到 satisfied）。粗门照查。
    */
-  private async resolveObjectId(session: SessionState, ref: string, signal?: AbortSignal): Promise<string> {
+  private async resolveObjectId(
+    session: SessionState,
+    ref: string,
+    signal?: AbortSignal,
+    options?: { allowDetached?: boolean },
+  ): Promise<string> {
     const target = session.refs.resolve(ref)
     const objectId = await this.resolveNodeObjectId(session, target.backendNodeId, signal)
     if (objectId === undefined) {
@@ -1364,7 +1374,74 @@ export class CdpBrowserProvider implements BrowserProvider {
         'BROWSER_STALE_REF',
       )
     }
+    await this.assertPreActionGate(session, ref, objectId, signal, options?.allowDetached === true)
     return objectId
+  }
+
+  /**
+   * **写前门**（方案 §5.1）：动作派发之前，拿手上的句柄核一次「页面还是不是我拍快照那一刻」。
+   *
+   * 为什么必须有它：`refs.resolve` 只保证「ref 属于当前纪元」，而当前纪元可能在模型
+   * 决策期间就被人工换成了另一份文档 —— 同文档 SPA 路由连 `backendNodeId` 都不重编
+   * （方案 §1.4），于是旧 ref 会静默命中新页面上的另一个元素。这里是**唯一还来得及拦**的时刻。
+   *
+   * 三档的实际落点（都比 D-3 批的「+1 次往返」不多花）：
+   * - **粗门 `url`**：与 `refs.publishedUrl` 比对（D-6=B，按纪元存一条）。
+   * - **细门 `isConnected`**：`[V36]` 实测「resolveNode 成功 ≠ 节点还在文档里」，
+   *   这一档此前只有 `locate` 查，mutate 路径是漏的。
+   * - **中门 `loaderId` 不单独花一次往返**，因为它能抓到而粗门抓不到的只有一类
+   *   （地址不变的整页刷新），而那一类新文档会让旧 `backendNodeId` 解析失败 ——
+   *   上面 `resolveNodeObjectId` 已经把它兜成 `BROWSER_STALE_REF`（实测 22/22 失败，方案 §10.4）。
+   *   **它兜不住的是同文档重排**：role/name 档才管得到，那是已知剩余漏报区间，
+   *   与 `locate` 的口径一致（见该方法的注释），不在本轮补。
+   *
+   * 读不到值（页面上下文异常、evaluate 抛错）时**放行**：门只负责「证据确凿就拦」，
+   * 拿不到证据不该把一次正常操作变成失败 —— 交给既有守卫和动作后的 `detectNavigation`。
+   *
+   * @throws `BROWSER_STALE_REF` —— 此时**一个输入事件都还没派发**。
+   */
+  private async assertPreActionGate(
+    session: SessionState,
+    ref: string,
+    objectId: string,
+    signal?: AbortSignal,
+    allowDetached = false,
+  ): Promise<void> {
+    const publishedUrl = session.refs.publishedUrl
+    const evaluated = await session.connection.send<EvaluateResult>(
+      'Runtime.callFunctionOn',
+      {
+        objectId,
+        functionDeclaration: 'function () { return { url: location.href, connected: this.isConnected }; }',
+        returnByValue: true,
+      },
+      { signal, timeoutMs: this.config.commandTimeoutMs },
+    ).catch(() => undefined)
+    const value = evaluated?.result?.value
+    if (typeof value !== 'object' || value === null) return
+    const { url, connected } = value as Record<string, unknown>
+    if (
+      publishedUrl !== undefined && typeof url === 'string' && url !== '' && url !== publishedUrl
+    ) {
+      // 文档已经换掉：整个纪元的 ref 都不该再用，作废它并让模型重拍。
+      session.refs.invalidate()
+      this.noteDocumentChange(session)
+      // 句柄是自己拿的，抛错前必须还 —— 调用方还没拿到 objectId，它的 finally 释放不到。
+      this.releaseObject(session, objectId, signal)
+      throw new BrowserError(
+        `ref "${ref}" points at a stale document: the page moved from ${publishedUrl} to ${url} `
+        + 'since the snapshot; the action was NOT dispatched. Run webpage_snapshot again.',
+        'BROWSER_STALE_REF',
+      )
+    }
+    if (connected === false && !allowDetached) {
+      this.releaseObject(session, objectId, signal)
+      throw new BrowserError(
+        `the element for ref "${ref}" was removed from the document (the page may have re-rendered); `
+        + 'the action was NOT dispatched. Run webpage_snapshot again.',
+        'BROWSER_STALE_REF',
+      )
+    }
   }
 
   /** 释放远端对象句柄（尽力而为；释放失败不影响主流程）。 */
@@ -1679,7 +1756,8 @@ export class CdpBrowserProvider implements BrowserProvider {
     } else {
       const ref = request.ref as string
       // hidden 语义也吃 ref 纪元：旧 ref 在这里直接抛，不会傻等一个不存在的元素。
-      const objectId = await this.resolveObjectId(session, ref, signal)
+      // 但「元素已脱离文档」正是本分支要等的结果，细门对它放行（allowDetached）。
+      const objectId = await this.resolveObjectId(session, ref, signal, { allowDetached: true })
       try {
         satisfied = await this.pollUntil(
           async () => {

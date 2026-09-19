@@ -350,4 +350,30 @@ describe('RefRegistry', () => {
     expect(registry.resolve('e1').backendNodeId).toBe(42)
     expect(registry.list().length).toBeLessThanOrEqual(LIVE_BINDING_CAP)
   })
+
+  it('records the page url on the epoch it published and clears it when the epoch dies', () => {
+    const registry = new RefRegistry()
+    // 还没观察过 → 没有地址可比，写前门此时应当放行（不能拿 undefined 当证据去拦）。
+    expect(registry.publishedUrl).toBeUndefined()
+
+    registry.publish([target('button', 'Save', 11)], false, 'loader-1', 'https://example.com/a')
+    expect(registry.publishedUrl).toBe('https://example.com/a')
+
+    // 区域快照走 adopt：不推进纪元，也就不能改写纪元地址。
+    registry.adopt([target('button', 'Draft', 12)])
+    expect(registry.publishedUrl).toBe('https://example.com/a')
+
+    registry.invalidate()
+    expect(registry.publishedUrl).toBeUndefined()
+  })
+
+  it('drops the epoch url on hydrate (落盘锚点没有地址，写前门宁可放行)', () => {
+    const registry = new RefRegistry()
+    registry.publish([target('button', 'Save', 11)], false, 'loader-1', 'https://example.com/a')
+    const bindings = registry.exportBindings()
+    const reborn = new RefRegistry()
+    reborn.hydrate(bindings)
+
+    expect(reborn.publishedUrl).toBeUndefined()
+  })
 })
