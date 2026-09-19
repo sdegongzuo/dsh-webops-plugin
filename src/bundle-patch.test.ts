@@ -109,7 +109,9 @@ function hasRow(body: string, id: string): boolean {
  */
 function rowBlock(body: string, id: string): string {
   const lines = body.split('\n')
-  const start = lines.findIndex(line => line.trim().replace(/^-\s+/u, '') === `id: ${id}`)
+  // 同一 id 可能出现两次（insert 里的行 + 后面的顶层覆盖条目），config 断言要的是
+  // **最后**那个 —— 顶层覆盖永远写在文件更靠后的位置（本文件自己的惯例，上游也是）。
+  const start = lines.findLastIndex(line => line.trim().replace(/^-\s+/u, '') === `id: ${id}`)
   if (start === -1) return ''
   const rest = lines.slice(start + 1)
   const end = rest.findIndex(line => line.trimStart().startsWith('- '))
@@ -127,7 +129,7 @@ describe('出货 patch（cordis.patch.yml）', () => {
   })
 
   it('仍然挂着浏览器那一组行（防止上面那条断言被「整文件清空」蒙混过关）', () => {
-    for (const id of ['browser', 'browser-cdp', 'browser-electron', 'tool-browser', 'browser-plugin']) {
+    for (const id of ['browser', 'browser-cdp', 'browser-electron', 'webpage-tools', 'webops-plugin']) {
       expect(hasRow(body, id), `出货 patch 少了 id: ${id}`).toBe(true)
     }
   })
@@ -142,6 +144,16 @@ describe('出货 patch（cordis.patch.yml）', () => {
     // 便携版包里没有独立的 electron.exe，宿主只能用桌面端主 exe 起第二个实例。
     expect(block, '少了 appMode: true，窗口宿主起不来')
       .toContain('appMode: true')
+  })
+
+  it('browser-cdp 必须默认停用（2026-09-19 主上定：桌面端用 electron provider 就够）', () => {
+    // 必须是**顶层**条目 + disabled: true（与上游 dsh-acp-app 关 session-title-llm/hmr 同款，
+    // 也是插件页手动关开关时 writePluginEnabled 写回的同构形态）——用户想连外部 Chrome
+    // 时在插件页把那行开关打开，profile 层会覆盖这里的默认值。
+    expect(hasRow(body, 'browser-cdp'), '出货 patch 少了 browser-cdp 的默认停用条目').toBe(true)
+    const block = rowBlock(body, 'browser-cdp')
+    expect(block, 'browser-cdp 没带 disabled: true，会白白在每个用户机器上跑一个外部 Chrome provider')
+      .toContain('disabled: true')
   })
 
   it('ptc-runtime 那行必须把 nodeExecutable 指到 DSH_PTC_NODE，并保留 process.execPath 兜底', () => {

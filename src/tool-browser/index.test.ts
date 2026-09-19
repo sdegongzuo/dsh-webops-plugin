@@ -71,7 +71,7 @@ const SCREENSHOT = {
 }
 
 /**
- * 用只实现被用到的那几个方法的桩上下文挂上 tool-browser。
+ * 用只实现被用到的那几个方法的桩上下文挂上 webpage-tools。
  *
  * `defineTool` 是真的 —— 所以这个测试同时证明了四个工具的 schema 能在 dsh 的 DSL 下编译通过，
  * 而这是 `apply()` 在真实 profile 里不炸的必要条件。
@@ -324,7 +324,7 @@ describe('registration', () => {
   })
 
   it('declares the plugin name and a section order right above the web tools', () => {
-    expect(pluginName).toBe('tool-browser')
+    expect(pluginName).toBe('webpage-tools')
     expect(TOOL_BROWSER_SECTION_ORDER).toBe(2050)
 
     const section = mount().sections[0]

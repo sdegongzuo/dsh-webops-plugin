@@ -70,16 +70,43 @@ export type BrowserErrorCode =
   | 'BROWSER_EXECUTE_NOT_ALLOWED'
 
 /** 能力缝隙与 provider 唯一抛出的错误类型。 */
+/**
+ * `BROWSER_STALE_REF` 的分桶原因：这个 ref 是被**哪一道门**拒的。
+ *
+ * 存在的理由只有一个 —— P0 取数（方案 §4）：光有总数答不了「换文档导致的旧号」与
+ * 「同文档被换掉 / 被复用」哪个是主要矛盾，而这两类分别要由粗门与细门来治。
+ * 从错误消息里正则硬分是脏办法，所以在**抛出点**就把它标出来。
+ *
+ * 只在 `code === 'BROWSER_STALE_REF'` 时有意义；其它错误码一律不带。
+ */
+export type BrowserStaleRefReason =
+  /** `refs.resolve`：这个号不在当前纪元的表里（换过一次快照 / 纪元刚被作废）。 */
+  | 'obsolete_epoch'
+  /** `DOM.resolveNode` 失败或拿不到句柄：节点彻底没了。 */
+  | 'node_gone'
+  /** `isConnected === false`：地址没变，但节点被换掉 / 摘掉了（同文档重渲染）。 */
+  | 'detached'
+  /** 写前门·粗门：纪元记的地址与当下顶层文档的地址不符（换文档，含 SPA 路由）。 */
+  | 'stale_document'
+  /** `revalidate` 的四道门对不上（loaderId / role+name）—— 归档恢复的拒绝理由。 */
+  | 'identity_mismatch'
 export class BrowserError extends Error {
   readonly code: BrowserErrorCode
   /** HTTP 状态码；仅当错误源自一次真实的 HTTP 响应时才有值（如 DevTools 端点回 404/403）。 */
   readonly status: number | undefined
+  /** 见 {@link BrowserStaleRefReason}；非 `BROWSER_STALE_REF` 时为 `undefined`。 */
+  readonly reason: BrowserStaleRefReason | undefined
 
-  constructor(message: string, code: BrowserErrorCode, options?: { cause?: unknown; status?: number }) {
+  constructor(
+    message: string,
+    code: BrowserErrorCode,
+    options?: { cause?: unknown; status?: number; reason?: BrowserStaleRefReason },
+  ) {
     super(message, options)
     this.name = 'BrowserError'
     this.code = code
     this.status = options?.status
+    this.reason = options?.reason
   }
 }
 
@@ -305,7 +332,7 @@ export interface BrowserMutationResult {
    * 收编是**异步**的（宿主的「弹窗转标签」通报实测 140~156ms 才到 provider），所以这是
    * 收尾时按会话台账取差集的结果，不是点击那一刻的快照。无新增时为 `undefined`。
    *
-   * 存在的理由见 {@link BrowserMutationResult} 的调用方（`tool-browser`）：没有这个字段时，
+   * 存在的理由见 {@link BrowserMutationResult} 的调用方（`webpage-tools`）：没有这个字段时，
    * 模型点完弹窗链接会一直以为只有一个标签，整条弯路都从这儿开始。
    */
   readonly openedTabs?: readonly BrowserTabInfo[]

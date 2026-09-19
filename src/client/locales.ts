@@ -5,7 +5,7 @@
 import type {} from '@deepseek-ai/dsh-client-ui-slots'
 
 /** 本插件的文案命名空间。 */
-export const BROWSER_NS = 'browser-plugin'
+export const BROWSER_NS = 'webops-plugin'
 
 /** 中文文案（也是 key 的唯一来源）。 */
 export const zh = {
@@ -42,6 +42,6 @@ export type BrowserKey = keyof typeof zh
 declare module '@deepseek-ai/dsh-client-ui-slots' {
   interface LocaleNamespaceMap {
     /** 浏览器观察面板的文案。 */
-    'browser-plugin': BrowserKey
+    'webops-plugin': BrowserKey
   }
 }

@@ -1,5 +1,5 @@
 /**
- * tool-browser —— 把 `ctx.browser` 暴露成模型可见的 `webpage_*` 工具。
+ * webpage-tools（目录名仍是 tool-browser/）—— 把 `ctx.browser` 暴露成模型可见的 `webpage_*` 工具。
  *
  * P0 只给 4 个只读工具（模型「看」页面）：
  *
@@ -67,15 +67,16 @@ import type { BrowserMutationRequest, BrowserNetworkEntry, BrowserSession, Brows
 // 工具描述里凡是讲「上限 / 默认值」的数字，一律引用实现层的常量而不是抄一份字面量：
 // 抄来的数字改了常量不会跟着变，描述就开始对模型撒谎（2026-09-17 修：
 // 5000 / 800 / 150 / 50 / 2000 / 20000 共 9 处是散落的字面量）。
-// 这里只导入**常量值**，不导入任何运行时类，所以不存在 tool-browser ↔ browser-cdp 的循环。
+// 这里只导入**常量值**，不导入任何运行时类，所以不存在 webpage-tools ↔ browser-cdp 的循环。
 import { DEFAULT_SNAPSHOT_LIMITS, FOLD_MARKER_PREFIX, MAX_SNAPSHOT_LINES } from '../browser-cdp/snapshot.ts'
 import { CONSOLE_TEXT_MAX_CHARS } from '../browser-cdp/console.ts'
 import { NETWORK_MAX_BASE64_CHARS, NETWORK_MAX_BODY_CHARS } from '../browser-cdp/network.ts'
 import { DEFAULT_P2_LIMIT, MAX_P2_LIMIT } from '../browser-cdp/provider.ts'
 import { noteLoaded } from '../debug.ts'
 
-/** Cordis 插件名，用于加载器诊断。 */
-export const name = 'tool-browser'
+/** Cordis 插件名，用于加载器诊断。与工具前缀 `webpage_*` 对齐（2026-09-19 改名；
+ * 模块路径仍是 `dsh-webops-plugin/tool-browser`，那是启停定位键、跟目录名走）。 */
+export const name = 'webpage-tools'
 
 /**
  * schema DSL 的 `{ type: 'json' }` 对应的值类型。
@@ -2063,7 +2064,7 @@ export function apply(ctx: Context, config: Config = {}): void {
   // 都已就绪 —— 任一个 inject 没解析成功，本函数根本不会被执行。
   const registered = (Object.keys(enabled) as (keyof typeof enabled)[])
     .filter(key => enabled[key])
-  noteLoaded('tool-browser', `registered ${registered.join(', ')}`)
+  noteLoaded('webpage-tools', `registered ${registered.join(', ')}`)
 }
 
 /** 保留给 P1：`presentResult` 需要按会话回放图片附件时才启用。 */

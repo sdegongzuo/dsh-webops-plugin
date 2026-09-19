@@ -78,7 +78,7 @@ function markRegistered(face: string, count: number): void {
  */
 export function apply(ctx: ClientContext): void {
   markLoaded()
-  ctx.effect(() => ctx.locale.register(BROWSER_NS, { zh, en }), 'browser-plugin: dictionaries')
+  ctx.effect(() => ctx.locale.register(BROWSER_NS, { zh, en }), 'webops-plugin: dictionaries')
 
   ctx.slots.inject('conversation.input.dock', () => {
     const dispose = ctx.slots.register(

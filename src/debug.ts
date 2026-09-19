@@ -19,7 +19,7 @@ export const DEBUG_ENV = 'DSH_BROWSER_PLUGIN_DEBUG'
 
 /**
  * 按需输出一行加载诊断。
- * @param face - 哪个半边（`browser` / `browser-cdp` / `tool-browser`）。
+ * @param face - 哪个半边（`browser` / `browser-cdp` / `webpage-tools`）。
  * @param detail - 这一行的细节。
  */
 export function noteLoaded(face: string, detail: string): void {

@@ -49,11 +49,19 @@
         enabled: true
         appMode: true
 
-    - id: tool-browser
+    - id: webpage-tools
       name: 'dsh-webops-plugin/tool-browser'
 
-    - id: browser-plugin
+    - id: webops-plugin
       name: 'dsh-webops-plugin'
+
+# 默认关掉 CDP provider（2026-09-19 主上定）：桌面端场景 browser-electron 就够，
+# 连外部 Chrome 的 provider 默认不装进运行态。写法沿用上游惯例（dsh-acp-app 对
+# session-title-llm / hmr 就是顶层条目 + disabled: true）—— 这也正是插件页
+# 手动关开关时 writePluginEnabled 写回 profile patch 的同构形态，所以用户想连
+# 外部 Chrome 时把插件页那行开关打开即可（profile 层覆盖这里的默认值）。
+- id: browser-cdp
+  disabled: true
 
 # 下面这条是**顶层** entry（不在 `insert:` 里），语义是「覆盖已存在的某行的 config」
 # —— `ptc-runtime` 行由 dsh 自己的 base bundle 定义
