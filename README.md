@@ -37,6 +37,10 @@
 | `browser-cdp` | `cdp` | 外部 Chrome 的标签页 | CLI / 想接自己日常浏览器时 |
 | `browser-electron` | `electron` | 桌面端自己真正的 `BrowserWindow` | 桌面端（默认） |
 
+⚠️ **`browser-cdp` 出货默认是关闭的**（`cordis.patch.yml` 顶层 `- id: browser-cdp: disabled: true`，2026-09-19 定）：
+桌面端有 `electron` 就够，不把连外部 Chrome 的 provider 装进运行态。要用它在 CLI 里连自己的浏览器，
+在插件页把那一行开关打开即可（profile 层覆盖默认）。
+
 页面上的一切按**不可信数据**处理 —— 这条写进了每个工具的描述与系统提示分段。
 
 ---
@@ -87,7 +91,7 @@ pnpm build         # 产出 lib/（host 半边多入口 + 包根 + 客户端 bun
 ```
 
 **基线以 [`docs/开发指南.md`](docs/开发指南.md) 为准**（那里有实测日期与跑法），当前为
-无浏览器 **429 passed / 5 skipped**（2026-09-19 实测，含 P1 写前门及其三轮 review 修正的用例；
+无浏览器 **455 passed / 5 skipped**（2026-09-19 23:23 实测，19 文件 ~19s；
 这个数字每批都会动，以现跑 `pnpm test` 为准）、接真 Chrome
 **418 passed / 0 skipped**（该路数字是上一轮的，本轮没起重跑；live 组那 5 个用例本身没动）。
 
@@ -205,8 +209,9 @@ pnpm run verify:portable -- --dir /path/to/解压后的目录 \
 | [`docs/架构与实现.md`](docs/架构与实现.md) | 接线为什么在 host 平面、两个 provider、ref 状态机、大纲折叠/去重、上下文预算、窗口宿主 |
 | [`docs/打包与发版.md`](docs/打包与发版.md) | 打包四前置、profile 物化、四道自检、出货 patch 红线、打包态专有坑 |
 | [`docs/CDP实测事实.md`](docs/CDP实测事实.md) | CDP 状态作用域的逐条实测结论 —— **接入新 CDP 命令前必读** |
-| `docs/多会话防冲突-设计评估.md` / `-实施方案.md` | **进行中的设计，尚未实施**：原三层设计的评估与 T1–T5 重排后的方案。⚠️ 这两份**尚未入库**，只在本地工作区可见 |
+| `docs/多会话防冲突设计评估.md` / `-实施方案.md` | 主上交代「先不动」的在途设计：原三层设计的评估 + T1–T5 重排后的方案。**已入库，且部分已落地** —— P1 写前门、§6.5 人工接管按钮、P0 事故分布取数代码（样本仍为零）；其余仍待实施 |
 | [`docs/portable-install.md`](docs/portable-install.md) | 插件便携版的用户安装说明（随包发出） |
+| `docs/webpage交互改进-实施方案.md` | **进行中**：真机会话里「动作没按意图落地 / 模型空转」的整改方案（与多会话防冲突那份的分工见它 §8） |
 
 ---
 

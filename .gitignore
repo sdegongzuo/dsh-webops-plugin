@@ -37,9 +37,10 @@ scripts/.kill-ports.txt
 # 点名而不是通配 `.*`：仓库根的 dotfile 里还有要入库的（`.gitignore` 自己、
 # `.env.local.example`），一条宽通配会把它们一起吞掉。
 #
-# ⚠️ **`.review-tmp/` 刻意不在本清单内** —— 它 2026-09-19 22:46 仍有 mtime（有人在写），
-# 且里面是 P2-P3 方案、impl、handover 一类**文档草稿**，去处该由它们的作者定。
-# AGENTS.md 的「与并行会话共存」那条也要求不替别人处置未跟踪文件。
+# 一次性 review 草稿（P2-P3 方案 / 状态归属规范 / asst-t*-s* 分派稿）。
+# 2026-09-19 23:33 主上定：忽略。只是**不入库**，文件仍留在本地 —— 要留档的自己搬走，
+# 忽略不等于删除。⚠️ 里面是并行会话的在途稿（最后 mtime 22:46），删除前先确认作者已完成。
+.review-tmp/
 .list-wins.py
 .shot-win*.py
 .lock-probe/

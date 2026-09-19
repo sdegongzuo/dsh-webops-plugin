@@ -57,15 +57,15 @@ dsh --profile <你的 profile 名> --dump-config
 [dsh-webops-plugin] root: client row registered
 [dsh-webops-plugin] browser-cdp: endpoint=http://127.0.0.1:9333
 [dsh-webops-plugin] browser-electron: enabled=true
-[dsh-webops-plugin] tool-browser: registered open, navigate, snapshot, screenshot, ...
+[dsh-webops-plugin] webpage-tools: registered webpage_open, webpage_navigate, webpage_snapshot, webpage_screenshot, ...（共 16 个，前缀统一 `webpage_`）
 ```
 
 ## 四、选 provider
 
 | provider | 环境变量 | 开的是什么 |
 |---|---|---|
-| `cdp`（默认，CLI） | `DSH_CDP_ENDPOINT=http://127.0.0.1:9333` | 你**自己开的**外部 Chrome 的标签页 |
 | `electron` | `DSH_BROWSER_PROVIDER=electron` | 桌面端自己的 `BrowserWindow` |
+| `cdp` | `DSH_CDP_ENDPOINT=http://127.0.0.1:9333` | 你**自己开的**外部 Chrome 的标签页。⚠️ **出货默认关闭**（`cordis.patch.yml` 里 `browser-cdp: disabled: true`）：桌面端用 `electron` 就够，不装它。要连外部 Chrome，在插件页把 `browser-cdp` 那行开关打开（profile 层覆盖默认值） |
 
 用 `cdp` 前必须先起一个带调试端口的 Chrome，**且必须用独立的 user-data-dir**，
 否则它会复用你日常那个实例，而那个实例不会开调试端口：
