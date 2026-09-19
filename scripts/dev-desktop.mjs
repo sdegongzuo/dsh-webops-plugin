@@ -190,6 +190,12 @@ async function main() {
   environment.ELECTRON_ENABLE_LOGGING ??= '1'
   // 打开本插件的加载诊断，便于确认 host 半边是否真的挂上。
   environment.DSH_BROWSER_PLUGIN_DEBUG ??= '1'
+  // P0 采样（方案 §4）：默认落在插件仓库内的 `.metrics/`（已 gitignore）。
+  // 为什么给默认值而不是只写文档：样本要「日常使用自动积累」，靠人记得在命令行加前缀
+  // 等于永远收不到样本（§4 的三个数至今为零就是这么来的）。`??=` 不覆盖外部设置，
+  // 想换目录仍然是 `DSH_BROWSER_PLUGIN_METRICS=<别处> pnpm run dev:desktop`。
+  // 出货包里这个变量不存在，插件侧整条计数为 no-op（metrics.ts 纪律 1）。
+  environment.DSH_BROWSER_PLUGIN_METRICS ??= join(PLUGIN_ROOT, '.metrics')
   // 开发态显式开闸：`fake-llm` 的 `llm/stream` 接管是**默认关闭**的（见 src/fake-llm/index.ts
   // 的 GATE_ENV），keyless 验证需要它，所以这里置 1。出货包里两者都不存在。
   environment.DSH_FAKE_LLM ??= '1'
@@ -209,6 +215,8 @@ async function main() {
   console.log(`dev-desktop: 调试端口 main=${PORTS.main} renderer=${PORTS.renderer} host=${PORTS.host}`)
   console.log(`dev-desktop: 浏览器 provider=${environment.DSH_BROWSER_PROVIDER}`
     + `（electron = 桌面端自己的窗口；换 cdp 需另起真 Chrome）`)
+  console.log(`dev-desktop: P0 采样落盘 → ${environment.DSH_BROWSER_PLUGIN_METRICS}`
+    + '（会话关闭时追加一行 JSONL；不想要就设成空串）')
   console.log('dev-desktop: 校验用 → pnpm run check:desktop')
 
   await new Promise((resolvePromise, reject) => {

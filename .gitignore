@@ -26,6 +26,9 @@ coverage/
 .probe-*
 .verify-card*.png
 .workbuddy/
+# P0 事故分布采样落盘（方案 §4；dev-desktop.mjs 默认指到这里）。
+# 一次性测量产物，出结论后连模块一起删。
+.metrics/
 # 真窗口调试脚本的临时输出（一次性的证据快照，不入库）
 scripts/.last-*
 scripts/.kill-ports.txt

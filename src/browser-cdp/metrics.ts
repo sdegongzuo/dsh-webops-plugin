@@ -48,6 +48,14 @@ export interface StaleRefMetricsRecord {
   readonly stale: Record<string, number>
   /** 命中总数，省得读的人自己加。 */
   readonly staleTotal: number
+  /**
+   * 写这一行时的 ref 纪元。
+   *
+   * ⚠ 这个字段**必须在这里声明**：它是靠对象展开（`...epoch === undefined ? {} : { epoch }`）
+   * 挂上去的，而 TS 不对展开做 excess-property 检查 —— 不声明时 tsc 全绿，但写出来的
+   * JSON 里就是有它，读的人从类型里看不出来。类型要么反映行为，要么就是谎话。
+   */
+  readonly epoch?: number
 }
 
 /**
