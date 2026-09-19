@@ -420,7 +420,8 @@ export class HttpCdpTransport implements CdpTransport {
   /** @inheritdoc */
   async closeTarget(targetId: string, signal?: AbortSignal): Promise<void> {
     try {
-      await this.request(`/json/close/${encodeURIComponent(targetId)}`, signal, 'PUT')
+      // Chrome 成功时回纯文本（见 requestText），所以这里不解析响应体，只看状态码。
+      await this.requestText(`/json/close/${encodeURIComponent(targetId)}`, signal, 'PUT')
     } catch (error: unknown) {
       // target 已经不存在时 Chrome 会回 404 —— 那正是我们想要的结果（幂等成功）。
       // 其它状态码（403 / 500…）是真错，必须照抛 —— 只看错误 code 一刀切的话会把它们一起吞掉。
@@ -432,7 +433,8 @@ export class HttpCdpTransport implements CdpTransport {
   /** @inheritdoc */
   async activateTarget(targetId: string, signal?: AbortSignal): Promise<void> {
     try {
-      await this.request(`/json/activate/${encodeURIComponent(targetId)}`, signal, 'GET')
+      // 与 close 同一族端点：成功回纯文本 `Target activated`（实测 Chrome 153），不解析体。
+      await this.requestText(`/json/activate/${encodeURIComponent(targetId)}`, signal, 'GET')
     } catch (error: unknown) {
       // target 已经不存在时 Chrome 会回 404 —— 幂等成功。同上，只吞 404。
       if (isTargetGone(error)) return
@@ -491,6 +493,21 @@ export class HttpCdpTransport implements CdpTransport {
   }
 
   private async requestRaw(path: string, signal: AbortSignal | undefined, method: string): Promise<unknown> {
+    const text = await this.requestText(path, signal, method)
+    if (text.length === 0) return {}
+    try {
+      return JSON.parse(text)
+    } catch (error: unknown) {
+      throw new BrowserError(`DevTools endpoint ${path} returned malformed JSON`, 'BROWSER_PROTOCOL_ERROR', { cause: error })
+    }
+  }
+
+  /**
+   * 发一个 DevTools HTTP 请求，只关心「状态码过不过」，把响应体原样当文本返回、**不解析**。
+   * 给 `/json/close` 与 `/json/activate` 这类端点用：Chrome 成功时回的是纯文本
+   * （实测 Chrome 153：`Target is closing` / `Target activated`），走 JSON 解析会把成功报成失败。
+   */
+  private async requestText(path: string, signal: AbortSignal | undefined, method: string): Promise<string> {
     const timeout = AbortSignal.timeout(this.requestTimeoutMs)
     const combined = signal === undefined ? timeout : AbortSignal.any([signal, timeout])
     let response: Response
@@ -506,13 +523,7 @@ export class HttpCdpTransport implements CdpTransport {
         { status: response.status },
       )
     }
-    const text = await response.text()
-    if (text.length === 0) return {}
-    try {
-      return JSON.parse(text)
-    } catch (error: unknown) {
-      throw new BrowserError(`DevTools endpoint ${path} returned malformed JSON`, 'BROWSER_PROTOCOL_ERROR', { cause: error })
-    }
+    return await response.text()
   }
 }
 

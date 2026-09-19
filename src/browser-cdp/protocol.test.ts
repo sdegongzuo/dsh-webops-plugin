@@ -243,6 +243,17 @@ describe('HttpCdpTransport', () => {
     }
   }
 
+  /**
+   * 用**纯文本**应答 —— `/json/close` 与 `/json/activate` 在真 Chrome 上成功时就是这个形态
+   * （实测 Chrome 153：`Target is closing` / `Target activated`）。用 JSON 体测不出这个坑。
+   */
+  function respondText(body: string, status = 200): void {
+    handler = (_req, res) => {
+      res.writeHead(status, { 'content-type': 'text/plain' })
+      res.end(body)
+    }
+  }
+
   it('reads the browser version and its websocket url', async () => {
     respondJson({ Browser: 'Chrome/141.0.0.0', webSocketDebuggerUrl: 'ws://127.0.0.1:9222/devtools/browser/abc' })
     const version = await new HttpCdpTransport(base).version()
@@ -300,6 +311,23 @@ describe('HttpCdpTransport', () => {
     respondJson({ message: 'Forbidden' }, 403)
     await expect(new HttpCdpTransport(base).closeTarget('locked'))
       .rejects.toThrow(expect.objectContaining({ code: 'BROWSER_PROTOCOL_ERROR', status: 403 }))
+  })
+
+  // 真 Chrome 上这两个端点成功时回的是纯文本，早先按 JSON 解析会把成功报成失败：
+  // `close()` 用 .catch 吞掉了它，`dispose()` 不吞 → 卸载路径恒一条假红。
+  it('close 认「200 + 纯文本 Target is closing」为成功', async () => {
+    respondText('Target is closing')
+    await expect(new HttpCdpTransport(base).closeTarget('t1')).resolves.toBeUndefined()
+  })
+
+  it('activate 认「200 + 纯文本 Target activated」为成功', async () => {
+    respondText('Target activated')
+    await expect(new HttpCdpTransport(base).activateTarget('t1')).resolves.toBeUndefined()
+  })
+
+  it('404 的幂等判定只看状态码，文本体 "No such target id" 也算成功关掉', async () => {
+    respondText('No such target id: t1', 404)
+    await expect(new HttpCdpTransport(base).closeTarget('t1')).resolves.toBeUndefined()
   })
 
   it('activate 同样只吞 404（500 照抛）', async () => {
