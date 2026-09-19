@@ -3,9 +3,11 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { beforeEach, describe, expect, it } from 'vitest'
 import { BrowserError } from '../browser/types.ts'
+import type { BrowserSnapshot } from '../browser/types.ts'
 import { METRICS_ENV, StaleRefMetrics } from './metrics.ts'
 import { CdpBrowserProvider } from './provider.ts'
 import type { BrowserHolder } from './provider.ts'
+import { PAGE_DOCUMENT_STATE_KEY } from './state.ts'
 import { CdpConnection } from './protocol.ts'
 import type { CdpSocket, CdpTarget, CdpTransport, CdpVersion } from './protocol.ts'
 import type { AxNode } from './snapshot.ts'
@@ -41,6 +43,13 @@ class FakeChrome {
   /** P1：点击是否引发导航（模拟链接点击）。 */
   navigateOnClick = false
   /**
+   * P1/P2：点击（或回车）引发导航时，是否同时发 `Page.frameNavigated`。
+   *
+   * 默认 **true** —— 真导航一定会发这个事件（`scripts/probe-within-document.ts` 实测）。
+   * 关掉它只在「只关心地址变化、不关心事件流」的用例里有意义；P2 的去重路径必须开着才测得准。
+   */
+  navigationEventOnClick = true
+  /**
    * P1：设置后，点击的 `mouseReleased` 会「弹出一个新窗口」（模拟 `target=_blank` /
    * `window.open`）。真链路上是宿主 `setWindowOpenHandler` → `openTab` → 通报 → 收编，
    * 这里由测试直接调 `adoptSession` 代替，只弹一次。
@@ -54,6 +63,15 @@ class FakeChrome {
    * 若同步触发，`click` 的 800ms 轮询与补观测窗口都成了摆设，测试会假绿。
    */
   popupDelayMs = 120
+  /**
+   * P2：设置后，点击引发一次**同文档软导航**（`history.pushState` / `replaceState` 那一类），
+   * 地址换成这个值，并补发 `Page.navigatedWithinDocument`。
+   *
+   * 这是真机上最常见的一档（Google 结果页每交互一次换一批遥测令牌，§5.1.2 ① 实测 17 次检出里
+   * 5 次是纯抖动）。与 `navigateOnClick` 的区别是**文档身份不变** —— 不 replace 文档、
+   * `loaderId` 不动，所以走的是 D-19 的「不作废纪元」那一档。
+   */
+  withinDocumentOnClick: string | undefined
   /** P1：回车是否引发导航（模拟表单提交，报告 S1 的维基搜索）。 */
   navigateOnEnter = false
   /**
@@ -291,6 +309,24 @@ class FakeChrome {
         if (this.navigateOnClick && params['type'] === 'mouseReleased') {
           this.href = 'https://example.com/next'
           this.page = { url: 'https://example.com/next', title: 'Next' }
+          // 真导航**一定**会发 `Page.frameNavigated`（`scripts/probe-within-document.ts` 实测），
+          // 而 provider 的脏累加器搭在这条事件流上 —— 不补这一条，P2 的去重路径就是假绿。
+          if (this.navigationEventOnClick) {
+            emitCdp(socket, 'Page.frameNavigated', {
+              frame: { id: 'frame-1', loaderId: 'loader-2', url: this.page.url },
+            })
+          }
+        }
+        // 同文档软导航：地址变了、**文档没换**（`loaderId` 不动），事件走另一条通道。
+        if (this.withinDocumentOnClick !== undefined && params['type'] === 'mouseReleased') {
+          this.page = { url: this.withinDocumentOnClick, title: this.page.title }
+          this.href = this.withinDocumentOnClick
+          if (this.navigationEventOnClick) {
+            emitCdp(socket, 'Page.navigatedWithinDocument', {
+              frameId: 'frame-1',
+              url: this.withinDocumentOnClick,
+            })
+          }
         }
         // 模拟「这点开了一个新窗口」：与导航可以同时发生（脚本里两者并发）。
         if (this.popupOnClick !== undefined && params['type'] === 'mouseReleased') {
@@ -305,6 +341,11 @@ class FakeChrome {
         if (this.navigateOnEnter && params['type'] === 'keyUp' && params['key'] === 'Enter') {
           this.href = 'https://zh.wikipedia.org/w/index.php?search=Electron'
           this.page = { url: this.href, title: 'Electron (software) - 维基百科，自由的百科全书' }
+          if (this.navigationEventOnClick) {
+            emitCdp(socket, 'Page.frameNavigated', {
+              frame: { id: 'frame-1', loaderId: 'loader-2', url: this.page.url },
+            })
+          }
         }
         return {}
       case 'Input.insertText':
@@ -2040,5 +2081,302 @@ describe('§6.5 控制权（人工接管按钮）', () => {
 
     // 会话没了，再切它的 holder 应当是静默 no-op（而不是抛「未知会话」之类的噪音）。
     expect(() => { provider.setControlHolder(sessionId, 'agent') }).not.toThrow()
+  })
+})
+
+/**
+ * P2（方案 §6.2 ①②③）+ D-5（§5.2）+ D-19（§13）。
+ *
+ * 三条放在同一个 describe 里，因为它们钉的是**同一条链**：页面在模型之外变过 → 攒着 →
+ * 下一次回执夹带 → 顺带写进簿记；而「只改 query 的抖动不算换文档」是这条链的取数口径。
+ */
+describe('§6.2 决策时通知（P2）+ D-5 + D-19', () => {
+  class DirtyProvider extends CdpBrowserProvider {
+    /** 等价于「人在标签条上按了接管 / 交还」。 */
+    setControlHolder(sessionId: string, holder: BrowserHolder): void {
+      this.setHolder(sessionId, holder)
+    }
+
+    /** 等价于「人开了 DevTools」。 */
+    setDevToolsTakeover(sessionId: string, active: boolean): void {
+      this.setTakeover(sessionId, active)
+    }
+
+    /** §6.2 ③ 的簿记：页面文档这条伪状态的记录。 */
+    documentRecord(sessionId: string): { owner: string; at: number; applied: unknown } | undefined {
+      return this.stateRegistry.get(sessionId, PAGE_DOCUMENT_STATE_KEY)
+    }
+  }
+
+  let chrome: FakeChrome
+  let provider: DirtyProvider
+
+  beforeEach(() => {
+    chrome = new FakeChrome()
+    chrome.axeNodes = PAGE_TREE
+    provider = new DirtyProvider({ navigationTimeoutMs: 200 }, chrome.transport())
+  })
+
+  /** 已建立的连接；事件注入走它。 */
+  function socket(): FakeSocket {
+    const found = chrome.sockets[0]
+    if (found === undefined) throw new Error('no connection was opened')
+    return found
+  }
+
+  /**
+   * 补发 `open()` 那一次导航的事件。
+   *
+   * 夹具不模拟浏览器，所以 `open()` 期间不会有 `Page.frameNavigated` 进来 —— 而真实链路上有。
+   * 不补这一条，累加器里的 `lastUrl` 会停在 `about:blank`，`route.from` 就成了一个假地址。
+   * 它同时被 `open()` 记下的赊账抵掉，所以不会污染计数。
+   */
+  function emitOpenNavigation(url: string): void {
+    emitCdp(socket(), 'Page.frameNavigated', { frame: { id: 'frame-1', loaderId: 'loader-1', url } })
+  }
+
+  /** 观察一次并窄化到快照（`observe` 的返回是 snapshot | screenshot 的联合）。 */
+  async function fullSnapshot(sessionId: string): Promise<BrowserSnapshot> {
+    const observed = await provider.observe({ kind: 'snapshot', sessionId })
+    if (observed.kind !== 'snapshot') throw new Error('expected a snapshot')
+    return observed
+  }
+
+  /** 开一个会话 + 全页快照；返回会话 id 与首个可用 ref。 */
+  async function openWithRef(): Promise<{ sessionId: string; ref: string }> {
+    const session = await provider.open({})
+    emitOpenNavigation(chrome.page.url)
+    const snapshot = await fullSnapshot(session.id)
+    return { sessionId: session.id, ref: snapshot.refs[0]?.ref as string }
+  }
+
+  it('全页快照回执带上「页面在模型之外变过」，并把锚点前移（下一次就干净了）', async () => {
+    const session = await provider.open({})
+    emitOpenNavigation(chrome.page.url)
+
+    // open 自己引发的那一次导航不算：赊账抵掉 + `reset()`。
+    const first = await fullSnapshot(session.id)
+    expect(first.pageChanged).toBeUndefined()
+
+    // 人工在两轮之间导航走了（这里靠事件流复现：地址也真的变了）。
+    chrome.page = { url: 'https://example.com/report', title: 'Report' }
+    emitCdp(socket(), 'Page.frameNavigated', {
+      frame: { id: 'frame-1', loaderId: 'loader-2', url: 'https://example.com/report' },
+    })
+
+    const second = await fullSnapshot(session.id)
+    expect(second.pageChanged).toMatchObject({
+      navigated: 1,
+      withinDocument: 0,
+      route: { from: 'https://example.com/', to: 'https://example.com/report' },
+    })
+    // 「观察不到这条通道」不等于「观察到 0 次」：没有接管信号时整条不出现。
+    expect(second.pageChanged).not.toHaveProperty('takeoverWindow')
+
+    // 全页快照落地 = 锚点前移，同一笔账不会再报第二遍。
+    const third = await fullSnapshot(session.id)
+    expect(third.pageChanged).toBeUndefined()
+  })
+
+  it('mutate 回执也带（人工的操作落在两轮之间时，模型下一轮往往是 click 而不是 snapshot）', async () => {
+    const { sessionId, ref } = await openWithRef()
+
+    // 页面自己软导航了一次（pushState 换路由）—— 地址栏没换文档，但模型手里的 ref 已经不再可信。
+    emitCdp(socket(), 'Page.navigatedWithinDocument', {
+      frameId: 'frame-1',
+      url: 'https://example.com/#/inbox',
+    })
+
+    const result = await provider.mutate({ kind: 'click', sessionId, ref })
+    expect(result.navigated).toBe(false)
+    expect(result.pageChanged).toMatchObject({
+      navigated: 0,
+      withinDocument: 1,
+      route: { to: 'https://example.com/#/inbox' },
+    })
+  })
+
+  it('自己动作引发的导航不报成「页面在模型之外变过」—— 那条已由 navigated 报过（§6.3 去重）', async () => {
+    const { sessionId, ref } = await openWithRef()
+    chrome.navigateOnClick = true
+
+    const result = await provider.mutate({ kind: 'click', sessionId, ref })
+
+    expect(result.navigated).toBe(true)
+    expect(result.pageChanged).toBeUndefined()
+  })
+
+  it('③ 文档变化写进 TargetStateRegistry，让「谁 / 何时」真的可报', async () => {
+    const { sessionId } = await openWithRef()
+
+    chrome.page = { url: 'https://example.com/other', title: 'Other' }
+    emitCdp(socket(), 'Page.frameNavigated', {
+      frame: { id: 'frame-1', loaderId: 'loader-2', url: 'https://example.com/other' },
+    })
+
+    const record = provider.documentRecord(sessionId)
+    expect(record).toBeDefined()
+    // owner 是这套词表里「非本会话」的那一侧；插件在事件层分不出「真人」与「页面脚本」，
+    // 所以回执文案按「本会话之外」写，不写死「有人」。
+    expect(record?.owner).toBe('human')
+    expect(record?.at).toBeGreaterThan(0)
+    expect(record?.applied).toMatchObject({ navigated: 1 })
+  })
+
+  it('D-19：同 host+path 只换了 query（遥测令牌抖动）不作废纪元、不拦动作，只如实标脏', async () => {
+    chrome.page = { url: 'https://www.google.com/search?q=cat&sxsrf=AAA', title: 'cat - Google' }
+    const session = await provider.open({})
+    emitOpenNavigation(chrome.page.url)
+    const snapshot = await fullSnapshot(session.id)
+    const ref = snapshot.refs[0]?.ref as string
+
+    // 同 host + 同 path，只有遥测参数变了 —— §5.1.2 ① 实测的那种「每次交互都抖一下」。
+    chrome.page = { url: 'https://www.google.com/search?q=cat&sxsrf=BBB', title: 'cat - Google' }
+
+    const result = await provider.mutate({ kind: 'click', sessionId: session.id, ref })
+    expect(result).toMatchObject({ navigated: false, epoch: snapshot.epoch })
+    expect(result.pageChanged?.addressDrift).toBe(1)
+
+    // 关键：纪元没被作废，同一个 ref 还能接着用（旧行为要让模型白重拍一次快照）。
+    await expect(provider.mutate({ kind: 'click', sessionId: session.id, ref }))
+      .resolves.toMatchObject({ action: 'click' })
+  })
+
+  it('自己点击引发的「仅 query 变」软导航归因给这次点击，不报成「页面在本会话之外变过」', async () => {
+    chrome.page = { url: 'https://www.google.com/search?q=cat&sxsrf=AAA', title: 'cat - Google' }
+    const session = await provider.open({})
+    emitOpenNavigation(chrome.page.url)
+    const snapshot = await fullSnapshot(session.id)
+    const ref = snapshot.refs[0]?.ref as string
+
+    // 这一次不是「页面在外面被人改了」，而是**这次点击自己**触发的软导航：
+    // 页面脚本换了一批遥测令牌（`replaceState`），文档身份不变。
+    //
+    // 事件线看到 `Page.navigatedWithinDocument` → 被点击前记下的赊账抵掉（§6.3 去重）；
+    // 轮询线（`detectNavigation`）随后也读到地址变了 —— 它必须**认出这是同一次变化**。
+    // 修前它在这里又数了一笔 `addressDrift`，回执于是渲染成「PAGE CHANGED OUTSIDE THIS
+    // SESSION … run webpage_snapshot (full)」：既把归因说反了，又让模型为一次遥测抖动
+    // 白付一次全量重拍（中位 ≈5500 字符）—— 正是 D-19 要省掉的那笔。
+    chrome.withinDocumentOnClick = 'https://www.google.com/search?q=cat&sxsrf=BBB'
+
+    const result = await provider.mutate({ kind: 'click', sessionId: session.id, ref })
+    expect(result.navigated).toBe(false)
+    expect(result.pageChanged).toBeUndefined()
+
+    // 纪元照旧没被作废：这一次点击的效果模型从回执自己的 `url` 就读得到（D-19 的口径）。
+    expect(result.url).toBe('https://www.google.com/search?q=cat&sxsrf=BBB')
+    expect(result.epoch).toBe(snapshot.epoch)
+  })
+
+  it('反向验证：地址变了但它**没进过事件流**时，轮询路径照旧如实标脏（兜底那一档还在）', async () => {
+    chrome.page = { url: 'https://www.google.com/search?q=cat&sxsrf=AAA', title: 'cat - Google' }
+    const session = await provider.open({})
+    emitOpenNavigation(chrome.page.url)
+    const snapshot = await fullSnapshot(session.id)
+    const ref = snapshot.refs[0]?.ref as string
+
+    // **故意不发事件**：模拟 `Page.enable` 之前就加载完 / 事件丢失那一档 —— 事件线从头到尾
+    // 没见过新地址，所以轮询线是这个变化唯一的观测者，它必须报出来。
+    // 与上一条配对：同样的动作、同样的地址变化，**只差事件到没到**，读数必须相反。
+    chrome.page = { url: 'https://www.google.com/search?q=cat&sxsrf=BBB', title: 'cat - Google' }
+
+    const result = await provider.mutate({ kind: 'click', sessionId: session.id, ref })
+    expect(result.pageChanged).toMatchObject({
+      navigated: 0,
+      withinDocument: 0,
+      addressDrift: 1,
+      route: {
+        from: 'https://www.google.com/search?q=cat&sxsrf=AAA',
+        to: 'https://www.google.com/search?q=cat&sxsrf=BBB',
+      },
+    })
+  })
+
+  it('同一次外部软导航不会在两个桶里各记一笔（事件线报过 → 轮询线不重复记）', async () => {
+    const { sessionId, ref } = await openWithRef()
+
+    // 页面自己在外面软导航了一次，**事件到齐**（地址也真的变了，两条线都会看见它）。
+    chrome.page = { url: 'https://example.com/#/inbox', title: 'Example' }
+    emitCdp(socket(), 'Page.navigatedWithinDocument', {
+      frameId: 'frame-1',
+      url: 'https://example.com/#/inbox',
+    })
+
+    // 下一次点击的门 / 轮询同样读到「地址与纪元不同」—— 但那是**同一次**变化，事件线已经记过。
+    const result = await provider.mutate({ kind: 'click', sessionId, ref })
+    expect(result.pageChanged?.withinDocument).toBe(1)
+    expect(result.pageChanged?.addressDrift).toBeUndefined()
+  })
+
+  it('D-19 反向验证：path 真的换了照旧作废 + 抛 stale_document（放宽只针对 query/hash）', async () => {
+    const { sessionId, ref } = await openWithRef()
+    chrome.page = { url: 'https://example.com/other', title: 'Other' }
+
+    await expect(provider.mutate({ kind: 'click', sessionId, ref }))
+      .rejects.toThrow(expect.objectContaining({ code: 'BROWSER_STALE_REF', reason: 'stale_document' }))
+  })
+
+  it('takeoverWindow：人按了接管 → 下一次回执报出来；交还本身不记', async () => {
+    const { sessionId } = await openWithRef()
+
+    provider.setControlHolder(sessionId, 'human')
+    provider.setControlHolder(sessionId, 'agent')
+
+    const snapshot = await fullSnapshot(sessionId)
+    expect(snapshot.pageChanged).toMatchObject({ takeoverWindow: 1, navigated: 0, withinDocument: 0 })
+  })
+
+  it('takeoverWindow：DevTools 被打开也算一次窗口（两条来源都进同一个桶）', async () => {
+    const { sessionId } = await openWithRef()
+    provider.setDevToolsTakeover(sessionId, true)
+
+    const snapshot = await fullSnapshot(sessionId)
+    expect(snapshot.pageChanged).toMatchObject({ takeoverWindow: 1 })
+  })
+
+  it('D-5：区域快照复用旧号换了指针 → 回执带 reboundRefs，且 epoch 不动（只报不作废）', async () => {
+    const session = await provider.open({})
+    emitOpenNavigation(chrome.page.url)
+    const full = await provider.observe({ kind: 'snapshot', sessionId: session.id })
+    if (full.kind !== 'snapshot') throw new Error('expected a snapshot')
+    const submit = full.refs.find(entry => entry.name === 'Submit')
+    if (submit === undefined) throw new Error('expected a Submit ref')
+
+    // 「提交」被换成了一个**新节点**，role / name / 祖先路径一字不差 —— 于是 adopt 的唯一命中
+    // 规则会复用旧号，把指针就地改写（§5.2 七步链的第 5 步）。
+    chrome.axeNodes = PAGE_TREE.map(node =>
+      node.backendDOMNodeId === 9 ? { ...node, backendDOMNodeId: 99 } : node)
+    chrome.layoutBoxes = [
+      { backendNodeId: 7, bounds: [0, 0, 200, 40] },
+      { backendNodeId: 8, bounds: [0, 50, 200, 30] },
+      { backendNodeId: 99, bounds: [0, 90, 200, 30] },
+    ]
+
+    const regional = await provider.observe({
+      kind: 'snapshot',
+      sessionId: session.id,
+      region: { viewport: true },
+    })
+    if (regional.kind !== 'snapshot') throw new Error('expected a snapshot')
+
+    expect(regional.epoch).toBe(full.epoch)
+    expect(regional.reboundRefs).toEqual([{ ref: submit.ref, role: 'button', name: 'Submit' }])
+    // 区域快照不推进锚点：别的 ref 依然可用（D-5 选 C 的前提）。
+    expect(regional.refs.find(entry => entry.name === 'Email')).toBeDefined()
+  })
+
+  it('D-5 反向验证：同一个节点被区域快照再次覆盖时**不报** rebound（别把重观察说成改绑）', async () => {
+    const session = await provider.open({})
+    emitOpenNavigation(chrome.page.url)
+    await provider.observe({ kind: 'snapshot', sessionId: session.id })
+
+    const regional = await provider.observe({
+      kind: 'snapshot',
+      sessionId: session.id,
+      region: { viewport: true },
+    })
+    if (regional.kind !== 'snapshot') throw new Error('expected a snapshot')
+
+    expect(regional.reboundRefs).toBeUndefined()
   })
 })

@@ -33,6 +33,7 @@ import type {
   BrowserObservation,
   BrowserObserveRequest,
   BrowserOpenRequest,
+  BrowserPageChanged,
   BrowserProvider,
   BrowserRevalidateFailure,
   BrowserRevalidateRequest,
@@ -45,8 +46,9 @@ import type {
   BrowserTabsResult,
 } from '../browser/types.ts'
 import { RefRegistry } from './refs.ts'
-import { TargetStateRegistry } from './state.ts'
+import { PAGE_DOCUMENT_STATE_KEY, TargetStateRegistry } from './state.ts'
 import type { RefTarget } from './refs.ts'
+import { sameDocumentIdentity, SessionDirtyTracker } from './dirty.ts'
 import {
   boundsToBox,
   boxesIntersect,
@@ -197,12 +199,21 @@ interface SessionState {
   readonly consoleCollector: ConsoleCollector
   /** P2 network 采集器（requestId 直接用，不做映射）。 */
   readonly networkCollector: NetworkCollector
+  /**
+   * P2 跨轮次脏累加器（方案 §6.2 ①）：攒着「页面在本会话之外变过」的分类计数，
+   * 下一次回执夹带。与 `takeover` 是两个维度 —— 见 `dirty.ts` 的文件头。
+   */
+  readonly dirty: SessionDirtyTracker
   url: string
   title: string
   /**
    * P3 人工接管状态位（方案 4.1.1）：有人正开着 DevTools 操作这个页面。
    * **幂等状态位，不是计数器** —— agent 自己 toggle DevTools 时也会被置位，无需去重。
    * 它只影响 snapshot 结果里的提示，**绝不推进 ref 纪元**（`[V31]`）。
+   *
+   * 与 {@link SessionState.dirty} 是**两个维度**，别合并：这个说「有人正开着 DevTools」（状态），
+   * 那个说「页面自上次快照之后变过」（动作计数）。人工不开 DevTools 改页面时这一位是 `false`
+   * 而那一边有数 —— 回执里两者同时出现不矛盾。
    */
   takeover: boolean
   /**
@@ -395,6 +406,13 @@ export class CdpBrowserProvider implements BrowserProvider {
       // 重放 / 实时事件会在订阅前溜走。
       consoleCollector: new ConsoleCollector(connection),
       networkCollector: new NetworkCollector(connection),
+      // 与采集器同序：构造函数里就订阅 `Page.*` 两个导航事件，必须赶在下面 `Page.enable` 之前建好。
+      // ③ 的簿记写入走这个回调（谁的页面、什么时候被换掉的）—— 见 `state.ts` 的 key 注释。
+      dirty: new SessionDirtyTracker(connection, target.url, {
+        onDocumentChanged: report => {
+          this.stateRegistry.reportExternalRewrite(target.id, PAGE_DOCUMENT_STATE_KEY, report)
+        },
+      }),
       url: target.url,
       title: target.title,
       takeover: false,
@@ -414,12 +432,20 @@ export class CdpBrowserProvider implements BrowserProvider {
       }
       // 等加载完成。超时**不**抛错：此时标签页已经建好，抛错会让调用方拿不到 session id，
       // 反而留下一个谁也管不着的孤儿标签。加载慢的页面交给模型自己再 snapshot。
+      //
+      // 赊账先记：这一次 open 自己引发的导航（含重定向链）到达时不该被算成「页面在模型之外变过」。
+      // 下面的 `reset()` 把已经数进去的清掉，而赊账**不会被它清掉** —— 那正好接住迟到几毫秒的事件。
+      session.dirty.expectSelfNavigation()
       await this.navigateTo(connection, url, session.url, signal)
       const meta = await this.readPageMeta(connection, signal)
       if (meta !== undefined) {
         session.url = meta.url
         session.title = meta.title
       }
+      // **建会话这一刻把脏累加器清零**：`about:blank` → 目标地址（可能还带一串重定向）全是
+      // 我们这一次 open 自己造成的，而「上一次快照」在此时根本不存在。不清的话第一条快照回执
+      // 就会报一句无中生有的「页面变过」。迟到几毫秒的事件由上面那笔赊账接住。
+      session.dirty.reset()
     } catch (error: unknown) {
       connection.close()
       await this.transport.closeTarget(target.id).catch(() => undefined)
@@ -464,6 +490,11 @@ export class CdpBrowserProvider implements BrowserProvider {
       // 与 open() 同序：采集器在构造时订阅事件，必须赶在 enable 之前建好。
       consoleCollector: new ConsoleCollector(connection),
       networkCollector: new NetworkCollector(connection),
+      dirty: new SessionDirtyTracker(connection, target.url, {
+        onDocumentChanged: report => {
+          this.stateRegistry.reportExternalRewrite(target.id, PAGE_DOCUMENT_STATE_KEY, report)
+        },
+      }),
       url: target.url,
       title: target.title,
       takeover: false,
@@ -485,12 +516,18 @@ export class CdpBrowserProvider implements BrowserProvider {
       // §6.5：连接断了（用户自己关了标签页）时，控制权簿记同样要清。
       this.stateRegistry.forget(session.targetId)
     })
+    // 收编时这个标签页可能还在加载：那一段的换文档事件不是「模型之外有人动过」，记笔赊账，
+    // 下面的 `reset()` 清掉已经数进去的、赊账接住迟到的。
+    session.dirty.expectSelfNavigation()
     await this.waitForDocument(connection, signal, this.config.navigationTimeoutMs)
     const meta = await this.readPageMeta(connection, signal)
     if (meta !== undefined && meta.url !== '') {
       session.url = meta.url
       session.title = meta.title
     }
+    // 与 `open()` 同理：收编发生在这个页面加载的尾巴上，那些换文档事件不是「模型之外有人动过」——
+    // 模型这时还没见过这个页面。
+    session.dirty.reset()
     return this.toSession(session)
   }
 
@@ -528,6 +565,8 @@ export class CdpBrowserProvider implements BrowserProvider {
     // 记住导航前的地址：新文档提交之前，`readyState` 仍是**旧**文档的 complete，
     // 只有「地址真的变了」才说明新页面已经顶上来。
     const previousUrl = session.url
+    // 这次导航是我们自己发的 —— 记一笔赊账，别让它进脏累加器（回执里本来也不带这个字段）。
+    session.dirty.expectSelfNavigation()
     const loaded = await this.navigateTo(session.connection, url, previousUrl, signal)
     // 导航无论成功与否都作废既有 ref —— 页面已经变了，旧 ref 指向的东西不再可信。
     session.refs.invalidate()
@@ -551,6 +590,9 @@ export class CdpBrowserProvider implements BrowserProvider {
     }
     // 加载完成即算「新文档能用」：读到空标题说明这页面本来就没有 <title>，不必再等。
     if (session.title.length === 0) await this.settleDocument(session, signal)
+    // 换了文档 ⇒ 之前攒的「页面在模型之外变过」全部失去意义（模型本来就得重拍快照），
+    // 而这一次导航是我们自己发的、不该记进去。清零比让它带着旧账进下一轮更诚实。
+    session.dirty.reset()
     return this.toSession(session)
   }
 
@@ -609,6 +651,10 @@ export class CdpBrowserProvider implements BrowserProvider {
       epoch: session.refs.currentEpoch,
       restored,
       failed,
+      // 恢复成功的判据只是「归档 loaderId 对得上 + role/name 一致」，同文档里的重排
+      // （列表换序、控件被替换）它一个字都看不出来。所以「页面自己变过」这条线索必须带上：
+      // 否则模型看到一片 restored，会以为手里的号全都干净。
+      ...this.dirtyField(session),
     }
   }
 
@@ -625,6 +671,7 @@ export class CdpBrowserProvider implements BrowserProvider {
     // 先摘采集器的订阅，再关连接：连接关闭会清掉全部监听，但显式退订让所有权更清楚。
     session.consoleCollector.dispose()
     session.networkCollector.dispose()
+    session.dirty.dispose()
     session.connection.close()
     // 标签页可能已经被用户手动关掉了，那正是我们想要的结果，不算失败。
     await this.transport.closeTarget(session.targetId).catch(() => undefined)
@@ -673,6 +720,11 @@ export class CdpBrowserProvider implements BrowserProvider {
     // 快照点必须在动作之前：页面可能在动作里就 adopt 出新会话（虽然实测要 150ms 级）。
     const beforeIds = new Set(this.sessions.keys())
     const watchUntil = Date.now() + TAB_OPEN_WATCH_MS
+    // click / press 可能引发导航（就是 `dispatchMutation` 下那两个 `awaitNavigation: true` 的分支）。
+    // 在**派发之前**记一笔赊账，让那一刻的 `Page.frameNavigated` / `navigatedWithinDocument`
+    // 到达时不进脏累加器 —— 那一次换文档是本次动作自己造成的，回执里的 `navigated: true`
+    // 已经报过，重复报会让模型以为「有人在旁边动过页面」（§6.3 要求与 `detectNavigation` 去重）。
+    if (request.kind === 'click' || request.kind === 'press') session.dirty.expectSelfNavigation()
     const result = await this.dispatchMutation(session, request, signal)
     // fill / scroll 不监视弹窗：输入与滚动不触发 window.open，等在这里纯属白付
     // TAB_OPEN_WATCH_MS（250ms）—— 每次操作都付。真有怪页面在 input/scroll 里开窗，
@@ -844,6 +896,10 @@ export class CdpBrowserProvider implements BrowserProvider {
     this.assertWritable(session)
     assertExecuteAllowed(request.method)
     const beforeUrl = session.url
+    // 逃生舱跑的是页面真代码，`Page.navigate` / `location.href=` / `form.submit()` 都能换文档。
+    // 派发前记一笔赊账，让那一刻的文档变化事件算在**本次动作**头上（回执里 navigated 已报过），
+    // 不进脏累加器 —— 否则模型会以为旁边有人在动页面（§6.3 的去重要求）。
+    session.dirty.expectSelfNavigation()
     const params: Record<string, unknown> = { ...request.params }
     if (request.method === 'Runtime.evaluate') {
       // 强制按值返回（`[V22]`）：返回引用的话拿到的 objectId 会随会话泄漏。
@@ -886,6 +942,7 @@ export class CdpBrowserProvider implements BrowserProvider {
         epoch: session.refs.currentEpoch,
         url: session.url,
         navigated: true,
+        ...this.dirtyField(session),
         result: capped.payload,
         truncated: capped.truncated,
       }
@@ -920,6 +977,7 @@ export class CdpBrowserProvider implements BrowserProvider {
         epoch: session.refs.currentEpoch,
         url: session.url,
         navigated,
+        ...this.dirtyField(session),
         value: capped.payload,
         truncated: capped.truncated,
       }
@@ -932,6 +990,7 @@ export class CdpBrowserProvider implements BrowserProvider {
       epoch: session.refs.currentEpoch,
       url: session.url,
       navigated: false,
+      ...this.dirtyField(session),
       result: capped.payload,
       truncated: capped.truncated,
     }
@@ -1032,6 +1091,7 @@ export class CdpBrowserProvider implements BrowserProvider {
     const results = await Promise.allSettled(sessions.map(async (session) => {
       session.consoleCollector.dispose()
       session.networkCollector.dispose()
+      session.dirty.dispose()
       session.connection.close()
       await this.transport.closeTarget(session.targetId)
     }))
@@ -1068,6 +1128,9 @@ export class CdpBrowserProvider implements BrowserProvider {
     // target 级状态整体算 human 所有。与下一条按钮的账**分开记**（reason 不同），各自撤销、
     // 互不覆盖 —— 为什么不能合成一个布尔，见 `state.ts` 里 `takeovers` 的注释。
     this.stateRegistry.markTakeover(sessionId, active, 'devtools')
+    // P2 ③：这条通道**存在**的第一次真实信号 —— 顺手把「上一次快照之后有过一次接管窗口」
+    // 记进脏累加器。只在 `active` 方向记：关掉 DevTools 不是模型需要知道的事。
+    if (active) session.dirty.noteTakeoverWindow()
   }
 
   /**
@@ -1096,6 +1159,9 @@ export class CdpBrowserProvider implements BrowserProvider {
     if (holder === 'human') {
       session.refs.invalidate()
       this.stateRegistry.markTakeover(sessionId, true, 'human')
+      // P2 ③：人按了「接管」—— 「上一次快照之后有人动过」里**最实**的一条信号
+      // （比 DevTools 启发式可靠：这是人按出来的声明）。交还（→ 'agent'）不记。
+      session.dirty.noteTakeoverWindow()
       return
     }
     this.stateRegistry.markTakeover(sessionId, false, 'human')
@@ -1166,6 +1232,17 @@ export class CdpBrowserProvider implements BrowserProvider {
   }
 
   /**
+   * P2 回执字段：**脏时才出现**（§6.2 的硬约束，见 `dirty.ts` 的 `report()`）。
+   *
+   * 单独抽一个是为了让「一条回执要不要带它」在每一处都是同一句话 —— 顺带兑现 J3：
+   * 干净时它连一个字段都不占，回执体积不变（实测基数中位 5516 字符）。
+   */
+  private dirtyField(session: SessionState): { pageChanged?: BrowserPageChanged } {
+    const changed = session.dirty.report()
+    return changed === undefined ? {} : { pageChanged: changed }
+  }
+
+  /**
    * 观察：可访问性树 → 大纲 → 分配 ref（推进纪元）。
    *
    * `maxLines` 只有调用方显式给时才改限额（见 {@link resolveSnapshotLimits}：行数预算和字符
@@ -1222,9 +1299,14 @@ export class CdpBrowserProvider implements BrowserProvider {
     // 晚一步会把人工之间的导航记成快照状态，方案 §5.1.1）。「一起」不是「同一瞬间」：粗门是启发式不是事务。
     const meta = await this.readPageMeta(session.connection, signal)
     const loaderId = regional ? undefined : await this.readMainLoaderId(session, signal)
+    // 脏标记要在**建立新锚点之前**取：它说的是「上**一**次快照之后」，而下面这次 publish 就是新锚点。
+    const changed = session.dirty.report()
     const publication = regional
       ? session.refs.adopt(outline.rows)
       : session.refs.publish(outline.rows, outline.truncated, loaderId, meta?.url)
+    // 全页快照落地 = 锚点前移。**区域快照不清**：`adopt()` 不换表、旧 ref 继续有效，
+    // 「页面在模型之外变过」这件事不会因为拍了一个角落就消失 —— D-5 那条静默改绑链正源于此。
+    if (!regional) session.dirty.reset()
     if (meta !== undefined) {
       session.url = meta.url
       session.title = meta.title
@@ -1248,6 +1330,11 @@ export class CdpBrowserProvider implements BrowserProvider {
       ...outsideRegion !== undefined ? { outsideRegion } : {},
       // 人工接管只加提示，**不动 epoch** —— 开合 DevTools 不该作废模型的 ref（[V31]）。
       ...session.takeover ? { takeover: true } : {},
+      // P2：页面在本会话之外变过的分类计数（脏时才出现）。
+      ...changed !== undefined ? { pageChanged: changed } : {},
+      // D-5：本次区域快照把哪几个号的指针换到了别的节点上（只报不作废）。只有 `adopt()`
+      // 那条路会产生它 —— 全页 `publish()` 一律发新号，恒为空。
+      ...publication.rebound.length > 0 ? { reboundRefs: publication.rebound } : {},
     }
   }
 
@@ -1574,7 +1661,9 @@ export class CdpBrowserProvider implements BrowserProvider {
    * （方案 §1.4），于是旧 ref 会静默命中新页面上的另一个元素。这里是**唯一还来得及拦**的时刻。
    *
    * 三档的实际落点（都比 D-3 批的「+1 次往返」不多花）：
-   * - **粗门 `url`**：与 `refs.publishedUrl` 比对（D-6=B，按纪元存一条）。
+   * - **粗门 `url`**：与 `refs.publishedUrl` 比**文档身份**（D-6=B 按纪元存一条 + D-19 只比
+   *   `scheme+host+path`）。身份变了才作废；只有 query / hash 变时放过这一次动作、记一笔脏 ——
+   *   理由与代价见下面那段注释。
    * - **细门 `isConnected`**：`[V36]` 实测「resolveNode 成功 ≠ 节点还在文档里」，
    *   这一档此前只有 `locate` 查，mutate 路径是漏的。
    * - **中门 `loaderId` 不单独花一次往返**，因为它能抓到而粗门抓不到的只有一类
@@ -1613,22 +1702,32 @@ export class CdpBrowserProvider implements BrowserProvider {
     const value = evaluated?.result?.value
     if (typeof value !== 'object' || value === null) return
     const { url, connected } = value as Record<string, unknown>
-    if (
-      publishedUrl !== undefined
-      && typeof url === 'string' && url !== '' && url !== publishedUrl
-    ) {
-      // 文档已经换掉：整个纪元的 ref 都不该再用，作废它并让模型重拍。
-      session.refs.invalidate()
-      this.noteDocumentChange(session)
-      // 句柄是自己拿的，抛错前必须还 —— 调用方还没拿到 objectId，它的 finally 释放不到。
-      this.metrics.noteStale(session.targetId, 'stale_document')
-      this.releaseObject(session, objectId, signal)
-      throw new BrowserError(
-        `ref "${ref}" points at a stale document: the page moved from ${publishedUrl} to ${url} `
-        + 'since the snapshot; the action was NOT dispatched; run webpage_snapshot again',
-        'BROWSER_STALE_REF',
-        { reason: 'stale_document' },
-      )
+    if (publishedUrl !== undefined && typeof url === 'string' && url !== '') {
+      if (!sameDocumentIdentity(url, publishedUrl)) {
+        // 文档身份（scheme + host + path）变了：整个纪元的 ref 都不该再用，作废它并让模型重拍。
+        session.refs.invalidate()
+        this.noteDocumentChange(session)
+        // 句柄是自己拿的，抛错前必须还 —— 调用方还没拿到 objectId，它的 finally 释放不到。
+        this.metrics.noteStale(session.targetId, 'stale_document')
+        this.releaseObject(session, objectId, signal)
+        throw new BrowserError(
+          `ref "${ref}" points at a stale document: the page moved from ${publishedUrl} to ${url} `
+          + 'since the snapshot; the action was NOT dispatched; run webpage_snapshot again',
+          'BROWSER_STALE_REF',
+          { reason: 'stale_document' },
+        )
+      }
+      // D-19：同一份文档，只有 query / hash 变了 —— **不作废纪元、也不拦这次动作**。
+      //
+      // 为什么放开：Google 类页面每交互一次就换一批遥测令牌（`sxsrf=` / `sca_esv=` / `ei=` …），
+      // 全文全等比较会把每次抖动都判成「换文档」，于是模型手上 ref 全废、必须重拍一次
+      // （§5.1.2 ① 实测 17 次检出里 5 次是纯抖动；一次重拍中位 ≈5500 字符）。
+      //
+      // 为什么敢放开：① 同 path 换 query 在搜索结果页确实可能是**真变化**，所以这里不作废、
+      // 但照样如实标脏，把判断交回模型；② 真换掉文档的那一类仍有兜底 —— `backendNodeId`
+      // 随文档重新编号，`DOM.resolveNode` 会解析失败，翻成更熟悉的那条
+      // `BROWSER_STALE_REF(node_gone)`（§10.4 实测 22/22 失败），只是晚了一次往返。
+      if (url !== publishedUrl) session.dirty.noteAddressDrift(publishedUrl, url)
     }
     if (connected === false && !allowDetached) {
       this.metrics.noteStale(session.targetId, 'detached')
@@ -2116,6 +2215,7 @@ export class CdpBrowserProvider implements BrowserProvider {
     signal?: AbortSignal,
   ): Promise<BrowserMutationResult> {
     const navigated = await this.detectNavigation(session, beforeUrl, awaitNavigation, signal)
+    const changed = session.dirty.report()
     return {
       kind: 'mutation',
       sessionId: session.targetId,
@@ -2124,20 +2224,27 @@ export class CdpBrowserProvider implements BrowserProvider {
       url: session.url,
       title: session.title,
       navigated,
+      ...changed !== undefined ? { pageChanged: changed } : {},
     }
   }
 
   /**
-   * 探测地址是否变了；变了就作废既有 ref、换文档、更新会话元信息。
+   * 探测地址是否变了；**文档身份**变了就作废既有 ref、换文档、更新会话元信息。
    *
    * 判据是**地址变化**（`meta.url !== beforeUrl`）而不是 `readyState`：软导航 / 异步提交
    * 都可能让 readyState 先于地址稳定。`awaitNavigation` 为真时给一个短轮询窗口
    * （`MUTATION_NAVIGATION_POLL_MS`），否则只读一次。
    *
+   * ⚠️ 地址变化分两档（D-19，与 {@link assertPreActionGate} 同一口径）：
+   * - **`scheme+host+path` 变了** → 真换文档，作废纪元；
+   * - **只有 query / hash 变了** → 同一份文档，**不作废**，交给脏累加器报一句。
+   *   这一档在 Google 类页面上是被实测过的痛点：遥测令牌每次交互都换，全文全等比较会让
+   *   每一次点击都白作废一次 ref 表。
+   *
    * 一旦判定导航（且 `awaitNavigation`），再等新文档「能用」（见 {@link settleDocument}）：
    * 地址变了但 `<title>` 还没解析时返回空标题，会被当成「页没就绪」（报告 S1）。
    *
-   * @returns 是否检测到导航（地址变化）。
+   * @returns 是否检测到**换文档**（不含仅 query/hash 变化）。
    */
   private async detectNavigation(
     session: SessionState,
@@ -2146,21 +2253,31 @@ export class CdpBrowserProvider implements BrowserProvider {
     signal?: AbortSignal,
   ): Promise<boolean> {
     let navigated = false
+    let settled = false
     // `timeoutMs = 0` 时骨架仍会先探一次再判超时 —— 这正是「只读一次」的语义。
     await this.pollUntil(
       async () => {
         const meta = await this.readPageMeta(session.connection, signal)
         if (meta !== undefined) {
           if (meta.url !== '' && meta.url !== beforeUrl) {
-            // 页面换掉了：旧 ref 全部作废，绝不许旧 ref 静默命中新页面上的元素。
-            session.refs.invalidate()
-            navigated = true
-            this.noteDocumentChange(session)
+            if (sameDocumentIdentity(meta.url, beforeUrl)) {
+              // D-19：同一份文档，只有 query / hash 变了（Google 类页面的遥测令牌抖动是最常见的一类）。
+              // **不作废纪元**：全文全等比较会把每次抖动都判成「换文档」，于是模型手上 ref 全废、
+              // 白重拍一次（中位 ≈5500 字符）。地址此刻已经定下来，所以也停止轮询，但**不算导航** ——
+              // 回执里的 `navigated` 保持 false，另由脏累加器如实报一句「地址变了」。
+              session.dirty.noteAddressDrift(beforeUrl, meta.url)
+              settled = true
+            } else {
+              // 文档身份变了：旧 ref 全部作废，绝不许旧 ref 静默命中新页面上的元素。
+              session.refs.invalidate()
+              navigated = true
+              this.noteDocumentChange(session)
+            }
           }
           session.url = meta.url
           session.title = meta.title
         }
-        return navigated
+        return navigated || settled
       },
       { timeoutMs: awaitNavigation ? MUTATION_NAVIGATION_POLL_MS : 0, signal },
     )

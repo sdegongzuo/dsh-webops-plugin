@@ -47,11 +47,30 @@ export type RefPublishRow = Omit<RefTarget, 'ref' | 'semanticKey'> & {
   readonly ancestorPath?: string
 }
 
+/**
+ * D-5（方案 §5.2）：一次 `adopt()` 把哪个 ref 的指针换到了**另一个 DOM 节点**上。
+ *
+ * 只在 `adopt()`（区域快照）里可能出现 —— `publish()` 一律发新号，不复用指针。
+ */
+export interface RefRebind {
+  readonly ref: string
+  readonly role: string
+  readonly name: string
+}
+
 /** 一次 snapshot 产出的 ref 表。 */
 export interface RefPublication {
   readonly epoch: number
   readonly refs: readonly RefTarget[]
   readonly truncated: boolean
+  /**
+   * 本次调用里**号没变、指向的节点变了**的那些 ref。`publish()` 恒为空数组。
+   *
+   * 为什么必须报出来：`adopt()` 不换表，所以从改指针那一刻起到模型下次用它之间，
+   * 没有任何一处代码知道发生过什么（详见方案 §5.2 的七步链）。这里只**报**、**不作废** ——
+   * 作废当前纪元会把「区域快照不失效其它 ref」这条契约推翻（D-5 选 C）。
+   */
+  readonly rebound: readonly RefRebind[]
 }
 
 /** 归档里的一条过期纪元：revalidate 用，`resolve` 不看这里。 */
@@ -212,7 +231,10 @@ export class RefRegistry {
     this.epochUrl = url === undefined || url === '' ? undefined : url
     this.epoch += 1
     this.trimLive()
-    return { epoch: this.epoch, refs, truncated }
+    // `publish()` 的号是**发新的**（跨重启复用走 `pendingRebind`，那是另一个语义：
+    // 上一进程的 `backendNodeId` 属于一个已经死掉的进程，拿它比对没有意义）。
+    // 所以这里恒空 —— D-5 的「号没变、指针变了」只在 `adopt()` 里成立。
+    return { epoch: this.epoch, refs, truncated, rebound: [] }
   }
 
   /**
@@ -229,13 +251,16 @@ export class RefRegistry {
     }
     const { keys, counts } = indexBatch(rows)
     const refs: RefTarget[] = []
+    const rebound: RefRebind[] = []
     for (let index = 0; index < rows.length; index += 1) {
       const row = rows[index] as RefPublishRow
       const uniqueInBatch = (counts.get(keys[index] as string) ?? 0) === 1
-      refs.push(this.bindRow(row, uniqueInBatch))
+      const bound = this.bindRow(row, uniqueInBatch)
+      refs.push(bound.target)
+      if (bound.rebound) rebound.push({ ref: bound.target.ref, role: bound.target.role, name: bound.target.name })
     }
     this.trimLive()
-    return { epoch: this.epoch, refs, truncated: false }
+    return { epoch: this.epoch, refs, truncated: false, rebound }
   }
 
   /**
@@ -372,8 +397,10 @@ export class RefRegistry {
   /**
    * 当前表里该 key 只有一条 → 复用其号；否则发新号。
    * 扫描当前 live 表，不看归档（跨 epoch 恢复走 restore / revalidate）。
+   *
+   * @returns `rebound` 为真表示**号没变、`backendNodeId` 变了**（D-5）—— 调用方要把它报进回执。
    */
-  private bindRow(row: RefPublishRow, uniqueInBatch: boolean): RefTarget {
+  private bindRow(row: RefPublishRow, uniqueInBatch: boolean): { target: RefTarget; rebound: boolean } {
     const live = this.targets
     if (live === undefined) {
       throw new Error('bindRow requires a live table')
@@ -383,7 +410,7 @@ export class RefRegistry {
       const minted = this.mint(row, semanticKey)
       live.set(minted.ref, minted)
       this.touch(minted.ref)
-      return minted
+      return { target: minted, rebound: false }
     }
     const hits: RefTarget[] = []
     for (const target of live.values()) {
@@ -394,7 +421,8 @@ export class RefRegistry {
       const updated = bindTarget(existing.ref, row, semanticKey)
       live.set(existing.ref, updated)
       this.touch(existing.ref)
-      return updated
+      // 同一个节点被重新观察到（区域快照覆盖到它了）不是改绑；指针换了才是。
+      return { target: updated, rebound: existing.backendNodeId !== updated.backendNodeId }
     }
     const evictedHits: string[] = []
     for (const [ref, key] of this.evicted) {
@@ -406,12 +434,15 @@ export class RefRegistry {
       const updated = bindTarget(ref, row, semanticKey)
       live.set(ref, updated)
       this.touch(ref)
-      return updated
+      // 软淘汰只留了 semanticKey、指针**已经丢掉**，所以这里重建出来的指针必然是新的 ——
+      // 不需要比较（也没有可比的东西）。语义上它同样属于 D-5：一个原本 `resolve` 会报 stale
+      // 的号，现在又「活」了并且指向一个插件从未核实过的节点。
+      return { target: updated, rebound: true }
     }
     const entry = this.mint(row, semanticKey)
     live.set(entry.ref, entry)
     this.touch(entry.ref)
-    return entry
+    return { target: entry, rebound: false }
   }
 
   private touch(ref: string): void {

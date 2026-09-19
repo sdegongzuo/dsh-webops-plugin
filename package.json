@@ -72,6 +72,7 @@
     "probe:p4": "tsx scripts/probe-p4-gate.ts",
     "probe:stale-node": "tsx scripts/probe-stale-node.ts",
     "probe:within-doc": "tsx scripts/probe-within-document.ts",
+    "probe:p2-dirty": "tsx scripts/probe-p2-dirty.ts",
     "window:desktop": "node scripts/window-in-host.mjs",
     "harness:build": "node scripts/harness-build.mjs",
     "package:portable": "node scripts/package-portable.mjs",

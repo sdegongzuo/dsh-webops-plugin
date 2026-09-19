@@ -4,7 +4,13 @@ import type { Context } from '@deepseek-ai/cordis'
 import type { ToolDefinition, ToolRunContext } from '@deepseek-ai/dsh-tools'
 import { validateJsonSchemaValue } from '@deepseek-ai/dsh-tools'
 import { apply, BROWSER_TOOL_CAPABILITIES, name as pluginName, TOOL_BROWSER_SECTION_ORDER } from './index.ts'
-import type { BrowserObservation, BrowserSession, BrowserSnapshot, BrowserTabInfo } from '../browser/index.ts'
+import type {
+  BrowserObservation,
+  BrowserPageChanged,
+  BrowserSession,
+  BrowserSnapshot,
+  BrowserTabInfo,
+} from '../browser/index.ts'
 
 const SESSION: BrowserSession = { id: 's1', url: 'https://example.com/', title: 'Example', epoch: 4 }
 
@@ -36,6 +42,10 @@ interface Harness {
   openedTabs: BrowserTabInfo[] | undefined
   /** 置 true 让 `mutate` 报 `navigated:true`（模拟点击跳走了页面）。 */
   mutateNavigated: boolean
+  /** 设置后 `mutate` / `observe` / `execute` / `revalidate` 的结果带上它（P2 的脏标记）。 */
+  pageChanged: BrowserPageChanged | undefined
+  /** 设置后 snapshot 的结果带上它（D-5 的改绑名单）。 */
+  reboundRefs: { ref: string; role: string; name: string }[] | undefined
   /** `mutate` 结果里的 sessionId；默认 s1，用来断言只丢导航的那一个会话。 */
   mutateSessionId: string
   /** 置 true 让 `execute` 报 `navigated:true`（模拟表达式改了 location）。 */
@@ -91,6 +101,8 @@ function mount(): Harness {
     snapshotResponse: SNAPSHOT,
     openedTabs: undefined,
     mutateNavigated: false,
+    pageChanged: undefined,
+    reboundRefs: undefined,
     mutateSessionId: 's1',
     executeNavigated: false,
     truncation: 'none',
@@ -154,6 +166,7 @@ function mount(): Harness {
           title: SESSION.title,
           navigated: harness.mutateNavigated,
           ...args.kind === 'wait' ? { satisfied: true } : {},
+          ...harness.pageChanged !== undefined ? { pageChanged: harness.pageChanged } : {},
           ...harness.openedTabs !== undefined ? { openedTabs: harness.openedTabs } : {},
         })
       },
@@ -193,6 +206,7 @@ function mount(): Harness {
           epoch: 4,
           restored: args.refs.map(ref => ({ ref, role: 'button', name: 'Submit' })),
           failed: [],
+          ...harness.pageChanged !== undefined ? { pageChanged: harness.pageChanged } : {},
         })
       },
       // P2 三工具的桩：返回最小合法结果，让转发与 schema 校验有东西可断言。
@@ -252,6 +266,7 @@ function mount(): Harness {
           epoch: 4,
           url: SESSION.url,
           navigated: harness.executeNavigated,
+          ...harness.pageChanged !== undefined ? { pageChanged: harness.pageChanged } : {},
           value: 2,
           truncated: false,
         })
@@ -1328,5 +1343,154 @@ describe('2026-09-18 折叠：find 必须能拿回被折叠的实例，并说清
     // 底稿退回折叠后的那份时，只有代表行能命中；标记行是插件写的注释，不会被当成命中
     // （否则会冒出一条没有 ref、点不了的幻影）。比报错好，但也不是完整能力，如实如此。
     expect(value.matches.map(match => match.ref)).toEqual(['e5'])
+  })
+})
+
+/**
+ * P2 的最后一公里（方案 §6.4）：字段名 + 文案 + output schema + 系统提示词。
+ *
+ * 没有这一层，「加一个回执字段」等于没做 —— 字段塞进去了，模型不知道该拿它做什么。
+ * 所以这一组测的是**模型能不能看见、看见了读不读得懂**，不是 provider 的计数。
+ */
+describe('§6.2 ② 回执字段与文案（P2 最后一公里）', () => {
+  let harness: Harness
+
+  beforeEach(() => { harness = mount() })
+
+  const CHANGED: BrowserPageChanged = {
+    navigated: 1,
+    withinDocument: 2,
+    addressDrift: 3,
+    route: { from: 'https://a.test/one', to: 'https://a.test/two' },
+    at: 1_758_300_000_000,
+  }
+
+  /** 渲染一个工具的某个输出值，取文本块。 */
+  function render(toolName: string, value: unknown): string {
+    return String((tool(harness, toolName).output.render({ session_id: 's1' }, value as never)[0] as { text: string }).text)
+  }
+
+  it('snapshot 回执把脏标记印在**大纲正文之前**（正文几千行，放末尾等于没报）', async () => {
+    harness.snapshotResponse = { ...SNAPSHOT, pageChanged: CHANGED }
+    const value = await tool(harness, 'webpage_snapshot').execute({ session_id: 's1' }, exec())
+    const text = render('webpage_snapshot', value)
+
+    expect(text).toContain('PAGE CHANGED OUTSIDE THIS SESSION')
+    // 文案给**动作**不给状态：几次、从哪到哪、所以该干什么。
+    expect(text).toContain('navigated 1 time(s) (https://a.test/one → https://a.test/two)')
+    expect(text).toContain('2 in-page navigation(s)')
+    expect(text).toContain('run webpage_snapshot (full')
+    // 位置：告警必须在第一行大纲之前，否则模型读到它时已经不在上下文里了。
+    expect(text.indexOf('PAGE CHANGED')).toBeLessThan(text.indexOf(SNAPSHOT.outline))
+  })
+
+  it('干净时一个字都不出现 —— 字段「脏时才出现」同时兑现 J3', async () => {
+    const value = await tool(harness, 'webpage_snapshot').execute({ session_id: 's1' }, exec())
+    expect(render('webpage_snapshot', value)).not.toContain('PAGE CHANGED')
+  })
+
+  it('mutate 回执也带（人工落在两轮之间时模型下一轮往往是 click，那条回执以前毫无痕迹）', async () => {
+    harness.pageChanged = CHANGED
+    const value = await tool(harness, 'webpage_click').execute({ session_id: 's1', ref: 'e1' }, exec())
+    const text = render('webpage_click', value)
+
+    expect(text).toContain('PAGE CHANGED OUTSIDE THIS SESSION')
+    // 与「我这次动作导航了没」那段相邻：两条说的是同一件事的两个侧面，分开放会只读到一句。
+    expect(text.indexOf('Refs from the latest snapshot')).toBeLessThan(text.indexOf('PAGE CHANGED'))
+  })
+
+  it('execute / revalidate 的回执同样带上（逃生舱能跑任意页面代码；revalidate 的成功判据看不出重排）', async () => {
+    harness.pageChanged = CHANGED
+    const executed = await tool(harness, 'webpage_execute')
+      .execute({ session_id: 's1', method: 'Runtime.evaluate' }, exec())
+    expect(render('webpage_execute', executed)).toContain('PAGE CHANGED OUTSIDE THIS SESSION')
+
+    const revalidated = await tool(harness, 'webpage_revalidate')
+      .execute({ session_id: 's1', refs: ['e1'] }, exec())
+    expect(render('webpage_revalidate', revalidated)).toContain('PAGE CHANGED OUTSIDE THIS SESSION')
+  })
+
+  it('仅地址抖动时，文案**不能**说成「ref 作废了」—— 那一档特意没作废纪元', async () => {
+    harness.snapshotResponse = {
+      ...SNAPSHOT,
+      pageChanged: { navigated: 0, withinDocument: 0, addressDrift: 2 },
+    }
+    const value = await tool(harness, 'webpage_snapshot').execute({ session_id: 's1' }, exec())
+    const text = render('webpage_snapshot', value)
+
+    expect(text).toContain('changed only its query/hash 2 time(s)')
+    expect(text).toContain('NOT invalidated')
+  })
+
+  it('takeover_window 缺省时不出现在文案里（「观察不到」与「观察到 0 次」是两件事）', async () => {
+    harness.snapshotResponse = { ...SNAPSHOT, pageChanged: { navigated: 1, withinDocument: 0 } }
+    const text = render('webpage_snapshot',
+      await tool(harness, 'webpage_snapshot').execute({ session_id: 's1' }, exec()))
+    expect(text).not.toContain('takeover window')
+
+    harness.snapshotResponse = {
+      ...SNAPSHOT,
+      pageChanged: { navigated: 1, withinDocument: 0, takeoverWindow: 1 },
+    }
+    const withWindow = render('webpage_snapshot',
+      await tool(harness, 'webpage_snapshot').execute({ session_id: 's1' }, exec()))
+    expect(withWindow).toContain('human takeover window was opened 1 time(s)')
+  })
+
+  it('D-5 的 reboundRefs 单独一段文案，并说清「报的是指针动过、不是元素变了」', async () => {
+    harness.snapshotResponse = {
+      ...SNAPSHOT,
+      reboundRefs: [{ ref: 'e1', role: 'button', name: 'Submit' }],
+    }
+    const value = await tool(harness, 'webpage_snapshot').execute({ session_id: 's1' }, exec())
+    const text = render('webpage_snapshot', value)
+
+    expect(text).toContain('RE-BOUND to a different DOM node')
+    expect(text).toContain('e1 (button "Submit")')
+    // 判不出「重渲染」与「换了个元素」，就不许给模型一个保证不了的结论。
+    expect(text).toContain('cannot be told')
+    expect(text.indexOf('RE-BOUND')).toBeLessThan(text.indexOf(SNAPSHOT.outline))
+  })
+
+  it('没有改绑时不出这段文案（反向验证）', async () => {
+    const value = await tool(harness, 'webpage_snapshot').execute({ session_id: 's1' }, exec())
+    expect(render('webpage_snapshot', value)).not.toContain('RE-BOUND')
+  })
+
+  it('四个 output schema 都接受新字段，且拒绝没声明的字段（模型可见契约是真契约）', async () => {
+    harness.snapshotResponse = {
+      ...SNAPSHOT,
+      pageChanged: CHANGED,
+      reboundRefs: [{ ref: 'e1', role: 'button', name: 'Submit' }],
+    }
+    const snapshotValue = await tool(harness, 'webpage_snapshot').execute({ session_id: 's1' }, exec())
+    expect(validateJsonSchemaValue(tool(harness, 'webpage_snapshot').output.schema, snapshotValue)).toEqual([])
+
+    harness.pageChanged = CHANGED
+    const mutationValue = await tool(harness, 'webpage_click').execute({ session_id: 's1', ref: 'e1' }, exec())
+    expect(validateJsonSchemaValue(tool(harness, 'webpage_click').output.schema, mutationValue)).toEqual([])
+
+    const executeValue = await tool(harness, 'webpage_execute')
+      .execute({ session_id: 's1', method: 'Runtime.evaluate' }, exec())
+    expect(validateJsonSchemaValue(tool(harness, 'webpage_execute').output.schema, executeValue)).toEqual([])
+
+    const revalidateValue = await tool(harness, 'webpage_revalidate')
+      .execute({ session_id: 's1', refs: ['e1'] }, exec())
+    expect(validateJsonSchemaValue(tool(harness, 'webpage_revalidate').output.schema, revalidateValue)).toEqual([])
+
+    // 反向验证：拼错字段名必须被 schema 拦住，否则「模型可见契约」是句空话。
+    const typo = { ...(snapshotValue as Record<string, unknown>), pageChanged: CHANGED }
+    expect(validateJsonSchemaValue(tool(harness, 'webpage_snapshot').output.schema, typo).length).toBeGreaterThan(0)
+  })
+
+  it('系统提示词里写上这两个字段与「先重新观察再动手」（§6.4 的硬要求）', () => {
+    const section = mount().sections[0]
+    const text = (section?.text as (context: { scope?: undefined }) => string)({ scope: undefined })
+
+    expect(text).toContain('page_changed')
+    expect(text).toContain('rebound_refs')
+    expect(text).toContain('webpage_snapshot (full)')
+    // 那句「仅地址抖动时不必重拍」也要在：否则模型会对每次遥测抖动都重拍一遍。
+    expect(text).toContain('address_drift')
   })
 })

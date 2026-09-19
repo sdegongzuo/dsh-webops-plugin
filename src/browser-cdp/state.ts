@@ -55,6 +55,19 @@ import { BrowserError } from '../browser/types.ts'
 export type StateOwner = 'agent' | 'human'
 
 /**
+ * 「页面文档身份」这条伪状态的 key（方案 §6.2 ③）。
+ *
+ * 页面自己被换文档（人工导航、页面脚本 `location.href=`）不是 `Emulation.*` 那一类**可写**
+ * 的 target 级状态，所以它**不参与** {@link TargetStateRegistry.claim} 的争用判定 ——
+ * 写死一个 `force` 也没有意义（没人会去 claim 它）。它的用途只有一个：让「谁 / 何时动过这个页面」
+ * 真的有条记录可报（`reportExternalRewrite` 写、`get` 读）。
+ *
+ * ⚠️ 记录里的 `owner: 'human'` 是这套词表里「非本会话」的那一侧，**不等于「一定是个真人」**：
+ * 页面自己的脚本换路由同样落在这里，而插件在事件这一层分不出这两者。回执文案按这个口径写。
+ */
+export const PAGE_DOCUMENT_STATE_KEY = 'page.document'
+
+/**
  * 「谁在让渡」——接管窗口的来源（§6.5 起有两个）。
  *
  * - `devtools`：有人开着 DevTools 操作这个页面（`devtools-opened` / `devtools-closed`）。

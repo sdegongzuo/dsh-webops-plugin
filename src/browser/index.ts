@@ -55,6 +55,7 @@ export type {
   BrowserObservation,
   BrowserObserveRequest,
   BrowserOpenRequest,
+  BrowserPageChanged,
   BrowserProvider,
   BrowserRef,
   BrowserRevalidateFailure,

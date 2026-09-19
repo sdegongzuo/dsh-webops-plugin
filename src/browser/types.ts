@@ -166,6 +166,56 @@ export interface BrowserRef {
 }
 
 /**
+ * 「自上一次全量快照之后，页面在本会话之外变过」—— 跨轮次累加的分类计数（方案 §6.2 ①）。
+ *
+ * 为什么不是一个 `takeover: boolean`：那个位只说明「有人开着 DevTools」，人工不开 DevTools
+ * 改页面、页面自己的脚本换路由，它一律看不见；而且它描述的是**状态**，模型拿到「内容随时可能变」
+ * 无从决策。这里给的是**动作**（导航过几次、从哪个地址到哪个地址），配一句话就能决策。
+ *
+ * 三个来源（`navigated` / `withinDocument` / `addressDrift`）都是**离散**事件，不刷屏 ——
+ * 所以它可以安全地挂在每条回执上；这也正是它没有做成「检出即 `invalidate()`」的原因：
+ * 时钟、轮询、SSE 那些非离散变化会被误判成变更，反复作废把上下文刷爆。
+ *
+ * ⚠️ **它是通知，不是防线**：纯 JS 改 DOM（`textContent`、列表重排）不产生任何导航事件，
+ * 这里完全看不见。保命靠写前门（方案 §5.1）。
+ */
+export interface BrowserPageChanged {
+  /** 主 frame **真导航**（换文档）次数 —— 由 `Page.frameNavigated` 计数。 */
+  readonly navigated: number
+  /**
+   * 主 frame **软导航**次数（`pushState` / `replaceState` / `location.hash`）——
+   * 由 `Page.navigatedWithinDocument` 计数。两个桶实测完全不重叠（方案 §6.3）。
+   */
+  readonly withinDocument: number
+  /**
+   * 同一 `scheme+host+path` 下只有 query / hash 变过的次数（D-19）。
+   *
+   * 单独一桶而不是并进 `navigated`，因为这一桶**没有作废 ref 纪元**（文档身份没变）：
+   * Google 类页面每交互一次就换一批遥测令牌（`sxsrf=` / `sca_esv=` / `ei=` …），
+   * 全文全等比较会把每次抖动都判成「换文档」→ 模型手上 ref 全废、白重拍一次。
+   * 但它也可能真是一次「同 path 换关键词」的变化，所以如实报出来让模型自己判断，
+   * 而不是插件替它选一边。
+   *
+   * ⚠️ 口径（2026-09-19 实测补）：这一桶只接**事件流没报过**的那一类变化。同一次变化若已经
+   * 走到 `navigated` / `withinDocument` 两个桶里（事件线处理过：外部变化计数、自己引发的抵账），
+   * 轮询线不再重复记 —— 否则自己点击引发的遥测抖动会被报成「本会话之外变过」，
+   * 把 D-19 要省的那笔全量重拍又加回来（见 `dirty.ts` 的 `noteAddressDrift`）。
+   */
+  readonly addressDrift?: number
+  /**
+   * 人工接管窗口开启次数（§6.5 的 `holder` → `human`，或 DevTools 被打开）。
+   *
+   * **通道缺席时整条不出现**（直连外部 Chrome 的 provider 没有这条信号）：「观察到 0 次」
+   * 与「观察不到」是两件事，都印成 0 就是给噪声加喇叭。
+   */
+  readonly takeoverWindow?: number
+  /** 最近一次文档变化：从哪个地址到哪个地址。地址读不到时缺席。 */
+  readonly route?: { readonly from: string; readonly to: string }
+  /** 最近一次文档变化的时刻（毫秒时间戳）。 */
+  readonly at?: number
+}
+
+/**
  * 紧凑页面大纲。
  *
  * ref 的**纪元语义**是这套能力的核心：ref 只在产生它的那次 snapshot、以及同一观察纪元内有效；
@@ -222,6 +272,27 @@ export interface BrowserSnapshot {
   readonly takeover?: boolean
   /** 区域快照：区域外还有几个可操作元素。与 foldedRepeats 口径独立。 */
   readonly outsideRegion?: number
+  /**
+   * 页面上一次全量快照之后在**本会话之外**变过的分类计数（方案 §6.2 ①②，字段**脏时才出现**）。
+   *
+   * 与 `takeover` 是两个维度，别混：`takeover` = 「有人正开着 DevTools」，`changed` =
+   * 「页面自那份快照之后变过」。所以回执里出现 `takeover: false` + 本字段是有意义的组合，
+   * 不矛盾 —— 人工没开 DevTools 一样能改页面，页面自己的脚本也能换路由。
+   */
+  readonly pageChanged?: BrowserPageChanged
+  /**
+   * D-5（方案 §5.2）：本次**区域快照**把哪几个 ref 的指针换到了另一个 DOM 节点上。
+   *
+   * `adopt()` 不换表，所以 ref 号被复用；同一个 `semanticKey`（role + name + 稳定祖先路径）
+   * 唯一命中时它会**就地改写 `backendNodeId`**，而号还是那个号 —— 从换掉那一刻起到模型下次
+   * 点击之间，没有任何一处代码知道发生过什么：写前门两道门（地址、`isConnected`）全绿，
+   * `webpage_revalidate` 也会（因为它当前表命中即成功，一次 CDP 都不发）说「这个号没问题」。
+   *
+   * ⚠️ 报出来的是「指针动过」，**不是**「元素变了」：SPA 重渲染把同一个控件换成新节点一样会命中
+   * 这里（同 role+name+路径、不同 `backendNodeId`），那是无害的。两者的区别在插件这一侧判不出来，
+   * 所以如实报事实、让模型自己决定要不要核实 —— 这比「静默」和「假装作废」都诚实。
+   */
+  readonly reboundRefs?: readonly BrowserRef[]
 }
 
 /** 截图。字节落盘走 `ctx.attachments.saveImage`，消息里只留引用。 */
@@ -323,6 +394,14 @@ export interface BrowserMutationResult {
   readonly title: string
   /** 本次操作是否引发了导航（地址变了）。wait 恒为 false。 */
   readonly navigated: boolean
+  /**
+   * 页面上一次全量快照之后在**本会话之外**变过的分类计数（方案 §6.2 ②，字段**脏时才出现**）。
+   *
+   * 这是本字段最要紧的落点：人工的操作落在两轮之间，而模型下一轮往往是 `webpage_click` ——
+   * 只有 `webpage_snapshot` 一条回执带提示的话，它**结构性地看不到**（§6.1 缺口 2）。
+   * 自己引发的导航不算（见 `dirty.ts` 的赊账机制），那条已经由 `navigated` 报过了。
+   */
+  readonly pageChanged?: BrowserPageChanged
   /** wait 独有：条件是否在超时前成立（超时为 false，不是错误）。 */
   readonly satisfied?: boolean
   /**
@@ -492,6 +571,11 @@ export interface BrowserExecuteResult {
   readonly url: string
   /** 该命令是否属于导航类（`Page.navigate` / `Page.reload`），或探测到地址变化。 */
   readonly navigated: boolean
+  /**
+   * 页面上一次全量快照之后在**本会话之外**变过的分类计数（方案 §6.2 ②，字段**脏时才出现**）。
+   * 逃生舱跑的可以是任意页面代码，所以它是「自己引发的导航」之外的最后一道可见性。
+   */
+  readonly pageChanged?: BrowserPageChanged
   /** `Runtime.evaluate` 的返回值（已确认可序列化）。 */
   readonly value?: unknown
   /** 其它命令的原始 CDP result。 */
@@ -541,6 +625,14 @@ export interface BrowserRevalidateResult {
   readonly epoch: number
   readonly restored: readonly BrowserRef[]
   readonly failed: readonly BrowserRevalidateFailure[]
+  /**
+   * 页面上一次全量快照之后在**本会话之外**变过的分类计数（方案 §6.2 ②，字段**脏时才出现**）。
+   *
+   * 这条回执尤其需要它：恢复成功的判据只是「归档 `loaderId` 对得上 + role/name 一致」，
+   * 而同一份文档里的重排（列表换序、控件被替换）它一个字都看不出来 —— 模型拿到一片
+   * `restored` 会以为「号都好了」，这时「页面自己变过」是它唯一能拿到的额外线索。
+   */
+  readonly pageChanged?: BrowserPageChanged
 }
 
 /** `webpage_locate` 的结果：视口坐标（语义与 click 的落点计算一致）。 */

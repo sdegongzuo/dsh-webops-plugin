@@ -102,6 +102,64 @@ describe('RefRegistry', () => {
     expect(registry.resolve('e2').name).toBe('More')
   })
 
+  it('publish never reports a rebind — 全页快照一律发新号（D-5 只在 adopt 那条路上成立）', () => {
+    const registry = new RefRegistry()
+    expect(registry.publish([target('button', 'Save', 11)], false).rebound).toEqual([])
+    // 同一个 semanticKey 再来一次也是新号，不是「复用旧号换了指针」。
+    const again = registry.publish([target('button', 'Save', 11)], false)
+    expect(again.refs[0]?.ref).toBe('e2')
+    expect(again.rebound).toEqual([])
+  })
+
+  it('adopt reports the ref it re-bound to another node (D-5 的静默改绑)', () => {
+    const registry = new RefRegistry()
+    registry.publish([{ ...target('button', '下一页', 11), ancestorPath: 'main>nav' }], false)
+
+    // 同一个 role + name + 祖先后，**另一个节点**：唯一命中 → 复用 e1、就地改写指针。
+    // 这正是 §5.2 那条七步链第 5 步，而写前门两道门（地址、isConnected）全绿。
+    const adopted = registry.adopt([{ ...target('button', '下一页', 4788), ancestorPath: 'main>nav' }])
+
+    expect(adopted.refs[0]?.ref).toBe('e1')
+    expect(registry.resolve('e1').backendNodeId).toBe(4788)
+    expect(adopted.rebound).toEqual([{ ref: 'e1', role: 'button', name: '下一页' }])
+  })
+
+  it('adopt reports nothing when the row points at the very same node (反向验证)', () => {
+    const registry = new RefRegistry()
+    registry.publish([{ ...target('button', 'Save', 11), ancestorPath: 'form' }], false)
+
+    // 区域快照又一次覆盖到同一个元素：号没变、指针也没变 —— 报成 rebound 就是噪声。
+    const adopted = registry.adopt([{ ...target('button', 'Save', 11), ancestorPath: 'form' }])
+
+    expect(adopted.refs[0]?.ref).toBe('e1')
+    expect(adopted.rebound).toEqual([])
+  })
+
+  it('adopt does not report a ref it minted fresh', () => {
+    const registry = new RefRegistry()
+    registry.publish([target('button', 'Save', 11)], false)
+    const adopted = registry.adopt([target('link', 'More', 22)])
+
+    expect(adopted.refs[0]?.ref).toBe('e2')
+    expect(adopted.rebound).toEqual([])
+  })
+
+  it('adopt reports the ref it revives from soft eviction — 那个号原本 resolve 会报 stale', () => {
+    const registry = new RefRegistry()
+    const rows = Array.from({ length: LIVE_BINDING_CAP + 1 }, (_, index) => ({
+      ...target('button', `Row ${String(index)}`, 1000 + index),
+      ancestorPath: 'list',
+    }))
+    registry.publish(rows, false)
+    // 最旧的一条被软淘汰：指针丢了，号还在 `evicted` 里。
+    expect(() => registry.resolve('e1')).toThrow(expect.objectContaining({ code: 'BROWSER_STALE_REF' }))
+
+    const adopted = registry.adopt([{ ...target('button', 'Row 0', 9999), ancestorPath: 'list' }])
+
+    expect(adopted.refs[0]?.ref).toBe('e1')
+    expect(adopted.rebound).toEqual([{ ref: 'e1', role: 'button', name: 'Row 0' }])
+  })
+
   it('would drop old refs if a regional snapshot used publish instead of adopt (反向)', () => {
     const registry = new RefRegistry()
     registry.publish([target('button', 'Save', 11)], false)
