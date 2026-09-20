@@ -13,6 +13,7 @@
  *   node scripts/cdp-act.mjs list  [--port 9333]
  *   node scripts/cdp-act.mjs text  --target shell        [--port 9333]
  *   node scripts/cdp-act.mjs click --target shell --text 继续   [--port 9333]
+ *   node scripts/cdp-act.mjs type  --text "帮我看下当前页面"  [--into <CSS 选择器>] [--submit]  [--port 9333]
  *   node scripts/cdp-act.mjs eval  --target shell --js "location.href"  [--port 9333]
  *   node scripts/cdp-act.mjs shot  --target app --out docs/x.png        [--port 9333]
  *   node scripts/cdp-act.mjs shot  --target app --out docs/x.png --clip "300,120,780,40,3"
@@ -86,6 +87,50 @@ const evaluate = async (socket, expression) => {
   return result?.result?.value
 }
 
+/**
+ * 在目标元素的**中心坐标**发真实鼠标事件（`mouseMoved` + `mousePressed` + `mouseReleased`）。
+ *
+ * 走渲染器的真实输入管线，而不是直接调 DOM 方法 —— 「元素被别的东西盖住」这类问题只有真实
+ * 事件才看得见。元素不存在 / 不可见 / 中心落在视口外一律**报错退出**，不静默成功。
+ *
+ * `click` 与 `type` 共用它：`type` 也要先真实点一下输入框（见那里的注释）。
+ *
+ * @param socket - 已连上的 target 会话。
+ * @param probe - `{ mode: 'text', value }` 按按钮文案找（先精确、再包含），`{ mode: 'selector', value }` 按 CSS 选择器找。
+ */
+const clickLocated = async (socket, probe) => {
+  const located = await evaluate(socket, `(() => {
+    const probe = ${JSON.stringify(probe)};
+    let el;
+    if (probe.mode === 'selector') el = document.querySelector(probe.value);
+    else el = [...document.querySelectorAll('button, [role="button"], a')]
+      .find(c => c.textContent.trim() === probe.value)
+      ?? [...document.querySelectorAll('button, [role="button"], a')]
+        .find(c => c.textContent.trim().includes(probe.value));
+    if (!el) return { found: false };
+    const r = el.getBoundingClientRect();
+    const style = getComputedStyle(el);
+    return { found: true, tag: el.tagName, label: el.textContent.trim(), disabled: el.disabled === true,
+      visible: style.visibility !== 'hidden' && style.display !== 'none' && r.width > 0 && r.height > 0,
+      x: Math.round(r.x + r.width / 2), y: Math.round(r.y + r.height / 2),
+      inViewport: r.x >= 0 && r.y >= 0 && r.right <= innerWidth && r.bottom <= innerHeight,
+      viewport: [innerWidth, innerHeight] };
+  })()`)
+  if (located.found !== true) throw new Error(`cdp-act: 没找到要点的元素（${JSON.stringify(probe)}）`)
+  console.log(`命中   <${String(located.tag)}> ${JSON.stringify(located.label)}  中心 (${String(located.x)}, ${String(located.y)})  视口 ${String(located.viewport[0])}×${String(located.viewport[1])}`)
+  if (located.disabled === true) throw new Error('cdp-act: 元素是 disabled，点了也不会响应')
+  if (located.visible !== true) throw new Error('cdp-act: 元素不可见（display/visibility 或尺寸为 0）')
+  if (located.inViewport !== true) throw new Error('cdp-act: 元素中心不在视口内，真实鼠标点不到')
+  // 真实输入：先移动再按下、抬起（部分组件只在拖动/悬停后有响应）。
+  const point = { x: located.x, y: located.y, button: 'left', clickCount: 1, buttons: 1 }
+  await send(socket, 'Input.dispatchMouseEvent', { type: 'mouseMoved', ...point, buttons: 0 })
+  await send(socket, 'Input.dispatchMouseEvent', { type: 'mousePressed', ...point })
+  await send(socket, 'Input.dispatchMouseEvent', { type: 'mouseReleased', ...point, buttons: 0 })
+}
+
+/** `type` 的默认输入目标：聊天输入框是一个 `contenteditable`，备用 `textarea`。 */
+const DEFAULT_TYPE_INTO = '[contenteditable="true"], textarea'
+
 async function main() {
   const list = await targets()
 
@@ -143,41 +188,32 @@ async function main() {
       const text = readArg('text')
       const selector = readArg('selector')
       if (text === undefined && selector === undefined) throw new Error('cdp-act: click 需要 --text <按钮文案> 或 --selector <CSS 选择器>')
-      const probe = text === undefined
+      await clickLocated(socket, text === undefined
         ? { mode: 'selector', value: selector }
-        : { mode: 'text', value: text }
-      const located = await evaluate(socket, `(() => {
-        const probe = ${JSON.stringify(probe)};
-        let el;
-        if (probe.mode === 'selector') el = document.querySelector(probe.value);
-        else el = [...document.querySelectorAll('button, [role="button"], a')]
-          .find(c => c.textContent.trim() === probe.value)
-          ?? [...document.querySelectorAll('button, [role="button"], a')]
-            .find(c => c.textContent.trim().includes(probe.value));
-        if (!el) return { found: false };
-        const r = el.getBoundingClientRect();
-        const style = getComputedStyle(el);
-        return { found: true, tag: el.tagName, label: el.textContent.trim(), disabled: el.disabled === true,
-          visible: style.visibility !== 'hidden' && style.display !== 'none' && r.width > 0 && r.height > 0,
-          x: Math.round(r.x + r.width / 2), y: Math.round(r.y + r.height / 2),
-          inViewport: r.x >= 0 && r.y >= 0 && r.right <= innerWidth && r.bottom <= innerHeight,
-          viewport: [innerWidth, innerHeight] };
-      })()`)
-      if (located.found !== true) throw new Error(`cdp-act: 没找到要点的元素（${JSON.stringify(probe)}）`)
-      console.log(`命中   <${String(located.tag)}> ${JSON.stringify(located.label)}  中心 (${String(located.x)}, ${String(located.y)})  视口 ${String(located.viewport[0])}×${String(located.viewport[1])}`)
-      if (located.disabled === true) throw new Error('cdp-act: 元素是 disabled，点了也不会响应')
-      if (located.visible !== true) throw new Error('cdp-act: 元素不可见（display/visibility 或尺寸为 0）')
-      if (located.inViewport !== true) throw new Error('cdp-act: 元素中心不在视口内，真实鼠标点不到')
-      // 真实输入：先移动再按下、抬起（部分组件只在拖动/悬停后有响应）。
-      const point = { x: located.x, y: located.y, button: 'left', clickCount: 1, buttons: 1 }
-      await send(socket, 'Input.dispatchMouseEvent', { type: 'mouseMoved', ...point, buttons: 0 })
-      await send(socket, 'Input.dispatchMouseEvent', { type: 'mousePressed', ...point })
-      await send(socket, 'Input.dispatchMouseEvent', { type: 'mouseReleased', ...point, buttons: 0 })
+        : { mode: 'text', value: text })
       console.log('cdp-act: 已发出真实鼠标事件（mousePressed + mouseReleased）')
       return
     }
 
-    throw new Error(`cdp-act: 未知子命令 ${JSON.stringify(command)}（list|text|click|eval|shot）`)
+    if (command === 'type') {
+      const text = readArg('text')
+      if (text === undefined) throw new Error('cdp-act: type 需要 --text <要输入的文字>')
+      // 先**真实点一下**输入框再 insertText：insertText 只认「当前聚焦的元素」，而聊天输入框
+      // 这类富文本要先拿到焦点才挂上编辑态。
+      await clickLocated(socket, { mode: 'selector', value: readArg('into') ?? DEFAULT_TYPE_INTO })
+      await send(socket, 'Input.insertText', { text })
+      console.log(`cdp-act: 已输入 ${String(text.length)} 个字符`)
+      if (args.includes('--submit')) {
+        // Enter 拆 keyDown / keyUp 两次发；`text` 只在 keyDown 上给（真实按键的 char 部分）。
+        const enter = { key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13 }
+        await send(socket, 'Input.dispatchKeyEvent', { type: 'keyDown', ...enter, text: '\r' })
+        await send(socket, 'Input.dispatchKeyEvent', { type: 'keyUp', ...enter })
+        console.log('cdp-act: 已发 Enter 提交')
+      }
+      return
+    }
+
+    throw new Error(`cdp-act: 未知子命令 ${JSON.stringify(command)}（list|text|click|type|eval|shot）`)
   } finally {
     socket.close()
   }
