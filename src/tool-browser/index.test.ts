@@ -1736,12 +1736,17 @@ describe('T-C 前缀成本守卫', () => {
   it('瘦身不能把契约砍掉：关键判据与失败码仍逐条在模型可见的 schema 里', () => {
     // 口径是**模型能看到的那一份整体**（description + parameters + output.schema）：
     // `occluded_by` 这类回执字段名只出现在 output schema 里，只扫 description 会假红。
-    const all = webTools().map(definition => JSON.stringify({
+    const defs = webTools()
+    const archive = (definition: (typeof defs)[number]): string => JSON.stringify({
       name: definition.name,
       description: definition.description,
       parameters: definition.parameters,
       output: definition.output.schema,
-    })).join('\n')
+    })
+    const all = defs.map(archive).join('\n')
+    const prose = defs.map(definition => definition.description ?? '').join('\n')
+
+    // 一档：整个 schema 里出现过就算数 —— 这些锚点里有几个同时被 parameters 的形状 / output schema 兜着。
     for (const needle of [
       'BROWSER_STALE_REF',      // 旧 ref 的失败码
       'BROWSER_SNAPSHOT_REQUIRED', // 没观察就动手的失败码
@@ -1752,6 +1757,23 @@ describe('T-C 前缀成本守卫', () => {
       'webpage_revalidate',     // 便宜探测
     ]) {
       expect(all, `模型可见 schema 里应仍有 ${needle}`).toContain(needle)
+    }
+
+    // 二档：**只出现在散文描述里**、没有任何结构性断言的锚点。措辞瘦身时它们最容易被顺手删掉，
+    // 而删掉之后总量仍 < 预算、上一档也照样绿 —— 没有任何门禁会红。所以单独锚在 description 上。
+    // 2026-09-20 评审补入：起因是发现失败的 `BROWSER_EXECUTE_RESULT_UNSERIALIZABLE` 不在原清单里。
+    for (const needle of [
+      'BROWSER_EXECUTE_NOT_ALLOWED',           // execute 的允许清单拒绝码
+      'BROWSER_EXECUTE_RESULT_UNSERIALIZABLE', // execute 返回值过不了 CDP 边界的码
+      'BROWSER_NAVIGATION_FAILED',             // 导航失败码
+      'replay_truncated',                      // network 回放被截断
+      'document_changed',                      // revalidate 的「文档已换」结论
+      'node_gone',                             // 旧 ref 的 node_gone 结论
+      'identity_mismatch',                     // open 拿到的不是目标页
+      'mime_type',                             // screenshot 的返回信息
+    ]) {
+      expect(prose, `描述散文里应仍有 ${needle}：它没有结构性断言保护，删掉不会触发任何门禁`)
+        .toContain(needle)
     }
   })
 })
