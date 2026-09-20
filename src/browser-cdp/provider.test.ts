@@ -127,6 +127,12 @@ class FakeChrome {
   /** B1-e：`Input.dispatchMouseEvent` 的 `mouseWheel` 是否回包（Electron 上实测不回）。 */
   wheelAcks = true
   /**
+   * B5-d：`Runtime.evaluate` 是否**永不回包** —— 模拟用户在页面里跑了一个永不落定的
+   * Promise（等一个不会来的事件 / `await` 了被拦的 fetch）。用来验「调用方给的
+   * `timeoutMs` 真的把等待压短了」，而不是靠读 mock 参数自证。
+   */
+  hangEvaluate = false
+  /**
    * B1-e：transport 报的「前台标签」；`undefined` = 这个 provider 答不出（外部 Chrome）。
    *
    * 缺省**不挂**这两个能力 —— 既有的 tabs 用例正是在验「没有 activate 能力时报
@@ -474,6 +480,12 @@ class FakeSocket implements CdpSocket {
     // `mouseWheel` 石沉大海。命令必须照样记进 `calls`（断言「已投递」靠它）。
     if (request.method === 'Input.dispatchMouseEvent' && params['type'] === 'mouseWheel'
       && !this.chrome.wheelAcks) {
+      this.chrome.handle(this, request.method, params)
+      return
+    }
+    // B5-d：`hangEvaluate=true` 时 `Runtime.evaluate` 同样「记下命令、绝不回包」——
+    // 实测就是永不 settle 的 Promise 的表现（V44）。
+    if (request.method === 'Runtime.evaluate' && this.chrome.hangEvaluate) {
       this.chrome.handle(this, request.method, params)
       return
     }
@@ -1868,6 +1880,60 @@ describe('P2: console / network / execute', () => {
     // 页面拒成 `NotAllowedError: Transient user activation is required` —— 模型看到的就是
     // 「JS 执行不了」。
     expect(call?.params['userGesture']).toBe(true)
+  })
+
+  it('stops waiting for a hung Runtime.evaluate at the caller-supplied timeout (B5-d · J8)', async () => {
+    await provider.open({})
+    // 永不落定的表达式：CDP 永远不回包（V44 实测形态）。不传 timeoutMs 时，
+    // 调用方要被 provider 的 commandTimeoutMs（默认 30s）硬挂 30 秒。
+    chrome.hangEvaluate = true
+
+    const started = Date.now()
+    let failure: unknown
+    try {
+      await provider.execute({
+        sessionId: 'tab-1',
+        method: 'Runtime.evaluate',
+        params: { expression: 'new Promise(() => {})' },
+        timeoutMs: 150,
+      })
+    } catch (error: unknown) {
+      failure = error
+    }
+    expect(failure).toBeInstanceOf(BrowserError)
+    // 判据精确到「150ms 那一档收的」—— 只断言「抛了错」证明不了 override 生效。
+    expect((failure as BrowserError).message).toContain('within 150 ms')
+    expect(Date.now() - started).toBeLessThan(2_000)
+    // 「超时」不等于「没发」：命令确实投递出去了，表达式已经在页面里跑过。
+    expect(chrome.calls.filter(entry => entry.method === 'Runtime.evaluate').at(-1)?.params['expression'])
+      .toBe('new Promise(() => {})')
+  })
+
+  it('never lets timeout_ms lengthen the provider budget (B5-d · 反向)', async () => {
+    // 换一个更小的 provider 预算：既验「不传时配置生效」，也验「传更大的值不许放大」。
+    provider = new CdpBrowserProvider({ commandTimeoutMs: 300, navigationTimeoutMs: 200 }, chrome.transport())
+    await provider.open({})
+    chrome.hangEvaluate = true
+
+    const cases = [
+      [undefined, 'within 300 ms'],
+      [5_000, 'within 300 ms'],
+      [120, 'within 120 ms'],
+    ] as const
+    for (const [timeoutMs, expected] of cases) {
+      let failure: unknown
+      try {
+        await provider.execute({
+          sessionId: 'tab-1',
+          method: 'Runtime.evaluate',
+          params: { expression: 'new Promise(() => {})' },
+          ...timeoutMs === undefined ? {} : { timeoutMs },
+        })
+      } catch (error: unknown) {
+        failure = error
+      }
+      expect((failure as BrowserError | undefined)?.message, `timeout_ms=${String(timeoutMs)}`).toContain(expected)
+    }
   })
 
   it('reports navigated=true when the evaluated expression changed the URL (2026-09-17)', async () => {

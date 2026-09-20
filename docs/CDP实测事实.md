@@ -65,6 +65,18 @@
 | V21 | `Page.bringToFront` 双方都能成功，无互斥 —— 它不是「锁」，是 target 级操作（最后调用者赢） | `g4.jsonl` |
 | V22 | `Runtime.evaluate` 返回值边界，见 §4 | `g4.jsonl` |
 | V33 | **`Page.captureScreenshot` 在 `show:false` 的窗口上永久挂起**（不报错、不返回）；`show:true` 立刻正常 | 本轮探针 |
+| V41 | **`Runtime.evaluate` 的顶层 `let`/`const`/`var` 跨调用持久**（全局词法环境是 realm 级共享）：`let x = 41` → 下一次 evaluate 读 `x` 得 `41`。真正的坑是**重复声明**：再写一次 `let x = …` 抛 `SyntaxError: Identifier 'x' has already been declared`。**不必往 `window` 上挂**（那才引入污染）；只有导航/换文档才清空 | `2026-09-20` Chrome 153 + **Electron 44（Chromium 152）** 双跑一致 |
+| V42 | **返回值深度上限在 250～300 层之间**（对象 250 ok / 300 起报 `Failed to convert response to JSON: CBOR: stack limit exceeded at position 3040`；数组 200 ok / 500 挂；2000 层换成 `Object reference chain is too long`）。**是报错，不是静默 `{}`**。⚠️ `CBOR: stack limit exceeded` 这条**没被 `translateEvaluateError` 映射**（只映射了 chain / `couldn't be returned` 两条）→ 模型拿到裸 `BROWSER_PROTOCOL_ERROR` | 同上 |
+| V43 | ★ **函数返回值静默变 `{}` 且不报错**：`() => 1` → `{type:'function', value:{}}`，而 `isEmptyObject` 守卫**只在 `type === 'object'` 分支里**，所以这条漏网。（`new Map` / `new Error` / `{}` 字面量都落在 `type:'object'` 分支，被守卫拦下 → 真想要空对象得回 `JSON.stringify({})`） | 同上 |
+| V44 | **`Runtime.evaluate` 的 `timeout` 参数只杀同步执行**：`while(true){}` + `timeout:1500` → 1517ms 回 CDP 错误 `Internal error`；`new Promise(()=>{})` + `timeout:1500` → **照样 8s 无回包**。→ 挂住的 Promise 只有 `Promise.race` 能救。另：一条挂住的 evaluate **不毒化连接**，同连接后续命令照常回包 | 同上 |
+| V45 | **隔离世界不共享 JS 状态**：`Page.createIsolatedWorld` 拿到的 contextId 里，主世界设的 `window.__p_mw` 与 `el.__expando` 都读不到（`undefined`）。→ 「走框架内部机制改 React 状态」**不能**用隔离世界（fiber 就挂在 DOM 元素的 expando 上） | 同上 |
+
+**V41–V45 双运行时复核（2026-09-20）**：五条在本机 **Chrome 153** 与 **Electron 44（Chromium 152）** 上各跑一遍，
+连报错文案都逐字一致（含 `CBOR: stack limit exceeded at position 3040` 里那个位置号）。
+→ 这批读数不是 Chrome 特有的，**V29 那种 Electron 特例在这里不成立**，可以当作 Chromium 层事实用。
+探针：`D:/tmp/cdp-exec-probe{,2,3}.mjs`（Chrome）、`D:/tmp/electron-probe/`（Electron：隐藏窗口 + 独立 CDP 端口，
+**不必碰正在跑的那个实例**）。⚠️ 本机 shell 带 `ELECTRON_RUN_AS_NODE=1`，起 Electron 前必须 `env -u`；
+而且后台进程会随工具调用结束被回收 → 必须**在同一条命令里**起、跑、收（`taskkill /T /F` 收按端口查到的 PID）。
 
 ---
 
@@ -184,10 +196,20 @@ V10 已证明 `Emulation.clearDeviceMetricsOverride` **连自己都还原不干�
 | `window` | 抛 `Object reference chain is too long` |
 | `Symbol('s')` | 抛 `Object couldn't be returned by value` |
 | `new Array(100000).fill(1).length` | 正常返回 `100000` |
+| `() => 1`（2026-09-20 补测） | **静默返回 `{}`，且连守卫都没进**（`type:'function'` 落到 `extractEvaluateValue` 的 `else if` 分支，而 `isEmptyObject` 只在 `type === 'object'` 里判）—— V43 |
+| 嵌套 300 层的对象（2026-09-20 补测） | 抛 `Failed to convert response to JSON: CBOR: stack limit exceeded` —— **未映射**，V42 |
+| `new Map` / `new Error` / `{}` 字面量 | `type:'object'` + `value:{}` → 被 `isEmptyObject` 拒掉（想真返回空对象得写 `JSON.stringify({})`） |
 
 → 强制 `returnByValue`；**不能只判断 `result.value === undefined`**（DOM 节点那种情况 `value` 是个 `{}`，
 看着「有值」其实是垃圾），要**同时检查 `result.type` / `result.subtype`**。
+**已知缺口**：`type === 'function'` 那条（V43）静默给 `{}`，以及 CBOR 深度错误没进
+`translateEvaluateError`（V42）—— 两处都在 `src/browser-cdp/execute.ts`，改前先看 §6 方法论。
 自己实现超时 —— V2 证明页面被断点暂停时命令仍能正常返回，但挂起风险不能因此排除。
+**工具侧其实有三层超时**（2026-09-20 核）：工具声明的 `timeoutMs`（`tool-browser/index.ts`，
+导航族 60s / 观察族 30s，由上游 `@deepseek-ai/dsh-tool-call-timeout-policy` 强制 → `TOOL_TIMEOUT`）、
+provider 的 `commandTimeoutMs`（30s，`provider.ts:1010` → `BrowserError('BROWSER_PROTOCOL_ERROR')`）、
+以及 `navigationTimeoutMs`(15s) / `waitTimeoutMs`(10s) / `WHEEL_ACK_TIMEOUT_MS`(2s) 这几个专用上限。
+**默认生效的是最内层**：挂住的 `Runtime.evaluate` 是 30s 后由 `commandTimeoutMs` 收掉，不是 60s。
 
 ---
 

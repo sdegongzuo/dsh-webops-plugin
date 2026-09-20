@@ -608,6 +608,18 @@ export interface BrowserExecuteRequest {
   /** `domain.method` 全文，例如 `Runtime.evaluate`。 */
   readonly method: string
   readonly params?: Record<string, unknown>
+  /**
+   * 本条 CDP 命令的等待上限（毫秒）——**只能用来缩短**。
+   *
+   * 实测（2026-09-20 · V44）：`Runtime.evaluate` 会一直等到 Promise settle，一个永不落定
+   * 的表达式（等一个不会来的事件、`await` 了被拦的 fetch）会把调用方挂到 provider 的
+   * `commandTimeoutMs`（默认 30s）才有回音。逃生舱因此允许调用方压短这段等待。
+   *
+   * provider 取 `min(此值, commandTimeoutMs)`：**只许更短，不许借此把内层超时放大**。
+   * ⚠️ 它不改变「拿不到值」这个事实 —— 对挂住的 Promise，缩短只省时间、不给结果，
+   * 想拿值仍要自己包 `Promise.race`。
+   */
+  readonly timeoutMs?: number
 }
 
 /** `webpage_execute` 的结果。 */

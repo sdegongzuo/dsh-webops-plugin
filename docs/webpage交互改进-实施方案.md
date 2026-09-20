@@ -17,6 +17,8 @@
 | **J4** | 回到上一页走 `webpage_navigate`，禁止 `webpage_execute("history.back()")` | 单测 back 成功 / 尽头失败；真机打开结果 → back → 再打开另一条 |
 | **J5** | 回执足够决定下一步：遮挡、截断、导航后不要 find、stable 超时改等文本 | §6「禁止再出现」清单为空 |
 | **J6** | `webpage_scroll` 3s 内返回；后台标签先 activate 或明确拒绝。禁止 30s 工具超时 | 前台长文、前台另一站点、后台标签 各一次 |
+| **J7** | `webpage_execute` 的返回值边界与实测一致：拿不到真值的形态一律报 `BROWSER_EXECUTE_RESULT_UNSERIALIZABLE`，**禁止静默回 `{}`**，且文案给出可执行写法 | 单测用**实测形态**夹具（`{type:'function', value:{}}`、CBOR 报文）钉住；打包态真跑 `() => 1` 与 300 层对象，都必须报错且带写法 |
+| **J8** | `webpage_execute` 不得让模型白等满 30s 才知道「没有结果」：挂起的表达式要在调用方可控的期限内收场，且回执照实说明副作用未回滚 | 打包态 `new Promise(()=>{})` 带 `timeout_ms: 2000` → ≤3s 返回失败回执 |
 
 ## 3. 施工顺序
 
@@ -378,3 +380,96 @@ B1-e 落地后场景 F 仍「前台标签 scroll 后位置完全没变」才做�
 未满足第 1 条就发版，等于没做本方案。
 
 B1/B2 落地后再回写 `docs/架构与实现.md`（click 命中校验、scroll 短超时、navigate history、snapshot OVERLAY）。没落地之前不要改架构文档。
+
+---
+
+## 8. 第二批（待定 · 2026-09-20 复核新增）
+
+来源：一份对 `webpage_execute` 的批评（7 条）+ 一轮对照实测。原始事实与实测编号在
+`docs/CDP实测事实.md` 的 **V41–V45**，这里只写「改什么」。**7 条批评里只有下面这些进了清单**，
+其余（副作用不可回滚、暴露 contextId、execute 聚合 console/network）见本节的「不做」表。
+
+### 8.1 任务
+
+> 状态见 **§8.4**：B5-a～B5-d 已落地（2026-09-20），只剩打包态回归待跑。下面的描述保留当时的原始判据。
+
+**B5-a 函数返回值静默 `{}`（必修 · 对应 J7）**
+
+- 病灶：`src/browser-cdp/execute.ts` 的 `extractEvaluateValue`，`isEmptyObject` 判定写在
+  `type === 'object'` 分支**内**。实测 `() => 1` → CDP 回 `{type:'function', value:{}}`，
+  落到 `else if (value === undefined && type !== 'undefined')` 直接放行 → 模型拿到一个
+  看着有值、其实是垃圾的 `{}`。**这正是那条守卫想防的形态，只是漏了函数这条分支。**
+- 改：把「空值/不可序列化」判定提到类型分支之外（`isEmptyObject(value)` 对所有类型生效），
+  并显式拒绝 `type === 'function'`；`type === 'undefined'` 仍放行。
+- **夹具必须照实测改**：现有 `src/browser-cdp/execute.test.ts:121` 用的是 `{type:'function'}`
+  （**没有 `value` 字段**）—— 实测不会出现这个形态，所以它绿着而生产漏着。换成
+  `{type:'function', value:{}}`，旧形态作为额外一例保留。
+- 完成标准：新单测先红后绿；打包态 J7 第一条真跑过。
+
+**B5-b CBOR 深度错误没翻译（必修 · 对应 J7）**
+
+- 病灶：同文件 `translateEvaluateError` 只映射 `Object reference chain is too long` 与
+  `Object couldn't be returned by value`。实测**250 层正常、300 层起**报
+  `Failed to convert response to JSON: CBOR: stack limit exceeded at position 3040` →
+  模型拿到裸 `BROWSER_PROTOCOL_ERROR`，看不出这是深度问题。
+- 改：加一条 `CBOR: stack limit exceeded` pattern → `BROWSER_EXECUTE_RESULT_UNSERIALIZABLE`，
+  文案指向「分片 `JSON.stringify` 取需要的字段」。
+- 完成标准：单测断言 code + 文案；打包态 300 层对象真跑过。
+
+**B5-c execute 描述补三句（低成本，但决定模型用不用得对）**
+
+- 位置：`src/tool-browser/index.ts` 的 `webpage_execute` description。
+- 三句：① 顶层 `let`/`const`/`var` **在同一个文档内跨调用存活**（V41），**不必挂 `window`**，
+  但**重复声明会 `SyntaxError: Identifier has already been declared`**，换变量名；
+  ② 深对象（>250 层）会被 CDP 拒，取字段用分片 `JSON.stringify`（V42）；
+  ③ 改受控组件（React/Vue）走 `webpage_click` / `webpage_fill` / `webpage_press` 这条
+  `Input.*` 真输入路径 —— evaluate 直接改 DOM 会被下一次渲染覆盖，而**隔离世界也读不到**
+  框架挂在 DOM 上的 expando（V45），所以那不是出路。
+- 完成标准：三句都在；`pnpm test` 不因描述变长而炸别的断言。
+
+**B5-d `webpage_execute` 可选 `timeout_ms`（P2，有取舍，先想清楚再动）**
+
+- 语义：`min(工具 60s deadline, 传入值)`，只覆盖 provider 传给 CDP 的 `commandTimeoutMs`
+  （`provider.ts` 的 `execute()`）。**不改** `Runtime.evaluate` 的 `timeout` 参数 ——
+  V44 实测它只杀同步死循环，对挂住的 Promise 无效（可顺带透传当第二道保险，但别当解药）。
+- 必须写进描述的代价：对挂住的 Promise 仍只是「白等 N 秒后失败」，**拿不到值**；
+  不写清楚，模型会以为它能救回结果。
+- 完成标准：单测断言传 2000 时 provider 收到 2000、不传时仍是 30000。
+
+### 8.2 不做
+
+| 不做 | 原因 |
+|---|---|
+| 执行前自动快照 DOM/全局 + 回滚 | CDP 侧能用的只有 `DOMSnapshot.captureSnapshot` / `Page.captureSnapshot`，两者都不在 execute 白名单；更关键的是改 DOM、改全局、挂监听、换事件处理器**无法一致还原**，做了只会给模型「已回滚」的错觉。真要回到原状只有导航一条路，而它同时清掉调试变量（V41） |
+| 暴露 contextId、让 evaluate 走 isolated world | 实测隔离世界读不到主世界 globals，**也读不到 DOM 元素上的 expando**（V45）—— React 的 fiber 正挂在 expando 上，这条路恰好断掉「走框架内部机制改」。隔离世界的用途是反向的：注入不污染页面的探针 |
+| 让 execute 一次带回 console/network | 记录**不会**因导航消失（环形缓冲 + `all_documents` 能读回，被遮住多少条会报数），缺的是聚合不是数据；三次调用 + 自己对齐时间窗的成本，小于一次大回执撑爆上下文 |
+
+### 8.3 真机回归（第二批）
+
+1. `pnpm portable:refresh` → 杀旧实例 → `portable:launch --cdp 9333`（`refresh` 后**必须重启**才生效）。
+2. 在**打包态**（Electron，不是 Chrome）跑三条：`() => 1` 报 `BROWSER_EXECUTE_RESULT_UNSERIALIZABLE`（J7）、
+   嵌套 300 层对象报错且带分片写法（J7）、`new Promise(()=>{})` 带 `timeout_ms` 在 ≤3s 内返回失败回执（J8）。
+3. **为什么必须在打包态跑**：本清单所有数字都是本机 **Chrome 153 + node 22** 测出来的
+   （`D:/tmp/cdp-exec-probe{,2,3}.mjs`），而 Electron 的集成补丁历史上改过 CDP 行为
+   （`CDP实测事实.md` V29 就是 `clearDeviceMetricsOverride` 的 Electron 特例）。
+
+### 8.4 落地记录（2026-09-20）
+
+| 条目 | 状态 | 说明 |
+|---|---|---|
+| B5-a 函数静默 `{}` | ✅ | `extractEvaluateValue` 新增 `type === 'function'` 分支先拦；`else if` 那条也改成类型无关的空值判定（`type !== 'undefined' && (value === undefined \|\| isEmptyObject(value))`），将来 CDP 加新类型不会再漏。**夹具改成实测形态** `{type:'function', value:{}}`，旧那条 `{type:'function'}`（没有 `value`，实测不出现）保留作对照 |
+| B5-b CBOR 深度错误 | ✅ | `translateEvaluateError` 加 `CBOR: stack limit exceeded` 一条，文案指向分片取；夹具带 `(code -32000)` 后缀，与 `mapCdpError` 的真实包装一致 |
+| B5-c execute 描述 | ✅ **缩到两句** | 只留「变量跨调用持久 + 重复声明会炸」与「受控组件走真实输入」。**深对象那条没进描述** —— B5-b 的错误文案已经逐字告诉模型「return the fields you need as a JSON string」，描述里再说一遍是重复计费（该文件正被 T-C2 瘦身，见下） |
+| B5-d 可选 `timeout_ms` | ✅ | 语义定为**只允许缩短**：schema `1-30000`，provider 取 `min(请求值, commandTimeoutMs)`；不传时行为与从前逐字一致。描述里写明「只缩短等待、不会让永不落定的 Promise 变成有值」 |
+| §8.3 打包态回归 | ⬜ 待跑 | 需要停掉占着 19387 的实例才能重启生效（当时那个是**别的会话在用**的实例，按纪律没动）。命令与三条判据见 8.3 |
+
+判据先红后绿（反向验证）：两条新用例在旧代码下分别红在「函数根本没抛错」与「CBOR 仍是 `BROWSER_PROTOCOL_ERROR`」，
+改完转绿（`execute.test.ts` 14 passed）；provider 侧两条新用例用**行为**断言 override 生效
+（`hangEvaluate` 夹具模拟永不回包，断言错误里出现 `within 150 ms` / `within 300 ms`），`provider.test.ts` 130 passed。
+全量：`tsc` 干净、**550 passed / 5 skipped / 1 failed** —— 唯一的红是并行会话当天新增的
+`T-C 前缀成本守卫`（schema 合计 21,329 > 18,000），那是 T-C2 描述瘦身的目标；
+**去掉本轮新增（约 615 字符）仍是 ~20,714，所以那个红不是本批引入的。**
+
+**双运行时复核**：V41–V45 在 Chrome 153 与 Electron 44（Chromium 152）上读数逐字一致
+（含 `position 3040`），所以 8.3 第 3 条的顾虑对这批事实不成立 —— 打包态回归要验的只剩
+「新代码确实进了包」。探针在 `D:/tmp/electron-probe/`（隐藏窗口 + 独立端口，不碰在跑的实例）。

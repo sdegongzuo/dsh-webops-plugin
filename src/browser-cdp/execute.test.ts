@@ -125,6 +125,26 @@ describe('extractEvaluateValue', () => {
     }
   })
 
+  it('rejects a function in the shape CDP actually returns (2026-09-20 · V43)', () => {
+    // ⚠️ 上面那条用的是 `{type:'function'}` —— **没有 `value` 字段**，是本机实测里不会出现的形态
+    // （照想象画的夹具，所以它绿着而生产漏着）。本机 Chrome 153 实测 `() => 1` 回的是
+    // `{type:'function', value:{}}`：`value` 是个 `{}`，而空对象守卫原先只写在 `type === 'object'`
+    // 分支里 → 走 `else if` 那条，`value !== undefined` 成立，**静默放行成 `{}`**。
+    // 「看着有值、其实是垃圾」正是这条守卫存在的理由，函数这条分支必须补上。
+    try {
+      extractEvaluateValue({ result: { type: 'function', value: {} } })
+      throw new Error('expected a rejection for a function result')
+    } catch (error: unknown) {
+      if (!(error instanceof BrowserError)) throw error
+      expect(error.code).toBe('BROWSER_EXECUTE_RESULT_UNSERIALIZABLE')
+      expect(error.message).toContain('function')
+      expect(error.message).toContain('JSON string')
+      expect(error.message).toContain('NOT rolled back')
+    }
+    // 反向：`undefined` 仍然是「合法空值」，不能被这条守卫误伤。
+    expect(extractEvaluateValue({ result: { type: 'undefined' } })).toBeUndefined()
+  })
+
   it('rejects a malformed CDP result body', () => {
     expect(() => extractEvaluateValue(undefined))
       .toThrow(expect.objectContaining({ code: 'BROWSER_EXECUTE_RESULT_UNSERIALIZABLE' }))
@@ -176,6 +196,21 @@ describe('translateEvaluateError', () => {
       expect(mapped).toBeInstanceOf(BrowserError)
       expect((mapped as BrowserError).code).toBe('BROWSER_EXECUTE_RESULT_UNSERIALIZABLE')
     }
+  })
+
+  it('maps the CBOR depth error too (2026-09-20 · V42)', () => {
+    // 实测：嵌套 250 层正常返回，**300 层起** CDP 回这条（2000 层换成 chain too long）。
+    // 旧映射表里只有 chain / couldn't be returned 两条，于是模型拿到的是裸
+    // `BROWSER_PROTOCOL_ERROR: CDP error: Failed to convert response to JSON: CBOR: ...` ——
+    // 看不出「这是深度问题，该分片取」。夹具带 `(code -32000)` 后缀，与 `mapCdpError` 的真实包装一致。
+    const mapped = translateEvaluateError(new BrowserError(
+      'CDP error: Failed to convert response to JSON: CBOR: stack limit exceeded at position 3040 (code -32000)',
+      'BROWSER_PROTOCOL_ERROR',
+    ))
+    expect(mapped).toBeInstanceOf(BrowserError)
+    expect((mapped as BrowserError).code).toBe('BROWSER_EXECUTE_RESULT_UNSERIALIZABLE')
+    expect((mapped as BrowserError).message).toContain('JSON string')
+    expect((mapped as BrowserError).message).toContain('NOT rolled back')
   })
 
   it('passes unrelated errors through untouched', () => {

@@ -26,11 +26,18 @@
  * | `Network.setCacheDisabled` | `[V27]` 作用域无法判定，按最坏假设处理 |
  * | `Page.addScriptToEvaluateOnNewDocument` / `remove…` | `[V35]` 实测注册表是 target 级共享：注册者不导航、**别人触发的导航照样被注入**。副作用要到「下一次导航」才显形，事后无法察觉 |
  *
- * ## 返回值处理（三种失败形态，`[V22]` 全部实测）
+ * ## 返回值处理（`[V22]` 全部实测，`[V42]`/`[V43]` 2026-09-20 补测）
  *
  * `document.body` + `returnByValue` 会**静默返回 `{}`**（不报错，最危险）；循环引用 / `window`
  * 抛 `Object reference chain is too long`；`Symbol('s')` 抛 `Object couldn't be returned by value`。
  * 所以**不能只判 `result.value === undefined`**，要同时看 `result.type` / `result.subtype`。
+ *
+ * 两条补充（都是「照 `type` 分派」这种做法本身漏出来的）：
+ *
+ * 1. **函数同样静默 `{}`**：`() => 1` 回 `{type:'function', value:{}}` —— `value` 是个 `{}`，
+ *    只写在 `object` 分支里的空对象守卫拦不住它，于是**静默放行**。函数现在单列一条先拦。
+ * 2. **深度上限在 250～300 层之间**：300 层起回 `CBOR: stack limit exceeded`（报错，不是静默），
+ *    2000 层换成 `chain too long`。两条都要翻译成能力错误码，并指向「分片取」。
  *
  * ## Promise：等它落定，再判能不能跨边界（2026-09-14 修）
  *
@@ -188,6 +195,13 @@ export function extractEvaluateValue(result: unknown): unknown {
   const type = typeof remote.type === 'string' ? remote.type : 'undefined'
   const subtype = typeof remote.subtype === 'string' ? remote.subtype : undefined
   const value = remote.value
+  // ⚠️ 函数必须**先**拦（2026-09-20 · V43，实测）：`() => 1` 回的是 `{type:'function', value:{}}` ——
+  // `value` 是个 `{}`，而下面的空对象守卫原先只写在 `object` 分支里，于是它落到 `else if` 那条、
+  // `value !== undefined` 成立 → **静默放行成 `{}`**。这正是守卫存在的理由（看着有值其实是垃圾），
+  // 只是漏了函数这条分支。夹具也必须照实测画：`{type:'function'}` 那种「没有 value」的形态不会出现。
+  if (type === 'function') {
+    throw unserializable('the expression returned a function, which CDP hands back as an empty object')
+  }
   if (type === 'object') {
     // `document.body` 会静默变成 `{}`（看着有值其实是垃圾），DOM 节点 subtype 是 `node`。
     if (subtype === 'promise') {
@@ -207,23 +221,40 @@ export function extractEvaluateValue(result: unknown): unknown {
     if (value === undefined || isEmptyObject(value)) {
       throw emptyObjectValue()
     }
-  } else if (value === undefined && type !== 'undefined') {
-    // function / symbol 之类没有可返回值。
+  } else if (type !== 'undefined' && (value === undefined || isEmptyObject(value))) {
+    // 兜底（V43 的结论推广）：**非 `object` 类型也不许吐出「没有值 / 空对象」**。
+    // 函数那条已在上方单列；这里管 symbol 之类，也保证将来 CDP 新增类型时不会再出现
+    // 「守卫生效范围跟着类型分支走」这种漏法。`type === 'undefined'` 是合法空值，照旧放行。
     throw unserializable(`the expression returned a ${type} value that cannot cross the CDP boundary`)
   }
   return value
 }
 
 /**
- * 把 CDP 在返回值序列化时抛出的两个错误消息映射成能力错误码（`[V22]`）。
+ * 把 CDP 在返回值序列化时抛出的三个错误消息映射成能力错误码（`[V22]` + `[V42]`）。
+ *
+ * 第三条是深度（2026-09-20 补测）：嵌套 250 层正常，**300 层起**回
+ * `Failed to convert response to JSON: CBOR: stack limit exceeded at position N`。
+ * 它和「太深到连 chain 都数不动」的 `Object reference chain is too long` 是同一件事的两档，
+ * 都要告诉调用方「分片取」而不是留给它一条裸 `BROWSER_PROTOCOL_ERROR`。
+ *
  * @param error - provider 捕获到的任意错误。
  * @returns 若是「无法序列化」，返回映射后的错误；否则原样返回。
  */
 export function translateEvaluateError(error: unknown): unknown {
   if (!(error instanceof BrowserError) || error.code !== 'BROWSER_PROTOCOL_ERROR') return error
   const { message } = error
-  if (message.includes('Object reference chain is too long') || message.includes("Object couldn't be returned by value")) {
+  if (
+    message.includes('Object reference chain is too long')
+    || message.includes("Object couldn't be returned by value")
+  ) {
     return unserializable(message)
+  }
+  if (message.includes('CBOR: stack limit exceeded')) {
+    return unserializable(
+      `${message} (the object graph is too deep for CDP to serialize; return the few fields you need as a `
+      + 'JSON string of primitives, or walk the object in slices, instead of the whole deep object)',
+    )
   }
   return error
 }

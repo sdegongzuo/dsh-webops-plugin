@@ -1002,7 +1002,12 @@ export class CdpBrowserProvider implements BrowserProvider {
     try {
       raw = await session.connection.send(request.method, params, {
         signal,
-        timeoutMs: this.config.commandTimeoutMs,
+        // B5-d：逃生舱允许调用方把**这一条命令**的等待压短。取 `min` 而不是直接用 ——
+        // 传一个比 `commandTimeoutMs` 更大的值不该放大内层超时（那只会让「挂住」更贵），
+        // 而配置里把 `commandTimeoutMs` 调小时也只有 `min` 才尊重配置。
+        timeoutMs: request.timeoutMs === undefined
+          ? this.config.commandTimeoutMs
+          : Math.min(request.timeoutMs, this.config.commandTimeoutMs),
       })
     } catch (error: unknown) {
       // 把「循环引用 / Symbol」这两条序列化错误映射成 BROWSER_EXECUTE_RESULT_UNSERIALIZABLE。
