@@ -16,6 +16,7 @@
  * 注意：本机 shell 自带 `ELECTRON_RUN_AS_NODE=1`，起应用时要 `env -u`（见 AGENTS.md）。
  */
 
+import { fetchLoopback } from './loopback.mjs'
 const portArg = process.argv.indexOf('--port')
 const port = portArg === -1 ? 9333 : Number(process.argv[portArg + 1])
 const closeSuspect = process.argv.includes('--close-suspect')
@@ -25,7 +26,7 @@ if (!Number.isInteger(port) || port <= 0) {
   process.exit(2)
 }
 
-const endpoint = `http://127.0.0.1:${String(port)}/json/list`
+const endpointLabel = `http://localhost:${String(port)}/json/list`
 
 /** 连到一个 target 并返回一个最小的 CDP 客户端。 */
 async function connect(target) {
@@ -73,16 +74,16 @@ const describeWindow = `({
 
 let targets
 try {
-  targets = await (await fetch(endpoint)).json()
+  targets = await (await fetchLoopback(port, '/json/list')).json()
 } catch (error) {
-  console.error(`取不到 ${endpoint} —— 应用起了吗？带 --remote-debugging-port=${String(port)} 了吗？`)
+  console.error(`取不到 ${endpointLabel} —— 应用起了吗？带 --remote-debugging-port=${String(port)} 了吗？`)
   console.error(String(error?.message ?? error))
   process.exit(1)
 }
 
 const pages = targets.filter((t) => t.type === 'page')
 if (pages.length === 0) {
-  console.error(`${endpoint} 里没有任何 page target`)
+  console.error(`${endpointLabel} 里没有任何 page target`)
   process.exit(1)
 }
 
@@ -113,7 +114,7 @@ function isSuspect(row) {
   return area(row) >= maxArea * 0.9
 }
 
-console.log(`共 ${String(rows.length)} 个窗口（${endpoint}）\n`)
+console.log(`共 ${String(rows.length)} 个窗口（${endpointLabel}）\n`)
 for (const row of rows) {
   const i = row.info
   const suspect = isSuspect(row)
@@ -143,7 +144,7 @@ if (suspects.length === 0) {
       console.log(`   已关掉 ${row.target.url}`)
     }
     await new Promise((resolve) => setTimeout(resolve, 1500))
-    const after = await (await fetch(endpoint)).json()
+    const after = await (await fetchLoopback(port, '/json/list')).json()
     console.log(`   关闭后剩余窗口：${after.map((t) => t.url).join(', ')}`)
   } else {
     console.log('   加 --close-suspect 可以直接关掉它们（遮挡会立刻解除）。')

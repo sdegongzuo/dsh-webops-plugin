@@ -46,7 +46,9 @@
  *
  * 踩过的坑：Electron（Windows）主进程的 `process.stdin` **会立刻 EOF**，
  * 一旦 `on('end')` 里收尾就把 app 关了，表现是「窗口刚建好就自己没了」。
- * stdout 是通的，所以反向来：子进程监听 `127.0.0.1:0`，把端口号从 stdout 宣布出来。
+ * stdout 是通的，所以反向来：子进程监听回环（优先 `127.0.0.1`，失败退 `localhost`，
+ * 见下面的 `listenOnLoopback`），把**端口与实际用的主机名**从 stdout 宣布出来 ——
+ * 只宣布端口的话，父进程连错名字就是「本机连本机也连不上」。
  *
  * ## 另三个必须踩准的时机（都表现为「命令发出去永远不回」或窗口自己消失）
  *
@@ -68,7 +70,7 @@
  * - `{ op: 'dispose', id }`
  *
  * 子 → 父：
- * - `{ type: 'listening', port }`
+ * - `{ type: 'listening', port, host }`（`host` 是**实际**监听的回环名，父进程照它连）
  * - `{ type: 'opened', id, tabId, url, title }`
  * - `{ type: 'cdp', id, result | error }`
  * - `{ type: 'devtools', id, tabId, action, isOpen }`（`isOpen` 是**真实**状态，用来把
@@ -787,7 +789,9 @@ app.whenReady().then(() => {
     { role: 'windowMenu' },
   ]))
 
-  const server = net.createServer((socket) => {
+  // 连接处理单独抽出来：回环兜底要在 `bind` 失败时**换一个名字重建** server，
+  // 回调得像这样能复用（见下面的 `listenOnLoopback`）。
+  const onConnection = (socket) => {
     // 只认第一个连接（父进程）。第二个连接一律拒绝：本机任意进程探测一下端口
     // 就能顶掉真父进程、甚至「连上再断开」直接触发下面的 app.quit() 杀死宿主。
     if (connection !== undefined && !connection.destroyed) {
@@ -824,13 +828,37 @@ app.whenReady().then(() => {
       // 父进程走了。keepAlive 时把窗口留给用户，否则这个宿主没有存在意义了。
       if (!keepAlive) app.quit()
     })
-  })
+  }
 
-  server.listen(0, '127.0.0.1', () => {
-    const address = server.address()
-    // 端口只能从 stdout 出去 —— 这条路是通的，stdin 不是。
-    process.stdout.write(`${JSON.stringify({ type: 'listening', port: address.port })}\n`)
-  })
+  /**
+   * 回环兜底：有的企业策略只放通 `localhost` 这个名字（或反过来只认字面 IP，而机器上
+   * 只剩 IPv6 回环），写死 127.0.0.1 就会出现「本机连本机也连不上」。`bind` 失败就换
+   * 下一个名字重建 server；**实际**用上的那个名字要随端口一起宣布 ——
+   * 父进程照它连，两边对不上就是白试（约定见 `bridge.ts` 的 `readAnnouncedAddress`）。
+   */
+  const LOOPBACK_HOSTS = ['127.0.0.1', 'localhost']
+
+  const listenOnLoopback = (index) => {
+    if (index >= LOOPBACK_HOSTS.length) {
+      // 一个都听不了就没什么可等的了：报出去，让父进程的握手超时给出完整诊断。
+      process.stdout.write(`${JSON.stringify({ type: 'error', message: 'cannot listen on any loopback host' })}\n`)
+      app.quit()
+      return
+    }
+    const host = LOOPBACK_HOSTS[index]
+    const server = net.createServer(onConnection)
+    server.once('error', () => {
+      try { server.close() } catch { /* 已经关了 */ }
+      listenOnLoopback(index + 1)
+    })
+    server.listen(0, host, () => {
+      const address = server.address()
+      // 端口只能从 stdout 出去 —— 这条路是通的，stdin 不是。
+      process.stdout.write(`${JSON.stringify({ type: 'listening', port: address.port, host })}\n`)
+    })
+  }
+
+  listenOnLoopback(0)
 })
 
 // 供单测使用：地址规范化与导航处理不依赖 Electron 运行时，导出后单测可以直接钉住

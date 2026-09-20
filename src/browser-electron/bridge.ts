@@ -13,10 +13,11 @@
 
 import { spawn, type ChildProcess } from 'node:child_process'
 import { existsSync } from 'node:fs'
-import { connect, type Socket } from 'node:net'
+import type { Socket } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { noteLoaded } from '../debug.ts'
+import { connectLoopback, loopbackCandidates } from '../loopback.ts'
 
 /**
  * 宿主脚本路径的传递变量（打包应用模式专用）。
@@ -85,6 +86,14 @@ export const DEFAULT_BRIDGE_COMMAND_TIMEOUT_MS = 30_000
 
 /** 默认握手超时。 */
 export const DEFAULT_BRIDGE_HANDSHAKE_TIMEOUT_MS = 20_000
+
+/**
+ * 老宿主不宣布主机名时的默认值。
+ *
+ * 那一版只写 `{ type: 'listening', port }` 且固定监听 `127.0.0.1`，所以按它处理是对的；
+ * 新宿主会把自己**实际**监听的名字写进 `host`（回环兜底，见 `host.cjs`）。
+ */
+const LEGACY_ANNOUNCED_HOST = '127.0.0.1'
 
 /**
  * 打包应用模式下第二个实例的 `--user-data-dir`。
@@ -347,7 +356,8 @@ export class ElectronWindowBridge implements TabHostChannel {
       if (stderr.length > STDERR_TAIL_LIMIT) stderr = stderr.slice(-STDERR_TAIL_LIMIT)
     })
 
-    const port = await readAnnouncedPort(child, options.handshakeTimeoutMs ?? DEFAULT_BRIDGE_HANDSHAKE_TIMEOUT_MS)
+    const handshakeTimeoutMs = options.handshakeTimeoutMs ?? DEFAULT_BRIDGE_HANDSHAKE_TIMEOUT_MS
+    const announced = await readAnnouncedAddress(child, handshakeTimeoutMs)
       .catch((error: unknown) => {
         child.kill()
         const detail = stderr.trim() === '' ? '' : `; host stderr:\n${stderr.trim()}`
@@ -357,26 +367,25 @@ export class ElectronWindowBridge implements TabHostChannel {
         )
       })
 
-    // TCP connect 也要有超时：connect 对「宿主进程挂着但 accept 队列满」这类情况会无限挂起。
+    // 连宿主也要有超时：connect 对「宿主进程挂着但 accept 队列满」这类情况会无限挂起。
     // 超时与失败都必须把子进程一起收掉 —— 否则起不来的宿主就成僵尸 Electron。
-    const socket = connect({ host: '127.0.0.1', port })
-    const connectTimeoutMs = options.handshakeTimeoutMs ?? DEFAULT_BRIDGE_HANDSHAKE_TIMEOUT_MS
+    //
+    // 主机名按宿主宣布的来，并且**带兜底**：有的企业策略只放通 `localhost` 这个名字
+    // （或反过来只认字面 IP，而机器上只剩 IPv6 回环），只试一个名字会「本机连本机也连不上」。
+    const hosts = loopbackCandidates(announced.host)
+    let socket: Socket
     try {
-      await new Promise<void>((resolve, reject) => {
-        const timer = setTimeout(() => {
-          reject(new Error(`connect timeout after ${String(connectTimeoutMs)}ms`))
-        }, connectTimeoutMs)
-        socket.once('connect', () => { clearTimeout(timer); resolve() })
-        socket.once('error', (error: Error) => { clearTimeout(timer); reject(error) })
-      })
+      const connected = await connectLoopback(announced.port, { hosts, timeoutMs: handshakeTimeoutMs })
+      socket = connected.socket
+      if (connected.host !== announced.host) {
+        noteLoaded('browser-electron', `bridge: ${announced.host} 连不上，改用回环兜底 ${connected.host}`)
+      }
     } catch (error: unknown) {
-      socket.destroy()
       child.kill()
       const detail = stderr.trim() === '' ? '' : `; host stderr:\n${stderr.trim()}`
       throw new BridgeError(
-        `cannot connect to the Electron window host on 127.0.0.1:${String(port)}: ${
-          error instanceof Error ? error.message : String(error)
-        }${detail}`,
+        `cannot connect to the Electron window host on port ${String(announced.port)} `
+        + `(tried ${hosts.join(', ')}): ${error instanceof Error ? error.message : String(error)}${detail}`,
         'BRIDGE_START_FAILED',
       )
     }
@@ -749,13 +758,44 @@ export class ElectronWindowBridge implements TabHostChannel {
   }
 }
 
-/** 从宿主 stdout 里读 `{ type: 'listening', port }`。 */
-function readAnnouncedPort(child: ChildProcess, timeoutMs: number): Promise<number> {
-  return new Promise<number>((resolve, reject) => {
+/** 宿主宣布的监听地址：`{ type: 'listening', port, host? }`。 */
+interface AnnouncedAddress {
+  readonly port: number
+  /** 宿主**实际**监听的主机名；老宿主不宣布时取 {@link LEGACY_ANNOUNCED_HOST}。 */
+  readonly host: string
+}
+
+/**
+ * 解析宿主 stdout 的一行握手消息（可单测：握手格式是跨进程的契约，不该只靠真机试）。
+ *
+ * `host` 缺失时按 {@link LEGACY_ANNOUNCED_HOST} 处理 —— 老宿主只宣布端口、且固定监听
+ * `127.0.0.1`。新宿主会把它**实际**监听的回环名写出来（回环兜底，见 `host.cjs`）。
+ *
+ * @param line - 一行 stdout（已去掉换行）。
+ * @returns 不是 listening 消息时 `undefined`（宿主可能往 stdout 写别的）。
+ */
+export function parseAnnouncedAddress(line: string): AnnouncedAddress | undefined {
+  let message: Record<string, unknown>
+  try {
+    message = JSON.parse(line) as Record<string, unknown>
+  } catch {
+    return undefined
+  }
+  const port = message['port']
+  if (message['type'] !== 'listening' || typeof port !== 'number') return undefined
+  return {
+    port,
+    host: typeof message['host'] === 'string' ? message['host'] : LEGACY_ANNOUNCED_HOST,
+  }
+}
+
+/** 从宿主 stdout 里读 `{ type: 'listening', port, host? }`。 */
+function readAnnouncedAddress(child: ChildProcess, timeoutMs: number): Promise<AnnouncedAddress> {
+  return new Promise<AnnouncedAddress>((resolve, reject) => {
     const timer = setTimeout(() => { reject(new Error('the host never announced a port')) }, timeoutMs)
-    const finish = (error?: Error, port?: number): void => {
+    const finish = (error?: Error, address?: AnnouncedAddress): void => {
       clearTimeout(timer)
-      if (error === undefined && port !== undefined) resolve(port)
+      if (error === undefined && address !== undefined) resolve(address)
       else reject(error ?? new Error('unknown handshake failure'))
     }
     child.once('exit', (code) => { finish(new Error(`the host exited early with code ${String(code)}`)) })
@@ -770,14 +810,10 @@ function readAnnouncedPort(child: ChildProcess, timeoutMs: number): Promise<numb
         buffer = buffer.slice(index + 1)
         const trimmed = line.trim()
         if (trimmed === '') continue
-        try {
-          const message = JSON.parse(trimmed) as Record<string, unknown>
-          if (message['type'] === 'listening' && typeof message['port'] === 'number') {
-            finish(undefined, message['port'])
-            return
-          }
-        } catch {
-          // 宿主往 stdout 写了别的（理论上不该有）；忽略，继续等端口。
+        const announced = parseAnnouncedAddress(trimmed)
+        if (announced !== undefined) {
+          finish(undefined, announced)
+          return
         }
       }
     })

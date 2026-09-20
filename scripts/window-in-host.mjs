@@ -16,6 +16,7 @@
 
 import { join, resolve } from 'node:path'
 import { harnessDevProject } from './local-env.mjs'
+import { fetchLoopback } from './loopback.mjs'
 
 const PORT = Number(process.env.HOST_INSPECT_PORT ?? 9230)
 // `DESKTOP_PROJECT_DIR` 显式指定优先；否则按 `.env.local` 的 `DSH_HARNESS` 推开发态工程目录
@@ -51,10 +52,10 @@ const EXPRESSION = `(async () => {
   })
 })()`
 
-const list = await (await fetch(`http://127.0.0.1:${String(PORT)}/json/list`)).json()
+const list = await (await fetchLoopback(PORT, '/json/list')).json()
 const target = list.find(item => typeof item.webSocketDebuggerUrl === 'string')
 if (target === undefined) {
-  throw new Error(`桌面端 host 没在 127.0.0.1:${String(PORT)} 上开 inspector；先跑 pnpm run dev:desktop`)
+  throw new Error(`桌面端 host 没在回环 ${String(PORT)} 端口上开 inspector；先跑 pnpm run dev:desktop`)
 }
 
 const socket = new WebSocket(target.webSocketDebuggerUrl)

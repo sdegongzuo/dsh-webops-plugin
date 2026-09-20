@@ -2,9 +2,10 @@
 // 只读：连 renderer，点击「轨迹」视图后抓取 webpage_execute 行的返回文本，
 // 验证新版 HOTSEARCH_EXPRESSION 抽到的 fifth 是否真是榜单序号 5。
 import { writeFileSync } from 'node:fs'
+import { fetchLoopback } from './loopback.mjs'
 
 const PORT = process.env.RENDERER_PORT ?? 9222
-const pages = await (await fetch(`http://127.0.0.1:${String(PORT)}/json/list`)).json()
+const pages = await (await fetchLoopback(PORT, '/json/list')).json()
 const page = pages.find(p => p.type === 'page' && p.webSocketDebuggerUrl)
 if (!page) throw new Error('没有可用的 page 目标')
 

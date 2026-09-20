@@ -1,8 +1,9 @@
 #!/usr/bin/env node
 // 只读+视图切换：点击「轨迹」tab，抓取轨迹全文里 c7（webpage_execute 详情页正文）的结果行，
 // 验证 detailDigest 依赖的 `Runtime.evaluate on session_id=` 格式是否存在。
+import { fetchLoopback } from './loopback.mjs'
 const PORT = process.env.RENDERER_PORT ?? 9222
-const pages = await (await fetch(`http://127.0.0.1:${String(PORT)}/json/list`)).json()
+const pages = await (await fetchLoopback(PORT, '/json/list')).json()
 const page = pages.find(p => p.type === 'page' && p.webSocketDebuggerUrl)
 if (!page) throw new Error('没有可用的 page 目标')
 

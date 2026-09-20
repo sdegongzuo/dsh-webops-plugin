@@ -73,7 +73,12 @@ import { StaleRefMetrics } from './metrics.ts'
 /** provider 的 id，也是 `ctx.browser` 配置里 `provider` 字段要填的值。 */
 export const CDP_PROVIDER_ID = 'cdp'
 
-/** 本机 Chrome 的默认调试端点。 */
+/**
+ * 本机 Chrome 的默认调试端点。
+ *
+ * 写 `127.0.0.1` 只是「先试哪个」：连不上时 `HttpCdpTransport` 会自动换 `localhost`
+ * 再试一次（企业策略常常只放通其中一个名字，见 `../loopback.ts`）。
+ */
 export const DEFAULT_CDP_ENDPOINT = 'http://127.0.0.1:9222'
 
 /** P0 支持的浏览器操作；能力缝隙的 `observe` 只认这些。 */

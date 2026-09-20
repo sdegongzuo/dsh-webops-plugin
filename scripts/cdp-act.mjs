@@ -25,6 +25,7 @@
  */
 import { mkdirSync, writeFileSync } from 'node:fs'
 import { dirname, resolve } from 'node:path'
+import { fetchLoopback } from './loopback.mjs'
 
 const args = process.argv.slice(2)
 const command = args[0]
@@ -54,7 +55,7 @@ function send(socket, method, params) {
 }
 
 async function targets() {
-  const response = await fetch(`http://127.0.0.1:${String(PORT)}/json/list`)
+  const response = await fetchLoopback(PORT, '/json/list')
   return await response.json()
 }
 
@@ -135,7 +136,7 @@ async function main() {
   const list = await targets()
 
   if (command === 'list' || command === undefined) {
-    console.log(`共 ${String(list.length)} 个 target（http://127.0.0.1:${String(PORT)}/json/list）`)
+    console.log(`共 ${String(list.length)} 个 target（本机 ${String(PORT)} 端口 /json/list）`)
     for (const item of list) console.log(`  ${item.type.padEnd(8)} ${(item.title || '(无标题)')}  ←  ${item.url}`)
     if (command === undefined) process.exitCode = 1
     return

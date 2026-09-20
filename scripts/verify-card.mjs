@@ -15,6 +15,7 @@
  */
 
 import { writeFileSync } from 'node:fs'
+import { fetchLoopback } from './loopback.mjs'
 
 const PORT = Number(process.env.RENDERER_PORT ?? 9222)
 const DEADLINE_MS = Number(process.env.VERIFY_DEADLINE_MS ?? 120_000)
@@ -24,7 +25,7 @@ const MESSAGE = process.env.VERIFY_MESSAGE ?? '打开谷歌首页，点击 AI �
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms))
 
 async function listPages() {
-  const response = await fetch(`http://127.0.0.1:${String(PORT)}/json/list`)
+  const response = await fetchLoopback(PORT, '/json/list')
   if (!response.ok) throw new Error(`/json/list 返回 ${String(response.status)}`)
   const pages = await response.json()
   return pages.filter(page => page.type === 'page' && typeof page.webSocketDebuggerUrl === 'string')

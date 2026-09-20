@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { createServer } from 'node:http'
 import type { IncomingMessage, Server, ServerResponse } from 'node:http'
 import type { AddressInfo } from 'node:net'
@@ -380,5 +380,82 @@ describe('HttpCdpTransport', () => {
     socket.close()
 
     await expect(connecting).rejects.toThrow(expect.objectContaining({ code: 'BROWSER_CONNECTION_LOST' }))
+  })
+})
+
+/**
+ * 回环兜底：有的企业策略只放通 `localhost` 这个名字（或反过来只认字面 IP），
+ * 写死 `127.0.0.1` 就会「本机连本机也连不上」。这一组用 stub 掉的 `fetch` 钉住换名重试
+ * —— 真机上「一个名字通、另一个不通」取决于机器策略，测不稳，只在这层钉行为。
+ */
+describe('HttpCdpTransport 的回环兜底', () => {
+  afterEach(() => { vi.unstubAllGlobals() })
+
+  it('127.0.0.1 连不上时改用 localhost 重试并成功', async () => {
+    const urls: string[] = []
+    vi.stubGlobal('fetch', async (url: string) => {
+      urls.push(url)
+      if (url.includes('127.0.0.1')) throw new Error('connect ECONNREFUSED 127.0.0.1:9222')
+      return new Response(JSON.stringify({
+        Browser: 'Chrome/141.0.0.0',
+        webSocketDebuggerUrl: 'ws://localhost:9222/devtools/browser/abc',
+      }))
+    })
+
+    const version = await new HttpCdpTransport('http://127.0.0.1:9222').version()
+
+    expect(version.browser).toBe('Chrome/141.0.0.0')
+    expect(urls).toEqual(['http://127.0.0.1:9222/json/version', 'http://localhost:9222/json/version'])
+  })
+
+  it('兜底生效后，命令通道地址跟着换到同一个主机名', async () => {
+    vi.stubGlobal('fetch', async (url: string) => {
+      if (url.includes('127.0.0.1')) throw new Error('blocked by enterprise policy')
+      return new Response(JSON.stringify({
+        Browser: 'Chrome/141.0.0.0',
+        // 服务端自己写的地址仍是 127.0.0.1 —— 它不知道我们靠哪个名字连上来的。
+        webSocketDebuggerUrl: 'ws://127.0.0.1:9222/devtools/browser/abc',
+      }))
+    })
+    const seen: string[] = []
+    let socket: FakeSocket | undefined
+    const transport = new HttpCdpTransport('http://127.0.0.1:9222', {
+      socketFactory: (url) => {
+        seen.push(url)
+        socket = new FakeSocket()
+        return socket
+      },
+    })
+
+    await transport.version()
+    const connecting = transport.connect('ws://127.0.0.1:9222/devtools/page/p1')
+    socket?.open()
+
+    await expect(connecting).resolves.toBeInstanceOf(CdpConnection)
+    expect(seen[0]).toBe('ws://localhost:9222/devtools/page/p1')
+  })
+
+  it('两个回环名都连不上时只各试一次，然后报端点不可达', async () => {
+    const urls: string[] = []
+    vi.stubGlobal('fetch', async (url: string) => {
+      urls.push(url)
+      throw new Error('blocked')
+    })
+
+    await expect(new HttpCdpTransport('http://127.0.0.1:9222').version())
+      .rejects.toThrow(expect.objectContaining({ code: 'BROWSER_ENDPOINT_UNREACHABLE' }))
+    expect(urls).toEqual(['http://127.0.0.1:9222/json/version', 'http://localhost:9222/json/version'])
+  })
+
+  it('非回环端点不换主机名 —— 兜底只在本机范围内成立', async () => {
+    const urls: string[] = []
+    vi.stubGlobal('fetch', async (url: string) => {
+      urls.push(url)
+      throw new Error('blocked')
+    })
+
+    await expect(new HttpCdpTransport('http://example.com:9222').version())
+      .rejects.toThrow(expect.objectContaining({ code: 'BROWSER_ENDPOINT_UNREACHABLE' }))
+    expect(urls).toEqual(['http://example.com:9222/json/version'])
   })
 })

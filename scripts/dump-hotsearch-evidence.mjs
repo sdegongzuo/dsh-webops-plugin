@@ -1,9 +1,10 @@
 #!/usr/bin/env node
 // 只读：切「轨迹」抓 c3 execute / c4 find / 打开的详情 URL。
 import { writeFileSync } from 'node:fs'
+import { fetchLoopback } from './loopback.mjs'
 
 const PORT = process.env.RENDERER_PORT ?? 9222
-const pages = await (await fetch(`http://127.0.0.1:${String(PORT)}/json/list`)).json()
+const pages = await (await fetchLoopback(PORT, '/json/list')).json()
 writeFileSync('scripts/.last-cdp-targets.json', JSON.stringify(pages.map(p => ({
   type: p.type, title: p.title, url: p.url, ws: Boolean(p.webSocketDebuggerUrl),
 })), null, 2))

@@ -12,6 +12,7 @@
 
 import { mkdirSync, writeFileSync } from 'node:fs'
 import { dirname, resolve } from 'node:path'
+import { fetchLoopback } from './loopback.mjs'
 
 const PORT = Number(process.env.RENDERER_PORT ?? 9222)
 const OUT = resolve(process.env.SHOT_OUT ?? 'docs/desktop-dock.png')
@@ -65,7 +66,7 @@ async function main() {
   let page
   while (Date.now() < deadline) {
     try {
-      const response = await fetch(`http://127.0.0.1:${String(PORT)}/json/list`)
+      const response = await fetchLoopback(PORT, '/json/list')
       const pages = await response.json()
       page = pages.find(item => item.type === 'page' && typeof item.webSocketDebuggerUrl === 'string')
       if (page !== undefined) break

@@ -13,6 +13,7 @@
 import { BrowserError } from '../browser/types.ts'
 import type { BrowserErrorCode } from '../browser/types.ts'
 import { noteLoaded } from '../debug.ts'
+import { isLoopbackHost, loopbackCandidates, withHost } from '../loopback.ts'
 
 /** Chrome DevTools HTTP 端点描述的一个 target。 */
 export interface CdpTarget {
@@ -368,9 +369,36 @@ function defaultSocketFactory(url: string): CdpSocket {
   return new Ctor(url)
 }
 
+/**
+ * 端点的回环候选主机名（端口与路径不变，只换名字）。
+ *
+ * 端点不是合法 URL 时给空数组 —— 那时照原样连一次，错由 `fetch` 自己报，
+ * 别在这里提前抛一个与真实原因无关的错误。
+ */
+function endpointHosts(endpoint: string): readonly string[] {
+  try {
+    return loopbackCandidates(new URL(endpoint).hostname)
+  } catch {
+    return []
+  }
+}
+
 /** {@link CdpTransport} 的默认实现：DevTools HTTP 端点 + 全局 WebSocket。 */
 export class HttpCdpTransport implements CdpTransport {
-  private readonly endpoint: string
+  /** 配置里给出的原始端点；候选主机名都是从它派生出来的。 */
+  private readonly baseEndpoint: string
+  /** 回环候选主机名，顺序即尝试顺序。 */
+  private readonly hosts: readonly string[]
+  /** 当前生效的候选下标。 */
+  private hostIndex = 0
+  /**
+   * 是否已经有过一次成功请求。
+   *
+   * 成了就**锁定**当前主机名：之后的失败只是「这次请求没成」，换个名字重试只会把
+   * 一个能用的端点换来换去，把真正的错误（端口上没服务）盖成「名字不对」。
+   */
+  private settled = false
+  private endpoint: string
   private readonly requestTimeoutMs: number
   private readonly commandTimeoutMs: number
   private readonly socketFactory: CdpSocketFactory
@@ -383,7 +411,9 @@ export class HttpCdpTransport implements CdpTransport {
     endpoint: string,
     options: { requestTimeoutMs?: number; commandTimeoutMs?: number; socketFactory?: CdpSocketFactory } = {},
   ) {
-    this.endpoint = endpoint
+    this.baseEndpoint = endpoint
+    this.hosts = endpointHosts(endpoint)
+    this.endpoint = this.hosts.length === 0 ? endpoint : withHost(endpoint, this.hosts[0] as string)
     this.requestTimeoutMs = options.requestTimeoutMs ?? 5_000
     this.commandTimeoutMs = options.commandTimeoutMs ?? DEFAULT_COMMAND_TIMEOUT_MS
     this.socketFactory = options.socketFactory ?? defaultSocketFactory
@@ -442,11 +472,33 @@ export class HttpCdpTransport implements CdpTransport {
     }
   }
 
+  /**
+   * 把命令通道地址的主机名归一到当前生效的那个。
+   *
+   * `/json/version` 回的是**服务端自己**写下的地址，常见形态是 `ws://127.0.0.1:9222/...`；
+   * 若 HTTP 是靠 `localhost` 才连上的，那条地址同样会被同一条策略拦掉。
+   * 只在两边都是回环且不一致时替换 —— 外部主机一个字都不动。
+   */
+  private rewriteWsHost(webSocketDebuggerUrl: string): string {
+    const host = this.hosts[this.hostIndex]
+    if (host === undefined) return webSocketDebuggerUrl
+    try {
+      const parsed = new URL(webSocketDebuggerUrl)
+      if (!isLoopbackHost(parsed.hostname) || parsed.hostname.replace(/^\[|\]$/gu, '') === host) {
+        return webSocketDebuggerUrl
+      }
+      return withHost(webSocketDebuggerUrl, host)
+    } catch {
+      return webSocketDebuggerUrl
+    }
+  }
+
   /** @inheritdoc */
   async connect(webSocketDebuggerUrl: string, signal?: AbortSignal): Promise<CdpConnection> {
+    const url = this.rewriteWsHost(webSocketDebuggerUrl)
     let rawSocket: CdpSocket
     try {
-      rawSocket = this.socketFactory(webSocketDebuggerUrl)
+      rawSocket = this.socketFactory(url)
     } catch (error: unknown) {
       throw transportError('websocket', error)
     }
@@ -510,20 +562,43 @@ export class HttpCdpTransport implements CdpTransport {
   private async requestText(path: string, signal: AbortSignal | undefined, method: string): Promise<string> {
     const timeout = AbortSignal.timeout(this.requestTimeoutMs)
     const combined = signal === undefined ? timeout : AbortSignal.any([signal, timeout])
-    let response: Response
-    try {
-      response = await fetch(`${this.endpoint}${path}`, { method, signal: combined })
-    } catch (error: unknown) {
-      throw transportErrorHttp(path, error)
+    for (;;) {
+      let response: Response
+      try {
+        response = await fetch(`${this.endpoint}${path}`, { method, signal: combined })
+      } catch (error: unknown) {
+        // 只有「连不上」才值得换名字重试；超时（signal 已 abort）换了也一样超时，直接抛。
+        if (combined.aborted || !this.fallback()) throw transportErrorHttp(path, error)
+        continue
+      }
+      if (!response.ok) {
+        throw new BrowserError(
+          `DevTools endpoint ${path} responded ${response.status}`,
+          'BROWSER_PROTOCOL_ERROR',
+          { status: response.status },
+        )
+      }
+      // 成了就锁定：后续请求不再换主机名。
+      this.settled = true
+      return await response.text()
     }
-    if (!response.ok) {
-      throw new BrowserError(
-        `DevTools endpoint ${path} responded ${response.status}`,
-        'BROWSER_PROTOCOL_ERROR',
-        { status: response.status },
-      )
-    }
-    return await response.text()
+  }
+
+  /**
+   * 换到下一个回环主机名。
+   *
+   * @returns 换了就 `true`；没有下一个候选、或已经有主机成功过就 `false`。
+   */
+  private fallback(): boolean {
+    if (this.settled) return false
+    const next = this.hostIndex + 1
+    const host = this.hosts[next]
+    if (host === undefined) return false
+    const from = this.hosts[this.hostIndex]
+    this.hostIndex = next
+    this.endpoint = withHost(this.baseEndpoint, host)
+    noteLoaded('browser-cdp', `端点 ${String(from)} 连不上，改用回环兜底 ${host}`)
+    return true
   }
 }
 

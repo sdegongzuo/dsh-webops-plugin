@@ -2,9 +2,10 @@
 // 只读检查：连渲染进程 CDP，读聊天 DOM 最后一段 assistant 回复文本，
 // 确认 fake-llm 动态证据收尾（打开谷歌 → AI 模式 → 提问）是否可见。
 import { writeFileSync } from 'node:fs'
+import { fetchLoopback } from './loopback.mjs'
 
 const PORT = process.env.RENDERER_PORT ?? 9222
-const pages = await (await fetch(`http://127.0.0.1:${String(PORT)}/json/list`)).json()
+const pages = await (await fetchLoopback(PORT, '/json/list')).json()
 const page = pages.find(p => p.type === 'page' && p.webSocketDebuggerUrl)
 if (!page) throw new Error('没有可用的 page 目标')
 

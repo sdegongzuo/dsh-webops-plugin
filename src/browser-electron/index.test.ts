@@ -14,7 +14,7 @@ import { connect, createServer, type Socket as NetSocket } from 'node:net'
 import { CdpConnection } from '../browser-cdp/protocol.ts'
 import { ElectronWindowBridge } from './bridge.ts'
 import type { BridgeControl, BridgeDevTools, BridgeTab, BridgeTabBar, ControlHolder, ControlListener, EventListener, TabHostChannel, TakeoverListener, TabOpenedListener } from './bridge.ts'
-import { resolveHostLaunch } from './bridge.ts'
+import { parseAnnouncedAddress, resolveHostLaunch } from './bridge.ts'
 import { ElectronBrowserProvider } from './provider.ts'
 import { WindowCdpSocket } from './socket.ts'
 import { ElectronWindowTransport, tabHandle, tabIdFromHandle } from './transport.ts'
@@ -928,5 +928,22 @@ describe('控制权（§6.5 人工接管按钮）通道', () => {
     const failure = await provider.navigate({ sessionId: session.id, url: 'https://example.com/other' })
       .then(() => undefined, (error: unknown) => error as { code?: string })
     expect(failure?.code).not.toBe('BROWSER_HUMAN_HOLDING')
+  })
+})
+
+describe('宿主握手的监听地址（回环兜底的跨进程契约）', () => {
+  it('新宿主宣布的 host 照单全收', () => {
+    expect(parseAnnouncedAddress('{"type":"listening","port":4321,"host":"localhost"}'))
+      .toEqual({ port: 4321, host: 'localhost' })
+  })
+
+  it('老宿主只宣布端口时按 127.0.0.1 处理', () => {
+    expect(parseAnnouncedAddress('{"type":"listening","port":4321}'))
+      .toEqual({ port: 4321, host: '127.0.0.1' })
+  })
+
+  it('非握手行不认（宿主往 stdout 写了别的）', () => {
+    expect(parseAnnouncedAddress('{"type":"opened","tabId":"t1"}')).toBeUndefined()
+    expect(parseAnnouncedAddress('not json')).toBeUndefined()
   })
 })
