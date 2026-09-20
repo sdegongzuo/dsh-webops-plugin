@@ -137,10 +137,17 @@ export interface BrowserOpenRequest {
   readonly url?: string
 }
 
-/** 让一个已存在的受控标签页跳转。**作废该会话的全部既有 ref。** */
+/**
+ * 让一个已存在的受控标签页跳转。**作废该会话的全部既有 ref。**
+ *
+ * `url` 与 `history` **恰好给一个**：后退 / 前进 / 刷新走浏览器自己的历史栈，
+ * 与「跳到某个地址」是两件事。都给或都不给都报错，绝不猜。
+ */
 export interface BrowserNavigateRequest {
   readonly sessionId: string
-  readonly url: string
+  readonly url?: string
+  /** 走历史栈：`back` / `forward` / `reload`。与 `url` 互斥。 */
+  readonly history?: 'back' | 'forward' | 'reload'
 }
 
 /** 一个受控的浏览器会话（P0 里等于一个标签页）。 */
@@ -380,6 +387,32 @@ export type BrowserMutationRequest =
     readonly timeoutMs?: number
   }
 
+/**
+ * 被点击目标的身份信息（`click` 才有）。
+ *
+ * 存在的理由：`navigated=false` 的回执如果不说「你刚才点的到底是什么、它的 href 是什么」，
+ * 模型只能去翻 console / network 猜（§6 禁止清单里的第四条）。
+ */
+export interface BrowserMutationTarget {
+  readonly role: string
+  readonly name: string
+  /** 绝对化后的链接地址（只给 http(s)）；不是链接时为 `undefined`。 */
+  readonly href?: string
+}
+
+/**
+ * 挡在点击落点上的那个元素（`click` 才有）。
+ *
+ * `hint` 是给模型的选择器线索（`#id` / `.class`）：遮罩通常不是可操作控件、**不在 ref 表里**，
+ * 没有 `ref` 可给；光有 role/name 模型还是无从下手。
+ */
+export interface BrowserOcclusion {
+  readonly role?: string
+  readonly name?: string
+  readonly ref?: string
+  readonly hint?: string
+}
+
 /** 一次页面操作的结果。 */
 export interface BrowserMutationResult {
   readonly kind: 'mutation'
@@ -424,6 +457,22 @@ export interface BrowserMutationResult {
    * 模型点完弹窗链接会一直以为只有一个标签，整条弯路都从这儿开始。
    */
   readonly openedTabs?: readonly BrowserTabInfo[]
+  /** 被点击目标的身份（只有 click 填）：未导航回执要用它报「点的是什么」。 */
+  readonly target?: BrowserMutationTarget
+  /**
+   * 落点被别的元素盖住（只有 click 填）。
+   *
+   * **事件照样派发了** —— 这个字段只是把「打在谁身上」如实回给模型。自动 Escape、
+   * 自动改点遮罩上的按钮都是误触（见方案 §5），不做。
+   */
+  readonly occluded_by?: BrowserOcclusion
+  /**
+   * 动作已投递出去，但**没拿到浏览器的回执**（只有 scroll 会置 true）。
+   *
+   * 不是失败：滚轮事件发过了，只是页面没回话（后台标签 / Electron 上不回包）。
+   * 与其让工具卡满 30s 报超时，不如如实说「不知道滚没滚」，让模型自己去确认位置。
+   */
+  readonly unconfirmed?: boolean
 }
 
 /** 标签页清单里的一项（本插件自己开的受控标签页）。 */

@@ -408,6 +408,21 @@ describe('argument and output contracts', () => {
     expect(value).toEqual({ session_id: 's1', url: 'https://example.com/', title: 'Example', epoch: 4 })
   })
 
+  it('walks the browser history without webpage_execute (B2-b · J4)', async () => {
+    // 「回到上一页」以前只能靠逃生舱 `webpage_execute("history.back()")`；现在是一等参数。
+    await tool(harness, 'webpage_navigate').execute({ session_id: 's1', history: 'back' }, exec())
+    expect(harness.browserCalls).toEqual([{ method: 'navigate', args: { sessionId: 's1', history: 'back' } }])
+
+    await tool(harness, 'webpage_navigate').execute({ session_id: 's1', history: 'reload' }, exec())
+    expect(harness.browserCalls[1]).toEqual({ method: 'navigate', args: { sessionId: 's1', history: 'reload' } })
+    // `url` 不再是必填 —— 否则 history 这条路根本填不出参数。
+    // （不用 `validateJsonSchemaValue`：实测它对未知字段不报错，拿它验「url 非必填」是装饰性断言。）
+    const parameters = JSON.stringify(tool(harness, 'webpage_navigate').parameters)
+    expect(parameters).toContain('history')
+    // url 那一项不许再带 `required`（它是 z 对象，键不在顶层，只能这样看序列化后的文本）。
+    expect(parameters).not.toMatch(/"url"[\s\S]{0,120}"required"\s*:\s*true/u)
+  })
+
   it('omits the url entirely when the model opens a blank page', async () => {
     await tool(harness, 'webpage_open').execute({}, exec())
     expect(harness.browserCalls).toEqual([{ method: 'open', args: {} }])
@@ -632,6 +647,72 @@ describe('webpage_tabs and the P1 mutation tools', () => {
     })
     expect(String((plain[0] as { text: string }).text)).not.toContain('NEW TAB(S) OPENED')
   })
+
+  it('tells the model why a click did NOT navigate, instead of a bare "click done" (B2-a · J5)', () => {
+    const render = (value: Record<string, unknown>): string =>
+      String((tool(harness, 'webpage_click').output.render({ session_id: 's1' }, value as never)[0] as { text: string }).text)
+    const base = {
+      session_id: 's1',
+      action: 'click',
+      epoch: 4,
+      url: SESSION.url,
+      title: SESSION.title,
+      navigated: false,
+    }
+    const target = { role: 'link', name: '外链标题', href: 'https://example.com/x' }
+
+    // ① 遮挡优先于 href —— 被盖住时「按 Enter」是错的指引，不许同时给。
+    const occluded = render({ ...base, target, occluded_by: { role: 'dialog', name: '登录后查看', hint: '#login-modal' } })
+    expect(occluded).toContain('occluded_by')
+    expect(occluded).toContain('role=dialog')
+    expect(occluded).toContain('#login-modal')
+    expect(occluded).toContain('DISPATCHED')
+    expect(occluded).toContain('do NOT go looking through console/network')
+    expect(occluded).not.toContain('press Enter')
+
+    // ② 有 href：报清「点的是谁」，并给下一步。
+    const withHref = render({ ...base, target })
+    expect(withHref).toContain('did NOT navigate')
+    expect(withHref).toContain('role=link')
+    expect(withHref).toContain('href=https://example.com/x')
+    expect(withHref).toContain('press Enter')
+    expect(withHref).toContain('webpage_navigate')
+
+    // ③ 没 href：当成 JS 控件，指向 snapshot（先别去翻 console）。
+    const jsButton = render({ ...base, target: { role: 'button', name: '展开' } })
+    expect(jsButton).toContain('no href')
+    expect(jsButton).toContain('webpage_snapshot')
+
+    // ④ 反向：导航了、或根本不是 click，就都不许出现这段。
+    expect(render({ ...base, navigated: true, target })).not.toContain('did NOT navigate')
+    expect(render({ ...base, action: 'scroll', target })).not.toContain('did NOT navigate')
+
+    // ⑤ 导航回执要点名「下一步是 snapshot，不是 find」；stable 没等到且页面还在忙时，
+    //    要点名「改等文本」—— 两条都是模型最容易走岔的岔口。
+    const navigated = render({ ...base, navigated: true, target })
+    expect(navigated).toContain('NOT webpage_find')
+    const busy = render({
+      ...base,
+      action: 'wait',
+      satisfied: false,
+      signals: { readyState: 'loading', dom: 'busy', network: 'busy' },
+    })
+    expect(busy).toContain('webpage_wait(text=')
+    // 反向：页面其实已经安静时，不该再劝它换姿势。
+    const quiet = render({
+      ...base,
+      action: 'wait',
+      satisfied: false,
+      signals: { readyState: 'complete', dom: 'quiet', network: 'quiet' },
+    })
+    expect(quiet).not.toContain('webpage_wait(text=')
+
+    // 新字段必须能被工具的输出契约接受（additionalProperties: false，漏声明就是运行时炸）。
+    expect(validateJsonSchemaValue(
+      tool(harness, 'webpage_click').output.schema,
+      { ...base, target, occluded_by: { role: 'dialog', name: '登录后查看', hint: '#login-modal' } },
+    )).toEqual([])
+  })
 })
 
 describe('webpage_screenshot', () => {
@@ -845,8 +926,36 @@ describe('webpage_find / webpage_locate (P3)', () => {
     await tool(harness, 'webpage_snapshot').execute({ session_id: 's1' }, exec())
     await tool(harness, 'webpage_navigate').execute({ session_id: 's1', url: 'https://example.com/next' }, exec())
 
+    // 「缓存是被什么清掉的」必须写进这条报错：模型刚跳完页最想做的正是 find，
+    // 不给原因它就只会再试一次（B2-c 第 2 条）。
     await expect(tool(harness, 'webpage_find').execute({ session_id: 's1', query: 'submit' }, exec()))
-      .rejects.toThrow(expect.objectContaining({ code: 'BROWSER_SNAPSHOT_REQUIRED' }))
+      .rejects.toThrow(expect.objectContaining({
+        code: 'BROWSER_SNAPSHOT_REQUIRED',
+        message: expect.stringContaining('cache is dropped by navigation'),
+      }))
+  })
+
+  it('blames the truncation when find hits nothing on a truncated outline (B2-e · J5)', async () => {
+    const render = (value: unknown): string =>
+      String((tool(harness, 'webpage_find').output.render({}, value as never)[0] as { text: string }).text)
+
+    harness.snapshotResponse = { ...SNAPSHOT, truncated: true }
+    await tool(harness, 'webpage_snapshot').execute({ session_id: 's1' }, exec())
+    const value = await tool(harness, 'webpage_find').execute({ session_id: 's1', query: '绝对不存在的词' }, exec())
+
+    expect(value).toMatchObject({ matches: [], outline_truncated: true })
+    const text = render(value)
+    expect(text).toContain('TRUNCATED')
+    expect(text).toContain('max_lines')
+    // find 是零状态检索：这条提示不许变成「偷偷再拍一次快照」。
+    expect(harness.browserCalls.filter(call => call.method === 'observe')).toHaveLength(1)
+
+    // 反向：大纲没被截断时，0 命中就是真的没找到 —— 不许再提截断。
+    harness.snapshotResponse = { ...SNAPSHOT, truncated: false }
+    await tool(harness, 'webpage_snapshot').execute({ session_id: 's1' }, exec())
+    const plain = await tool(harness, 'webpage_find').execute({ session_id: 's1', query: '绝对不存在的词' }, exec())
+    expect(plain).not.toHaveProperty('outline_truncated')
+    expect(render(plain)).not.toContain('TRUNCATED')
   })
 
   it('renders find output with the untrusted-content notice', () => {

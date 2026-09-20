@@ -23,7 +23,9 @@ function makeProvider(id: string, available: boolean): BrowserProvider {
     id,
     available: () => available,
     open: (request: BrowserOpenRequest) => Promise.resolve({ ...SESSION, url: request.url ?? SESSION.url }),
-    navigate: (request: BrowserNavigateRequest) => Promise.resolve({ ...SESSION, url: request.url }),
+    // `url` 现在是可选的（B2-b 起还有 `history` 这条路）；桩里回退到默认地址，
+    // 好让「history 导航」这类请求也能过 `BrowserSession` 的类型。
+    navigate: (request: BrowserNavigateRequest) => Promise.resolve({ ...SESSION, url: request.url ?? SESSION.url }),
     observe: (request: BrowserObserveRequest) => Promise.resolve({
       kind: 'snapshot',
       sessionId: request.sessionId,

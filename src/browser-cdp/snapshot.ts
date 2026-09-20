@@ -734,6 +734,26 @@ export function renderOutline(
     .join('\n')
 }
 
+/**
+ * 大纲顶部的浮层提示行（B2-d）。
+ *
+ * 为什么要占大纲第一行：无 `role=dialog` 的浮层在 AX 里排在 `<body>` **末尾**，小 `max_lines`
+ * 会把它整段截掉 —— 模型看到的第一屏于是「像是可以点正文」，而实际点击全落在遮罩上。
+ * 放在最前面，是因为它是这次快照里唯一「模型不查就永远不知道」的事实（与 `opened_tabs`
+ * 同一条理由）。
+ *
+ * 只提示、不处置：自动关弹窗会误关对话框（方案 §5）。
+ */
+export function renderOverlayNotice(overlay: { role: string; name: string; hint: string }): string {
+  const who = [
+    overlay.role.length > 0 ? overlay.role : 'element',
+    overlay.name.length > 0 ? `"${overlay.name}"` : '',
+    overlay.hint.length > 0 ? overlay.hint : '',
+  ].filter(part => part.length > 0).join(' ')
+  return `OVERLAY at viewport center: ${who} — this covers the page; actionable controls may be at the end `
+    + 'of the outline. Raise max_lines if truncated.'
+}
+
 /** 文档坐标下的轴对齐矩形。 */
 export interface BoxRect {
   readonly x: number
