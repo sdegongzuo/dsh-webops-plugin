@@ -44,7 +44,7 @@ index e5c789c165..820be9081e 100644
      const targetName = resolveDesktopBuildTarget()
      const target = { platform: process.platform, arch: targetName.endsWith('arm64') ? 'arm64' : 'x64' }
 diff --git a/apps/desktop/src/main.ts b/apps/desktop/src/main.ts
-index d5bfb1e0b3..1a9102c200 100644
+index d5bfb1e0b3..6f753c3941 100644
 --- a/apps/desktop/src/main.ts
 +++ b/apps/desktop/src/main.ts
 @@ -1,7 +1,9 @@
@@ -66,6 +66,15 @@ index d5bfb1e0b3..1a9102c200 100644
  import { DesktopProjectManager } from './project-manager.ts'
  import { DesktopHostProcess, DesktopHostUncleanExitError } from './host-process.ts'
  import { installDesktopDirectoryPicker } from './directory-picker.ts'
+@@ -27,7 +29,7 @@ import { DESKTOP_IPC, SCHEME, assertDesktopSender, type DesktopUpdateState } fro
+ import { formatDesktopMessage, resolveDesktopLocale } from './locale.ts'
+ import { claimDesktopSingleInstance } from './single-instance.ts'
+ import { DesktopUpdateCoordinator } from './update-coordinator.ts'
+-import { serveWebDocument, authenticateWebHost, forwardWebRequest } from './web-document.ts'
++import { serveWebDocument, authenticateLoopbackHost, forwardWebRequest } from './web-document.ts'
+ import { DesktopFatalRecovery } from './fatal-recovery.ts'
+ import { DesktopUpdateJournal } from './update-journal.ts'
+ import { DesktopUpdatePreparationError } from './update-error.ts'
 @@ -40,6 +42,69 @@ import { DesktopPolicyTestAuth } from './policy-test-auth.ts'
  import { DesktopUpdateDialog, type UpdateDialogOptions } from './update-dialog.ts'
  import { readDesktopRuntime } from './runtime-tree.ts'
@@ -156,7 +165,21 @@ index d5bfb1e0b3..1a9102c200 100644
    return { node, nodeBin, pnpm, dsh }
  }
  
-@@ -407,6 +482,16 @@ async function main(): Promise<void> {
+@@ -255,8 +330,11 @@ async function main(): Promise<void> {
+     return {
+       start: async () => {
+         const ready = await host.start()
+-        hostCookie = await authenticateWebHost(ready.url)
+-        hostUrl = ready.url
++        // 回环兜底：连不上就用另一个回环名再试一次（企业策略常常只放通其中一个），
++        // 后续所有转发都用同一个名字 —— 见 web-document.ts 的 authenticateLoopbackHost。
++        const authenticated = await authenticateLoopbackHost(ready.url)
++        hostCookie = authenticated.cookie
++        hostUrl = authenticated.url
+         if (ready.injections === undefined) throw new Error('Desktop Host did not provide boot injections')
+         injections = ready.injections
+       },
+@@ -407,6 +485,16 @@ async function main(): Promise<void> {
        }
        return forwardWebRequest(request, hostUrl, hostCookie)
      }
@@ -173,7 +196,7 @@ index d5bfb1e0b3..1a9102c200 100644
      return Promise.resolve(new Response(null, { status: 404 }))
    })
  
-@@ -771,17 +856,29 @@ async function main(): Promise<void> {
+@@ -771,17 +859,29 @@ async function main(): Promise<void> {
    publishUpdate(updateState)
  }
  
@@ -248,11 +271,113 @@ index cf03e38c36..878122bcd6 100644
 +  const portableHome = resolve(dirname(executablePath), '..', 'home')
 +  return existsSync(portableHome) ? portableHome : undefined
 +}
+diff --git a/apps/desktop/src/web-document.ts b/apps/desktop/src/web-document.ts
+index d7fe1d7fca..315bf1837e 100644
+--- a/apps/desktop/src/web-document.ts
++++ b/apps/desktop/src/web-document.ts
+@@ -35,6 +35,73 @@ export async function serveWebDocument(request: Request, root: string): Promise<
+   })
+ }
+ 
++/** Authentication exchange failed for reasons that changing the host name cannot fix. */
++export class WebHostAuthenticationError extends Error {
++  constructor() {
++    super('Desktop Host authentication failed')
++    this.name = 'WebHostAuthenticationError'
++  }
++}
++
++/**
++ * Loopback host names to try, in order.
++ *
++ * 中文备注（本段是本地补丁，非上游原稿）：有的企业终端策略只放通 `localhost` 这个名字
++ * （代理 bypass 名单、防火墙 / WFP 规则、终端管控），或者反过来只认字面 IP；还有的机器
++ * 只剩 IPv6 回环。写死 `127.0.0.1` 时「本机连本机」也会失败，而报错与「服务没起来」
++ * 一模一样，极难诊断 —— 所以按候选顺序试。
++ */
++const LOOPBACK_HOSTS = ['127.0.0.1', 'localhost'] as const
++
++/** Whether a host name is one of the loopback spellings, brackets included. */
++function isLoopback(host: string): boolean {
++  const name = host.replace(/^\[|\]$/g, '').toLowerCase()
++  return name === '127.0.0.1' || name === 'localhost' || name === '::1'
++}
++
++/** Rewrite a URL's host name, keeping port, path and query intact. */
++function withHost(url: string, host: string): string {
++  const target = new URL(url)
++  // IPv6 literals need brackets: assigning `::1` to `hostname` fails silently.
++  target.hostname = host.includes(':') && !host.startsWith('[') ? `[${host}]` : host
++  const text = target.toString()
++  // `URL` appends a root slash to bare hosts (`http://h:19387` → `.../`).
++  return url.endsWith('/') ? text : text.replace(/\/+$/, '')
++}
++
++/** Candidate URLs for `url`, its own host first; non-loopback hosts get no fallback. */
++function loopbackCandidates(url: string): string[] {
++  let host: string
++  try { host = new URL(url).hostname.replace(/^\[|\]$/g, '').toLowerCase() } catch { return [url] }
++  if (!isLoopback(host)) return [url]
++  return [url, ...LOOPBACK_HOSTS.filter(candidate => candidate !== host).map(candidate => withHost(url, candidate))]
++}
++
++/**
++ * Authenticate against whichever loopback host name actually reaches the Host.
++ *
++ * The authentication exchange is already an HTTP round trip, so it doubles as the
++ * probe: only a failure to **reach** the server moves on to the next candidate; a
++ * negative answer from the server itself is final (retrying it would only relabel
++ * it as a connectivity problem).
++ *
++ * @param url - Authenticated URL reported by the owned Host process.
++ * @returns The URL that worked and its cookie — keep the pair together, every later
++ *   request is forwarded to that same host name.
++ */
++export async function authenticateLoopbackHost(url: string): Promise<{ url: string; cookie: string }> {
++  let lastError: unknown = new Error('Desktop Host is unreachable')
++  for (const candidate of loopbackCandidates(url)) {
++    try {
++      return { url: candidate, cookie: await authenticateWebHost(candidate) }
++    } catch (error: unknown) {
++      if (error instanceof WebHostAuthenticationError) throw error
++      lastError = error
++    }
++  }
++  throw lastError
++}
++
+ /**
+  * Exchange the Host launch URL for an authority-bound browser cookie.
+  * @param url - Authenticated URL reported by the owned Host process.
+@@ -44,7 +111,7 @@ export async function authenticateWebHost(url: string): Promise<string> {
+   const response = await fetch(url, { redirect: 'manual' })
+   const cookie = response.headers.get('set-cookie')
+   await response.body?.cancel()
+-  if (response.status !== 303 || cookie === null) throw new Error('Desktop Host authentication failed')
++  if (response.status !== 303 || cookie === null) throw new WebHostAuthenticationError()
+   const end = cookie.indexOf(';')
+   return end < 0 ? cookie : cookie.slice(0, end)
+ }
 diff --git a/apps/desktop/tests/main-startup.spec.ts b/apps/desktop/tests/main-startup.spec.ts
-index 246dcbcfdf..8d7d3df13e 100644
+index 246dcbcfdf..9eb9b1d45b 100644
 --- a/apps/desktop/tests/main-startup.spec.ts
 +++ b/apps/desktop/tests/main-startup.spec.ts
-@@ -220,7 +220,7 @@ vi.mock('node:fs/promises', async (importOriginal) => {
+@@ -14,7 +14,13 @@ import { DesktopUpdatePreparationError } from '../src/update-error.ts'
+ type InvokeEvent = { sender?: unknown; senderFrame: { url: string } }
+ type InvokeHandler = (event: InvokeEvent, ...args: unknown[]) => unknown
+ 
+-vi.mock('../src/web-document.ts', () => ({ authenticateWebHost: async () => 'test-cookie', serveWebDocument: vi.fn(), forwardWebRequest: vi.fn() }))
++vi.mock('../src/web-document.ts', () => ({
++  // Loopback fallback returns the host name together with its cookie; the shell
++  // forwards everything to whichever name actually reached the Host.
++  authenticateLoopbackHost: async (url: string) => ({ url, cookie: 'test-cookie' }),
++  serveWebDocument: vi.fn(),
++  forwardWebRequest: vi.fn(),
++}))
+ 
+ const harness = await vi.hoisted(async () => {
+   const { EventEmitter } = await import('node:events')
+@@ -220,7 +226,7 @@ vi.mock('node:fs/promises', async (importOriginal) => {
    }) }
  })
  vi.mock('../src/runtime-tree.ts', () => ({ readDesktopRuntime: () => ({ release: { version: '1.0.0' } }) }))
@@ -261,6 +386,61 @@ index 246dcbcfdf..8d7d3df13e 100644
  vi.mock('../src/project-manager.ts', () => ({
    DesktopProjectManager: class {
      readonly applyRelease = harness.applyRelease
+@@ -1288,7 +1294,8 @@ describe('desktop main startup', () => {
+     expect(harness.applyRelease).toHaveBeenCalledTimes(1)
+     expect(harness.hosts[0]).toMatchObject({
+       node: process.execPath,
+-      runtime: join(harness.app.getAppPath(), 'dsh'),
++      // 便携布局把 dsh 运行时放在 `resources\dsh` 真目录（不跟着上游塞进 app.asar）。
++      runtime: join('desktop-test-resources', 'dsh'),
+       primaryRuntime: join('desktop-test-resources', 'runtime', 'primary-runtime'),
+       profileResolution: 'runtime',
+       profile: 'desktop-test-profile',
+diff --git a/apps/desktop/tests/web-document.spec.ts b/apps/desktop/tests/web-document.spec.ts
+index f6ddc47894..e0b009b49b 100644
+--- a/apps/desktop/tests/web-document.spec.ts
++++ b/apps/desktop/tests/web-document.spec.ts
+@@ -2,7 +2,7 @@ import { afterEach, expect, it, vi } from 'vitest'
+ import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises'
+ import { tmpdir } from 'node:os'
+ import { join } from 'node:path'
+-import { authenticateWebHost, forwardWebRequest, serveWebDocument } from '../src/web-document.ts'
++import { authenticateLoopbackHost, authenticateWebHost, forwardWebRequest, serveWebDocument } from '../src/web-document.ts'
+ 
+ const roots: string[] = []
+ afterEach(async () => {
+@@ -35,6 +35,31 @@ it('requires the Host authentication exchange and retains only its cookie value'
+   await expect(authenticateWebHost('http://127.0.0.1:1234/')).rejects.toThrow('authentication failed')
+ })
+ 
++it('falls back to another loopback name when the announced one cannot be reached', async () => {
++  const urls: string[] = []
++  const fetch = vi.fn().mockImplementation(async (input: unknown) => {
++    const url = String(input)
++    urls.push(url)
++    if (url.includes('127.0.0.1')) throw new TypeError('fetch failed')
++    return new Response(null, { status: 303, headers: { 'set-cookie': 'session=owned' } })
++  })
++  vi.stubGlobal('fetch', fetch)
++
++  // Subsequent forwarding uses whichever name worked, so the Host name travels with the cookie.
++  await expect(authenticateLoopbackHost('http://127.0.0.1:19387/?token=owned'))
++    .resolves.toEqual({ url: 'http://localhost:19387/?token=owned', cookie: 'session=owned' })
++  expect(urls).toEqual(['http://127.0.0.1:19387/?token=owned', 'http://localhost:19387/?token=owned'])
++})
++
++it('does not relabel a rejected authentication handshake as unreachable', async () => {
++  const fetch = vi.fn().mockResolvedValue(new Response('unauthorized', { status: 401 }))
++  vi.stubGlobal('fetch', fetch)
++
++  await expect(authenticateLoopbackHost('http://127.0.0.1:19387/?token=owned'))
++    .rejects.toThrow('authentication failed')
++  expect(fetch).toHaveBeenCalledTimes(1)
++})
++
+ it('forwards upload bytes and cancellation with Host credentials while keeping the response streaming', async () => {
+   const body = new ReadableStream({ start(controller) { controller.enqueue(new TextEncoder().encode('stream')); controller.close() } })
+   const fetch = vi.fn().mockResolvedValue(new Response(body, { headers: { 'content-encoding': 'gzip', 'set-cookie': 'private' } }))
 diff --git a/packages/sandbox/sandbox-local/src/index.ts b/packages/sandbox/sandbox-local/src/index.ts
 index 037dc90079..f09a2ee5d3 100644
 --- a/packages/sandbox/sandbox-local/src/index.ts

@@ -25,6 +25,9 @@ coverage/
 .smoke-*.png
 .probe-*
 .verify-card*.png
+# `verify-browser-host.mjs` 的截图产物（文档里的用法是 `--out dist/verify-browser-host.png`；
+# 不带 --out 跑一次就会落在仓库根 —— 那是运行产物，不入库）。
+verify-browser-host.png
 .workbuddy/
 # P0 事故分布采样落盘（方案 §4；dev-desktop.mjs 默认指到这里）。
 # 一次性测量产物，出结论后连模块一起删。
