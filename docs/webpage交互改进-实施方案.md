@@ -453,6 +453,42 @@ B1/B2 落地后再回写 `docs/架构与实现.md`（click 命中校验、scroll
    （`D:/tmp/cdp-exec-probe{,2,3}.mjs`），而 Electron 的集成补丁历史上改过 CDP 行为
    （`CDP实测事实.md` V29 就是 `clearDeviceMetricsOverride` 的 Electron 特例）。
 
+**实测记录（2026-09-20 23:43，打包态，✅ 五条全绿）**
+
+环境：`D:/dsh-build/portable-test`；插件层是 23:28 那次 `portable:refresh` 的产物（进包前逐条 grep 过：
+`type === "function"` 拦截、`CBOR: stack limit exceeded` 映射、`timeout_ms` 参数与
+`typeof args.timeout_ms === "number" ? { timeoutMs: args.timeout_ms }` 转发都在 bundle 里）；
+`portable:launch --cdp 9333`，夹具页 `http://127.0.0.1:9788/`。
+驱动方式：`cdp-act.mjs click --text 新会话` 新开一个会话 → `cdp-act.mjs type --text "<验收指令>" --submit`
+（都是真实鼠标/键盘事件，不是 `element.click()`）。证据：会话轨迹
+`home/sessions/--D-dev-cli-dsh-webops-plugin--/session-e87e19d0…/session.v3.jsonl.zstd`。
+
+| 判据 | 表达式 / 参数 | 实测回执（原文） | 耗时 |
+|---|---|---|---|
+| J7-a 函数不再静默 `{}` | `() => 1` | `Error: the expression's value could not be serialized by CDP: the expression returned a function, which CDP hands back as an empty object. … Return a primitive value or a JSON string (for example JSON.stringify(...)) instead of a DOM node, a cyclic object, a function, a Symbol, or an unawaited Promise.` | 8ms |
+| J7-b 深度超限给可执行写法 | 300 层嵌套对象 | `Error: the expression's value could not be serialized by CDP: CDP error: Failed to convert response to JSON: CBOR: stack limit exceeded at position 3040 (the object graph is too deep for CDP to serialize; return the few fields you need as a JSON string of primitives, or walk the object in slices, instead of the whole deep object). …` | 8ms |
+| J8 挂住的 Promise 由调用方定期限 | `new Promise(() => {})` + `timeout_ms: 2000` | `Error: CDP command "Runtime.evaluate" did not complete within 2000 ms` | **2019ms** |
+| B5-c/V41 变量跨调用持久 | `let __b5 = 41` → `__b5` | 第一条 `(no value returned)`；第二条 `41` | 13ms / 8ms |
+| B5-d 参数确实送到 provider | 上面第 3 行的 `timeout_ms` 出现在 tool/call 的 `arguments` 里 | 见上 | — |
+
+- **打包态读数与 Chrome 侧逐字一致**（含 `position 3040`）→ V29 那种 Electron 特例在这批事实里不成立，
+  两处读数可以互相当证据用。
+- 附一条**非本批**的观察（P2，待议）：失败回执**文本里只有散文、没有错误码** —— 跨 8 份会话轨迹
+  grep `Error: … BROWSER_*` **零命中**，码只存在于结构化的 `.code` 里；而工具描述对模型写的是
+  「fails with `BROWSER_EXECUTE_RESULT_UNSERIALIZABLE`」。描述与回执口径不一致，模型只能靠散文辨识。
+  要收口就是把码写进 message 文本（`BROWSER_STALE_REF` 那类老路径同样如此，得一起看）。
+  **这一条是跑完让模型自己回读回执时被抓出来的** —— 它的结论表三行都写着「回执原文未出现 error code 字段」。
+- 附第二条（P2，待议，**J8 只做了一半**）：超时回执
+  `CDP command "Runtime.evaluate" did not complete within 2000 ms` **没有可执行写法、也没说副作用未回滚**，
+  而 J8 的原话是「回执照实说明副作用未回滚」。挂住的表达式**还在页面里跑**，说清这点比说清超时更有用；
+  文案该落在 `src/browser-cdp/protocol.ts:165`（⚠️ 那个文件目前有并行会话未提交的 loopback 改动，
+  动它之前先知会）。建议文案：`… did not complete within N ms; the expression is still running in the page,
+  so any side effect it has or will have is NOT rolled back — raise timeout_ms or wrap it in Promise.race([...]).`
+- 现场备注：模型写到第 7 步（结论表）时，实例与 9788 夹具**一起消失**了（9333 / 19387 / 9788 同时不再监听）、
+  轨迹停在 `step/start`；五条回执在这之前已经落盘，不影响判据。事后确认是**被并行会话杀掉**的
+  （不是崩溃），23:49 重启实例 + 夹具后会话仍在，让它「接着补第 6 步」即拿到结论表 ——
+  **中断的对话可以续，回执与判据都不依赖它**。
+
 ### 8.4 落地记录（2026-09-20）
 
 | 条目 | 状态 | 说明 |
@@ -461,7 +497,7 @@ B1/B2 落地后再回写 `docs/架构与实现.md`（click 命中校验、scroll
 | B5-b CBOR 深度错误 | ✅ | `translateEvaluateError` 加 `CBOR: stack limit exceeded` 一条，文案指向分片取；夹具带 `(code -32000)` 后缀，与 `mapCdpError` 的真实包装一致 |
 | B5-c execute 描述 | ✅ **缩到两句** | 只留「变量跨调用持久 + 重复声明会炸」与「受控组件走真实输入」。**深对象那条没进描述** —— B5-b 的错误文案已经逐字告诉模型「return the fields you need as a JSON string」，描述里再说一遍是重复计费（该文件正被 T-C2 瘦身，见下） |
 | B5-d 可选 `timeout_ms` | ✅ | 语义定为**只允许缩短**：schema `1-30000`，provider 取 `min(请求值, commandTimeoutMs)`；不传时行为与从前逐字一致。描述里写明「只缩短等待、不会让永不落定的 Promise 变成有值」 |
-| §8.3 打包态回归 | ⬜ 待跑 | 需要停掉占着 19387 的实例才能重启生效（当时那个是**别的会话在用**的实例，按纪律没动）。命令与三条判据见 8.3 |
+| §8.3 打包态回归 | ✅ 2026-09-20 23:43 | 打包态（23:28 那次 `refresh` 的包，Electron）真跑一轮对话，五条判据全绿 —— 逐条回执原文与耗时见 §8.3 的「实测记录」 |
 
 判据先红后绿（反向验证）：两条新用例在旧代码下分别红在「函数根本没抛错」与「CBOR 仍是 `BROWSER_PROTOCOL_ERROR`」，
 改完转绿（`execute.test.ts` 14 passed）；provider 侧两条新用例用**行为**断言 override 生效
@@ -473,3 +509,5 @@ B1/B2 落地后再回写 `docs/架构与实现.md`（click 命中校验、scroll
 **双运行时复核**：V41–V45 在 Chrome 153 与 Electron 44（Chromium 152）上读数逐字一致
 （含 `position 3040`），所以 8.3 第 3 条的顾虑对这批事实不成立 —— 打包态回归要验的只剩
 「新代码确实进了包」。探针在 `D:/tmp/electron-probe/`（隐藏窗口 + 独立端口，不碰在跑的实例）。
+**这两条收官于 2026-09-20 23:43 的打包态对话实测（见 §8.3「实测记录」）：进包确认 ✅、五条判据 ✅。**
+第二批 B5-a～B5-d 至此全部落地，无待跑项。
