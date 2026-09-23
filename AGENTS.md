@@ -174,21 +174,25 @@ Electron 可执行文件）统一经 `scripts/local-env.mjs` 取；值写在仓�
   （本机 7890 在监听但没进环境变量；`%LOCALAPPDATA%\electron\Cache` 里那几个 hash 目录不含目标版本，别指望命中）。
   **优先改用镜像**（见下条，不必开代理）。
 - **本机重编桌面端一律走 `pnpm harness:build`**（2026-09-19 实测：直跑 `package:win:x64:dir` 必挂，
-  而且是**先跑 20 分钟再挂**）。两处坑都是「上游写死 + 本机网速」，`scripts/harness-build.mjs` 已挡掉：
-  1. **registry 被上游硬编码成 npmjs.org**（`apps/desktop/scripts/prepare-dsh.ts:77,89`），而且该脚本
-     主动剥掉子进程里所有 `npm_*`/`pnpm_*` 变量、把 `--config.userconfig` 指向一个空文件
-     → **`~/.npmrc` 里配的镜像完全无效，环境变量也注不进去**，只能临时改文件。
-     本机直连 npmjs 只有 **11–31 KB/s**（实测 `node-pty` 7.15MB 要 ~10 分钟），而它每轮用 `mkdtemp`
-     新建 BUILD_ROOT（pnpm store 就在里面）→ **store 每轮都是冷的** → 大包必然撞 pnpm 的 60s
+  而且是**先跑 20 分钟再挂**）。两处坑都是网络，`scripts/harness-build.mjs` 已挡掉：
+  1. **registry 走镜像**。⚠️ **2026-09-22 起上游自己修了**：dsh 0.1.7-alpha.1 的 `prepare-dsh.ts`
+     改成 `resolveNpmRegistry(process.env)`，读环境变量 **`DSH_DESKTOP_NPM_REGISTRY`**（默认才是
+     npmjs），并把它显式写进 pnpm 子进程的 `NPM_CONFIG_REGISTRY`。所以新版上游**注入环境变量即可、
+     一个字节都不用改文件**；脚本会自动判模式（打 `registry=env`），只在旧上游上才回落到
+     「临时替换文件 + 无条件还原」那条路。
+     为什么要换：本机直连 npmjs 只有 **11–31 KB/s**（实测 `node-pty` 7.15MB 要 ~10 分钟），而它每轮用
+     `mkdtemp` 新建 BUILD_ROOT（pnpm store 就在里面）→ **store 每轮都是冷的** → 大包必然撞 pnpm 的 60s
      `fetch-timeout`，报 `[23] The operation was aborted due to timeout`。
-     换 npmmirror（`DSH_NPM_REGISTRY`）实测 **1.8–2.5 MB/s（约 100 倍）**。
+     npmmirror（`DSH_NPM_REGISTRY`）实测 **1.8–2.5 MB/s（约 100 倍）**。
      产物不受影响：pnpm 按 lockfile 校验 `integrity`，镜像有出入会直接失败，不会静默换包。
   2. **`prepare:runtime` 要下 157MB 的 `electron-v<版本>-win32-x64.zip`**，直连 GitHub 实测
      `TypeError: fetch failed`。设 `ELECTRON_MIRROR`（`DSH_ELECTRON_MIRROR`）指 npmmirror 的
      electron 镜像即可（URL 形如 `<镜像><版本>/electron-v<版本>-win32-x64.zip`）。
-  ⚠️ 该脚本会**临时替换** `prepare-dsh.ts` 再**无条件还原** —— 它是
+     ⚠️ 上游**没有**为它开环境变量入口，靠的是 `@electron/get` 原生读 `ELECTRON_MIRROR` —— 上游哪天改用
+     `mirrorOptions` 传参，这条就静默失效（届时要看 `prepare-runtime.ts` 的 `downloadArtifact` 调用）。
+  ⚠️ 回落路径会**临时替换** `prepare-dsh.ts` 再**无条件还原** —— 它是
   `docs/harness-desktop-build.patch` 的目标文件，替换残留会随补丁出货到 CI。所以还原带 sha256 自证
-  （不一致 → 非 0 退出 + 打出备份路径）。自测用 `pnpm harness:build --dry-run`（只演练替换/还原）。
+  （不一致 → 非 0 退出 + 打出备份路径）。自测用 `pnpm harness:build --dry-run`。
   两个镜像值都在 `.env.local`。
 - 火绒按 exe 路径放行：新目录里的副本出不去网（看着像包坏）。换目录先用
   `ELECTRON_RUN_AS_NODE=1 <exe> D:/Temp/net-check2.mjs` 验出网。

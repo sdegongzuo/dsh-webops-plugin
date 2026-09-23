@@ -189,16 +189,19 @@ export function harnessDevProject() {
 const withSlash = (url) => (url.endsWith('/') ? url : `${url}/`)
 
 /**
- * 重编桌面端时给 `prepare-dsh.ts` **临时替换**用的 npm registry。
+ * 重编桌面端时给 `prepare-dsh.ts` 用的 npm registry。
  *
- * 为什么需要它（2026-09-19 实测，别删）：harness 的 `apps/desktop/scripts/prepare-dsh.ts`
- * 把 registry **硬编码**成 `https://registry.npmjs.org/`（第 77、89 两行），并主动剥掉子进程
- * 环境里所有 `npm_*` / `pnpm_*` 变量、把 `--config.userconfig` 指向一个空文件 —— 所以
- * **`~/.npmrc` 里配的镜像完全不起作用**，也没法用环境变量注入。
- * 而本机直连 npmjs 只有 **11–31 KB/s**（实测 `node-pty` 7.15MB 要 ~10 分钟），且该脚本每轮
- * 用 `mkdtemp` 新建 BUILD_ROOT（pnpm store 就在里面）→ **store 每轮都是冷的** → 大包必然
- * 撞 pnpm 的 60s `fetch-timeout`。改走 npmmirror 实测 **1.8–2.5 MB/s（~100 倍）**。
- * 临时替换由 `scripts/harness-build.mjs` 负责，用完必还原。
+ * 为什么需要它（2026-09-19 首测，2026-09-22 补记）：本机直连 npmjs 只有 **11–31 KB/s**
+ * （实测 `node-pty` 7.15MB 要 ~10 分钟），而 harness 那个脚本每轮用 `mkdtemp` 新建
+ * BUILD_ROOT（pnpm store 就在里面）→ **store 每轮都是冷的** → 大包必然撞 pnpm 的 60s
+ * `fetch-timeout`。改走 npmmirror 实测 **1.8–2.5 MB/s（~100 倍）**。
+ *
+ * 注入方式随上游变（`scripts/harness-build.mjs` 自动判）：
+ *  · **dsh 0.1.7-alpha.1 起**：上游改读 `resolveNpmRegistry(process.env)`，键名
+ *    `DSH_DESKTOP_NPM_REGISTRY` → 直接注入环境变量，**不改文件**；
+ *  · **更早的 ref**：registry 被硬编码成 `https://registry.npmjs.org/`（第 77、89 两行），
+ *    还剥掉子进程所有 `npm_*` / `pnpm_*` 变量、把 `--config.userconfig` 指向空文件
+ *    → 镜像与 env 都无效，只能临时替换文件（用完必还原）。
  * @returns {string} 以 `/` 结尾。
  */
 export function npmRegistry() {

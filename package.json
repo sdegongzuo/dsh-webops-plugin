@@ -89,11 +89,11 @@
     "portable:clean": "node scripts/portable-dev.mjs clean"
   },
   "peerDependencies": {
-    "@deepseek-ai/cordis": "^4.0.2",
-    "@deepseek-ai/dsh-attachment": "^0.1.6-alpha.1",
-    "@deepseek-ai/dsh-system-prompt": "^0.1.6-alpha.1",
-    "@deepseek-ai/dsh-tools": "^0.1.6-alpha.1",
-    "@deepseek-ai/schemastery": "^3.18.2"
+    "@deepseek-ai/cordis": "^4.0.3",
+    "@deepseek-ai/dsh-attachment": "^0.1.7-alpha.1",
+    "@deepseek-ai/dsh-system-prompt": "^0.1.7-alpha.1",
+    "@deepseek-ai/dsh-tools": "^0.1.7-alpha.1",
+    "@deepseek-ai/schemastery": "^3.18.3"
   },
   "devDependencies": {
     "@deepseek-ai/cordis": "link:../deepseek-harness/vendor/cordis",

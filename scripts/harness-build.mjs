@@ -13,6 +13,15 @@
  *    **store 每轮都是冷的** → 大包必然撞 pnpm 的 60s `fetch-timeout`，报
  *    `[23] The operation was aborted due to timeout`。
  *    → 本脚本临时把那 2 处换成 `DSH_NPM_REGISTRY`（默认 npmmirror），实测 **1.8–2.5 MB/s**。
+ *
+ *    ⚠️ **2026-09-22 更新（dsh 0.1.7-alpha.1）：这个坑上游已经修了。** `prepare-dsh.ts`
+ *    现在写的是 `resolveNpmRegistry(process.env)`（`desktop-release-environment.mjs` 的
+ *    `NPM_REGISTRY_ENV` = **`DSH_DESKTOP_NPM_REGISTRY`**，默认值才是 npmjs），并把解析结果
+ *    显式注入 pnpm 子进程的 `NPM_CONFIG_REGISTRY`。所以新版上游**不用再改文件**，
+ *    直接注入环境变量即可。
+ *    本脚本会自动判模式：上游能读环境变量就走 `env`（**一个字节都不动**），
+ *    读不到才回落到旧的「改文件」路径（兼容旧 ref）。下面那套替换 / 无条件还原的防线
+ *    只在回落路径上生效。
  * 2. **Electron 二进制下载**。`prepare:runtime` 要下 **157MB** 的
  *    `electron-v<版本>-win32-x64.zip`，直连 GitHub 实测 `TypeError: fetch failed`。
  *    → 注入 `ELECTRON_MIRROR`（默认 npmmirror 的 electron 镜像）。
@@ -67,7 +76,21 @@ export function buildSteps(skipPrepare) {
   return skipPrepare ? all.slice(-1) : all
 }
 
-/* ---------- 临时替换 / 无条件还原 ---------- */
+/* ---------- registry 注入模式 ---------- */
+
+/**
+ * 上游能否从环境变量读 registry（dsh 0.1.7-alpha.1 起）。
+ *
+ * 判据用 `resolveNpmRegistry` 这个标识，而不是数 `https://registry.npmjs.org/` 的出现次数 ——
+ * 后者会随注释、示例、默认值挪动而变，而「能从环境变量读」这个能力必须有那个函数。
+ */
+export function supportsRegistryEnv() {
+  const target = join(harnessDesktopDir(), 'scripts', 'prepare-dsh.ts')
+  if (!existsSync(target)) fail(`找不到 ${target} —— DSH_HARNESS 指对了吗？`)
+  return readFileSync(target, 'utf8').includes('resolveNpmRegistry')
+}
+
+/* ---------- 临时替换 / 无条件还原（只在旧上游回落路径上跑）---------- */
 
 /** 还原凭据；`null` = 没替换过。 */
 let swap = null
@@ -131,7 +154,12 @@ function restoreRegistry() {
 
 /* ---------- 跑构建 ---------- */
 
-function runSteps(skipPrepare) {
+/**
+ * 依次跑构建步骤。
+ * @param {boolean} skipPrepare 只跑最后那步 `package:win:x64:dir`。
+ * @param {string|undefined} registryEnv 新版上游读的 registry 环境变量值；`undefined` = 不注入。
+ */
+function runSteps(skipPrepare, registryEnv) {
   const desktop = harnessDesktopDir()
   const env = {
     ...process.env,
@@ -141,6 +169,9 @@ function runSteps(skipPrepare) {
     CODEBUDDY_SAFE_DELETE_ENABLED: '0',
     TAR_OPTIONS: '--force-local',
     ELECTRON_MIRROR: electronMirror(),
+    // ⚠️ 只对**新版上游**有效：它必须在子进程环境里（上游用 `process.env` 读，
+    // 再显式写进 pnpm 子进程的 NPM_CONFIG_REGISTRY）。旧上游没有这个入口。
+    ...(registryEnv === undefined ? {} : { DSH_DESKTOP_NPM_REGISTRY: registryEnv }),
   }
   for (const step of buildSteps(skipPrepare)) {
     const extra = step === 'package:win:x64:dir' ? ['--unsigned'] : []
@@ -187,16 +218,28 @@ if (isEntry) {
 
   console.log(`harness   ${harnessRoot()}`)
   console.log(`步骤      ${dryRun ? '（--dry-run：不跑构建）' : buildSteps(skipPrepare).join(' → ')}`)
-  if (noMirror) console.log('镜像      未启用（--no-mirror）—— 直连 npmjs 本机只有 11–31 KB/s，大概率超时')
-  else applyRegistryMirror(npmRegistry())
+  // registry 两条路：新版上游走环境变量（不动文件），旧上游回落到改文件。
+  const registryMode = noMirror ? 'off' : supportsRegistryEnv() ? 'env' : 'patch'
+  const registryValue = registryMode === 'off' ? undefined : npmRegistry()
+  if (registryMode === 'off') {
+    console.log('镜像      未启用（--no-mirror）—— 直连 npmjs 本机只有 11–31 KB/s，大概率超时')
+  } else if (registryMode === 'env') {
+    console.log(`registry  环境变量注入 ${registryValue}（上游原生支持，不改文件）`)
+  } else {
+    console.log('registry  上游没有环境变量入口 —— 回落到临时替换文件（用完无条件还原）')
+    applyRegistryMirror(registryValue)
+  }
 
   if (dryRun) {
     restoreRegistry()
-    if (process.exitCode !== 1) console.log('\n✓ 替换 / 还原往返正常（未跑构建）')
+    if (process.exitCode !== 1) {
+      console.log(`\n✓ 模式判定完成（registry=${registryMode}），未跑构建`
+        + (registryMode === 'patch' ? '；替换 / 还原往返正常' : ''))
+    }
   } else {
     let ok = false
     try {
-      ok = runSteps(skipPrepare)
+      ok = runSteps(skipPrepare, registryMode === 'env' ? registryValue : undefined)
     } finally {
       restoreRegistry()
     }

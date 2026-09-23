@@ -1,19 +1,16 @@
 diff --git a/apps/desktop/scripts/electron-builder-config.mjs b/apps/desktop/scripts/electron-builder-config.mjs
-index ea33c60b2a..cd420fd598 100644
+index e3873de35f..96a90e0322 100644
 --- a/apps/desktop/scripts/electron-builder-config.mjs
 +++ b/apps/desktop/scripts/electron-builder-config.mjs
-@@ -104,9 +104,6 @@ export function createElectronBuilderConfig(
-       'lib/preload-update-dialog.cjs',
+@@ -134,13 +134,17 @@ export function createElectronBuilderConfig(
+       'lib/preload-welcome.cjs',
        'renderer/**/*',
        'package.json',
 -      { from: buildPaths.dsh, to: 'dsh', filter: ['**/*'] },
 -      // electron-builder excludes a source directory's root node_modules.
 -      { from: join(buildPaths.dsh, 'node_modules'), to: 'dsh/node_modules', filter: ['**/*'] },
      ],
-     asarUnpack: [
-       '**/*.{node,dylib,dll,so,exe}',
-@@ -116,6 +113,13 @@ export function createElectronBuilderConfig(
-     ],
+     asarUnpack: unpack,
      extraResources: [
        { from: buildPaths.runtime, to: 'runtime' },
 +      // dsh 运行时**必须**在 extraResources，不能进 files（app.asar）：
@@ -27,24 +24,24 @@ index ea33c60b2a..cd420fd598 100644
      ],
      mac: {
 diff --git a/apps/desktop/scripts/prepare-dsh.ts b/apps/desktop/scripts/prepare-dsh.ts
-index e5c789c165..820be9081e 100644
+index a89247ad18..c0dadd1988 100644
 --- a/apps/desktop/scripts/prepare-dsh.ts
 +++ b/apps/desktop/scripts/prepare-dsh.ts
-@@ -119,7 +119,11 @@ async function main(): Promise<void> {
+@@ -127,7 +127,11 @@ async function main(): Promise<void> {
        readFileSync(join(BUILD_ROOT, 'pnpm-lock.yaml'), 'utf8'),
        readDesktopCorePackageSet(BUILD_ROOT, release.version),
      )
--    await runPnpm(['install', '--prod', '--frozen-lockfile', '--trust-lockfile'])
+-    await packagingStep(process.env.DSH_DESKTOP_PACKAGING_RUN_DIR, 'runtime:install', () => runPnpm(['install', '--prod', '--frozen-lockfile', '--trust-lockfile']))
 +    // 去掉 --frozen-lockfile / --trust-lockfile：这两个标志下 pnpm 会卡在
 +    // 「added 241/507」且 download 恒为 0，与 registry 无关（换源也不动），
 +    // 同一项目去掉后 21.5 秒装完。构建目录是一次性的，且上面刚做过
 +    // verifyDesktopCoreLockfile 校验，此处不再复用 pnpm 自身的 lockfile 闸门。
-+    await runPnpm(['install', '--prod'])
++    await packagingStep(process.env.DSH_DESKTOP_PACKAGING_RUN_DIR, 'runtime:install', () => runPnpm(['install', '--prod']))
      const packageSet = readDesktopCorePackageSet(BUILD_ROOT, release.version)
      const targetName = resolveDesktopBuildTarget()
      const target = { platform: process.platform, arch: targetName.endsWith('arm64') ? 'arm64' : 'x64' }
 diff --git a/apps/desktop/src/main.ts b/apps/desktop/src/main.ts
-index d5bfb1e0b3..6f753c3941 100644
+index 46ce1f45c1..0e3d0a71a4 100644
 --- a/apps/desktop/src/main.ts
 +++ b/apps/desktop/src/main.ts
 @@ -1,7 +1,9 @@
@@ -57,7 +54,7 @@ index d5bfb1e0b3..6f753c3941 100644
  import { join } from 'node:path'
  import { fileURLToPath } from 'node:url'
  import {
-@@ -18,7 +20,7 @@ import {
+@@ -20,7 +22,7 @@ import {
    type IpcMainInvokeEvent,
    type MenuItemConstructorOptions,
  } from 'electron'
@@ -65,19 +62,19 @@ index d5bfb1e0b3..6f753c3941 100644
 +import { resolveDesktopPaths, resolvePortableDshHome } from './paths.ts'
  import { DesktopProjectManager } from './project-manager.ts'
  import { DesktopHostProcess, DesktopHostUncleanExitError } from './host-process.ts'
- import { installDesktopDirectoryPicker } from './directory-picker.ts'
-@@ -27,7 +29,7 @@ import { DESKTOP_IPC, SCHEME, assertDesktopSender, type DesktopUpdateState } fro
- import { formatDesktopMessage, resolveDesktopLocale } from './locale.ts'
+ import { DesktopPlatformView, PLATFORM_IPC, platformBounds } from './platform-view.ts'
+@@ -31,7 +33,7 @@ import { DESKTOP_IPC, SCHEME, assertDesktopSender, type DesktopUpdateState } fro
+ import { formatDesktopMessage, resolveDesktopLocale, resolveDesktopStartupLocale } from './locale.ts'
  import { claimDesktopSingleInstance } from './single-instance.ts'
  import { DesktopUpdateCoordinator } from './update-coordinator.ts'
 -import { serveWebDocument, authenticateWebHost, forwardWebRequest } from './web-document.ts'
 +import { serveWebDocument, authenticateLoopbackHost, forwardWebRequest } from './web-document.ts'
  import { DesktopFatalRecovery } from './fatal-recovery.ts'
- import { DesktopUpdateJournal } from './update-journal.ts'
- import { DesktopUpdatePreparationError } from './update-error.ts'
-@@ -40,6 +42,69 @@ import { DesktopPolicyTestAuth } from './policy-test-auth.ts'
- import { DesktopUpdateDialog, type UpdateDialogOptions } from './update-dialog.ts'
+ import { openWelcomeWindow } from './welcome-window.ts'
+ import { WELCOME_IPC, needsWelcome } from './welcome-api.ts'
+@@ -48,6 +50,69 @@ import { DesktopUpdateDialog, type UpdateDialogOptions } from './update-dialog.t
  import { readDesktopRuntime } from './runtime-tree.ts'
+ import { DesktopBrowserGuests } from './browser-guests.ts'
  
 +// 让 host 子进程（以及跑在里面的插件）知道 shell 主 exe 在哪 —— 便携版没有独立的
 +// electron.exe，browser-electron 的窗口宿主只能用这个 exe 起第二个实例。
@@ -145,7 +142,7 @@ index d5bfb1e0b3..6f753c3941 100644
  let focusPrimaryWindow = (): void => {}
  let stopForRecovery = async (): Promise<void> => {}
  let shuttingDown = false
-@@ -93,8 +158,18 @@ function runtimeResources(): RuntimeResources {
+@@ -101,8 +166,18 @@ function runtimeResources(): RuntimeResources {
    const pnpm = (development ? process.env.DSH_DESKTOP_PNPM_ENTRY : undefined)
      ?? (development ? join(app.getAppPath(), 'node_modules', 'pnpm', 'bin', 'pnpm.mjs')
        : join(process.resourcesPath, 'runtime', 'pnpm', 'bin', 'pnpm.mjs'))
@@ -165,7 +162,7 @@ index d5bfb1e0b3..6f753c3941 100644
    return { node, nodeBin, pnpm, dsh }
  }
  
-@@ -255,8 +330,11 @@ async function main(): Promise<void> {
+@@ -321,8 +396,11 @@ async function main(): Promise<void> {
      return {
        start: async () => {
          const ready = await host.start()
@@ -178,30 +175,20 @@ index d5bfb1e0b3..6f753c3941 100644
 +        hostUrl = authenticated.url
          if (ready.injections === undefined) throw new Error('Desktop Host did not provide boot injections')
          injections = ready.injections
-       },
-@@ -407,6 +485,16 @@ async function main(): Promise<void> {
-       }
-       return forwardWebRequest(request, hostUrl, hostCookie)
-     }
-+    // Shell-owned documents (update confirmation, mandatory update, policy-login placeholder)
-+    // load from `dsh-app://shell/<file>`: their preload bridges gate on the exact
-+    // `location.href`, and DesktopUpdateDialog.owned() also compares `senderFrame.url`
-+    // against that literal. So they cannot be served from a `file:` path instead —
-+    // without this branch the URL falls through to 404, the window still shows as a
-+    // blank, transparent, main-window-sized overlay and swallows every mouse event.
-+    // The files ship inside this app directory (`renderer/`), next to `lib/`.
-+    if (url.hostname === 'shell') {
-+      return serveWebDocument(request, join(app.getAppPath(), 'renderer'))
-+    }
-     return Promise.resolve(new Response(null, { status: 404 }))
-   })
- 
-@@ -771,17 +859,29 @@ async function main(): Promise<void> {
+         welcomeBackend = await connectDesktopWelcome(ready.url, (input, init) => net.fetch(input, init), async () => (await session.defaultSession.cookies.get({ url: ready.url })).map(cookie => `${cookie.name}=${cookie.value}`).join('; '))
+@@ -1038,17 +1116,29 @@ async function main(): Promise<void> {
    publishUpdate(updateState)
  }
  
 -const ownsDesktopInstance = claimDesktopSingleInstance(app, () => { focusPrimaryWindow() })
--
++// 窗口宿主模式：便携版里 browser-electron 用主 exe 起第二个实例来开浏览器窗口，
++// 靠 `DSH_BROWSER_ELECTRON_HOST` 把宿主脚本的绝对路径传进来
++// （「Exe host.cjs」在打包应用上不成立 —— app 路径固定在 asar 里，argv 里的脚本会被忽略）。
++//
++// 必须在 `claimDesktopSingleInstance` **之前**接管：先抢了单实例锁的话第二个实例会直接退出。
++// 宿主只管开窗口，不碰 profile、也不开主窗口。
++const browserHostScript = process.env.DSH_BROWSER_ELECTRON_HOST
+ 
 -if (ownsDesktopInstance) void app.whenReady().then(main).catch(async (error: unknown) => {
 -  const message = error instanceof Error ? error.message : String(error)
 -  console.error(error)
@@ -214,14 +201,6 @@ index d5bfb1e0b3..6f753c3941 100644
 -  console.error(error)
 -  app.exit(1)
 -})
-+// 窗口宿主模式：便携版里 browser-electron 用主 exe 起第二个实例来开浏览器窗口，
-+// 靠 `DSH_BROWSER_ELECTRON_HOST` 把宿主脚本的绝对路径传进来
-+// （「Exe host.cjs」在打包应用上不成立 —— app 路径固定在 asar 里，argv 里的脚本会被忽略）。
-+//
-+// 必须在 `claimDesktopSingleInstance` **之前**接管：先抢了单实例锁的话第二个实例会直接退出。
-+// 宿主只管开窗口，不碰 profile、也不开主窗口。
-+const browserHostScript = process.env.DSH_BROWSER_ELECTRON_HOST
-+
 +if (browserHostScript !== undefined && browserHostScript !== '') {
 +  createRequire(import.meta.url)(browserHostScript)
 +} else {
@@ -359,10 +338,10 @@ index d7fe1d7fca..315bf1837e 100644
    return end < 0 ? cookie : cookie.slice(0, end)
  }
 diff --git a/apps/desktop/tests/main-startup.spec.ts b/apps/desktop/tests/main-startup.spec.ts
-index 246dcbcfdf..9eb9b1d45b 100644
+index 26c31d906c..6bac9c2cce 100644
 --- a/apps/desktop/tests/main-startup.spec.ts
 +++ b/apps/desktop/tests/main-startup.spec.ts
-@@ -14,7 +14,13 @@ import { DesktopUpdatePreparationError } from '../src/update-error.ts'
+@@ -15,7 +15,13 @@ import { DesktopUpdatePreparationError } from '../src/update-error.ts'
  type InvokeEvent = { sender?: unknown; senderFrame: { url: string } }
  type InvokeHandler = (event: InvokeEvent, ...args: unknown[]) => unknown
  
@@ -377,7 +356,7 @@ index 246dcbcfdf..9eb9b1d45b 100644
  
  const harness = await vi.hoisted(async () => {
    const { EventEmitter } = await import('node:events')
-@@ -220,7 +226,7 @@ vi.mock('node:fs/promises', async (importOriginal) => {
+@@ -247,7 +253,7 @@ vi.mock('node:fs/promises', async (importOriginal) => {
    }) }
  })
  vi.mock('../src/runtime-tree.ts', () => ({ readDesktopRuntime: () => ({ release: { version: '1.0.0' } }) }))
@@ -386,7 +365,7 @@ index 246dcbcfdf..9eb9b1d45b 100644
  vi.mock('../src/project-manager.ts', () => ({
    DesktopProjectManager: class {
      readonly applyRelease = harness.applyRelease
-@@ -1288,7 +1294,8 @@ describe('desktop main startup', () => {
+@@ -1517,7 +1523,8 @@ describe('desktop main startup', () => {
      expect(harness.applyRelease).toHaveBeenCalledTimes(1)
      expect(harness.hosts[0]).toMatchObject({
        node: process.execPath,
@@ -394,10 +373,10 @@ index 246dcbcfdf..9eb9b1d45b 100644
 +      // 便携布局把 dsh 运行时放在 `resources\dsh` 真目录（不跟着上游塞进 app.asar）。
 +      runtime: join('desktop-test-resources', 'dsh'),
        primaryRuntime: join('desktop-test-resources', 'runtime', 'primary-runtime'),
-       profileResolution: 'runtime',
        profile: 'desktop-test-profile',
+     })
 diff --git a/apps/desktop/tests/web-document.spec.ts b/apps/desktop/tests/web-document.spec.ts
-index f6ddc47894..e0b009b49b 100644
+index ec07655a76..9d157891c3 100644
 --- a/apps/desktop/tests/web-document.spec.ts
 +++ b/apps/desktop/tests/web-document.spec.ts
 @@ -2,7 +2,7 @@ import { afterEach, expect, it, vi } from 'vitest'
@@ -442,10 +421,10 @@ index f6ddc47894..e0b009b49b 100644
    const body = new ReadableStream({ start(controller) { controller.enqueue(new TextEncoder().encode('stream')); controller.close() } })
    const fetch = vi.fn().mockResolvedValue(new Response(body, { headers: { 'content-encoding': 'gzip', 'set-cookie': 'private' } }))
 diff --git a/packages/sandbox/sandbox-local/src/index.ts b/packages/sandbox/sandbox-local/src/index.ts
-index 037dc90079..f09a2ee5d3 100644
+index 5f180668cf..0c1864384a 100644
 --- a/packages/sandbox/sandbox-local/src/index.ts
 +++ b/packages/sandbox/sandbox-local/src/index.ts
-@@ -147,6 +147,41 @@ interface AclTempCapability {
+@@ -148,6 +148,41 @@ interface AclTempCapability {
    grant: AclWriteGrant
  }
  
@@ -487,7 +466,7 @@ index 037dc90079..f09a2ee5d3 100644
  /**
   * The runner chain per platform — selection is BY PLATFORM first, probes
   * second: a platform's chain is probed in preference order only when it has
-@@ -557,13 +592,15 @@ export class LocalSandboxProvider extends SandboxProvider {
+@@ -560,13 +595,15 @@ export class LocalSandboxProvider extends SandboxProvider {
     * Pin the source loader and TypeScript paths to this installation, independently
     * of target cwd or environment overrides.
     * The prefix stays `[node, runner, ...]` — a future native-exe runner keeps
