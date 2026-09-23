@@ -93,7 +93,7 @@ index d406c27235..36bb70f4fb 100644
    if (!inside(appDir, sourceRoot)) {
      // Builder's source matcher slices the appDir prefix even for external FileSets.
 diff --git a/apps/desktop/src/main.ts b/apps/desktop/src/main.ts
-index 9f8ad5c22f..9fe3f4b460 100644
+index 9f8ad5c22f..541cfdc1af 100644
 --- a/apps/desktop/src/main.ts
 +++ b/apps/desktop/src/main.ts
 @@ -1,7 +1,9 @@
@@ -194,7 +194,7 @@ index 9f8ad5c22f..9fe3f4b460 100644
  let focusPrimaryWindow = (): void => {}
  let stopForRecovery = async (): Promise<void> => {}
  let shuttingDown = false
-@@ -134,8 +199,18 @@ function runtimeResources(): RuntimeResources {
+@@ -134,8 +199,17 @@ function runtimeResources(): RuntimeResources {
    const pnpm = (development ? process.env.DSH_DESKTOP_PNPM_ENTRY : undefined)
      ?? (development ? join(app.getAppPath(), 'node_modules', 'pnpm', 'bin', 'pnpm.mjs')
        : join(process.resourcesPath, 'runtime', 'pnpm', 'bin', 'pnpm.mjs'))
@@ -204,17 +204,16 @@ index 9f8ad5c22f..9fe3f4b460 100644
 +  // 发版自检的完整性校验必然失败。0.1.5 及更早就是这条 extraResources 路径。
 +  // 只动打包态那半：开发态上游已改成 `.desktop-build/development/project`（语义是
 +  // 备好的 profile 工程，不是运行时），照原样保留。
-+  // 配套的 `profileResolution` 在构造 host 时按打包态内联传入（开发态 link、打包态 runtime），
-+  // 与布局无关 —— 布局 flat、解析 runtime，这个组合是刻意的。
-+  // 注：校验脚本 `verify-portable` 会按**调用点那行**的字面量判定解析模式，所以这句话刻意
-+  // 不写出那个三元表达式的原文，免得正文注释被当成判据命中。
++  // 0.1.7 之前这里还要解释「布局 flat、解析 runtime 是刻意组合」—— 上游把 `profileResolution`
++  // 整个概念删掉后（宿主一律从随包 runtime 解析），那句话已经没有对立面了；
++  // 我们配套的 verify-portable 断言同日一并删掉，判据见本仓 `scripts/verify-portable.mjs`。
    const dsh = (development ? process.env.DSH_DESKTOP_DSH_DIR : undefined)
 -    ?? (development ? join(app.getAppPath(), '.desktop-build', 'development', 'project') : join(app.getAppPath(), 'dsh'))
 +    ?? (development ? join(app.getAppPath(), '.desktop-build', 'development', 'project') : join(process.resourcesPath, 'dsh'))
    return { node, nodeBin, pnpm, dsh }
  }
  
-@@ -376,8 +451,11 @@ async function main(): Promise<void> {
+@@ -376,8 +450,11 @@ async function main(): Promise<void> {
      return {
        start: async () => {
          const ready = await host.start()
@@ -228,7 +227,7 @@ index 9f8ad5c22f..9fe3f4b460 100644
          if (ready.injections === undefined) throw new Error('Desktop Host did not provide boot injections')
          injections = ready.injections
          welcomeBackend = await connectDesktopWelcome(ready.url, (input, init) => net.fetch(input, init), async () => (await session.defaultSession.cookies.get({ url: ready.url })).map(cookie => `${cookie.name}=${cookie.value}`).join('; '))
-@@ -1103,17 +1181,29 @@ async function main(): Promise<void> {
+@@ -1103,17 +1180,29 @@ async function main(): Promise<void> {
    publishUpdate(updateState)
  }
  

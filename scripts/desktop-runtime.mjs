@@ -15,7 +15,9 @@
  * `extraResources`（进了 app 目录会被 electron-builder 当生产依赖剪裁，`desktop-runtime.json`
  * 的 files 清单随之对不上）。保留 asar 分支是为了**上游升级后的第一次自检**能给出可读诊断，
  * 而不是让我们跑 asar。
- * 注意：布局与解析模式（`profileResolution`）是两件事，别混 —— 见 `verify-portable.mjs`。
+ * ⚠️ 曾经与布局并列的第二个维度「解析模式（`profileResolution`）」**已被上游 0.1.7 整删**
+ * （三条判据见 `verify-portable.mjs` 里那段说明），现在只剩布局这一件事：上游能是 asar、
+ * 我们出货永远是 flat。别再去 `main.ts` 里找那个字段 —— 找不到是正常的。
  *
  * 上层两个消费者：
  *   · `package-desktop-portable.mjs` 只要 descriptor（一个 JSON，用 extractFile 取，很便宜）；

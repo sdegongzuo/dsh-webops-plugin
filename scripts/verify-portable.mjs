@@ -161,48 +161,33 @@ const harnessDesktopSrc = join(
   options.harness === undefined ? harnessRoot() : resolve(options.harness),
   'apps', 'desktop', 'src',
 )
-for (const file of ['runtime-tree.ts', 'profile-packages.ts', 'paths.ts']) {
+// ⚠️ 只查这两个文件。**别再往里加 `profile-packages.ts`** —— 它在 0.1.6-alpha.2 时还在
+// （只剩一个一次性迁移函数），升到 **0.1.7-alpha.1 时被上游删掉**（`938b62c0aa
+// refactor(desktop): drop link-era profile cleanup`）。留着它会让**整道自检在第一步就抛错**，
+// 而它其实只是「link 时代」的残留检查：本文件下面 §「profile 是怎么被准备的」那段早已改成
+// 不读它了（见 220 行附近的注释）。判据是「脚本真的要用它做什么」，不是「以前有没有它」。
+for (const file of ['runtime-tree.ts', 'paths.ts']) {
   if (!existsSync(join(harnessDesktopSrc, file))) {
     throw new Error(`verify-portable: 找不到 ${join(harnessDesktopSrc, file)} —— 用 --harness 指向 deepseek-harness 源码根目录`)
   }
 }
 
-/**
- * 桌面端用什么方式把宿主包给到插件：**只能问 harness 源码，不能拿布局猜。**
- *
- * 判据是「打包态解析模式是否为 runtime」：
- * - 0.1.5 / 0.1.6-alpha.1：`runtimeResources()` 返回 `profileResolution: 'runtime'`；
- * - 0.1.6-alpha.2 起：字段被删掉了，改在构造 host 那行的**实参位置**内联三元
- *   `development ? 'link' : 'runtime', resources)`（见 `new DesktopHostProcess(...)`）。
- *
- * 为何非查源码不可：runtime 模式走 `recordDesktopRuntimeProfile`（只记状态、不建链），
- * link 模式走 `linkDesktopHostPackages`（建几百条 junction）；两条路产物完全不同。
- * 而它**与布局彼此独立** —— 0.1.6 上游把两件事绑在一起改，我们打补丁把 dsh 挪回了
- * extraResources，于是出现「布局 flat、解析 runtime」的组合，按布局推断必然跑错分支。
- *
- * 判据锚在**实参位置**（`'link' : 'runtime', resources)`），不全文扫 `'runtime'`：
- * `runtimeResources()` 里到处是 `resourcesPath, 'runtime', ...` 这类路径片段，全文扫必误判。
- * 两种形态都不认得就直接报错 —— 宁可自检挂掉，也不要静默走错分支出一个假绿。
- *
- * **为什么没有「link」那一种形态**（2026-09-18 review 后删掉了原先预留的那支）：查过上游
- * `main.ts` 的历史，`profileResolution` 这个字段**只出现过 `'runtime'` 一个字面量** ——
- * 上游的写法始终是 `...(development ? {} : { profileResolution: 'runtime' })`，开发态
- * 干脆不带这个字段，任何版本都不会产出字面量 `'link'`。所以那一支是凭空的猜测：它一旦命中，
- * 只可能是「有人把字段硬写成 link」这种异常，而猜成 link 会让本脚本去跑 link 那套期望 ——
- * 正是本函数注释里说的「静默走错分支」。认不出就抛错。
- * @param source - `apps/desktop/src/main.ts` 的源码。
- * @returns 打包态的解析模式，目前只可能是 `'runtime'`（见上）；认不出判据则抛错。
- */
-function detectResolutionMode(source) {
-  if (/'link'\s*:\s*'runtime'\s*,\s*resources\s*\)/u.test(source)) return 'runtime'
-  if (/profileResolution:\s*'runtime'/u.test(source)) return 'runtime'
-  throw new Error(
-    'verify-portable: 在 main.ts 里找不到 resolutionMode 判据（既没有实参位置的三元，'
-    + "也没有 profileResolution 字段）—— 上游大概又改了桌面壳，先看本函数的注释再动判据",
-  )
-}
-
-const resolutionMode = detectResolutionMode(readFileSync(join(harnessDesktopSrc, 'main.ts'), 'utf8'))
+// ⚠️ **这里曾经有一条 `detectResolutionMode()` 断言，2026-09-23 删掉了** —— 不是放宽，是
+// 被断言的**那个东西在上游不存在了**，没有第二个分支可走错，再留着只会让自检整道挂掉。
+//
+// 它的历史（留着是为了下次升级时能看出这里发生过什么）：
+// - 0.1.5 / 0.1.6-alpha.1：`runtimeResources()` 返回体里带 `profileResolution: 'runtime'`；
+// - 0.1.6-alpha.2：字段删掉，改成构造 host 时在**实参位置**内联 `development ? 'link' : 'runtime'`；
+// - **0.1.7-alpha.1 起：整个概念被上游删除**。判据（三条全空，2026-09-23 实测）：
+//   `grep -rn profileResolution --include=*.ts packages/ apps/ | grep -v /lib/` → 0 命中（0.1.6-alpha.2
+//   时 `host-process.ts:104` 还有 `private readonly profileResolution: 'link' | 'runtime' = 'link'`）；
+//   宿主 spawn 的 argv 里也没有它（现在只剩 `entry, runtimeDir, projectDir, primaryRuntime, [pnpm, nodeBin]`）；
+//   `packages/boot/app-boot` 只留下清理 link 时代产物的 `profile-resolution/legacy-links.ts`。
+// - 所以「布局 flat、解析 runtime」这个曾经的刻意组合**已经没有对立面**：打包态一律从随包 runtime
+//   解析宿主包。原先那条断言与我们的「dsh 外置」补丁配套，现在两边都不用再管。
+//
+// 替换它的**不是**另一条源码断言，而是一行 note —— 见下面 `notes.push` 处。真实覆盖在别处：
+// 本脚本 [2/5] 直接跑真代码 `applyRelease()`，`portable:verify` 则真的起三轮宿主。
 
 const failures = []
 const notes = []
@@ -288,12 +273,12 @@ const BUILTIN_BUNDLES = ['@deepseek-ai/dsh-base', '@deepseek-ai/dsh-web-app']
 const scratchBase = mkdtempSync(join(tmpdir(), 'dsh-verify-profile-'))
 const workProfileDir = join(scratchBase, options.profile)
 
-// 打包态把 profileResolution 传成 runtime 这件事仍然重要（app-boot 的 `runProfile` 按它决定
-// 从哪里解析宿主包），但它**不再从 profile 的内容上看得出来** —— link 模式那套记账
-// （`linkDesktopHostPackages`）已被上游整个删除，profile 在两种模式下长得一样。
-// 所以它只能按源码判据断言，这也成了 `detectResolutionMode` 如今唯一的用途。
-check(resolutionMode === 'runtime',
-  'main.ts 的打包态把 profileResolution 传成 runtime（源码判据，见 detectResolutionMode）')
+// 这里原先断言「打包态把 profileResolution 传成 runtime」（app-boot 按它决定从哪里解析宿主包）。
+// 上游 0.1.7 把那个概念整个删了 —— 现在没有 link/runtime 两条路，打包态一律从随包 runtime 解析，
+// 源码里也没有可锚的判据（判据与实测见文件上方那段注释）。**宁可不写，也不要编一条假断言**：
+// 记成 note 供升级时对照，真正的覆盖交给 [2/5] 的真代码 `applyRelease()` 与 `portable:verify` 的三轮起宿主。
+notes.push('profileResolution 已随上游 0.1.7 退役（无 link/runtime 之分），本项不再断言 —— 源码判据已消失，'
+  + '若将来它又回来，本脚本该补回一条真断言')
 
 if (existsSync(profileDir)) {
   // 在副本上做：applyRelease 会加锁、会清理 core 包、还会让 initProfile 补写缺的文件，

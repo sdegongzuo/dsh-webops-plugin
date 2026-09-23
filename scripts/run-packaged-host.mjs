@@ -2,10 +2,24 @@
  * 按桌面端生产路径拉起 packaged `@deepseek-ai/dsh-desktop-host`。
  *
  * 0.1.6-alpha.2 起这个包不再导出 `runDesktopHost()`（`lib/index.js` 只剩 `export {}`），
- * 入口是 `import.meta.main` 的进程：argv = runtimeDir / profileDir / primaryRuntime /
- * profileResolution，就绪后走 IPC `{ type: 'ready', url }`。Electron 壳里对应
- * `apps/desktop/src/host-process.ts` 的 spawn。自检必须走同一条路，再 import 那个
- * 已删除的函数只会得到 `is not a function`。
+ * 入口是 `import.meta.main` 的进程，就绪后走 IPC `{ type: 'ready', url }`。
+ * Electron 壳里对应 `apps/desktop/src/host-process.ts` 的 spawn。自检必须走同一条路，
+ * 再 import 那个已删除的函数只会得到 `is not a function`。
+ *
+ * **argv 契约**（0.1.7-alpha.2 的 `apps/desktop-host/src/index.ts:21-38`，子进程视角）：
+ * `[1]=entry`、`[2]=runtimeDir`、`[3]=projectDir`、`[4]=primaryRuntime`，
+ * `[5]=pnpm 入口文件`、`[6]=nodeBin 目录`。末两项**成对**：宿主写的是
+ * `...(process.argv[5] === undefined ? {} : { packageManager: { command: process.execPath,
+ * args: ['--expose-internals', process.argv[5]], …PATH: argv[6] + delimiter + PATH } })`。
+ *
+ * ⚠️ 0.1.7 之前 `[5]` 是 `profileResolution`（`'runtime'`），这个概念上游 0.1.7 已整删
+ * （`grep profileResolution --include=*.ts packages/ apps/ | grep -v /lib/` 零命中）。
+ * 我们曾只把那个字面量原地留着 —— 结果它落进 `[5]`，被当成 **pnpm 路径**：宿主的
+ * `packageManager` 因此被设成一个假值，**盖掉** plugin-manager 自己的兜底
+ * （`packages/boot/plugin-manager/src/index.ts:287` 的
+ * `...this.profile.packageManager ?? { command: this.pnpmCommand }`），
+ * 装插件时会去跑 `node --expose-internals runtime`。传个错的值比不传更糟 ——
+ * 不传（`undefined`）至少会退回 `pnpmCommand`。
  */
 import { spawn, spawnSync } from 'node:child_process'
 import { existsSync } from 'node:fs'
@@ -106,6 +120,8 @@ export function assertHostPortFree(options = {}) {
  * @param {string} [options.label] 端口被占时报告里用的调用方名字。
  * @param {boolean} [options.skipPortCheck] 调用方自己已经等过端口释放时跳过预检。
  * @returns {{ ready: Promise<{ url: string, injections?: unknown }>, stop: () => Promise<void> }}
+ *
+ * pnpm 入口 / nodeBin 由本函数按打包布局自动探测（存在才成对传），调用方无需关心。
  */
 export function startPackagedDesktopHost(options) {
   // 先过端口：这是「包看着好好的但插件就是不上来」的头号真凶，且在同步阶段就能诊断完，
@@ -119,13 +135,22 @@ export function startPackagedDesktopHost(options) {
   const entry = join(runtimeDir, 'node_modules', '@deepseek-ai', 'dsh-desktop-host', 'lib', 'index.js')
   if (!existsSync(entry)) throw new Error(`找不到 desktop-host 入口：${entry}`)
 
+  // 打包布局：runtimeDir 就是 `resources/dsh`，所以 `runtimeDir/..` 即 `resources`。
+  // 与 `primaryRuntime` 的默认值同源（`resources/runtime/primary-runtime`）。
+  const resources = join(runtimeDir, '..')
+  const pnpm = join(resources, 'runtime', 'pnpm', 'bin', 'pnpm.mjs')
+  const nodeBin = join(resources, 'runtime', 'bin')
+  // 成对传，缺一不传：宿主只看 `argv[5] === undefined` 决定要不要建 packageManager 对象，
+  // 给半个反而会造出「paths 是空串的 pnpm」。
+  const packageManager = existsSync(pnpm) ? [pnpm, nodeBin] : []
+
   const child = spawn(node, [
     '--expose-internals',
     entry,
     runtimeDir,
     profileDir,
     primaryRuntime,
-    'runtime',
+    ...packageManager,
   ], {
     cwd: profileDir,
     env: { ...(options.env ?? process.env), ELECTRON_RUN_AS_NODE: '1' },

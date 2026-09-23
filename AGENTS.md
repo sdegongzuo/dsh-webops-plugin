@@ -154,8 +154,9 @@ Electron 可执行文件）统一经 `scripts/local-env.mjs` 取；值写在仓�
   改完立刻 `grep` 复核关键标识确实在位，再往下走。
 - 打包态 `process.execPath` 是主 exe，不是 node。`DSH_DESKTOP_` 前缀会被 `host-process.ts:119` 过滤，
   自定义变量只能用其它 `DSH_*`。
-- 判断运行时布局与解析模式是两件事：布局看有没有 `resources/dsh`，解析模式看 `main.ts` 里有没有
-  `profileResolution: 'runtime'`。找运行时目录统一走 `scripts/desktop-runtime.mjs`。
+- 运行时布局只剩一件事要判：有没有 `resources/dsh`。曾经的第二个维度「解析模式」（`profileResolution`）
+  **已被上游 0.1.7 整删，别再找它** —— 判据见 `scripts/verify-portable.mjs` 里那段说明。
+  找运行时目录统一走 `scripts/desktop-runtime.mjs`。
 - 新增/修改 `scripts/*.mjs` 时保持自足：能独立跑（`node scripts/xxx.mjs --dir ...`），
   参数缺省给可读用法提示，失败给 `exit=1`。**本机绝对路径不放脚本里** —— 一律经
   `scripts/local-env.mjs` 取（见上面「本机路径」一节）。

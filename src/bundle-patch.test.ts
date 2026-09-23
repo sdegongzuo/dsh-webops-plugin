@@ -24,6 +24,17 @@ import { describe, expect, it } from 'vitest'
 /** 会改变用户真实对话行为的插件名（不是「调试工具」，是「出厂即劫持」）。 */
 const HIJACKERS = ['fake-llm', 'llm-replay', 'mock-llm']
 
+/** 取 `spawn(node, [...], {…})` 的实参数组原文（截到 `], {` 为止，不含选项对象）。 */
+function spawnArgvBlock(source: string, near: string): string {
+  const at = source.indexOf(near)
+  if (at === -1) return ''
+  const open = source.indexOf('[', at)
+  if (open === -1) return ''
+  const close = source.indexOf('], {', open)
+  if (close === -1) return ''
+  return source.slice(open, close)
+}
+
 function readRepoFile(name: string): string {
   return readFileSync(new URL(`../${name}`, import.meta.url), 'utf8')
 }
@@ -303,7 +314,6 @@ describe('alpha.2 宿主入口（desktop-host 不再导出 runDesktopHost）', (
     const helper = readRepoFile('scripts/run-packaged-host.mjs')
     expect(helper, 'helper 没 spawn packaged desktop-host').toContain('dsh-desktop-host')
     expect(helper, 'helper 没走 IPC').toContain("'ipc'")
-    expect(helper, 'argv 里必须把 profileResolution 传成 runtime').toContain("\n    'runtime',\n")
     expect(helper).not.toContain('await runDesktopHost(')
     for (const file of scripts) {
       const body = readRepoFile(file)
@@ -311,6 +321,33 @@ describe('alpha.2 宿主入口（desktop-host 不再导出 runDesktopHost）', (
       expect(body, `${file} 还在 destructure 已删除的 runDesktopHost`).not.toContain('{ runDesktopHost }')
       expect(body, `${file} 没改走 startPackagedDesktopHost`).toContain('startPackagedDesktopHost')
     }
+  })
+
+  it('argv 按 0.1.7 契约排：runtimeDir / projectDir / primaryRuntime / [pnpm, nodeBin]', () => {
+    const argv = spawnArgvBlock(readRepoFile('scripts/run-packaged-host.mjs'), 'const child = spawn(node,')
+    expect(argv, 'helper 里找不到 spawn 的 argv 数组').not.toBe('')
+    // 0.1.7 之前这里的第 5 位是 profileResolution 的 'runtime'。概念已退役（上游
+    // grep profileResolution 零命中），而字面量原地留着会被宿主当成 **pnpm 路径**，
+    // 把 `packageManager` 设成假值、盖掉 plugin-manager 自己的 pnpm 兜底 ——
+    // 传个错的值比不传更糟，所以这一条必须是「有断言」而不是「有注释」。
+    expect(argv, 'argv 里还留着已退役的 profileResolution 字面量').not.toContain("'runtime'")
+    expect(argv, 'argv 没成对带上 pnpm/nodeBin').toContain('...packageManager')
+    const order = ['runtimeDir', 'profileDir', 'primaryRuntime', '...packageManager']
+      .map(token => argv.indexOf(token))
+    expect(order.every(index => index >= 0), `argv 缺项：${argv}`).toBe(true)
+    expect([...order].sort((left, right) => left - right), `argv 顺序不对：${argv}`).toEqual(order)
+  })
+
+  it('pnpm / nodeBin 按打包布局探测，且成对（缺一不传）', () => {
+    const helper = readRepoFile('scripts/run-packaged-host.mjs')
+    expect(helper, 'resources 根不是从 runtimeDir 推的')
+      .toContain("const resources = join(runtimeDir, '..')")
+    expect(helper, 'pnpm 探测路径与 resources 布局不符')
+      .toContain("join(resources, 'runtime', 'pnpm', 'bin', 'pnpm.mjs')")
+    expect(helper, 'nodeBin 探测路径与 resources 布局不符')
+      .toContain("join(resources, 'runtime', 'bin')")
+    expect(helper, 'packageManager 不是「存在才成对给」（宿主只看 argv[5] 是否为 undefined）')
+      .toContain('const packageManager = existsSync(pnpm) ? [pnpm, nodeBin] : []')
   })
 })
 
