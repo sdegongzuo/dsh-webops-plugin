@@ -190,9 +190,10 @@ function status() {
   console.log(`  便携骨架      ${existsSync(exePath) ? '✓' : '✗'} ${exePath}`)
   console.log(`  dsh 运行时    ${dshVersion ?? '✗ 读不到（app/resources/dsh/package.json 缺失）'}`)
   console.log(`  插件版本      ${pluginVersion ?? '✗ 读不到'}`)
-  console.log(`  启动过        ${launched ? '是（有 home/storages/workspace.json）→ 只能手动测 + verify:plugin-update' : '否（出厂态）→ 也还能喂 verify:portable'}`)
+  console.log(`  启动过        ${launched ? '是（有 home/storages/workspace.json）' : '否（出厂态）'}`)
   console.log('')
-  console.log('  ⚠ verify:portable 不能用这个目录（它要求「刚解压、没启动过」）。')
+  console.log('  ✅ verify:portable 可以直接喂这个目录（2026-09-19 实测全绿；早先「必须刚解压」'
+    + '已被证伪 —— 上游 0.1.6-alpha.2 起退役了 link 模式，那条「profile 里没有越权 overlay」也改成按内容判）。')
 }
 
 /* ---------- env ---------- */

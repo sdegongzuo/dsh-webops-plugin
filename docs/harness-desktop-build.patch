@@ -1,8 +1,8 @@
 diff --git a/apps/desktop/scripts/electron-builder-config.mjs b/apps/desktop/scripts/electron-builder-config.mjs
-index e3873de35f..96a90e0322 100644
+index 2cee72d23d..04b3654f97 100644
 --- a/apps/desktop/scripts/electron-builder-config.mjs
 +++ b/apps/desktop/scripts/electron-builder-config.mjs
-@@ -134,13 +134,17 @@ export function createElectronBuilderConfig(
+@@ -135,13 +135,17 @@ export function createElectronBuilderConfig(
        'lib/preload-welcome.cjs',
        'renderer/**/*',
        'package.json',
@@ -93,7 +93,7 @@ index d406c27235..36bb70f4fb 100644
    if (!inside(appDir, sourceRoot)) {
      // Builder's source matcher slices the appDir prefix even for external FileSets.
 diff --git a/apps/desktop/src/main.ts b/apps/desktop/src/main.ts
-index 46ce1f45c1..0e3d0a71a4 100644
+index 9f8ad5c22f..9fe3f4b460 100644
 --- a/apps/desktop/src/main.ts
 +++ b/apps/desktop/src/main.ts
 @@ -1,7 +1,9 @@
@@ -113,7 +113,7 @@ index 46ce1f45c1..0e3d0a71a4 100644
 -import { resolveDesktopPaths } from './paths.ts'
 +import { resolveDesktopPaths, resolvePortableDshHome } from './paths.ts'
  import { DesktopProjectManager } from './project-manager.ts'
- import { DesktopHostProcess, DesktopHostUncleanExitError } from './host-process.ts'
+ import { DesktopHostFatalError, DesktopHostProcess, DesktopHostUncleanExitError } from './host-process.ts'
  import { DesktopPlatformView, PLATFORM_IPC, platformBounds } from './platform-view.ts'
 @@ -31,7 +33,7 @@ import { DESKTOP_IPC, SCHEME, assertDesktopSender, type DesktopUpdateState } fro
  import { formatDesktopMessage, resolveDesktopLocale, resolveDesktopStartupLocale } from './locale.ts'
@@ -122,9 +122,9 @@ index 46ce1f45c1..0e3d0a71a4 100644
 -import { serveWebDocument, authenticateWebHost, forwardWebRequest } from './web-document.ts'
 +import { serveWebDocument, authenticateLoopbackHost, forwardWebRequest } from './web-document.ts'
  import { DesktopFatalRecovery } from './fatal-recovery.ts'
+ import { pruneCrashReports, RendererConsoleTail, writeCrashReport, type CrashReportSource } from './crash-report.ts'
  import { openWelcomeWindow } from './welcome-window.ts'
- import { WELCOME_IPC, needsWelcome } from './welcome-api.ts'
-@@ -48,6 +50,69 @@ import { DesktopUpdateDialog, type UpdateDialogOptions } from './update-dialog.t
+@@ -49,6 +51,69 @@ import { DesktopUpdateDialog, type UpdateDialogOptions } from './update-dialog.t
  import { readDesktopRuntime } from './runtime-tree.ts'
  import { DesktopBrowserGuests } from './browser-guests.ts'
  
@@ -194,7 +194,7 @@ index 46ce1f45c1..0e3d0a71a4 100644
  let focusPrimaryWindow = (): void => {}
  let stopForRecovery = async (): Promise<void> => {}
  let shuttingDown = false
-@@ -101,8 +166,18 @@ function runtimeResources(): RuntimeResources {
+@@ -134,8 +199,18 @@ function runtimeResources(): RuntimeResources {
    const pnpm = (development ? process.env.DSH_DESKTOP_PNPM_ENTRY : undefined)
      ?? (development ? join(app.getAppPath(), 'node_modules', 'pnpm', 'bin', 'pnpm.mjs')
        : join(process.resourcesPath, 'runtime', 'pnpm', 'bin', 'pnpm.mjs'))
@@ -214,7 +214,7 @@ index 46ce1f45c1..0e3d0a71a4 100644
    return { node, nodeBin, pnpm, dsh }
  }
  
-@@ -321,8 +396,11 @@ async function main(): Promise<void> {
+@@ -376,8 +451,11 @@ async function main(): Promise<void> {
      return {
        start: async () => {
          const ready = await host.start()
@@ -228,7 +228,7 @@ index 46ce1f45c1..0e3d0a71a4 100644
          if (ready.injections === undefined) throw new Error('Desktop Host did not provide boot injections')
          injections = ready.injections
          welcomeBackend = await connectDesktopWelcome(ready.url, (input, init) => net.fetch(input, init), async () => (await session.defaultSession.cookies.get({ url: ready.url })).map(cookie => `${cookie.name}=${cookie.value}`).join('; '))
-@@ -1038,17 +1116,29 @@ async function main(): Promise<void> {
+@@ -1103,17 +1181,29 @@ async function main(): Promise<void> {
    publishUpdate(updateState)
  }
  
@@ -248,7 +248,7 @@ index 46ce1f45c1..0e3d0a71a4 100644
 -  if (diagnosticFile !== undefined) {
 -    await writeFile(diagnosticFile, `${error instanceof Error ? error.stack ?? message : message}\n`).catch(() => undefined)
 -  }
--  reportFatal(error)
+-  reportFatal(error, 'main')
 -}).catch((error: unknown) => {
 -  console.error(error)
 -  app.exit(1)
@@ -265,7 +265,7 @@ index 46ce1f45c1..0e3d0a71a4 100644
 +    if (diagnosticFile !== undefined) {
 +      await writeFile(diagnosticFile, `${error instanceof Error ? error.stack ?? message : message}\n`).catch(() => undefined)
 +    }
-+    reportFatal(error)
++    reportFatal(error, 'main')
 +  }).catch((error: unknown) => {
 +    console.error(error)
 +    app.exit(1)
@@ -303,7 +303,7 @@ index cf03e38c36..878122bcd6 100644
 +  return existsSync(portableHome) ? portableHome : undefined
 +}
 diff --git a/apps/desktop/src/web-document.ts b/apps/desktop/src/web-document.ts
-index d7fe1d7fca..315bf1837e 100644
+index a74ea7c7ef..e29953ddf2 100644
 --- a/apps/desktop/src/web-document.ts
 +++ b/apps/desktop/src/web-document.ts
 @@ -35,6 +35,73 @@ export async function serveWebDocument(request: Request, root: string): Promise<
@@ -390,10 +390,10 @@ index d7fe1d7fca..315bf1837e 100644
    return end < 0 ? cookie : cookie.slice(0, end)
  }
 diff --git a/apps/desktop/tests/main-startup.spec.ts b/apps/desktop/tests/main-startup.spec.ts
-index 26c31d906c..6bac9c2cce 100644
+index 0242d214a3..6182b3aa03 100644
 --- a/apps/desktop/tests/main-startup.spec.ts
 +++ b/apps/desktop/tests/main-startup.spec.ts
-@@ -15,7 +15,13 @@ import { DesktopUpdatePreparationError } from '../src/update-error.ts'
+@@ -16,7 +16,13 @@ import { writeCrashReport } from '../src/crash-report.ts'
  type InvokeEvent = { sender?: unknown; senderFrame: { url: string } }
  type InvokeHandler = (event: InvokeEvent, ...args: unknown[]) => unknown
  
@@ -405,10 +405,10 @@ index 26c31d906c..6bac9c2cce 100644
 +  serveWebDocument: vi.fn(),
 +  forwardWebRequest: vi.fn(),
 +}))
- 
- const harness = await vi.hoisted(async () => {
-   const { EventEmitter } = await import('node:events')
-@@ -247,7 +253,7 @@ vi.mock('node:fs/promises', async (importOriginal) => {
+ // Report persistence has its own unit tests; here it resolves within microtasks so the fatal
+ // dialog never outlives the test that triggered it.
+ vi.mock('../src/crash-report.ts', async importOriginal => ({
+@@ -257,7 +263,7 @@ vi.mock('node:fs/promises', async (importOriginal) => {
    }) }
  })
  vi.mock('../src/runtime-tree.ts', () => ({ readDesktopRuntime: () => ({ release: { version: '1.0.0' } }) }))
@@ -417,7 +417,7 @@ index 26c31d906c..6bac9c2cce 100644
  vi.mock('../src/project-manager.ts', () => ({
    DesktopProjectManager: class {
      readonly applyRelease = harness.applyRelease
-@@ -1517,7 +1523,8 @@ describe('desktop main startup', () => {
+@@ -1603,7 +1609,8 @@ describe('desktop main startup', () => {
      expect(harness.applyRelease).toHaveBeenCalledTimes(1)
      expect(harness.hosts[0]).toMatchObject({
        node: process.execPath,
@@ -428,7 +428,7 @@ index 26c31d906c..6bac9c2cce 100644
        profile: 'desktop-test-profile',
      })
 diff --git a/apps/desktop/tests/web-document.spec.ts b/apps/desktop/tests/web-document.spec.ts
-index ec07655a76..9d157891c3 100644
+index 0fd9b591b1..8c8bcb5424 100644
 --- a/apps/desktop/tests/web-document.spec.ts
 +++ b/apps/desktop/tests/web-document.spec.ts
 @@ -2,7 +2,7 @@ import { afterEach, expect, it, vi } from 'vitest'
