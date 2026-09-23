@@ -38,11 +38,12 @@
  * ## 用法
  *
  * ```bash
- * pnpm harness:build                 # 全链：prepare:runtime → prepare:packages → prepare:dsh → package
- * pnpm harness:build --skip-prepare  # 前 3 步已过，只重打 package
- * pnpm harness:build --no-mirror     # 不换 registry（网络好时用，例如海外环境）
- * pnpm harness:build --dry-run       # 只演练「临时替换 → 无条件还原」，不跑构建
+ * pnpm harness:build              # 跑 package:win:x64:dir（上游的完整链，见 buildSteps 说明）
+ * pnpm harness:build --no-mirror  # 不换 registry（网络好时用，例如海外环境）
+ * pnpm harness:build --dry-run    # 只打印模式判定（env / patch / off），不跑构建
  * ```
+ *
+ * （`--skip-prepare` 已于 2026-09-22 退役：链上只剩一步，没有「前置」可跳。）
  *
  * 成功后打出的 win-unpacked 路径直接喂：
  *   `node scripts/portable-dev.mjs set-app --from <它>`
@@ -70,10 +71,24 @@ export function harnessUnpackedDir() {
   return join(harnessDesktopDir(), '.desktop-build', 'targets', 'win-x64', 'unsigned-artifacts', 'win-unpacked')
 }
 
-/** 按顺序跑的步骤（`--skip-prepare` 时只留最后一步）。 */
-export function buildSteps(skipPrepare) {
-  const all = ['prepare:runtime', 'prepare:packages', 'prepare:dsh', 'package:win:x64:dir']
-  return skipPrepare ? all.slice(-1) : all
+/**
+ * 要跑的步骤 —— 只有一步。
+ *
+ * ⚠️ **不要再手写「prepare:runtime → prepare:packages → prepare:dsh → package」那份子集。**
+ * 2026-09-22 实测：那份子集**依赖 `.desktop-build/packed/` 的残留**才跑得起来 ——
+ * `prepare:packages` 要读 `release:pack` 产出的 tarball（`packed/dsh`），而 `release:pack`
+ * 只在 harness 的 `package-target.ts` 里被调用。跑一次 `pnpm clean` 把 `.desktop-build`
+ * 删掉，它立刻变成 `ENOENT: no such file or directory, scandir '…\packed\dsh'`。
+ *
+ * 而上游的 `package:win:x64:dir` 内部**本来就是完整链**：
+ * build:official → release:pack（dsh / desktop-host / vendor / landlock）→ prepare:runtime
+ * → prepare:packages → prepare:dsh → electron-builder。CI（`release-desktop.yml`）也正是
+ * 只跑这一条，且每次都是全新 checkout（没有任何残留）。
+ *
+ * 所以这里保持「一步」—— 上游将来加一个前置步骤，我们不会静默跑偏。
+ */
+export function buildSteps() {
+  return ['package:win:x64:dir']
 }
 
 /* ---------- registry 注入模式 ---------- */
@@ -156,10 +171,9 @@ function restoreRegistry() {
 
 /**
  * 依次跑构建步骤。
- * @param {boolean} skipPrepare 只跑最后那步 `package:win:x64:dir`。
  * @param {string|undefined} registryEnv 新版上游读的 registry 环境变量值；`undefined` = 不注入。
  */
-function runSteps(skipPrepare, registryEnv) {
+function runSteps(registryEnv) {
   const desktop = harnessDesktopDir()
   const env = {
     ...process.env,
@@ -173,7 +187,7 @@ function runSteps(skipPrepare, registryEnv) {
     // 再显式写进 pnpm 子进程的 NPM_CONFIG_REGISTRY）。旧上游没有这个入口。
     ...(registryEnv === undefined ? {} : { DSH_DESKTOP_NPM_REGISTRY: registryEnv }),
   }
-  for (const step of buildSteps(skipPrepare)) {
+  for (const step of buildSteps()) {
     const extra = step === 'package:win:x64:dir' ? ['--unsigned'] : []
     console.log(`\n=== ${step}${extra.length > 0 ? ` ${extra.join(' ')}` : ''} ===`)
     const result = spawnSync('pnpm', ['run', step, ...extra], { cwd: desktop, env, stdio: 'inherit', shell: true })
@@ -208,8 +222,9 @@ const isEntry = process.argv[1] !== undefined
 
 if (isEntry) {
   const argv = process.argv.slice(2)
-  const flags = new Set(['--skip-prepare', '--no-mirror', '--dry-run'])
-  const skipPrepare = argv.includes('--skip-prepare')
+  // `--skip-prepare` 已退役（2026-09-22）：链上只剩一步（见 buildSteps 的说明），没有「前置」可跳。
+  // 仍然传它会落到下面那句「未知参数」，fail-loud 而不是被静默忽略。
+  const flags = new Set(['--no-mirror', '--dry-run'])
   const noMirror = argv.includes('--no-mirror')
   const dryRun = argv.includes('--dry-run')
   for (const flag of argv) {
@@ -217,7 +232,7 @@ if (isEntry) {
   }
 
   console.log(`harness   ${harnessRoot()}`)
-  console.log(`步骤      ${dryRun ? '（--dry-run：不跑构建）' : buildSteps(skipPrepare).join(' → ')}`)
+  console.log(`步骤      ${dryRun ? '（--dry-run：不跑构建）' : buildSteps().join(' → ')}`)
   // registry 两条路：新版上游走环境变量（不动文件），旧上游回落到改文件。
   const registryMode = noMirror ? 'off' : supportsRegistryEnv() ? 'env' : 'patch'
   const registryValue = registryMode === 'off' ? undefined : npmRegistry()
@@ -239,7 +254,7 @@ if (isEntry) {
   } else {
     let ok = false
     try {
-      ok = runSteps(skipPrepare, registryMode === 'env' ? registryValue : undefined)
+      ok = runSteps(registryMode === 'env' ? registryValue : undefined)
     } finally {
       restoreRegistry()
     }

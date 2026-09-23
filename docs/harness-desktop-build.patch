@@ -40,6 +40,58 @@ index a89247ad18..c0dadd1988 100644
      const packageSet = readDesktopCorePackageSet(BUILD_ROOT, release.version)
      const targetName = resolveDesktopBuildTarget()
      const target = { platform: process.platform, arch: targetName.endsWith('arm64') ? 'arm64' : 'x64' }
+diff --git a/apps/desktop/scripts/smoke-packaged-runtime.ts b/apps/desktop/scripts/smoke-packaged-runtime.ts
+index 106830b5ad..3926678927 100644
+--- a/apps/desktop/scripts/smoke-packaged-runtime.ts
++++ b/apps/desktop/scripts/smoke-packaged-runtime.ts
+@@ -1,4 +1,5 @@
+ /** Validate the assembled application, including native Office conversion outside ASAR. */
++import { existsSync, readFileSync } from 'node:fs'
+ import { join } from 'node:path'
+ import { parseArgs } from 'node:util'
+ import { resolveDesktopBuildTarget, resolveDesktopTargetBuildPaths } from './desktop-build-paths.mjs'
+@@ -20,4 +21,21 @@ const executable = windows ? join(application, 'DeepSeek Harness.exe') : join(ap
+ const descriptor = await verifyDesktopRuntime(paths.dsh, readDesktopRuntime(paths.dsh).release.version,
+   resolveDesktopPackageTarget(target))
+ if (windows && !values.unsigned) await verifyWindowsCode(application)
+-await smokePreparedRuntime(join(resources, 'app.asar', 'dsh'), executable, join(resources, 'runtime'), descriptor)
++// The dsh runtime may be shipped OUTSIDE the archive (`extraResources` -> `resources/dsh`) instead of
++// being packed into `app.asar`. That is a supported layout, but it makes `smokePreparedRuntime`'s
++// archive check vacuous: `runtimeArchivePath()` only recognises a runtime whose parent directory is
++// `app.asar` and silently skips the byte comparison otherwise, leaving packaged artifacts covered by
++// nothing but "it booted". Re-run the same inventoried verification against the packaged directory so
++// the external layout keeps an equivalent guarantee — including that packaging did not rewrite
++// anything it copied.
++const externalRuntime = join(resources, 'dsh')
++const external = existsSync(join(externalRuntime, 'desktop-runtime.json'))
++if (external) {
++  if (!readFileSync(join(externalRuntime, 'desktop-runtime.json'))
++    .equals(readFileSync(join(paths.dsh, 'desktop-runtime.json')))) {
++    throw new Error('desktop runtime: packaged descriptor differs from preparation')
++  }
++  await verifyDesktopRuntime(externalRuntime, descriptor.release.version, resolveDesktopPackageTarget(target))
++}
++await smokePreparedRuntime(external ? externalRuntime : join(resources, 'app.asar', 'dsh'), executable,
++  join(resources, 'runtime'), descriptor)
+diff --git a/apps/desktop/scripts/windows-asar-unpack.mjs b/apps/desktop/scripts/windows-asar-unpack.mjs
+index d406c27235..36bb70f4fb 100644
+--- a/apps/desktop/scripts/windows-asar-unpack.mjs
++++ b/apps/desktop/scripts/windows-asar-unpack.mjs
+@@ -26,6 +26,14 @@ export async function prepareWindowsAsarUnpack(context, sourceRoot) {
+   const files = (await windowsRuntimeCode(sourceRoot)).map(file => relative(sourceRoot, file))
+   const { config, info } = context.packager
+   const { appDir } = info
++  // The dsh runtime may be shipped OUTSIDE the archive (extraResources -> `resources/dsh`) instead of
++  // being packed into `app.asar`. That is a supported layout: every PE then already lives in a real
++  // directory, so there is nothing to unpack and nothing to verify inside the archive. Detect it by the
++  // absence of any FileSet pointing at `sourceRoot` and stay out of the build — otherwise the
++  // afterPack `verifyWindowsAsarUnpack` looks up the literal `dsh/<file>` entry, finds no node, and
++  // fails the package with `Cannot find node for path: dsh/…`.
++  if (!config.files.some(file => typeof file !== 'string' && file.from !== undefined
++    && inside(sourceRoot, resolve(appDir, file.from)))) return []
+   let copyRoot = sourceRoot
+   if (!inside(appDir, sourceRoot)) {
+     // Builder's source matcher slices the appDir prefix even for external FileSets.
 diff --git a/apps/desktop/src/main.ts b/apps/desktop/src/main.ts
 index 46ce1f45c1..0e3d0a71a4 100644
 --- a/apps/desktop/src/main.ts

@@ -116,10 +116,14 @@ jobs:
         # `apps/desktop/.env.windows` 读，读不到就抛
         # `cannot read …\.env.windows; copy …example and fill in the local settings`，
         # 打包一步都走不动（旧 ref 0d1f5000 上这个加载器还不存在，所以是本轮新加的前置）。
-        # 两个必须在文件里、写环境变量没用的键：
+        # 必须在文件里、写环境变量没用的三个键：
         #   · DSH_DESKTOP_APP_ID —— 环境变量会被 `AMBIENT_RELEASE_SETTING` 过滤掉；
         #   · 选中部署的那个 mandatory-update origin —— `resolveDesktopPolicyEnvironment()`
-        #     在 --unsigned 下**照样**要过（只有签名/自动更新凭据会被 --unsigned 跳过）。
+        #     在 --unsigned 下**照样**要过（只有签名/自动更新凭据会被 --unsigned 跳过）；
+        #   · DSH_DESKTOP_MANDATORY_UPDATE_CONFIG —— **dsh 0.1.7-alpha.1 起新增的必填**：
+        #     `AUTO_UPDATE_ENV=test` 时要求里面的 `allowedAuthOrigins` 是非空数组，否则抛
+        #     `test policy requires nonempty allowedAuthOrigins`（实测 fail 得很快）。
+        #     production 则**禁止**该字段。它是「登录窗口允许导航到的文档源站」。
         # `DSH_DESKTOP_AUTO_UPDATE_ENV` 的合法取值是 'test' / 'production'（不是 'prod'）。
         # 其余（签名证书、上传凭据）留空：--unsigned 不需要。
         shell: pwsh
@@ -130,6 +134,7 @@ jobs:
             'DSH_DESKTOP_AUTO_UPDATE_ENV=test'
             'DSH_DESKTOP_MANDATORY_UPDATE_TEST_ORIGIN=https://harness-test.deepseek.com'
             'DSH_DESKTOP_MANDATORY_UPDATE_PROD_ORIGIN=https://harness.deepseek.com'
+            'DSH_DESKTOP_MANDATORY_UPDATE_CONFIG=''{"allowedAuthOrigins":["https://harness-test.deepseek.com"]}'''
             'DSH_DESKTOP_WINDOWS_CER_FILE='
             'DSH_DESKTOP_WINDOWS_SIGNTOOL='
             'DSH_DESKTOP_WINDOWS_KEY_CONTAINER='
