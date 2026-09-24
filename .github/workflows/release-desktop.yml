@@ -239,6 +239,24 @@ jobs:
           Set-Location (Join-Path (Split-Path $PWD) 'deepseek-harness\apps\desktop')
           pnpm run package:win:x64:dir --unsigned
 
+      - name: 冒烟失败后的 LibreOffice 诊断（只在上面失败后跑）
+        # 上游 0.1.7 新加的 Office→PDF 冒烟在我们 CI 上**必现**地挂在 xlsx 上（docx 能过），
+        # 报 `loadComponentFromURL returned an empty reference`。那句话信息量太低，
+        # 而失败证据随 runner 一起消失 —— 所以这里把现场带回来。脚本会打印三组数字：
+        #   ① 载荷对上游 `prebuilds.json` 那份**全量 sha256 清单**的自检（缺 / 哈希不符）；
+        #   ② 机器状况（内存、C 盘、临时目录）—— Calc 是进程内加载，比 Writer 重得多；
+        #   ③ **绕开 dsh 宿主**、直接用 kit CLI 单跑 docx / xlsx / pptx。
+        # 判读：单跑也挂 ⇒ LibreOffice 对这台 runner 有问题（缺组件/字体/内存）；
+        #       单跑能过 ⇒ 问题在 dsh 宿主那一侧，与 runner 无关。
+        # 这一步**不改变成败**（脚本恒 exit 0，不 fail-fast），只加证据。
+        if: failure()
+        shell: pwsh
+        env:
+          HARNESS_ROOT: ${{ github.workspace }}/../deepseek-harness
+        run: |
+          $resources = "$env:HARNESS_ROOT\apps\desktop\.desktop-build\targets\win-x64\unsigned-artifacts\win-unpacked\resources"
+          node "$env:GITHUB_WORKSPACE/scripts/diag-libreoffice.mjs" --resources $resources --harness $env:HARNESS_ROOT
+
       - name: 定位 win-unpacked
         id: locate
         shell: pwsh
