@@ -74,8 +74,13 @@
  *    宿主包改由运行时目录直接供给（profile 里**不建链**），所以这套连锁报错不会发生。
  * ② 中间改写成「只有 `profile 里没有越权 overlay` 会假红，想全绿得另解压一份新鲜的」——
  *    也**已修掉**：那条断言原先只看文件在不在，而宿主**首次启动**会自己在 profile 根写两个
- *    出厂空模板（`cordis.yml` / `cordis.patch.yml`，内容只有注释 + `[]`）。现在改成按**内容**判
- *    （见 `isStockEmptyPatch`），空模板放行、**有内容的 patch 照样红**。
+ *    出厂空模板（`cordis.yml` / `cordis.patch.yml`，内容只有注释 + `[]`）→ 改成按**内容**判。
+ * ③ 2026-09-24 又修一次：便携包**开始故意带**一份 profile patch（0.1.7 退役了
+ *    `home/settings.yaml`，设置的家变成 profile patch，出厂模型配置只能写它），而且这份
+ *    文件**同时是用户设置文档**（宿主与设置页都会自己追加行 —— 实测固定目录里就有
+ *    `ui-settings-general`/`welcomeNoticeVersion`）→ 按 id 判会把「人用过目录」判成违规，
+ *    于是最终改成按**结构**判违规（`insert:` / `disabled: true`，见 `inspectProfilePatch`），
+ *    条目名只印出来给人看。
  *    → 因此：**一个固定目录就够了**，不必为它再解压第二份 1.2G。
  *
  * `--harness` 指向 deepseek-harness 源码（默认取 `DSH_HARNESS`，本机写在 `.env.local`；
@@ -375,28 +380,51 @@ if (existsSync(shippedPluginDir)) {
 }
 
 /**
- * 判断一个 profile 级 patch 文件是不是**出厂空模板**。
- *
- * 为什么按内容判、不按存在判（2026-09-19 实测修正）：宿主**首次启动**会自己在 profile 根写下
- * `cordis.yml` 与 `cordis.patch.yml`，内容只有注释 + 一个空数组 `[]` —— 这是**无副作用的空
- * patch**，不是「越权 overlay」。可原断言只看文件在不在，于是它对**复用过的目录恒红**
- * （本脚本第 [4/5] 步自己就会起宿主，跑第二次必红），害得本地只能再解压一份 1.2G 的新目录去绕。
- * 真正要拦的是「**有人把有内容的 patch 带进了出货 profile**」—— 那必然非空，所以看内容足够。
+ * 读一个 profile 级 patch：顶层条目名 + 有没有**结构性的**越权写法。
  * @param path - profile 根的 patch 文件路径。
- * @returns 文件不存在、或去掉注释后只剩 `[]` / 空 → `true`。
+ * @returns `stock` = 文件不存在或只有注释 + `[]`；`ids` = 顶层 `- id:` 条目名；`leaked` = 违规行。
  */
-function isStockEmptyPatch(path) {
-  if (!existsSync(path)) return true
-  const body = readFileSync(path, 'utf8')
+function inspectProfilePatch(path) {
+  if (!existsSync(path)) return { stock: true, ids: [], leaked: [] }
+  const lines = readFileSync(path, 'utf8')
     .split(/\r?\n/u)
     .filter(line => !line.trimStart().startsWith('#'))
-    .join('')
-    .trim()
-  return body === '' || body === '[]'
+  const body = lines.join('').trim()
+  if (body === '' || body === '[]') return { stock: true, ids: [], leaked: [] }
+  return {
+    stock: false,
+    ids: lines.flatMap(line => {
+      const match = line.match(/^-\s+id:\s*(\S+)\s*$/u)
+      return match === null ? [] : [match[1]]
+    }),
+    // 结构违规只看两件东西：`insert:`（挂载新插件的唯一机制 —— 开发态塞假 llm 走的就是它）
+    // 与 `disabled: true`（静默关掉一个出货条目，设置页不会写这种行）。
+    leaked: lines.filter(line => /^-\s*insert\s*:/u.test(line) || /^\s+disabled:\s*true\s*$/u.test(line)),
+  }
 }
 
-check(isStockEmptyPatch(join(profileDir, 'cordis.patch.yml')),
-  'profile 里没有越权 overlay（出货包不该带 profile 级 patch；宿主首启写的空模板 `[]` 不算）')
+{
+  // ⚠️ 这条断言**不再按 id 白名单判**（2026-09-24 第三次修）。原因：
+  // ① 便携包**开始故意带**一份出厂模型配置 —— 0.1.7 退役了 `home/settings.yaml`
+  //    （`importLegacyDocument()` 只把它一次性导入本 profile 再改名），设置的家变成了
+  //    这份 profile patch，所以出厂配置只能写它；
+  // ② 这份文件**同时是用户自己的设置文档** —— 宿主与设置页都会自己往里写行（实测固定
+  //    测试目录里多出一行 `ui-settings-general` / `welcomeNoticeVersion: 2026-08-13.1`，
+  //    那是应用自己记的状态）。按 id 白名单判会把「人用过这个目录」判成违规，
+  //    于是本地又得为一条假红再解压 1.2G —— 正是 2026-09-19 修过的那类坑。
+  // 所以：结构判违规（`insert:` / `disabled: true`），条目名只印出来给人看。
+  // 「出厂配置本身对不对」不在这里验 —— 由 `verify-settings` 在**新解压的包**上
+  // 静态 + 真宿主双向断言（含 `describe()` 用户层，字段名写错会当场红）。
+  const profilePatch = inspectProfilePatch(join(profileDir, 'cordis.patch.yml'))
+  if (profilePatch.stock) {
+    check(true, 'profile patch 是宿主首启写的空模板（`[]`），无越权内容')
+  } else {
+    check(profilePatch.leaked.length === 0,
+      `profile patch 里没有 insert / disabled 这类越权写法（实得 ${JSON.stringify(profilePatch.leaked)}）`)
+    console.log(`  · profile patch 条目：${JSON.stringify(profilePatch.ids)}`
+      + '（含出厂模型配置；宿主与设置页会自己追加行，正常）')
+  }
+}
 
 /* ---------- 3.6 app.asar 里必须真含 harness 补丁注入的代码 ---------- */
 
@@ -465,7 +493,10 @@ const scratchHome = options.home === undefined
 mkdirSync(scratchHome, { recursive: true })
 const packagedHome = join(packageRoot, 'home')
 if (options.home === undefined && existsSync(packagedHome)) {
-  for (const entry of ['settings.yaml', '.credentials.yaml', '.anonymous-user-id']) {
+  // 只有**凭据 / 匿名 id** 这两类 `$DSH_HOME` 级文件要搬过来。出厂模型配置不在这里 ——
+  // 它是 profile 级文件（`home/profiles/<名>/cordis.patch.yml`，0.1.7 起设置的家），
+  // 随上面那次 `cpSync(profileDir, workProfileDir)` 一起进来，落点本来就在 profile 目录里。
+  for (const entry of ['.credentials.yaml', '.anonymous-user-id']) {
     const from = join(packagedHome, entry)
     if (existsSync(from)) cpSync(from, join(scratchHome, entry))
   }

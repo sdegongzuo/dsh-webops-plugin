@@ -284,7 +284,9 @@ jobs:
         #                      打包态 process.execPath 是 Electron exe，而 ptc 子进程会
         #                      删掉 ELECTRON_RUN_AS_NODE，于是永远不回应。只验「服务存在」
         #                      拦不住，必须真跑一段程序看返回值。
-        #   verify-settings —— 出厂 settings.yaml 真的注册成了 llm provider。
+        #   verify-settings —— 出厂 profile patch 真的注册成了 llm provider
+        #                      （落点是 home/profiles/desktop/cordis.patch.yml：
+        #                       0.1.7 起设置的家就是 profile patch，settings.yaml 已退役）。
         #                      字段名写错（baseURL/baseUrl）或取值越界时，pi-ai 会把
         #                      **整条路由静默拒掉**，用户只看到「一个模型都没有」。
         #   verify-browser-host —— agent 调 browser_open 真能开出窗口（spawn 主 exe 的
@@ -334,7 +336,7 @@ jobs:
 
           ### 第一次打开：填一个模型 API Key
 
-          包里的 `home\settings.yaml` 已经预置好**云知声 MaaS**（[maas.unisound.com](https://maas.unisound.com)，
+          包里的 `home\profiles\desktop\cordis.patch.yml`（dsh 的设置文档）已经预置好**云知声 MaaS**（[maas.unisound.com](https://maas.unisound.com)，
           OpenAI 兼容），默认模型 `u2-flash`，备选 17 个（DeepSeek / Kimi / GLM / MiniMax / Qwen 等）。
           **包里不含任何 API Key**，需要你自己填一个：
 

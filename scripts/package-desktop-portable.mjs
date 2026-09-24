@@ -564,17 +564,28 @@ console.log(`  · app 内的 dsh 运行时：${runtime.release.version}`
   + `（node ${runtime.release.nodeVersion}, ${runtime.platform}/${runtime.arch}）`
   + ' —— 不写 profile 状态文件（alpha.2 起该文件已退役）')
 
-// 2.7) 出厂 settings.yaml：预置模型接入。便携版的 home\ 是全新的一份，不写这里的话
+// 2.7) 出厂模型配置：预置模型接入。便携版的 home\ 是全新的一份，不写这里的话
 //      用户开箱只有 dsh 自带的默认路由、且没有凭据，等于没有可用模型。
-//      模板在 scripts/portable-home-settings.yaml：**凭据引用名**（apiKeyEnv）进包，
+//      模板在 scripts/portable-profile-patch.yaml：**凭据引用名**（apiKeyEnv）进包，
 //      API Key 本身不进包，由用户在「设置 → 模型」里填，落到 home\.credentials.yaml。
-const settingsTemplate = join(ROOT, 'scripts', 'portable-home-settings.yaml')
-if (!existsSync(settingsTemplate)) {
-  console.error(`package-desktop-portable: 缺少出厂配置模板 ${settingsTemplate}`)
+//
+// ⚠️ **落点是 profile patch，不是 `home/settings.yaml`**（2026-09-24 适配 dsh 0.1.7）。
+//      上游在 0.1.7 把 `settings.yaml` 退役了（`packages/settings/settings/src/index.ts`
+//      的 `importLegacyDocument()` 只把它一次性导入本 profile 再改名 `.imported`，
+//      源码注释称其为 the **removed** `settings.yaml`）。设置现在的家就是这份 profile patch
+//      （`configEditor.documentPath` = `profileContext.patchPath`），用户每次在「设置」页里
+//      改动也写在这里 —— 出厂配置直接写在终点。
+//      历史：v0.2.x 一直写 `home/settings.yaml`，靠上面那个迁移垫片生效；垫片一旦被上游删掉，
+//      用户开箱就没有任何可用模型，所以主动前移。
+//      ⚠️ 这个文件是**用户自己的设置文档**（出厂表头就写着 “Your patch layer”），我们只填初值、
+//      之后由设置页维护 —— 别把它当成「我们的」文件去覆盖用户改动（增量包不碰它）。
+const profilePatchTemplate = join(ROOT, 'scripts', 'portable-profile-patch.yaml')
+if (!existsSync(profilePatchTemplate)) {
+  console.error(`package-desktop-portable: 缺少出厂配置模板 ${profilePatchTemplate}`)
   process.exit(1)
 }
-cpSync(settingsTemplate, join(STAGE, 'home', 'settings.yaml'))
-console.log('  + home/settings.yaml（预置云知声 MaaS provider）')
+cpSync(profilePatchTemplate, join(profileDir, 'cordis.patch.yml'))
+console.log('  + home/profiles/desktop/cordis.patch.yml（预置云知声 MaaS provider）')
 
 // 3) 插件真身。必须是**真实文件**：validateDesktopPluginGraph 见 symlink 就拒。
 //    发布版 package.json 剔除 devDependencies 里指向本机 harness 的 link:。
@@ -636,7 +647,7 @@ writeFileSync(
     '  并在该 profile 的 dsh.profile.bundles 里登记过，开箱即用。',
     '',
     '【第一次打开：填一个模型 API Key】',
-    '  home\\settings.yaml 已经预置好云知声 MaaS（https://maas.unisound.com，',
+    '  home\\profiles\\desktop\\cordis.patch.yml 已经预置好云知声 MaaS（https://maas.unisound.com，',
     '  OpenAI 兼容），默认模型 u2-flash，另有 17 个备选（DeepSeek / Kimi / GLM /',
     '  MiniMax / Qwen 等）。**包里不含任何 API Key**，需要你自己填一个：',
     '',

@@ -294,12 +294,31 @@ describe('便携版使用说明（scripts/package-desktop-portable.mjs）', () =
   })
 })
 
-describe('出厂 settings 不含真实 key', () => {
-  const settings = readRepoFile('scripts/portable-home-settings.yaml')
+describe('出厂模型配置：落点与凭据卫生', () => {
+  const patch = readRepoFile('scripts/portable-profile-patch.yaml')
 
   it('只写凭据引用名 apiKeyEnv，正文里没有 sk- 形态的 secret', () => {
-    expect(settings).toContain('apiKeyEnv: UNISOUND_API_KEY')
-    expect(settings, '出厂 YAML 混进了 sk- 开头的 key').not.toMatch(/sk-[A-Za-z0-9]{8,}/u)
+    expect(patch).toContain('apiKeyEnv: UNISOUND_API_KEY')
+    expect(patch, '出厂 YAML 混进了 sk- 开头的 key').not.toMatch(/sk-[A-Za-z0-9]{8,}/u)
+  })
+
+  it('落点是 profile patch，不是被 0.1.7 退役的 home/settings.yaml', () => {
+    // 0.1.7 起 settings.yaml 只被一次性导入本 profile 再改名（importLegacyDocument），
+    // 源码注释称其为 the **removed** settings.yaml。出厂配置写在终点
+    // home/profiles/desktop/cordis.patch.yml，才不必依赖一个上游明确标为已移除的垫片。
+    expect(
+      () => readRepoFile('scripts/portable-home-settings.yaml'),
+      '旧模板还在：它只会让下一个人以为出厂配置仍写 settings.yaml',
+    ).toThrow()
+    const packager = readRepoFile('scripts/package-desktop-portable.mjs')
+    expect(packager, '打包脚本没读新的出厂模板').toContain("'scripts', 'portable-profile-patch.yaml'")
+    expect(packager, '新模板没落到 home/profiles/desktop').toContain("join(profileDir, 'cordis.patch.yml')")
+    expect(packager, '打包脚本还在写出厂 settings.yaml').not.toMatch(/cpSync\([^)]*'settings\.yaml'/u)
+  })
+
+  it('模板带 dsh 自己的 PROFILE_PATCH_TEMPLATE 表头', () => {
+    // 用户看到的就是同一份文件该有的样子：表头逐字取自上游 profile.ts。
+    expect(patch).toContain('# Your patch layer for this dsh profile, applied after every bundle layer:')
   })
 })
 

@@ -1,0 +1,103 @@
+# Your patch layer for this dsh profile, applied after every bundle layer:
+# a top-level YAML array of loader patch entries (id-targeted config
+# overrides, disables, and insert lists; `!!js` expressions allowed).
+#
+# ↑ 三行是 dsh 自己的出厂表头（`packages/boot/app-boot/src/profile.ts` 的 PROFILE_PATCH_TEMPLATE），
+#   保持逐字一致，用户看到的就是同一份文件该有的样子；下面才是我们预置的内容。
+#
+# 便携包出厂模型配置　—— 由 scripts/package-desktop-portable.mjs 复制成
+#   <便携包根>/home/profiles/desktop/cordis.patch.yml
+#
+# 只预置云知声 MaaS 一个 provider：便携版的 home\ 是全新的，别的 provider 没有凭据也
+# 用不起来。API Key 不进包（`apiKeyEnv` 只是凭据引用名），由用户在
+# 「设置 → 模型」里填，落到 home\.credentials.yaml。
+#
+# 平台：https://maas.unisound.com  文档：https://maas.unisound.com/docs/guide/overview
+# base_url 与 OpenAI 完全兼容（/v1/chat/completions），故 api 取 openai-completions。
+#
+# ⚠️ 为什么写在这里、而不是 `home/settings.yaml`（2026-09-24 适配 dsh 0.1.7）：
+#   0.1.7 起 `settings.yaml` 已被上游**退役**——`packages/settings/settings/src/index.ts` 的
+#   `importLegacyDocument()` 只在启动时把它**一次性**导入本 profile 然后改名成
+#   `.imported`（源码注释原话是「the **removed** `settings.yaml`」）。设置现在的家就是
+#   这份 profile patch（`configEditor.documentPath` = `profileContext.patchPath`），
+#   用户在「设置」页里的每一次改动也写在这里。出厂配置直接写在终点，就不必再依赖一个
+#   上游明确标为「已移除」的迁移垫片（垫片一旦被删，用户开箱就没有任何可用模型）。
+#
+# 这两段能不能被 dsh 接受**只能真跑**（字段名写错不会报错，整段会被静默丢掉 →
+# 用户装完包看不到任何 provider）。判据：`node scripts/verify-settings.mjs`。
+
+- id: agent-default-model
+  name: "@deepseek-ai/dsh-agent-default-model"
+  config:
+    provider: unisound
+    model: u2-flash
+
+- id: llm-pi-ai
+  name: "@deepseek-ai/dsh-llm-pi-ai"
+  config:
+    providers:
+      unisound:
+        # 凭据引用名，不是 key 本身。用户填的 key 存进 home\.credentials.yaml。
+        apiKeyEnv: UNISOUND_API_KEY
+        displayName: 云知声 MaaS
+        api: openai-completions
+        baseURL: https://maas-api.unisound.com/v1
+        # 只列文本对话模型。同平台的 TTS / ASR / OCR / 医疗影像模型不吃这套
+        # chat 协议（走各自的 /docs/api/… 端点），列进来只会让模型选择器出现选不动的项。
+        # contextWindow 取自官方模型广场标注；maxTokens 故意不写，走 dsh 默认的 32768
+        # —— 输出上限设错会让请求被服务端拒掉，而这里没法离线核实每个模型的真实上限。
+        models:
+          - id: u2-flash
+            name: U2 Flash
+            contextWindow: 524288
+          - id: u2
+            name: Unisound U2
+            contextWindow: 163840
+          - id: deepseek-v4-flash-0731
+            name: DeepSeek V4 Flash 0731
+            contextWindow: 1048576
+          - id: deepseek-v4-pro
+            name: DeepSeek V4 Pro
+            contextWindow: 1048576
+          - id: kimi-k2.5
+            name: Kimi K2.5
+            contextWindow: 262144
+          - id: kimi-k2.6
+            name: Kimi K2.6
+            contextWindow: 262144
+          - id: kimi-k3
+            name: Kimi K3
+            contextWindow: 1048576
+          - id: glm-5.3-flash
+            name: GLM-5.3-Flash
+            contextWindow: 1048576
+          - id: glm-5.2
+            name: GLM-5.2
+            contextWindow: 1048576
+          - id: glm-5.1
+            name: GLM-5.1
+            contextWindow: 206848
+          - id: glm-5
+            name: GLM-5
+            contextWindow: 206848
+          - id: MiniMax-M2.5
+            name: MiniMax M2.5
+            contextWindow: 208896
+          - id: qwen3.8-max
+            name: Qwen3.8-Max
+            contextWindow: 1048576
+          - id: qwen3.7-max
+            name: Qwen3.7-Max
+            contextWindow: 1048576
+          - id: qwen3.7-plus
+            name: Qwen3.7-Plus
+            contextWindow: 262144
+          - id: qwen3.6-plus
+            name: Qwen3.6-Plus
+            contextWindow: 262144
+          - id: qwen3.6-flash
+            name: Qwen3.6-Flash
+            contextWindow: 262144
+          - id: qwen3.6-35b-a3b
+            name: Qwen3.6-35B-A3B
+            contextWindow: 262144

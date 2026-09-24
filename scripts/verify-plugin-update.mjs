@@ -138,8 +138,10 @@ check(stray.length === 0,
 
 cpSync(srcProfile, profile, { recursive: true })
 mkdirSync(home, { recursive: true })
-const shippedSettings = join(packageRoot, 'home', 'settings.yaml')
-if (existsSync(shippedSettings)) cpSync(shippedSettings, join(home, 'settings.yaml'))
+// 出厂模型配置现在是 **profile 级文件**（profile patch），随上面那次 profile 拷贝一起进来，
+// 不再是 `$DSH_HOME/settings.yaml`（0.1.7 已退役）。留一条存在性断言：它没进来的话，
+// 后面的对话轮次会因为「没有可用模型」而失败 —— 那个症状离现场很远，不值得再查一次。
+check(existsSync(join(profile, 'cordis.patch.yml')), '出厂 profile patch 随 profile 拷贝进了工作目录')
 process.env.DSH_HOME = home
 rmSync(join(home, '.credentials.yaml.lock'), { force: true })
 
