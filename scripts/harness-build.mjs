@@ -36,6 +36,14 @@
  *    → `runSteps` 先无条件跑一次 `pnpm --filter @deepseek-ai/node-addon-system run build:js`
  *    （`tsc -b` 增量，秒级）。**判据是「上游有没有自己挂」，不是「本机现在有没有」** ——
  *    根 `build:native-system` 只编 C 原生插件、非 linux/darwin 直接 exit 0，指望不上。
+ * 4. **`build:lib:host` 之前必须先把 workspace 的 `lib/index.js` 落盘，否则桌面端本体会把
+ *    workspace devDependency 静默 external 化**（v0.2.8 CI 连撞三次，run 35961828946 起）：
+ *    那是一次 rolldown 批构建，`apps/desktop` 与它依赖的包在**同一个进程**里，而 import 解析的
+ *    目标 `packages/<组>/<包>/lib/index.js` **正是这一轮才写出来的文件** → 解析失败只留一行
+ *    warning、**exit 仍是 0** → 打包后 Electron 主进程 `ERR_MODULE_NOT_FOUND`，而它**只弹模态框、
+ *    不写 stderr**，报出来的是「等满 20 秒没等到端口」。
+ *    → `runSteps` 先跑一次 `pnpm run build:lib:host`（幂等预热，详见 `warmWorkspaceLibs`）。
+ *    **本机因为留着旧 `lib/` 所以永远看不出来**，别因为「本机好好的」把这一步删掉。
  *
  * ## 安全设计：临时替换**必须无条件还原**
  *
@@ -134,8 +142,55 @@ function ensureNativeAddonLib(env) {
   return true
 }
 
-/* ---------- registry 注入模式 ---------- */
+/**
+ * 预热：把 workspace 的 `build:lib:host` 先跑一遍，让 `packages/<组>/<包>/lib/index.js` 落盘。
+ *
+ * ## 为什么必须有（机制）
+ *
+ * `package:win:x64:dir` 内部的 `build:official` → `build:lib:host` 是
+ * `tsc -b tsconfig.host.json && tsdown --env.DSH_BUILD_FACE host` —— **一次 rolldown 批构建**
+ * （根 `tsdown.config.ts` 的 `workspace:` 字段把 `apps/desktop`、`apps/cli`、`apps/desktop-host`、
+ * `packages/<组>/<包>` 塞进**同一个进程**）。entries 是 `tsc -b` 的产物 `lib/types/*.js`，
+ * 而各包 `package.json` 的 `exports` 指向 **tsdown 自己的产物** `lib/index.js`。于是当
+ * `apps/desktop` import 一个 workspace **devDependency**（`dsh-home-paths` / `dsh-app-boot` /
+ * `dsh-deepseek-account`）时，rolldown 要解析的 `packages/<组>/<包>/lib/index.js`
+ * **正是这一轮自己才要写出来的文件** → 本次解析失败 → 只打一行
+ * `[UNRESOLVED_IMPORT] … treating it as an external dependency` 的 warning，**exit 0**，
+ * 把它当裸 import 留在 `lib/main.js` 里。
+ *
+ * 后果不在构建期，而在**打包后**：`app.asar` 里的主进程 `ERR_MODULE_NOT_FOUND`，而 Electron
+ * 对主进程未捕获异常**只弹一个模态框、stderr 一个字节都不写** → 桌面端起不来，报的却是
+ * 「等满 20 秒没等到端口」。v0.2.8 CI 上连撞三次（run 35961828946 起）。
+ *
+ * 本机为什么一直看不出来：`packages/<组>/<包>/lib/` 被根 `.gitignore` 的 `lib/` 排除，重复构建的机器上
+ * **一直留着**，解析永远成功、代码被内联 —— 只有全新 checkout 才暴露。
+ *
+ * 为什么先跑一遍就够了（确定性，不是碰运气）：根 `tsdown.config.ts` 是 `clean: false`，
+ * 预热写出的 `packages/<组>/<包>/lib/index.js` 不会被正式那一轮清掉。本机实测（藏起那三个包的 `lib/`
+ * 复刻全新 checkout）：预热 193774 字节（带裸 import，与 CI 一字不差）→ 正式 319913 字节、裸 import 归零。
+ *
+ * ## 它不是被退役的那份「子集」
+ *
+ * `buildSteps()` 上面警告过的手写子集是 `prepare:runtime → prepare:packages → prepare:dsh → package`
+ * —— 那份依赖 `.desktop-build/packed/` 的残留才跑得起来。这里调的是上游**自己的独立脚本**
+ * `build:lib:host`（`apps/desktop/package.json` 之外、根 `package.json` 里就有），只做一个
+ * 幂等的产出补齐，不动上游的链。
+ *
+ * 复发兜底：CI 里有 `scripts/check-desktop-shell-bundle.mjs` 把「裸 import 的包名必须在
+ * `dependencies` 里」钉成显式判据；本机可随时 `node scripts/check-desktop-shell-bundle.mjs --harness <harness 根>`。
+ */
+export function warmWorkspaceLibs(env) {
+  const args = ['run', 'build:lib:host']
+  console.log(`\n=== 预热 pnpm ${args.join(' ')} ===`)
+  const result = spawnSync('pnpm', args, { cwd: harnessRoot(), env, stdio: 'inherit', shell: true })
+  if (result.status !== 0) {
+    console.error(`harness-build: 预热 pnpm ${args.join(' ')} 失败（exit ${String(result.status)}）`)
+    return false
+  }
+  return true
+}
 
+/* ---------- registry 注入模式 ---------- */
 /**
  * 上游能否从环境变量读 registry（dsh 0.1.7-alpha.1 起）。
  *
@@ -231,6 +286,7 @@ function runSteps(registryEnv) {
     ...(registryEnv === undefined ? {} : { DSH_DESKTOP_NPM_REGISTRY: registryEnv }),
   }
   if (!ensureNativeAddonLib(env)) return false
+  if (!warmWorkspaceLibs(env)) return false
   for (const step of buildSteps()) {
     const extra = step === 'package:win:x64:dir' ? ['--unsigned'] : []
     console.log(`\n=== ${step}${extra.length > 0 ? ` ${extra.join(' ')}` : ''} ===`)
@@ -278,7 +334,7 @@ if (isEntry) {
   console.log(`harness   ${harnessRoot()}`)
   console.log(`步骤      ${dryRun
     ? '（--dry-run：不跑构建）'
-    : `前置 ${nativeAddonPackage()} build:js → ${buildSteps().join(' → ')}`}`)
+    : `前置 ${nativeAddonPackage()} build:js → 预热 build:lib:host → ${buildSteps().join(' → ')}`}`)
   // registry 两条路：新版上游走环境变量（不动文件），旧上游回落到改文件。
   const registryMode = noMirror ? 'off' : supportsRegistryEnv() ? 'env' : 'patch'
   const registryValue = registryMode === 'off' ? undefined : npmRegistry()

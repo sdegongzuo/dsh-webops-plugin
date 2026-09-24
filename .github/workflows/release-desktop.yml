@@ -265,6 +265,45 @@ jobs:
           node "$env:GITHUB_WORKSPACE/scripts/check-office-payload-path.mjs" --harness "$env:HARNESS_ROOT"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
+      - name: 预热 workspace 的 lib 产物（不预热的话桌面端本体会把 workspace 依赖静默 external 化）
+        # ⚠️ 这一步是 v0.2.8 第三次 CI 失败（run 35961828946 起连续三次）的修复。症状是
+        # `verify:browser-host` 报 `the host never announced a port`，与真因毫无关联。
+        #
+        # 机制：`build:official` 链里的 `build:lib:host` 是
+        #   `tsc -b tsconfig.host.json && tsdown --env.DSH_BUILD_FACE host`
+        # —— **一次 rolldown 批构建**（根 `tsdown.config.ts` 的 `workspace:` 字段把
+        # `apps/desktop`、`apps/cli`、`apps/desktop-host`、`packages/<组>/<包>` 放进同一个进程）。
+        # entries 是 `tsc -b` 的产物 `lib/types/*.js`，但各包 `package.json` 的 `exports`
+        # 指向的是 **tsdown 自己的产物** `lib/index.js`。于是桌面端本体 import 一个 workspace
+        # **devDependency**（`dsh-home-paths` / `dsh-app-boot` / `dsh-deepseek-account`）时，
+        # rolldown 要解析的 `packages/*/lib/index.js` **正是这一轮才要写出来的文件** →
+        # 全新 checkout 上解析不到 → 只打一行
+        # `[UNRESOLVED_IMPORT] … treating it as an external dependency` 的 warning，
+        # **exit code 仍是 0**，把它当裸 import 留在 `lib/main.js` 里。
+        #
+        # 为什么只有 CI 中招：`packages/*/lib/` 被根 `.gitignore` 的 `lib/` 排除，本机因为反复
+        # 构建所以一直留着，解析永远成功、代码被内联 —— 本机**永远看不出来**（这条是这一步
+        # 存在的主要理由，别因为「本机好好的」删掉它）。
+        #
+        # 为什么这个修法是确定性的、不是碰运气：根 `tsdown.config.ts` 设了 `clean: false`，
+        # 预热写出的 `packages/*/lib/index.js` 不会被正式那一轮清掉 → 正式那一轮全部解析成功、
+        # 全部内联。本机实测（藏起那三个包的 `lib/` 复刻全新 checkout）：预热 193774 字节
+        # （带裸 import，与 CI 一字不差）→ 正式 319913 字节、裸 import 归零。
+        #
+        # 为什么不去给那三个包开白名单：上游加一个 host 侧 workspace devDependency 就会**静默
+        # 复发**，而它造成的失败离得很远（Electron 主进程 `ERR_MODULE_NOT_FOUND` 只弹模态框、
+        # stderr 一个字节都不写）。预热是按机制修的，覆盖面跟着上游依赖走；复发由下一步的守卫兜。
+        #
+        # 代价：一次 host face 的 tsdown（~25s）；`tsc -b` 是增量的，正式那一轮几乎不多花时间。
+        #
+        # 本机同款验证：`pnpm harness:build`（它内部也做了这一步）。
+        if: steps.base-cache.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          Set-Location $env:HARNESS_ROOT
+          pnpm run build:lib:host
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
       - name: 构建桌面端应用目录
         if: steps.base-cache.outputs.cache-hit != 'true'
         # `package:win:x64:dir` = electron-builder --dir，产出可直接运行的 win-unpacked 目录。
@@ -279,6 +318,27 @@ jobs:
         run: |
           Set-Location (Join-Path $env:HARNESS_ROOT 'apps\desktop')
           pnpm run package:win:x64:dir --unsigned
+
+      - name: 桌面端本体裸 import 守卫（拦住「静默 external 化」的复发）
+        # 上游那行 `UNRESOLVED_IMPORT` 只是 warning、exit code 0；它造成的失败要到**打包后**
+        # Electron 主进程 `ERR_MODULE_NOT_FOUND` 才出现 —— 而 Electron 对主进程未捕获异常
+        # **只弹一个模态框、stderr 一个字节都不写**，于是 `verify:browser-host` 等满 20 秒，
+        # 报 `the host never announced a port`，那句话里没有任何线索指向「少了个 workspace 包」。
+        #
+        # 所以把它钉成一条 1 秒内出口的显式判据：产物里每个裸 import 的**包名**必须落在
+        # `apps/desktop/package.json` 的 `dependencies` 里 —— electron-builder 只把
+        # `dependencies` 装进 `app.asar/node_modules`，`devDependencies` 一个都不装。
+        # 判据里没有硬编码包名，所以上游换依赖时它会自己跟上。
+        #
+        # 反向验证（本机）：`node scripts/check-desktop-shell-bundle.mjs --selftest`
+        #   干净产物 exit 0 / 注入一条 devDependency 裸 import exit 1 / 缺 package.json exit 2。
+        # 与上面那步同一个缓存条件：命中缓存时这台机器既没构建也没产物，守卫无从下手；
+        # 而缓存**只由成功的 job 保存**，所以缓存里的产物必然已经过了这一步。
+        if: steps.base-cache.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          node "$env:GITHUB_WORKSPACE/scripts/check-desktop-shell-bundle.mjs" --harness "$env:HARNESS_ROOT"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: 冒烟失败后的 LibreOffice 诊断（只在上面失败后跑）
         # 上游 0.1.7 新加的 Office→PDF 冒烟在我们 CI 上**必现**地挂在 xlsx 上（docx 能过），
