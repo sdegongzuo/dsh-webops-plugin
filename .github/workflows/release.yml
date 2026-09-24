@@ -28,9 +28,9 @@ permissions:
 
 env:
   # 默认 pin 到与本机 checkout 一致的提交，避免上游 main 漂移把构建搞挂。
-  # c36a83ff6b = dsh 0.1.7-alpha.1（tag `dsh-v0.1.7-alpha.1`）：与 `release-desktop.yml`
+  # 46a7f68b09 = tag `dsh-v0.1.7-rc.1`：与 `release-desktop.yml`
   # 用同一个 ref，也让本 workflow 的构建对着我们实际随包出货的那个 harness 版本。
-  HARNESS_REF: ${{ inputs.harness_ref || '00102833dfaee1da9f48a3a8eae9d34005a75218' }}
+  HARNESS_REF: ${{ inputs.harness_ref || '46a7f68b0922371ce7144b668b90e377d8e799f4' }}
   TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
 
 jobs:

@@ -1,8 +1,8 @@
 diff --git a/apps/desktop/scripts/electron-builder-config.mjs b/apps/desktop/scripts/electron-builder-config.mjs
-index 2cee72d23d..04b3654f97 100644
+index e0a707dc32..bb4360b4eb 100644
 --- a/apps/desktop/scripts/electron-builder-config.mjs
 +++ b/apps/desktop/scripts/electron-builder-config.mjs
-@@ -135,13 +135,17 @@ export function createElectronBuilderConfig(
+@@ -136,13 +136,17 @@ export function createElectronBuilderConfig(
        'lib/preload-welcome.cjs',
        'renderer/**/*',
        'package.json',
@@ -24,7 +24,7 @@ index 2cee72d23d..04b3654f97 100644
      ],
      mac: {
 diff --git a/apps/desktop/scripts/prepare-dsh.ts b/apps/desktop/scripts/prepare-dsh.ts
-index a89247ad18..c0dadd1988 100644
+index 377c300efb..0c6245ef02 100644
 --- a/apps/desktop/scripts/prepare-dsh.ts
 +++ b/apps/desktop/scripts/prepare-dsh.ts
 @@ -127,7 +127,11 @@ async function main(): Promise<void> {
@@ -93,7 +93,7 @@ index d406c27235..36bb70f4fb 100644
    if (!inside(appDir, sourceRoot)) {
      // Builder's source matcher slices the appDir prefix even for external FileSets.
 diff --git a/apps/desktop/src/main.ts b/apps/desktop/src/main.ts
-index 9f8ad5c22f..541cfdc1af 100644
+index 6690a3c69c..eb37055992 100644
 --- a/apps/desktop/src/main.ts
 +++ b/apps/desktop/src/main.ts
 @@ -1,7 +1,9 @@
@@ -213,7 +213,7 @@ index 9f8ad5c22f..541cfdc1af 100644
    return { node, nodeBin, pnpm, dsh }
  }
  
-@@ -376,8 +450,11 @@ async function main(): Promise<void> {
+@@ -386,8 +460,11 @@ async function main(): Promise<void> {
      return {
        start: async () => {
          const ready = await host.start()
@@ -227,7 +227,7 @@ index 9f8ad5c22f..541cfdc1af 100644
          if (ready.injections === undefined) throw new Error('Desktop Host did not provide boot injections')
          injections = ready.injections
          welcomeBackend = await connectDesktopWelcome(ready.url, (input, init) => net.fetch(input, init), async () => (await session.defaultSession.cookies.get({ url: ready.url })).map(cookie => `${cookie.name}=${cookie.value}`).join('; '))
-@@ -1103,17 +1180,29 @@ async function main(): Promise<void> {
+@@ -1113,17 +1190,29 @@ async function main(): Promise<void> {
    publishUpdate(updateState)
  }
  
@@ -389,7 +389,7 @@ index a74ea7c7ef..e29953ddf2 100644
    return end < 0 ? cookie : cookie.slice(0, end)
  }
 diff --git a/apps/desktop/tests/main-startup.spec.ts b/apps/desktop/tests/main-startup.spec.ts
-index 0242d214a3..6182b3aa03 100644
+index 9cd00f74c4..fe5c432930 100644
 --- a/apps/desktop/tests/main-startup.spec.ts
 +++ b/apps/desktop/tests/main-startup.spec.ts
 @@ -16,7 +16,13 @@ import { writeCrashReport } from '../src/crash-report.ts'
@@ -416,7 +416,7 @@ index 0242d214a3..6182b3aa03 100644
  vi.mock('../src/project-manager.ts', () => ({
    DesktopProjectManager: class {
      readonly applyRelease = harness.applyRelease
-@@ -1603,7 +1609,8 @@ describe('desktop main startup', () => {
+@@ -1604,7 +1610,8 @@ describe('desktop main startup', () => {
      expect(harness.applyRelease).toHaveBeenCalledTimes(1)
      expect(harness.hosts[0]).toMatchObject({
        node: process.execPath,

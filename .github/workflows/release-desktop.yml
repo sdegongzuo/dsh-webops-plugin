@@ -49,10 +49,10 @@ permissions:
 
 env:
   # 默认 pin 到与本机 checkout 一致的提交，避免上游 main 漂移把构建搞挂。
-  # c36a83ff6b = master @ dsh 0.1.7-alpha.1（tag `dsh-v0.1.7-alpha.1`，PR #4901）。之所以必须跟着上游走：
+  # 46a7f68b09 = tag `dsh-v0.1.7-rc.1`。之所以必须跟着上游走：
   # `docs/harness-desktop-build.patch` 的上下文行取自这个提交，pin 旧 ref 会直接 apply 失败。
   # 换 ref 会让本体缓存 key 失效，CI 得全量重建一次（~18min），属预期。
-  HARNESS_REF: ${{ inputs.harness_ref || '00102833dfaee1da9f48a3a8eae9d34005a75218' }}
+  HARNESS_REF: ${{ inputs.harness_ref || '46a7f68b0922371ce7144b668b90e377d8e799f4' }}
   TAG: ${{ github.event_name == 'workflow_dispatch' && format('desktop-v{0}', inputs.version) || github.ref_name }}
   # ⚠️ 这一条**不生效**：dsh 0.1.6-alpha.2 起 `loadDesktopPackageEnvironment()` 会把环境变量里的
   # release 设置全部过滤掉（`AMBIENT_RELEASE_SETTING`），`DSH_DESKTOP_APP_ID` 只能由
