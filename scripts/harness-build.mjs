@@ -25,6 +25,17 @@
  * 2. **Electron 二进制下载**。`prepare:runtime` 要下 **157MB** 的
  *    `electron-v<版本>-win32-x64.zip`，直连 GitHub 实测 `TypeError: fetch failed`。
  *    → 注入 `ELECTRON_MIRROR`（默认 npmmirror 的 electron 镜像）。
+ * 3. **`@deepseek-ai/node-addon-system` 的 `lib/` 不在 git 里**（dsh 0.1.7 起新出现）。
+ *    `apps/desktop/scripts/macos-notarization-proxy.ts:8` 在 **import 期**就
+ *    `import { tryLockExclusive } from '@deepseek-ai/node-addon-system/flock'`，而
+ *    `package-target.ts:26` 顶层导入该模块 → 链**一步都没进**就
+ *    `ERR_MODULE_NOT_FOUND: …/node-addon-system/lib/flock.js`（3 秒即挂）。
+ *    该 `lib/` 是 `tsc -b` 产物、被 `native/system/.gitignore` 的 `packages/<名>/lib/` 排除，
+ *    所以**只在全新 checkout 上缺**；本机第一次撞到它是在 CI（v0.2.8，run 35952690821），
+ *    本地因为留着旧产物而看不出来。
+ *    → `runSteps` 先无条件跑一次 `pnpm --filter @deepseek-ai/node-addon-system run build:js`
+ *    （`tsc -b` 增量，秒级）。**判据是「上游有没有自己挂」，不是「本机现在有没有」** ——
+ *    根 `build:native-system` 只编 C 原生插件、非 linux/darwin 直接 exit 0，指望不上。
  *
  * ## 安全设计：临时替换**必须无条件还原**
  *
@@ -89,6 +100,38 @@ export function harnessUnpackedDir() {
  */
 export function buildSteps() {
   return ['package:win:x64:dir']
+}
+
+/* ---------- 上游没挂、但链的**入口**强制要求的前置 ---------- */
+
+/** 提供 `…/flock` 的那个 workspace 包（`native/system/packages/entry`）。 */
+export function nativeAddonPackage() {
+  return '@deepseek-ai/node-addon-system'
+}
+
+/**
+ * 编译 `@deepseek-ai/node-addon-system` 的 `lib/`。
+ *
+ * 为什么**必须显式做**，而不是「本机有就算了」：
+ *   · 那个 `lib/` 是 `tsc -b` 产物，被 `native/system/.gitignore` 的 `packages/<名>/lib/` 排除
+ *     → **只在全新 checkout 上缺**（CI 必缺，本机常因残留旧产物而看不出来）；
+ *   · `package-target.ts:26` 顶层 import 的 `macos-notarization-proxy.ts:8` 在 **import 期**
+ *     就要 `…/node-addon-system/lib/flock.js` → 缺它时链在**入口之前**就抛
+ *     `ERR_MODULE_NOT_FOUND`，症状与「harness ref 取错了」几乎无法区分
+ *     （v0.2.8 CI 实测：3 秒即挂，run 35952690821）。
+ *
+ * 无条件跑（而不是「不存在才跑」）：`tsc -b` 是增量的、秒级完成，而「存在就跳过」会把
+ * 「上游改了 src、产物是旧的」这类问题静默留下来。
+ */
+function ensureNativeAddonLib(env) {
+  const args = ['--filter', nativeAddonPackage(), 'run', 'build:js']
+  console.log(`\n=== 前置 pnpm ${args.join(' ')} ===`)
+  const result = spawnSync('pnpm', args, { cwd: harnessRoot(), env, stdio: 'inherit', shell: true })
+  if (result.status !== 0) {
+    console.error(`harness-build: 前置 pnpm ${args.join(' ')} 失败（exit ${String(result.status)}）`)
+    return false
+  }
+  return true
 }
 
 /* ---------- registry 注入模式 ---------- */
@@ -187,6 +230,7 @@ function runSteps(registryEnv) {
     // 再显式写进 pnpm 子进程的 NPM_CONFIG_REGISTRY）。旧上游没有这个入口。
     ...(registryEnv === undefined ? {} : { DSH_DESKTOP_NPM_REGISTRY: registryEnv }),
   }
+  if (!ensureNativeAddonLib(env)) return false
   for (const step of buildSteps()) {
     const extra = step === 'package:win:x64:dir' ? ['--unsigned'] : []
     console.log(`\n=== ${step}${extra.length > 0 ? ` ${extra.join(' ')}` : ''} ===`)
@@ -232,7 +276,9 @@ if (isEntry) {
   }
 
   console.log(`harness   ${harnessRoot()}`)
-  console.log(`步骤      ${dryRun ? '（--dry-run：不跑构建）' : buildSteps().join(' → ')}`)
+  console.log(`步骤      ${dryRun
+    ? '（--dry-run：不跑构建）'
+    : `前置 ${nativeAddonPackage()} build:js → ${buildSteps().join(' → ')}`}`)
   // registry 两条路：新版上游走环境变量（不动文件），旧上游回落到改文件。
   const registryMode = noMirror ? 'off' : supportsRegistryEnv() ? 'env' : 'patch'
   const registryValue = registryMode === 'off' ? undefined : npmRegistry()

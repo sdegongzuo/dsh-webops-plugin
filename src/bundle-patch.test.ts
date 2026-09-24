@@ -395,3 +395,36 @@ describe('开发专用 overlay（cordis.fake-llm.patch.yml）', () => {
     expect(manifest.files ?? []).not.toContain('cordis.fake-llm.patch.yml')
   })
 })
+
+describe('打包前置：node-addon-system 的 lib 必须先于 package-target.ts 的 import 存在', () => {
+  // v0.2.8 第一次 CI 就死在这里（run 35952690821）：`构建桌面端应用目录` **3 秒**即挂，
+  // 报 `ERR_MODULE_NOT_FOUND … node-addon-system/lib/flock.js` —— 症状像「HARNESS_REF 取错了」，
+  // 实际是 dsh 0.1.7 新增的 `apps/desktop/scripts/macos-notarization-proxy.ts` 在 **import 期**
+  // 就 import 了 `@deepseek-ai/node-addon-system/flock`，而 `package-target.ts:26` 顶层导入那个模块，
+  // 于是链**一步都没进**（build:official 等都还没跑）。
+  //
+  // 为什么只有 CI 缺：那个 `lib/` 是 `tsc -b` 产物、被 `native/system/.gitignore` 排除，
+  // 只在**全新 checkout** 上不存在；本机因为留着上一次的旧产物而永远看不出来。
+  const workflow = readRepoFile('.github/workflows/release-desktop.yml')
+  const buildLibArgv = '--filter @deepseek-ai/node-addon-system run build:js'
+
+  it('CI 里这一步存在，且排在 `package:win:x64:dir` 之前', () => {
+    const buildLib = workflow.indexOf(buildLibArgv)
+    const pkgStep = workflow.indexOf('pnpm run package:win:x64:dir --unsigned')
+    expect(buildLib, 'CI 不再编译 @deepseek-ai/node-addon-system 的 lib').toBeGreaterThan(-1)
+    expect(pkgStep, '找不到打包那一步，锚点失效了').toBeGreaterThan(-1)
+    // 排到后面就等于没做：失败点发生在打包命令的**模块加载期**，构建步骤根本走不到。
+    expect(buildLib, 'lib 编译排在了打包之后 —— 等于没做').toBeLessThan(pkgStep)
+    // 只 `pnpm … run build:js` 失败时 GitHub 不保证非 0 退出，必须显式转嫁。
+    const step = workflow.slice(workflow.lastIndexOf('- name:', buildLib), pkgStep)
+    expect(step, 'CI 这步没把失败转成非 0 退出').toContain('if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }')
+  })
+
+  it('本机 `pnpm harness:build` 走同一条前置（否则只有全新 clone 才踩得到）', () => {
+    const local = readRepoFile('scripts/harness-build.mjs')
+    expect(local, '本地打包没补这一步').toContain("'--filter', nativeAddonPackage(), 'run', 'build:js'")
+    // 无条件跑（而不是 `existsSync(lib)` 才跑）：tsc -b 是增量的，而「存在就跳过」会把
+    // 「上游改了 src、产物还是旧的」静默留下来 —— 那正是本机看不出来的同一类盲区。
+    expect(local, '本地前置退化成了「存在才跳过」').not.toMatch(/existsSync\([^)]*node-addon-system[^)]*\)/u)
+  })
+})

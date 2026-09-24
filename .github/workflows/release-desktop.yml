@@ -199,6 +199,31 @@ jobs:
           path: .desktop-base
           key: dsh-win-unpacked-${{ runner.os }}-${{ env.HARNESS_REF }}-${{ hashFiles('docs/harness-desktop-build.patch', 'scripts/patch-electron-builder.mjs') }}
 
+      - name: 构建 node-addon-system 的 lib（上游 tsc -b 产物，不在 git 里）
+        # ⚠️ 这一步是 v0.2.8 首次 CI 失败（run 35952690821）的修复，失败只花 **3 秒**、且
+        # 报错点在链的**入口之前**，很容易误判成「harness ref 取错了」。
+        #
+        # 机制：dsh 0.1.7 起 `apps/desktop/scripts/macos-notarization-proxy.ts:8` 在 **import 期**就
+        # `import { tryLockExclusive } from '@deepseek-ai/node-addon-system/flock'`，
+        # 而 `package-target.ts:26` 顶层就导入那个模块 —— 于是 `pnpm run package:win:x64:dir`
+        # **一步都没进**（build:official 等都还没跑）就
+        # `ERR_MODULE_NOT_FOUND: …/node-addon-system/lib/flock.js`。
+        #
+        # 为什么只有 CI 缺：该 `lib/` 是 `tsc -b` 产物，被 `native/system/.gitignore` 的
+        # `packages/*/lib/` 排除 —— 全新 checkout 里根本不存在；本机因为留着上一次的旧产物
+        # 而**永远看不出来**（这是本步存在的主要理由，别因为「本机好好的」就删掉）。
+        #
+        # 为什么不用上游的脚本：根 `build:native-system`（= `native/system/scripts/build.ts
+        # --host-addon-only`）只编 C 原生插件，且**非 linux/darwin 直接 `process.exit(0)`**，
+        # 在 Windows 上什么也不做；而 entry 包自己的 `prepack`（`verify-entry-lib.mjs`）
+        # 恰恰是「没有 lib 就拒绝打包」，说明上游预设这个产物已存在。所以只能这里补。
+        if: steps.base-cache.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          Set-Location (Join-Path (Split-Path $PWD) 'deepseek-harness')
+          pnpm --filter @deepseek-ai/node-addon-system run build:js
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
       - name: 构建桌面端应用目录
         if: steps.base-cache.outputs.cache-hit != 'true'
         # `package:win:x64:dir` = electron-builder --dir，产出可直接运行的 win-unpacked 目录。
