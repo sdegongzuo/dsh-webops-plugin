@@ -90,23 +90,49 @@ jobs:
           node-version: 22
           cache: pnpm
 
-      - name: 取 deepseek-harness 源码
+      - name: 取 deepseek-harness 源码（放**短路径**下，细节见下）
+        # ⚠️ 为什么不能放插件仓旁边（`..\deepseek-harness`）：dsh 0.1.7 给打包链最后一步加了
+        # Office→PDF 冒烟，而 LibreOffice 载荷（2053 个文件）被放到
+        #   <harness>\apps\desktop\.desktop-build\targets\win-x64\unsigned-artifacts\
+        #            win-unpacked\resources\dsh\node_modules\@deepseek-ai\libreoffice-kit-win32-x64\
+        # 之下，其中相对最长的一条是 84 字符。本 runner 的 GITHUB_WORKSPACE 是
+        # `D:\a\dsh-webops-plugin\dsh-webops-plugin`，放在旁边会让载荷根到 **181** 字符、
+        # 最深那条到 **266** —— 越过 Windows 的 MAX_PATH(260)。LibreOffice 是原生程序、
+        # 不做长路径处理，于是 docx（Writer）能过而 xlsx（Calc）报
+        # `loadComponentFromURL returned an empty reference`、pptx（Impress）helper 原生崩溃。
+        # 「Writer 能过」极具误导性：报错指向 Calc/Impress 的过滤器，实测与字体/内存/载荷
+        # 全都无关（载荷 sha256 与上游 `prebuilds.json` 全量一致，本机同载荷三个全过）。
+        # 本机只改路径长度就复现同样三连：`scripts/probe-deep-path.mjs`。
+        # 挪到上一级（`D:\a\h` = 5 字符）省掉 32 个字符，余量 26；仍由下面的守卫把关。
+        #
+        # 为什么还要补一个**目录联接**：本仓 package.json 里 13 个
+        # `link:../deepseek-harness/...`（本机开发就靠它，不能改成别的路径），
+        # 所以把老名字接回短路径处 —— CI 侧一个联接解决，仓库与 lock 都不用动。
         shell: pwsh
         run: |
-          $dest = Join-Path (Split-Path $PWD) 'deepseek-harness'
+          $repo = $env:GITHUB_WORKSPACE                                   # …\dsh-webops-plugin\dsh-webops-plugin
+          $dest = Join-Path (Split-Path (Split-Path $repo)) 'h'           # …\a\h
+          $link = Join-Path (Split-Path $repo) 'deepseek-harness'         # 老名字，给 link: 用
           Write-Host "harness ref: $env:HARNESS_REF -> $dest"
+          Remove-Item $dest -Recurse -Force -ErrorAction SilentlyContinue
           New-Item -ItemType Directory -Path $dest -Force | Out-Null
           Set-Location $dest
           git init --quiet
           git remote add origin https://github.com/deepseek-ai/deepseek-harness.git
           git fetch --depth 1 origin $env:HARNESS_REF
           git checkout --quiet FETCH_HEAD
+          # 删联接只能用 Directory.Delete：Remove-Item -Recurse 对重解析点会**跟着进目标**删。
+          if (Test-Path $link) { [System.IO.Directory]::Delete($link) }
+          New-Item -ItemType Junction -Path $link -Target $dest | Out-Null
+          Write-Host "harness 根 $($dest.Length) 字符：$dest"
+          Write-Host "目录联接 $link -> $dest"
+          Add-Content -Path $env:GITHUB_ENV -Value "HARNESS_ROOT=$dest"
 
       - name: 应用 harness 构建补丁
         # 修 prepare:dsh 的 registry 硬编码 / install 标志 / fs-ext 冒烟校验，见文件头说明。
         shell: pwsh
         run: |
-          Set-Location (Join-Path (Split-Path $PWD) 'deepseek-harness')
+          Set-Location $env:HARNESS_ROOT
           git apply --ignore-whitespace "$env:GITHUB_WORKSPACE/docs/harness-desktop-build.patch"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           git --no-pager diff --stat
@@ -128,7 +154,7 @@ jobs:
         # 其余（签名证书、上传凭据）留空：--unsigned 不需要。
         shell: pwsh
         run: |
-          $path = Join-Path (Join-Path (Split-Path $PWD) 'deepseek-harness') 'apps\desktop\.env.windows'
+          $path = Join-Path $env:HARNESS_ROOT 'apps\desktop\.env.windows'
           @(
             'DSH_DESKTOP_APP_ID=com.sdegongzuo.dshwebops'
             'DSH_DESKTOP_AUTO_UPDATE_ENV=test'
@@ -147,7 +173,7 @@ jobs:
         shell: pwsh
         timeout-minutes: 30
         run: |
-          Set-Location (Join-Path (Split-Path $PWD) 'deepseek-harness')
+          Set-Location $env:HARNESS_ROOT
           pnpm install --no-frozen-lockfile
 
       - name: 装本仓依赖
@@ -167,7 +193,7 @@ jobs:
         # 必须在 pnpm install 之后（改的是 node_modules 里的 app-builder-lib）。
         shell: pwsh
         run: |
-          node "$env:GITHUB_WORKSPACE/scripts/patch-electron-builder.mjs" (Join-Path (Split-Path $PWD) 'deepseek-harness')
+          node "$env:GITHUB_WORKSPACE/scripts/patch-electron-builder.mjs" "$env:HARNESS_ROOT"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: 判断 tar 是否需要 --force-local
@@ -220,8 +246,23 @@ jobs:
         if: steps.base-cache.outputs.cache-hit != 'true'
         shell: pwsh
         run: |
-          Set-Location (Join-Path (Split-Path $PWD) 'deepseek-harness')
+          Set-Location $env:HARNESS_ROOT
           pnpm --filter @deepseek-ai/node-addon-system run build:js
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: 载荷路径长度前置检查（MAX_PATH 会把 Office 转换打挂）
+        # 这一步存在的唯一理由：上面那件事**出错时报错完全指不到路径上**（见「取 harness 源码」
+        # 那一步的注释）。守卫量的是真实载荷里最长的那条相对路径，投影到打包位置跟 259 比
+        # （MAX_PATH 的 260 含结尾 NUL），越界就在**打包前**用一句话说清，而不是等 20 分钟
+        # 后从 LibreOffice 嘴里听到 `loadComponentFromURL returned an empty reference`。
+        # 为什么不能靠「把路径改短」一次性了结：上游换版本、载荷再深一层，余量就可能被吃掉。
+        # 为什么搜不到载荷时不拦：上游改布局/改名就会搜不到，那种情况不该把发版堵死。
+        # 反向验证（本机）：`node scripts/probe-deep-path.mjs --guard`
+        #   短根 → exit 0；把根造成旧布局的 37 字符 → exit 1。两个方向都真跑过。
+        if: steps.base-cache.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          node "$env:GITHUB_WORKSPACE/scripts/check-office-payload-path.mjs" --harness "$env:HARNESS_ROOT"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: 构建桌面端应用目录
@@ -236,7 +277,7 @@ jobs:
         env:
           PYTHON: python
         run: |
-          Set-Location (Join-Path (Split-Path $PWD) 'deepseek-harness\apps\desktop')
+          Set-Location (Join-Path $env:HARNESS_ROOT 'apps\desktop')
           pnpm run package:win:x64:dir --unsigned
 
       - name: 冒烟失败后的 LibreOffice 诊断（只在上面失败后跑）
@@ -251,10 +292,8 @@ jobs:
         # 这一步**不改变成败**（脚本恒 exit 0，不 fail-fast），只加证据。
         if: failure()
         shell: pwsh
-        env:
-          HARNESS_ROOT: ${{ github.workspace }}/../deepseek-harness
         run: |
-          $resources = "$env:HARNESS_ROOT\apps\desktop\.desktop-build\targets\win-x64\unsigned-artifacts\win-unpacked\resources"
+          $resources = Join-Path $env:HARNESS_ROOT 'apps\desktop\.desktop-build\targets\win-x64\unsigned-artifacts\win-unpacked\resources'
           node "$env:GITHUB_WORKSPACE/scripts/diag-libreoffice.mjs" --resources $resources --harness $env:HARNESS_ROOT
 
       - name: 定位 win-unpacked
@@ -275,7 +314,7 @@ jobs:
             Write-Host "缓存目录里没有可用槽，回落重新构建"
           }
 
-          $base = Join-Path (Split-Path $PWD) 'deepseek-harness\apps\desktop\.desktop-build\targets\win-x64'
+          $base = Join-Path $env:HARNESS_ROOT 'apps\desktop\.desktop-build\targets\win-x64'
           # 取**最新**的那个，不用 `Select-Object -First 1`：本机 .desktop-build 会留着
           # 多次构建的 win-unpacked，目录枚举顺序不保证任何东西，取错就会打出旧本体。
           $candidates = @(Get-ChildItem -Path $base -Recurse -Directory -Filter 'win-unpacked' -ErrorAction SilentlyContinue |
@@ -342,12 +381,10 @@ jobs:
         # 三条新检查都只用临时 home / 临时解析目录，不会把待验目录「启动过」，
         # 所以能跟在 verify-portable 后面依次跑。
         shell: pwsh
-        env:
-          # harness 是插件仓的兄弟目录（同「取 deepseek-harness 源码」step 的 Split-Path 结果）。
-          # 用 GitHub 表达式拼路径而不是 pwsh 的 Join-Path/Split-Path —— 少一层本机验不了的语法风险
-          # （这个环境里 psh 工具输出恒为空，pwsh 表达式没法本地试跑）。
-          HARNESS_ROOT: ${{ github.workspace }}/../deepseek-harness
         run: |
+          # harness 根由「取 deepseek-harness 源码」那一步写进 $GITHUB_ENV
+          #（不再是用 GitHub 表达式拼 `github.workspace/../deepseek-harness` ——
+          # 那个位置会让 LibreOffice 载荷越过 MAX_PATH，见那一步的注释）。
           $zip = Join-Path "$env:GITHUB_WORKSPACE\dist" "$env:ZIP_NAME"
           $dest = Join-Path "$env:GITHUB_WORKSPACE" ".desktop-verify"
           Write-Host "解压后再自检: $zip -> $dest"
@@ -372,7 +409,8 @@ jobs:
 
           ### 用法
 
-          1. 解压到**不含中文和空格**的路径
+          1. 解压到**不含中文和空格**的路径（也**别太深**：文档转 PDF 走的是 LibreOffice，
+             它是不认长路径的原生程序 —— 解压目标路径过长时「转 PDF」会失败）
           2. 双击 **启动.cmd**；直接双击 `app\` 里的 exe 也一样 —— 从 v0.2.2 起 exe 会自己
              认出旁边的 `home\`（`resolvePortableDshHome`），配置照样随包走
           3. 首次运行会被 SmartScreen 拦，点「更多信息」→「仍要运行」

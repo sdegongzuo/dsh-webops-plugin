@@ -428,3 +428,57 @@ describe('打包前置：node-addon-system 的 lib 必须先于 package-target.t
     expect(local, '本地前置退化成了「存在才跳过」').not.toMatch(/existsSync\([^)]*node-addon-system[^)]*\)/u)
   })
 })
+
+describe('harness 必须放在短路径下：LibreOffice 载荷会撞 MAX_PATH', () => {
+  // v0.2.8 第二次 CI 失败（run 35954434113 / 35957268005）：上游 0.1.7 新增的 Office→PDF 冒烟里
+  // docx 能过、xlsx 报 `loadComponentFromURL returned an empty reference`、pptx helper 原生崩溃。
+  // 报错全指向 Calc/Impress 的过滤器，实测与字体/内存/载荷损坏都无关 —— 载荷 sha256 与上游
+  // `prebuilds.json` 全量 2051/2051 一致，**同一份载荷在本机三个全过**。
+  //
+  // 真因是路径长度：载荷被放到
+  //   <harness>\apps\desktop\.desktop-build\targets\win-x64\unsigned-artifacts\win-unpacked\
+  //            resources\dsh\node_modules\@deepseek-ai\libreoffice-kit-win32-x64\
+  // 之下，内部相对最长的一条是 84 字符；harness 放插件仓旁边（37 字符）时长到 266 > MAX_PATH(260)。
+  // 本机只改长度就复现同样三连：`node scripts/probe-deep-path.mjs --run`（169 全过 / 181 挂两个）。
+  //
+  // 这三条断言锁的是「别再退回长路径」+「守卫没被顺手删掉」，不是锁某个具体字符数。
+  const workflow = readRepoFile('.github/workflows/release-desktop.yml')
+
+  it('harness 不再放在插件仓旁边，且 harness 根由 GITHUB_ENV 传给后面各步', () => {
+    // 旧写法两个形态都锁死：它们会重新把载荷推过 MAX_PATH，而症状离原因极远。
+    expect(workflow, 'harness 又回到了 `Split-Path $PWD` 旁边（载荷会重新越过 MAX_PATH）')
+      .not.toContain("(Split-Path $PWD) 'deepseek-harness'")
+    expect(workflow, 'harness 又用 GitHub 表达式拼成了 `github.workspace/../deepseek-harness`')
+      .not.toContain('${{ github.workspace }}/../deepseek-harness')
+    expect(workflow, '没有把 harness 根写进 GITHUB_ENV，后面各步会拿到空路径').toContain('HARNESS_ROOT=$dest')
+  })
+
+  it('补的目录联接必须与 package.json 的 `link:../deepseek-harness` 同名', () => {
+    // 本仓 13 个 devDependency 是 `link:../deepseek-harness/...`，本机开发就靠它 ——
+    // 所以 CI 侧只能用联接把老名字接回短路径，不能改 link 目标。
+    expect(workflow, 'CI 不再补目录联接 —— link:../deepseek-harness 会解析不到，装依赖就挂')
+      .toContain('New-Item -ItemType Junction')
+    const linked = Object.values(
+      (JSON.parse(readRepoFile('package.json')) as { devDependencies: Record<string, string> }).devDependencies,
+    ).some(spec => spec.startsWith('link:../deepseek-harness/'))
+    expect(linked, 'link 目标已经不是 ../deepseek-harness，那上面的联接名字也得跟着改').toBe(true)
+  })
+
+  it('守卫排在打包之前，且量的是真实载荷 + 259 上限', () => {
+    const guardCall = workflow.indexOf('check-office-payload-path.mjs')
+    const pkgStep = workflow.indexOf('pnpm run package:win:x64:dir --unsigned')
+    expect(guardCall, 'CI 里没有载荷路径长度守卫').toBeGreaterThan(-1)
+    expect(pkgStep, '找不到打包那一步，锚点失效了').toBeGreaterThan(-1)
+    // 排到打包之后就没用了：越界本身不会让打包失败，只会让 20 分钟后的冒烟报一句指不到原因的话。
+    expect(guardCall, '守卫排在了打包之后 —— 等于没做').toBeLessThan(pkgStep)
+    const step = workflow.slice(workflow.lastIndexOf('- name:', guardCall), pkgStep)
+    expect(step, '守卫没有把失败转成非 0 退出').toContain('if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }')
+
+    const guard = readRepoFile('scripts/check-office-payload-path.mjs')
+    // 259 而不是 260：MAX_PATH 的 260 含结尾 NUL。
+    expect(guard, '上限写错了（应是 MAX_PATH 减 1）').toMatch(/export const LIMIT = 259/u)
+    expect(guard, '守卫没有量真实载荷，等于把长度写死').toContain('longestRelativePath')
+    expect(guard, '守卫找不到载荷时应该放行 —— 否则上游一改布局就把发版堵死')
+      .toContain('跳过路径长度检查')
+  })
+})
