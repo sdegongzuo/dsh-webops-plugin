@@ -112,6 +112,33 @@ const DEVTOOLS_SETTLE_TIMEOUT_MS = 3000
  */
 const CDP_COMMAND_TIMEOUT_MS = 30000
 
+/**
+ * 往 stdout 宣布一条**诊断**行。父进程只认 `type === 'listening'`，其它行原样忽略
+ * （见 `bridge.ts` 的 `parseAnnouncedAddress`），所以加它不动协议。
+ *
+ * 为什么必须有（2026-09-24 加）：CI 上 `verify-browser-host` 连着两次**整 20s 超时、
+ * 宿主一个字节都没输出**，而同一份产物在本机 843ms 就宣布了端口。父进程那句
+ * `the host never announced a port` 分不出三种机制 —— 卡在 shell 的模块加载、
+ * 卡在 `app.whenReady()`、还是只是冷启动慢 —— 修法完全不同。这三条线把三段切开：
+ *
+ *   `host-loaded`  → 脚本已被 require（即 shell 的模块图已加载完、窗口宿主分支走到了）
+ *   `host-ready`   → `app.whenReady()` 落定
+ *   `listening`    → 回环已监听（真正的对外契约）
+ */
+function announce(type) {
+  // 只在**真的跑在 Electron 主进程里**时宣布：这个文件也被单测 require 进来测内联逻辑
+  // （`地址栏（host.cjs 内联逻辑）`），那时往 stdout 写一行会把测试输出弄脏。
+  // `process.type === 'browser'` 正是「我是 Electron 主进程」。
+  if (process.type !== 'browser') return
+  process.stdout.write(`${JSON.stringify({
+    type,
+    pid: process.pid,
+    electron: process.versions.electron,
+  })}\n`)
+}
+
+announce('host-loaded')
+
 /** 标签页；`debugger` 在 `dom-ready` 之后才有。 */
 const tabs = new Map()
 let shell
@@ -752,6 +779,7 @@ app.on('window-all-closed', () => {
 })
 
 app.whenReady().then(() => {
+  announce('host-ready')
   ipcMain.on('dsh-tab-select', (_event, id) => { activateTab(id) })
   ipcMain.on('dsh-tab-close', (_event, id) => { closeTab(id) })
   ipcMain.on('dsh-tab-create', () => { void openTab('about:blank', undefined, { announce: true }) })

@@ -398,6 +398,30 @@ jobs:
           node "$env:GITHUB_WORKSPACE/scripts/verify-browser-host.mjs" --dir "$dest" --out "$env:GITHUB_WORKSPACE/dist/verify-browser-host.png"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
+      - name: 窗口宿主失败后的现场诊断（只在上面失败后跑）
+        # 2026-09-24：`verify-browser-host` 挂在 `the host never announced a port`，而那句话
+        # **分不出三种完全不同的机制**（修法也不同）：
+        #   ① 宿主根本没走到窗口宿主分支（shell 的模块图在 import 期就卡住 —— 分支在那一大堆 import 之后）；
+        #   ② 走到了，但 `app.whenReady()` 一直没落定（runner 的 GPU / 会话问题）；
+        #   ③ 只是冷启动慢（240MB 的 exe + 杀软首扫），bridge 的 20s 不够。
+        # 所以这里单独把宿主拉起来、把输出逐行打时间戳、观察窗口放到 90s，跑**两种坑位**
+        # （包内原路径 / 临时拷贝，后者复刻自检的做法），让下一次失败自带证据。
+        # 本机实测正常时 843ms 就宣布了 listening，差 100 倍必然有原因。
+        if: failure()
+        shell: pwsh
+        run: |
+          $dest = Join-Path "$env:GITHUB_WORKSPACE" ".desktop-verify"
+          $probe = "$env:GITHUB_WORKSPACE/scripts/probe-host-launch.mjs"
+          Write-Host "===== 包内原路径 ====="
+          node $probe --dir "$dest" --timeout 90000
+          Write-Host "===== 临时拷贝（复刻 verify-browser-host）====="
+          node $probe --dir "$dest" --timeout 90000 --tmp-copy
+          # 顺带看有没有上一轮留下的实例（这条链在本 job 里会连起四次 Electron）
+          Get-Process -Name "DeepSeek Harness" -ErrorAction SilentlyContinue |
+            Select-Object Id, ProcessName, CPU, StartTime | Format-Table -AutoSize
+          # 诊断步骤自己不许把结论搅浑：真正的失败在上面那一步已经报过了。
+          exit 0
+
       - name: 写 release 说明
         shell: pwsh
         run: |

@@ -346,23 +346,32 @@ export class ElectronWindowBridge implements TabHostChannel {
       windowsHide: false,
     })
 
-    // stderr 只保留尾部：宿主与页面都可能整生命周期地往 stderr 刷，无界累积就是慢性内存泄漏。
-    // 这里只用于启动失败时的诊断，尾部（崩溃现场就在最后）足够。
-    const STDERR_TAIL_LIMIT = 64 * 1024
-    let stderr = ''
-    child.stderr?.setEncoding('utf8')
-    child.stderr?.on('data', (chunk: string) => {
-      stderr += chunk
-      if (stderr.length > STDERR_TAIL_LIMIT) stderr = stderr.slice(-STDERR_TAIL_LIMIT)
-    })
+    // stdout / stderr 都只保留**尾部**：宿主与页面都可能整生命周期地往这两条管道刷，
+    // 无界累积就是慢性内存泄漏。这里只用于启动失败时的诊断，尾部（崩溃现场就在最后）足够。
+    //
+    // stdout 以前不收（它由 `readAnnouncedAddress` 消费，握手成功就不需要了）。但握手**失败**时
+    // 恰恰是 stdout 最有信息量：宿主自己会宣布 `host-loaded` / `host-ready`（见 host.cjs），
+    // 这两行能把「卡在 shell 的模块加载」「卡在 app.whenReady()」「只是冷启动慢」分开 ——
+    // 2026-09-24 CI 上整 20s 超时、stderr 一个字节都没有，只凭旧回执无从下手。
+    const tails = { stdout: '', stderr: '' }
+    const collect = (stream: NodeJS.ReadableStream | null, key: 'stdout' | 'stderr'): void => {
+      if (stream === null) return
+      stream.setEncoding('utf8')
+      stream.on('data', (chunk: string) => {
+        const next = tails[key] + chunk
+        tails[key] = next.length > STREAM_TAIL_LIMIT ? next.slice(-STREAM_TAIL_LIMIT) : next
+      })
+    }
+    collect(child.stdout, 'stdout')
+    collect(child.stderr, 'stderr')
 
     const handshakeTimeoutMs = options.handshakeTimeoutMs ?? DEFAULT_BRIDGE_HANDSHAKE_TIMEOUT_MS
     const announced = await readAnnouncedAddress(child, handshakeTimeoutMs)
       .catch((error: unknown) => {
         child.kill()
-        const detail = stderr.trim() === '' ? '' : `; host stderr:\n${stderr.trim()}`
         throw new BridgeError(
-          `the Electron window host failed to start: ${error instanceof Error ? error.message : String(error)}${detail}`,
+          `the Electron window host failed to start within ${String(handshakeTimeoutMs)}ms: `
+          + `${error instanceof Error ? error.message : String(error)}${formatHostOutput(tails)}`,
           'BRIDGE_START_FAILED',
         )
       })
@@ -382,10 +391,9 @@ export class ElectronWindowBridge implements TabHostChannel {
       }
     } catch (error: unknown) {
       child.kill()
-      const detail = stderr.trim() === '' ? '' : `; host stderr:\n${stderr.trim()}`
       throw new BridgeError(
         `cannot connect to the Electron window host on port ${String(announced.port)} `
-        + `(tried ${hosts.join(', ')}): ${error instanceof Error ? error.message : String(error)}${detail}`,
+        + `(tried ${hosts.join(', ')}): ${error instanceof Error ? error.message : String(error)}${formatHostOutput(tails)}`,
         'BRIDGE_START_FAILED',
       )
     }
@@ -756,6 +764,28 @@ export class ElectronWindowBridge implements TabHostChannel {
       // 已经断了。
     }
   }
+}
+
+/** 启动诊断保留的 stdout / stderr 尾部上限（字符）。两部分各算一份。 */
+const STREAM_TAIL_LIMIT = 64 * 1024
+
+/**
+ * 把宿主启动失败时的 stdout/stderr 尾部拼成回执后缀。
+ *
+ * 抽成纯函数是为了可单测：这条回执是「宿主起不来」**唯一**的现场证据，而它最容易
+ * 退化成「什么都没说」—— 之前只收 stderr，宿主一个字节都不输出时回执就只剩
+ * `never announced a port`，三种完全不同的机制（模块加载卡住 / `whenReady` 没落定 /
+ * 冷启动慢）看起来一模一样。
+ *
+ * @param tails - 已收集的两条管道尾部。
+ * @returns 以 `; ` 开头的后缀；两条都空时明说「什么都没打印」（而不是留白）。
+ */
+export function formatHostOutput(tails: { readonly stdout: string; readonly stderr: string }): string {
+  const parts: string[] = []
+  if (tails.stdout.trim() !== '') parts.push(`host stdout:\n${tails.stdout.trim()}`)
+  if (tails.stderr.trim() !== '') parts.push(`host stderr:\n${tails.stderr.trim()}`)
+  if (parts.length === 0) parts.push('the host printed nothing at all on stdout or stderr')
+  return `; ${parts.join('; ')}`
 }
 
 /** 宿主宣布的监听地址：`{ type: 'listening', port, host? }`。 */

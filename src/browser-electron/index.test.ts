@@ -8,13 +8,16 @@
 
 import { describe, expect, it, vi } from 'vitest'
 import Module from 'node:module'
+import { readFileSync } from 'node:fs'
 import { createRequire } from 'node:module'
+import { fileURLToPath } from 'node:url'
 import type { ChildProcess } from 'node:child_process'
 import { connect, createServer, type Socket as NetSocket } from 'node:net'
 import { CdpConnection } from '../browser-cdp/protocol.ts'
 import { ElectronWindowBridge } from './bridge.ts'
 import type { BridgeControl, BridgeDevTools, BridgeTab, BridgeTabBar, ControlHolder, ControlListener, EventListener, TabHostChannel, TakeoverListener, TabOpenedListener } from './bridge.ts'
 import { parseAnnouncedAddress, resolveHostLaunch } from './bridge.ts'
+import { formatHostOutput } from './bridge.ts'
 import { ElectronBrowserProvider } from './provider.ts'
 import { WindowCdpSocket } from './socket.ts'
 import { ElectronWindowTransport, tabHandle, tabIdFromHandle } from './transport.ts'
@@ -945,5 +948,32 @@ describe('宿主握手的监听地址（回环兜底的跨进程契约）', () =
   it('非握手行不认（宿主往 stdout 写了别的）', () => {
     expect(parseAnnouncedAddress('{"type":"opened","tabId":"t1"}')).toBeUndefined()
     expect(parseAnnouncedAddress('not json')).toBeUndefined()
+  })
+})
+
+describe('宿主启动失败的现场回执（2026-09-24 补：CI 上整 20s 超时、宿主零输出）', () => {
+  it('两条管道都有内容时分开列出', () => {
+    const detail = formatHostOutput({ stdout: '{"type":"host-loaded"}\n', stderr: 'boom\n' })
+    expect(detail).toContain('host stdout:\n{"type":"host-loaded"}')
+    expect(detail).toContain('host stderr:\nboom')
+  })
+
+  it('只有 stdout 时也报出来（诊断行就在 stdout 上）', () => {
+    const detail = formatHostOutput({ stdout: '{"type":"host-loaded"}\n', stderr: '' })
+    expect(detail).toContain('host stdout:')
+    expect(detail).not.toContain('host stderr:')
+  })
+
+  it('两条都空时明说「什么都没打印」，而不是留白', () => {
+    expect(formatHostOutput({ stdout: '\n', stderr: '  ' }))
+      .toBe('; the host printed nothing at all on stdout or stderr')
+  })
+
+  it('host.cjs 必须宣布 host-loaded / host-ready（这两行是分诊的唯一依据）', () => {
+    // 断言的是「诊断契约」而不是实现：宿主脚本换成别的写法也行，但不能把这两条线丢了 ——
+    // 丢了之后「卡在 shell 模块加载」与「卡在 whenReady」在回执里长得一模一样。
+    const source = readFileSync(fileURLToPath(new URL('./host.cjs', import.meta.url)), 'utf8')
+    expect(source).toContain("announce('host-loaded')")
+    expect(source).toContain("announce('host-ready')")
   })
 })
