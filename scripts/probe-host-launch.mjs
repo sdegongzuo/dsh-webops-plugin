@@ -34,6 +34,88 @@ import { cpSync, existsSync, mkdtempSync, readdirSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 
+/**
+ * 读一个进程的「未捕获异常框」文本（Windows）。Electron 的错误框是原生对话框，
+ * **异常消息与调用栈就在里面**，而 Node 拿不到窗口文本，所以借 PowerShell：
+ *
+ *   1. 先走 **UI Automation** —— Electron 那个框是 TaskDialog 风格，消息文本不在普通子控件里
+ *      （2026-09-24 实测：Win32 枚举只读得到「确定」按钮），UIA 才看得到 Text 元素；
+ *   2. UIA 什么都读不到时，退回 Win32 `EnumChildWindows` 兜底。
+ *
+ * 脚本走 `-EncodedCommand`（base64 的 UTF-16LE），免得跟引号打架；
+ * 读不到不算失败，只是少一条证据。
+ *
+ * @param pid - 目标进程号。
+ * @returns 文本行；读不到就返回空数组。
+ */
+function dumpDialogTexts(pid) {
+  if (process.platform !== 'win32') return []
+  const script = `
+$ErrorActionPreference = 'Stop'
+try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch {}
+$target = ${String(pid)}
+$out = New-Object System.Collections.ArrayList
+try {
+  Add-Type -AssemblyName UIAutomationClient
+  Add-Type -AssemblyName UIAutomationTypes
+  $root = [System.Windows.Automation.AutomationElement]::RootElement
+  $cond = New-Object System.Windows.Automation.PropertyCondition(
+    [System.Windows.Automation.AutomationElement]::ProcessIdProperty, $target)
+  $wins = $root.FindAll([System.Windows.Automation.TreeScope]::Children, $cond)
+  foreach ($w in $wins) {
+    [void]$out.Add('UIA WINDOW: ' + $w.Current.Name)
+    $all = $w.FindAll([System.Windows.Automation.TreeScope]::Descendants,
+      [System.Windows.Automation.Condition]::TrueCondition)
+    foreach ($e in $all) {
+      $n = $e.Current.Name
+      if ($n) { [void]$out.Add('  ' + $e.Current.ControlType.ProgrammaticName + ': ' + $n) }
+    }
+  }
+} catch { [void]$out.Add('UIA 失败: ' + $_.Exception.Message) }
+if ($out.Count -eq 0) {
+  try {
+    Add-Type -TypeDefinition @'
+using System;
+using System.Text;
+using System.Runtime.InteropServices;
+public class DshWinDump {
+  public delegate bool EnumProc(IntPtr hWnd, IntPtr lParam);
+  [DllImport("user32.dll")] public static extern bool EnumWindows(EnumProc cb, IntPtr p);
+  [DllImport("user32.dll")] public static extern bool EnumChildWindows(IntPtr h, EnumProc cb, IntPtr p);
+  [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetWindowTextW(IntPtr h, StringBuilder s, int n);
+  [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
+}
+'@
+    $found = New-Object System.Collections.ArrayList
+    $visit = [DshWinDump+EnumProc]{
+      param($h, $l)
+      $owner = 0
+      [void][DshWinDump]::GetWindowThreadProcessId($h, [ref]$owner)
+      if ($owner -eq $target) {
+        $inner = [DshWinDump+EnumProc]{
+          param($c, $l2)
+          $sb = New-Object System.Text.StringBuilder 16384
+          [void][DshWinDump]::GetWindowTextW($c, $sb, 16384)
+          if ($sb.Length -gt 0) { [void]$found.Add('WIN32 TEXT: ' + $sb.ToString()) }
+          return $true
+        }
+        [void][DshWinDump]::EnumChildWindows($h, $inner, [IntPtr]::Zero)
+      }
+      return $true
+    }
+    [void][DshWinDump]::EnumWindows($visit, [IntPtr]::Zero)
+    foreach ($t in $found) { [void]$out.Add($t) }
+  } catch { [void]$out.Add('Win32 兜底也失败: ' + $_.Exception.Message) }
+}
+foreach ($line in $out) { Write-Output $line }
+`
+  const encoded = Buffer.from(script, 'utf16le').toString('base64')
+  const result = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-EncodedCommand', encoded],
+    { encoding: 'utf8', windowsHide: true, timeout: 60_000 })
+  if (result.error !== undefined) return []
+  return String(result.stdout ?? '').split(/\r?\n/u).map(line => line.trimEnd()).filter(line => line.trim() !== '')
+}
+
 const args = process.argv.slice(2)
 const readArg = (name) => {
   const at = args.indexOf(`--${name}`)
@@ -43,7 +125,7 @@ const has = (name) => args.includes(`--${name}`)
 
 const packageRoot = resolve(readArg('dir') ?? '')
 if (readArg('dir') === undefined) {
-  console.error('用法: node scripts/probe-host-launch.mjs --dir <解压后的便携包根目录> [--timeout 60000] [--tmp-copy]')
+  console.error('用法: node scripts/probe-host-launch.mjs --dir <包根> [--timeout 60000] [--tmp-copy] [--host <宿主脚本>] [--exe <主 exe>]')
   process.exit(1)
 }
 const timeoutMs = Number(readArg('timeout') ?? 60_000)
@@ -65,7 +147,7 @@ if (has('tmp-copy')) {
   pluginDir = join(scratch, 'node_modules', 'dsh-webops-plugin')
   cpSync(packagedPluginDir, pluginDir, { recursive: true })
 }
-const hostScript = join(pluginDir, 'lib', 'browser-electron', 'host.cjs')
+const hostScript = readArg('host') ?? join(pluginDir, 'lib', 'browser-electron', 'host.cjs')
 
 console.log('=== 窗口宿主现场诊断 ===')
 console.log(`坑位       : ${has('tmp-copy') ? '临时拷贝（复刻自检）' : '包内原路径'}`)
@@ -159,13 +241,31 @@ if (outLines.length === 0 && marks['host-loaded'] === undefined) {
 if (alive && marks['host-loaded'] !== undefined && marks['host-ready'] === undefined) {
   console.log('  · 走到了宿主脚本但 whenReady 没落定 → 指向 runner 的 GUI/会话，而不是我们的代码')
 }
+let windowTitle
 if (alive && process.platform === 'win32') {
   // 冻住 vs 忙等：CPU 时间为 0 说明进程被挂起（杀软扫描 / SmartScreen），不为 0 说明它在干活。
+  // 顺带取最后一列「Window Title」—— Electron 的未捕获异常框标题恒为 `Error`，是最硬的指纹。
   const row = spawnSync('tasklist', ['/FI', `PID eq ${String(child.pid)}`, '/V', '/FO', 'CSV', '/NH'],
     { encoding: 'utf8', windowsHide: true })
   const line = String(row.stdout ?? '').trim().split(/\r?\n/u)[0] ?? ''
   if (line !== '') console.log(`tasklist /V ：${line}`)
+  // CSV 里字段都用双引号包着：`"a","b",…,"窗口标题"`。
+  const fields = line.replace(/^"|"$/gu, '').split('","')
+  windowTitle = fields.at(-1)
 }
+
+// 没宣布 + 还活着 + 窗口标题是 `Error` = Electron 给主进程未捕获异常弹的**模态**框。
+// 它在原生层阻塞进程，**并且不往 stderr 写一个字** —— 2026-09-24 本机用故意抛错的宿主脚本
+// 复刻过：stderr 只有 NODE_OPTIONS 警告，框的标题就叫 `Error`，进程 CPU 为 0、不退。
+// 所以那句报错只能从窗口里读：这里 P/Invoke 枚举该进程的窗口与子控件，把静态文本
+// （= 异常消息 + 调用栈）打出来。读不到不算失败，只是没有额外证据。
+if (alive && process.platform === 'win32' && windowTitle === 'Error') {
+  console.log('  · 窗口标题是 `Error` → 读它的内容（Electron 的未捕获异常框）')
+  const texts = dumpDialogTexts(child.pid)
+  if (texts.length === 0) console.log('    （枚举不到文本；框可能已被关掉或权限不足）')
+  for (const text of texts) console.log(`    ${text}`)
+}
+
 if (child.exitCode === null) child.kill()
 if (scratch !== undefined) rmSync(scratch, { recursive: true, force: true })
 process.exit(0)
