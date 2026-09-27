@@ -174,15 +174,29 @@ jobs:
           $notes | Out-File -FilePath dist/notes.md -Encoding utf8
 
       - name: 发布 Release
+        # **幂等**：理由同 `release-desktop.yml` 的同名步骤 —— `gh release create` 撞上
+        # 「同名 Release 已存在」会 exit 1，哪怕这一步之前的构建全都成功了（症状极具误导性）。
+        # 已存在时不新建，改为把终态对齐（覆盖两个附件 / 更新说明与标题 / 确保已发布）。
         shell: pwsh
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           # 显式列出两个附件，不用 `dist/*.zip` 通配 —— 万一以后 dist/ 里多出别的 zip，
           # 通配会把不相干的文件一起传上去。
-          $pluginZip = Join-Path dist "$env:PLUGIN_ZIP_NAME"
-          $updateZip = Join-Path dist "$env:UPDATE_ZIP_NAME"
-          gh release create "$env:TAG" `
-            --title "$env:TAG" `
-            --notes-file dist/notes.md `
-            $pluginZip $updateZip
+          $pluginZip = Join-Path "$env:GITHUB_WORKSPACE\dist" "$env:PLUGIN_ZIP_NAME"
+          $updateZip = Join-Path "$env:GITHUB_WORKSPACE\dist" "$env:UPDATE_ZIP_NAME"
+          foreach ($f in @($pluginZip, $updateZip)) {
+            if (-not (Test-Path $f)) { Write-Error "找不到待发布的产物：$f"; exit 1 }
+          }
+
+          gh release view "$env:TAG" *> $null
+          if ($LASTEXITCODE -eq 0) {
+            Write-Host "Release $env:TAG 已存在 —— 覆盖上传产物并更新说明（不新建）。"
+            gh release upload "$env:TAG" $pluginZip $updateZip --clobber
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            gh release edit "$env:TAG" --title "$env:TAG" --notes-file dist/notes.md --draft=false
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            Write-Host "已对齐：附件为本次生成的两个 zip。"
+          } else {
+            gh release create "$env:TAG" --title "$env:TAG" --notes-file dist/notes.md $pluginZip $updateZip
+          }
