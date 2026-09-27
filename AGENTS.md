@@ -100,6 +100,10 @@ Electron 可执行文件）统一经 `scripts/local-env.mjs` 取；值写在仓�
   被 Actions 接受、`ref:` 确实来自输入、小结在失败路径也执行，而**零副作用**。
   拿已存在的 tag 当试验品会一路构建完并命中 `gh release upload --clobber`，
   把**已发布**的附件重传一遍（2026-09-27 在 `desktop-v0.2.9` 上真付过这个代价）。
+  ⚠️ 这种负向 run 的红叉**挂在被 dispatch 的 ref 的 HEAD 上**（commit 旁一个红叉，
+  容易被读成「修复没生效」）⇒ 验完把 run 删掉，或从**一次性分支** dispatch。
+  红在 checkout 且只有 `The process 'git.exe' failed with exit code 1`、**没有任何 git 文本**是正常的：
+  git 对「wildcard refspec 零匹配」静默 exit 1，checkout@v5 只回传退出码 —— 别怀疑认证/网络。
 - **只在打包态复现的 bug，自检必须跑打包态运行时**；开发态跑绿不算数。
 - **新断言必须反向验证**：故意改坏一处，确认 `exit=1`，再改回并复验绿。装饰性的断言等于没有。
 - **判「开发态脚本设的变量 → 打包态必然 bug」**：翻 `scripts/dev-desktop.mjs` 的每行 `environment.X`，
