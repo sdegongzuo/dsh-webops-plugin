@@ -121,6 +121,24 @@ let appDir = readArg('app')
  */
 const STAGE = resolve(readArg('stage') ?? join(BUILD_ROOT, '.desktop-stage'))
 
+/**
+ * 构建期残留：**不该进交付物**的文件名（相对 `app/`）。
+ *
+ * 上游打包链在 electron-builder 之后还会跑一步 smoke（`scripts/package-target.ts` →
+ * `smoke-packaged-runtime.ts` → `smoke-runtime.ts`），它**真启动**一次产物里的 exe
+ * 来验证「打包后能起得来」。本机那次启动会把 crashpad 的 ERROR 落成 **exe 同目录的
+ * `debug.log`**（Electron 在 Windows GUI 模式、没有有效 stderr 时写这里），
+ * 随后被当作产物的一部分拷进缓存槽 → 进包。
+ *
+ * 实测：0.1.7 系列的四个本地包全带它，`0.1.6-alpha.2` 的没有（边界正是上游 0.1.7
+ * 给链上补的那步 smoke）；CI 侧不产生（推断是本机特有的环境行为，未在 CI 直接取证）。
+ * 它只是构建机日志、没有任何功能作用 —— 交付物里不该有。
+ *
+ * 它在 `app/` 根下、**不在 `app.asar` 里**，所以按文件名剔即可（不必进 asar 内部）。
+ * `verify-portable.mjs` 里有对应断言守着这条，别只在这里删而让断言失效。
+ */
+const RUNTIME_RESIDUE = ['debug.log']
+
 /** 把错误压成一行。垫片抛的 `Error` **没有 `error.code`**，所以不能只看 code（见 `removeTree`）。 */
 function describeError(error) {
   const kind = error.code ?? error.constructor?.name ?? 'Error'
@@ -511,6 +529,29 @@ mkdirSync(STAGE, { recursive: true })
 // 1) 应用本体
 cpSync(appDir, join(STAGE, 'app'), { recursive: true })
 console.log('  + app/')
+
+// 1.1) 剔掉构建期残留（见上面 `RUNTIME_RESIDUE` 的说明）。
+//      放在这里而不是「打包完再筛」：zip 是从 STAGE 压的，所以在这之后 STAGE 就是交付内容的
+//      唯一来源；早剔一步，后面所有步骤看到的都是干净的树。
+for (const residue of RUNTIME_RESIDUE) {
+  const target = join(STAGE, 'app', residue)
+  if (existsSync(target)) {
+    rmSync(target, { force: true })
+    console.log(`  - app/${residue}（构建期残留，已剔除）`)
+  }
+}
+// 剔除后确认 —— 这是「交付内容」的契约：`RUNTIME_RESIDUE` 里列的一律不许出现在产物里。
+//
+// 为什么不把这条放在 `verify-portable.mjs`：那个自检也会被喂**启动过的测试目录**
+// （`portable-test`，那里本来就有 `debug.log`，属正常现象），加在那里会变成持续假红；
+// 而 AGENTS.md 明确记着「那个固定目录喂 verify:portable 会全绿」，不该破坏。
+// 契约守在这里就够了：zip 是从这个 STAGE 压的，STAGE 干净 ⇒ 产物干净。
+const leftover = RUNTIME_RESIDUE.filter(name => existsSync(join(STAGE, 'app', name)))
+if (leftover.length > 0) {
+  console.error(`package-desktop-portable: 构建期残留剔除失败，暂存目录里仍有：${leftover.join('、')}`)
+  console.error(`  位置：${join(STAGE, 'app')}`)
+  process.exit(1)
+}
 
 // 2) profile：官方模板 + 本插件
 //    dependencies 必须是**精确版本**（project-manager.ts:160-162 会校验），
