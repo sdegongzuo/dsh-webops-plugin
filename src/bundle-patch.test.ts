@@ -544,11 +544,20 @@ describe('发布链的身份契约：签出哪个 ref、版本对不对得上、
       .not.toContain('pnpm test')
   })
 
-  it.each(files)('%s：同一个 ref 上不并跑两个 run', (file) => {
+  it.each(files)('%s：并发组按「这次要发哪个 tag」分组，不能只按 github.ref', (file) => {
     const workflow = yamlBody(readRepoFile(file))
-    expect(workflow, '没有 concurrency 块 —— 同一个 ref 重推会让两个 run 同时 `gh release upload --clobber` 抢同一份附件')
+    expect(workflow, '没有 concurrency 块 —— 两个 run 会同时 `gh release upload --clobber` 抢同一份附件')
       .toContain('cancel-in-progress: false')
-    expect(workflow, 'concurrency 的分组键没了，两个 workflow 之间会互相排队').toContain('group: ${{ github.workflow }}-')
+    const m = workflow.match(/^ {2}group: (\$\{\{ github\.workflow \}\}.+)$/m)
+    expect(m, 'concurrency 的 group 行没了（或不再以 `${{ github.workflow }}-` 开头）').not.toBeNull()
+    const group = m![1]
+    // 2026-09-27 实测：`group: …-${{ github.ref }}` 看着像分组，其实**拦不住**要防的那次冲突 ——
+    // tag push 的 ref 是 `refs/tags/desktop-v0.2.9`，在 main 上 dispatch 补发**同一个**版本时是
+    // `refs/heads/main`，两个键不同 ⇒ 两条链并跑、同时 `--clobber` 同一份 release 的附件。
+    expect(group, '分组键只用了 github.ref —— dispatch 与 tag push 会落到不同组，等于没分组')
+      .not.toContain('github.ref }}')
+    expect(group, '分组键没引用 inputs —— 手动补发与 tag push 落不到同一组，照样会并跑')
+      .toContain('inputs.')
   })
 
   it.each(files)('%s：四个 action 都不在 node20 时代的大版本上', (file) => {

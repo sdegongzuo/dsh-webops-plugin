@@ -26,11 +26,14 @@ on:
 permissions:
   contents: write
 
-# 理由同 `release-desktop.yml` 的同名块：同一个 ref 上不并跑两个 run（会同时
+# 理由同 `release-desktop.yml` 的同名块：同一个**要发的 tag**上不并跑两个 run（会同时
 # `gh release upload --clobber` 抢同一份附件）；后来者排队等而不是把前一个打断，
 # 因为 `--clobber` 是「先删旧资产再上传」，打断可能留下一份缺附件的公开 Release。
+# ⚠️ 键**不能只用 `github.ref`**：tag push 是 `refs/tags/v0.1.0`，在 main 上 dispatch 补发
+# 同一个 tag 时是 `refs/heads/main` —— 两个键不同就等于没分组。这里与 `env.TAG` 用同一个
+# 表达式，保证 push 与 dispatch 落同一组；不同 tag 仍是不同组，可以并行。
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
   cancel-in-progress: false
 
 env:

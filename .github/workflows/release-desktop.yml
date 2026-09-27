@@ -51,10 +51,15 @@ permissions:
 # 抢同一份附件。`cancel-in-progress: false` = 后来者**排队等**，而不是把前一个打断：
 # 本仓是公开仓库，而 `--clobber` 是「先删旧资产再上传」，打断有可能留下一份
 # **没有可下载资产**的公开 Release（下一次 run 会对齐，但没必要冒这个险 —— 等待只是慢）。
-# 分组键用 `github.ref`：推不同 tag 落在不同组，互不影响；`workflow_dispatch` 的分组是所选分支。
 # 想改成「后来者胜、旧 run 立刻取消」，把 false 改 true 即可（一句话）。
+#
+# ⚠️ 分组键**不能只用 `github.ref`**（2026-09-27 实测修正）：tag push 时它是
+# `refs/tags/desktop-v0.2.9`，而在 main 上手动 dispatch 补发**同一个**版本时它是
+# `refs/heads/main` —— 两个键不同 ⇒ 等于没分组，两条链会并跑抢**同一份** release 的附件
+# （正是本块要防的场景；当天只是碰巧没重叠）。所以键要按「这次要发哪个 tag」算，
+# 与 `env.TAG` 用同一个表达式 ⇒ push 与 dispatch 落同一组；不同版本仍是不同组，可并行。
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.event_name == 'workflow_dispatch' && format('desktop-v{0}', inputs.version) || github.ref_name }}
   cancel-in-progress: false
 
 env:
