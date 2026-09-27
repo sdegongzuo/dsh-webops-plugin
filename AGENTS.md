@@ -95,6 +95,11 @@ Electron 可执行文件）统一经 `scripts/local-env.mjs` 取；值写在仓�
   没有 harness 的构建产物（`@deepseek-ai/*` 的 `main`/`types` 都指向被 gitignore 的 `lib/`），
   跑必然炸（实测 35×TS2307）。要 CI 门禁就**另起一个不阻塞发布的 workflow**，见
   `docs/打包与发版.md` §10 第 1 条。⇒ **推 tag 前本机必跑 `pnpm typecheck` + `pnpm test`**。
+- **改完发布 workflow 想「真跑一遍」，别拿已存在的 tag 试**：`workflow_dispatch` 一个**不存在**的
+  tag/版本（如 `-f version=9.9.9`）让它停在签出/版本断言处 —— 能验 YAML 与 `concurrency` 表达式
+  被 Actions 接受、`ref:` 确实来自输入、小结在失败路径也执行，而**零副作用**。
+  拿已存在的 tag 当试验品会一路构建完并命中 `gh release upload --clobber`，
+  把**已发布**的附件重传一遍（2026-09-27 在 `desktop-v0.2.9` 上真付过这个代价）。
 - **只在打包态复现的 bug，自检必须跑打包态运行时**；开发态跑绿不算数。
 - **新断言必须反向验证**：故意改坏一处，确认 `exit=1`，再改回并复验绿。装饰性的断言等于没有。
 - **判「开发态脚本设的变量 → 打包态必然 bug」**：翻 `scripts/dev-desktop.mjs` 的每行 `environment.X`，
