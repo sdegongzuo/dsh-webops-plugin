@@ -47,6 +47,16 @@ on:
 permissions:
   contents: write
 
+# 同一个 tag 被重推时，别让两个 run 并跑 —— 它们会同时 `gh release upload --clobber`
+# 抢同一份附件。`cancel-in-progress: false` = 后来者**排队等**，而不是把前一个打断：
+# 本仓是公开仓库，而 `--clobber` 是「先删旧资产再上传」，打断有可能留下一份
+# **没有可下载资产**的公开 Release（下一次 run 会对齐，但没必要冒这个险 —— 等待只是慢）。
+# 分组键用 `github.ref`：推不同 tag 落在不同组，互不影响；`workflow_dispatch` 的分组是所选分支。
+# 想改成「后来者胜、旧 run 立刻取消」，把 false 改 true 即可（一句话）。
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
 env:
   # 默认 pin 到与本机 checkout 一致的提交，避免上游 main 漂移把构建搞挂。
   # 477b4f4205 = tag `dsh-v0.1.7-rc.2`。之所以必须跟着上游走：
@@ -73,7 +83,15 @@ jobs:
         # 产物内 package.json 的 version 全指向旧版本号），正是本仓最忌讳的「名实不符」。
         # 写成 `ref:` 之后两条路径同构：push 时 `env.TAG == github.ref_name`（同一个 tag），
         # dispatch 时就是输入的那个 tag；顺带让下面那条版本断言改成对**该 tag 的** package.json 生效。
-        uses: actions/checkout@v4
+        # actions 的版本口径（2026-09-27）：**取「最小的大版本」= 清掉 Node 20 弃用告警、
+        # 又不引入多余行为变更**。这里四个 action 的 `@v4` 在 `action.yml` 里声明的都是
+        # `runs.using: node20`，runner 现在把 node20 强制升到 node24 跑并报
+        # 「Node.js 20 is deprecated」；**最小**已声明 node24 的大版本恰好都是 v5。
+        # 升到 v6/v7 也能清告警，但那是额外行为变更，该当独立一次改动做。
+        # 输入项已逐个核过 v5 仍在：checkout 的 `ref`/`fetch-depth`、pnpm 的 `version`、
+        # setup-node 的 `node-version`/`cache`、cache 的 `path`/`key`。
+        # ⚠️ 这条告警**与插件无关**：它说的是这几个 action 自己的运行时，不是产物里的 Node。
+        uses: actions/checkout@v5
         with:
           ref: ${{ env.TAG }}
 
@@ -91,10 +109,10 @@ jobs:
           if ($pkg -ne $version) { throw "版本不一致：tag=$version package.json=$pkg —— 先把 package.json 的版本提上去（并推一个提交）再打 tag" }
 
       - name: 装 pnpm + Node
-        uses: pnpm/action-setup@v4
+        uses: pnpm/action-setup@v5
         with:
           version: 11.12.0
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
           node-version: 22
           cache: pnpm
@@ -195,6 +213,26 @@ jobs:
         # 不必等 120 分钟的 dsh 打包跑完才报。
         run: pnpm install --no-frozen-lockfile
 
+      - name: 静态检查 + 单测（发布前门禁）
+        # 为什么要有：这两个 workflow 此前**一步测试都不跑** —— 插件包可以在单测全红的情况下
+        # 发出去。四道自检（verify:portable / ptc / settings / browser-host）只证
+        # 「包结构 + 生产链」，证不了「代码本身没回归」；单测才是那道网。
+        # 成本很低（本机 typecheck 7s、564 条单测 30s），放在构建之前，失败就不必再烧 20 分钟。
+        #
+        # ⚠️ 必须**逐命令转嫁退出码**：pwsh 默认不会因为原生命令非 0 就中断，
+        # 而 GitHub 只在脚本末尾补一次「以末条命令的退出码结束」—— 于是
+        # `pnpm typecheck` 挂了、`pnpm test` 过了，这一步会被判成**绿的**（真栽过这个坑）。
+        #
+        # ⚠️ `src/bundle-patch.test.ts` 会**读 workflow YAML 本身**做断言（harness 短路径、
+        # GITHUB_ENV、载荷守卫……）—— 改完 workflow 一定要在本机重跑 `pnpm test`，
+        # 否则这条门禁会在 CI 上替你把改动挡回来。
+        shell: pwsh
+        run: |
+          pnpm typecheck
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          pnpm test
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
       - name: 构建插件
         run: pnpm build
 
@@ -229,7 +267,7 @@ jobs:
         # 分槽存（`.desktop-base/<版本>/app`），槽位名要构建完才知道，缓存路径没法事先写死。
         # key 里带 HARNESS_REF，所以 harness 一换就是全新缓存条目，不会新旧混着命中。
         id: base-cache
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: .desktop-base
           key: dsh-win-unpacked-${{ runner.os }}-${{ env.HARNESS_REF }}-${{ hashFiles('docs/harness-desktop-build.patch', 'scripts/patch-electron-builder.mjs') }}
@@ -590,3 +628,28 @@ jobs:
           } else {
             gh release create "$env:TAG" --title $title --notes-file dist/notes.md $zip
           }
+
+      - name: 收尾小结（无论成败都写）
+        # 为什么要有：这个 workflow **没有 `upload-artifact`**，失败的 run 在 runner 回收后
+        # 不留任何可下载产物 —— 于是「红」在观感上等于「什么都没出」，而 zip 往往十几分钟前
+        # 就打好了。desktop-v0.2.5 就是被这么误读的（详见 `docs/打包与发版.md` §13）。
+        # 这一步把「产物到底出来没有 + 失败该往哪看」写进 run 的 Summary：几 KB、不占
+        # artifact 配额，同时从根上消灭那个错觉。
+        # 刻意不上传整包本体（412MB）：绿的时候 Release 上本来就有；红的时候真想要那份包，
+        # 再单独加 upload-artifact，不必平时就背着它。
+        if: always()
+        shell: pwsh
+        run: |
+          $lines = @('## 产物与结论', '')
+          $zip = if ($env:ZIP_NAME) { Join-Path "$env:GITHUB_WORKSPACE\dist" "$env:ZIP_NAME" } else { $null }
+          if ($zip -and (Test-Path $zip)) {
+            $f = Get-Item $zip
+            $lines += "- 产物已打好：$($f.Name)（$([math]::Round($f.Length / 1MB, 1)) MB）"
+            $lines += "- sha256：$env:ZIP_SHA256"
+            $lines += ''
+            $lines += "> 若这次 run 显示失败，先看**哪一步**红：只有末步「发布 Release」红才是"
+            $lines += "> 发布动作的问题（见 docs/打包与发版.md §13）；红在构建 / 自检 / 门禁是真失败。"
+          } else {
+            $lines += "- 产物**没产出**（dist 下没有 $env:ZIP_NAME）—— 失败发生在打包之前，是真失败。"
+          }
+          $lines | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8

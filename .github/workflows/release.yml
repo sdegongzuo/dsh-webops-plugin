@@ -26,6 +26,13 @@ on:
 permissions:
   contents: write
 
+# 理由同 `release-desktop.yml` 的同名块：同一个 ref 上不并跑两个 run（会同时
+# `gh release upload --clobber` 抢同一份附件）；后来者排队等而不是把前一个打断，
+# 因为 `--clobber` 是「先删旧资产再上传」，打断可能留下一份缺附件的公开 Release。
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
 env:
   # 默认 pin 到与本机 checkout 一致的提交，避免上游 main 漂移把构建搞挂。
   # 477b4f4205 = tag `dsh-v0.1.7-rc.2`：与 `release-desktop.yml`
@@ -45,7 +52,9 @@ jobs:
         # 分支（默认 main）⇒ 「补发某个已存在的 tag」会变成「拿 main 的代码冒充旧 tag」。
         # ⚠️ 因此 dispatch 的 `tag` 输入**必须带 `v` 前缀**（与推 tag 时的 `github.ref_name` 同形）；
         # 写漏了 checkout 会直接报「找不到该 ref」——这是有意的，比静默发错包好。
-        uses: actions/checkout@v4
+        # actions 版本口径同 `release-desktop.yml`：取**最小**已声明 `runs.using: node24`
+        # 的大版本（v4 声明的都是 node20，runner 强制升 node24 会报弃用告警）。输入项已核过。
+        uses: actions/checkout@v5
         with:
           ref: ${{ env.TAG }}
 
@@ -65,10 +74,10 @@ jobs:
           if ($pkg -ne $version) { throw "版本不一致：tag=$version package.json=$pkg —— 先把 package.json 的版本提上去（并推一个提交）再打 tag" }
 
       - name: 装 pnpm + Node
-        uses: pnpm/action-setup@v4
+        uses: pnpm/action-setup@v5
         with:
           version: 11.12.0
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
           node-version: 22
           cache: pnpm
@@ -99,6 +108,19 @@ jobs:
 
       - name: 装本仓依赖
         run: pnpm install --no-frozen-lockfile
+
+      - name: 静态检查 + 单测（发布前门禁）
+        # 理由同 `release-desktop.yml` 的同名步骤：此前这条发布链**一步测试都不跑**，
+        # 插件包可以在单测全红的情况下发出去。成本 40 秒，放在构建之前。
+        # ⚠️ 必须逐命令转嫁退出码，否则前者挂了、后者过了，这一步会被判成绿的。
+        # ⚠️ `src/bundle-patch.test.ts` 会读 workflow YAML 做断言 —— 改完 workflow
+        # 一定要在本机重跑 `pnpm test`。
+        shell: pwsh
+        run: |
+          pnpm typecheck
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          pnpm test
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: 构建
         run: pnpm build
@@ -222,3 +244,27 @@ jobs:
           } else {
             gh release create "$env:TAG" --title "$env:TAG" --notes-file dist/notes.md $pluginZip $updateZip
           }
+
+      - name: 收尾小结（无论成败都写）
+        # 理由同 `release-desktop.yml` 的同名步骤：没有 `upload-artifact` ⇒ 失败的 run
+        # 不留可下载产物，「红」容易被读成「什么都没出」。这里把两个附件的名字与大小写进
+        # run 的 Summary，几 KB 就能把那个错觉消掉。
+        if: always()
+        shell: pwsh
+        run: |
+          $lines = @('## 产物与结论', '')
+          $any = $false
+          foreach ($name in @($env:PLUGIN_ZIP_NAME, $env:UPDATE_ZIP_NAME)) {
+            if (-not $name) { continue }
+            $f = Join-Path "$env:GITHUB_WORKSPACE\dist" $name
+            if (Test-Path $f) {
+              $item = Get-Item $f
+              $lines += "- 产物已打好：$($item.Name)（$([math]::Round($item.Length / 1KB, 1)) KB）"
+              $any = $true
+            } else {
+              $lines += "- ⚠️ 缺少产物：$name"
+            }
+          }
+          if (-not $any) { $lines += "- 产物**没产出** —— 失败发生在打包之前，是真失败。" }
+          else { $lines += "> 若这次 run 显示失败，先看**哪一步**红：只有末步「发布 Release」红才是发布动作的问题（见 docs/打包与发版.md §13）。" }
+          $lines | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8

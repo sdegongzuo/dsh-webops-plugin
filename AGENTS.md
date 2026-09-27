@@ -89,6 +89,10 @@ Electron 可执行文件）统一经 `scripts/local-env.mjs` 取；值写在仓�
 
 - **自检通过 ≠ 可发版**。四道自检只证「包结构 + 生产链」，证不了状态条可见 / 模型真回话 / 真去调工具。
   没在真机点过一遍，别提发版。
+- **改过 `.github/workflows/*.yml` 就重跑 `pnpm test`**：`src/bundle-patch.test.ts` 会**读 workflow YAML
+  本身**做断言（harness 短路径、`GITHUB_ENV`、载荷守卫、签出哪个 ref、版本断言、门禁步…）。
+  两个 workflow 也都在发布前跑 `pnpm typecheck` + `pnpm test` 当门禁 —— 不本机先跑，
+  CI 会替你把改动挡回来（还白烧一次 tag）。
 - **只在打包态复现的 bug，自检必须跑打包态运行时**；开发态跑绿不算数。
 - **新断言必须反向验证**：故意改坏一处，确认 `exit=1`，再改回并复验绿。装饰性的断言等于没有。
 - **判「开发态脚本设的变量 → 打包态必然 bug」**：翻 `scripts/dev-desktop.mjs` 的每行 `environment.X`，

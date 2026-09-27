@@ -482,3 +482,85 @@ describe('harness 必须放在短路径下：LibreOffice 载荷会撞 MAX_PATH',
       .toContain('跳过路径长度检查')
   })
 })
+
+/**
+ * 发布链的「身份契约」。
+ *
+ * 2026-09-27 补的三道，都属于**同一族**：不报错、不报红，只是**静默产出身份错的包**
+ * （或静默放行回归的代码）。这类东西没有断言就一定会回来，所以照本文件既有口径锁在文本上。
+ *
+ *   1. `actions/checkout` 不写 `ref:` ⇒ 默认行为**只在 `push: tags` 下**等于该 tag；
+ *      `workflow_dispatch` 下它签出的是 UI 里选的那个 ref（默认 main）⇒
+ *      「用来补发某个已存在的 tag」实际是「拿 main 的代码、盖上旧 tag 的版本号」。
+ *   2. `release.yml` 曾缺「tag 版本 == package.json version」断言 —— 而 AGENTS.md 与
+ *      `docs/打包与发版.md` §10 都写着「两个 workflow 的第一步都会校验」。漏了不会报错：
+ *      `--version` 是显式传下去的，打包脚本会拿它**覆盖**产物内 package.json 的 version，
+ *      于是「仓里声明的版本」与「发出去的包」从此对不上。
+ *   3. 两个 workflow 都**一步测试都不跑** ⇒ 单测全红也能发版。
+ *
+ * ⚠️ 断言一律跑在 `yamlBody()`（剥掉整行注释）之上：这一带的说明文字里必然引用
+ * 「错误的写法」，直接对全文断言会被自己的注释喂绿 —— 那就是装饰性断言。
+ */
+describe('发布链的身份契约：签出哪个 ref、版本对不对得上、门禁在不在', () => {
+  const files = ['.github/workflows/release-desktop.yml', '.github/workflows/release.yml'] as const
+  const HARNESS_CLONE = 'git remote add origin https://github.com/deepseek-ai/deepseek-harness.git'
+
+  /** 取 `anchor` 所在那一步的整段（同缩进的兄弟 step 之前为止）。 */
+  function stepBlock(workflow: string, anchor: string): string {
+    const at = workflow.indexOf(anchor)
+    if (at === -1) return ''
+    const next = workflow.indexOf('\n      - ', at)
+    return workflow.slice(workflow.lastIndexOf('- name:', at), next === -1 ? undefined : next)
+  }
+
+  it.each(files)('%s：checkout 显式签出 $env:TAG（否则 dispatch 打的是 main 的代码）', (file) => {
+    const workflow = yamlBody(readRepoFile(file))
+    expect(workflow, 'checkout 没写 `with: ref:` —— workflow_dispatch 会签出 UI 选的分支，而不是输入里的 tag')
+      .toContain('ref: ${{ env.TAG }}')
+  })
+
+  it.each(files)('%s：校验 tag 版本 == package.json version，且排在任何 harness 克隆之前', (file) => {
+    const workflow = yamlBody(readRepoFile(file))
+    expect(workflow, '缺「tag 版本 == package.json version」断言 —— 版本不一致会静默发出「名实不符」的包')
+      .toContain('if ($pkg -ne $version) { throw')
+    // 排到 harness 克隆之后就分辨不出读的是谁家的 package.json 了
+    // （`Get-Content package.json` 在 `Set-Location $dest` 之后读的是 **harness 仓的**）。
+    const assertAt = workflow.indexOf('if ($pkg -ne $version) { throw')
+    expect(workflow.indexOf(HARNESS_CLONE), '找不到 harness 克隆那一步，锚点失效了').toBeGreaterThan(-1)
+    expect(assertAt, '版本断言排在了 harness 克隆之后 —— 那读到的可能是 harness 的 package.json')
+      .toBeLessThan(workflow.indexOf(HARNESS_CLONE))
+  })
+
+  it.each(files)('%s：发布前真的跑门禁，且逐命令转嫁退出码', (file) => {
+    const workflow = yamlBody(readRepoFile(file))
+    const gate = stepBlock(workflow, 'pnpm test')
+    expect(gate, '发布链没跑单测 —— 单测全红也能发版').not.toBe('')
+    expect(gate, '门禁缺 `pnpm typecheck`').toContain('pnpm typecheck')
+    // 只写 `pnpm typecheck\npnpm test` 是不够的：pwsh 默认不因原生命令非 0 而中断，
+    // GitHub 只在脚本末尾补一次「以末条命令的退出码结束」⇒ 前者挂了、后者过了会判成绿的。
+    const hooks = gate.match(/if \(\$LASTEXITCODE -ne 0\) \{ exit \$LASTEXITCODE \}/g) ?? []
+    expect(hooks.length, '门禁没逐命令转嫁退出码（typecheck 挂了、单测过了，这一步会被判成绿的）').toBe(2)
+  })
+
+  it.each(files)('%s：同一个 ref 上不并跑两个 run', (file) => {
+    const workflow = yamlBody(readRepoFile(file))
+    expect(workflow, '没有 concurrency 块 —— 同一个 ref 重推会让两个 run 同时 `gh release upload --clobber` 抢同一份附件')
+      .toContain('cancel-in-progress: false')
+    expect(workflow, 'concurrency 的分组键没了，两个 workflow 之间会互相排队').toContain('group: ${{ github.workflow }}-')
+  })
+
+  it.each(files)('%s：四个 action 都不在 node20 时代的大版本上', (file) => {
+    const workflow = yamlBody(readRepoFile(file))
+    expect(workflow, '连 actions/checkout 都没有？锚点可能失效了').toContain('uses: actions/checkout@v')
+    for (const action of ['actions/checkout', 'actions/setup-node', 'actions/cache', 'pnpm/action-setup']) {
+      const re = new RegExp(`uses: ${action.replace('/', '\\/')}@v(\\d+)`, 'g')
+      for (const match of workflow.matchAll(re)) {
+        // v4 及更早的 `action.yml` 声明 `runs.using: node20`，runner 会强制升到 node24 并报
+        // 「Node.js 20 is deprecated」；**最小**已声明 node24 的大版本是 v5。
+        // ⚠️ 这条告警与插件无关（是 action 自己的运行时），但硬失败迟早会来。
+        expect(Number(match[1]), `${action}@v${match[1]} 声明的是 node20 运行时（>= v5 才是 node24）`)
+          .toBeGreaterThanOrEqual(5)
+      }
+    }
+  })
+})
