@@ -66,7 +66,16 @@ jobs:
 
     steps:
       - name: 签出插件仓
+        # **显式签出 `$env:TAG` 指向的 ref**，不要 checkout 的默认行为。
+        # 默认行为只在 `push: tags` 下正好等于该 tag；而 **`workflow_dispatch` 下签出的是
+        # 你在 UI 里选的那个 ref（默认 main）** —— 于是「用来补发某个已存在的 tag」实际会
+        # 拿 **main 的代码**、盖上**旧 tag 的版本号**发出去（zip 名、profile 里登记的插件版本、
+        # 产物内 package.json 的 version 全指向旧版本号），正是本仓最忌讳的「名实不符」。
+        # 写成 `ref:` 之后两条路径同构：push 时 `env.TAG == github.ref_name`（同一个 tag），
+        # dispatch 时就是输入的那个 tag；顺带让下面那条版本断言改成对**该 tag 的** package.json 生效。
         uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
 
       - name: 校验 tag 版本与 package.json 一致
         # 放最前面（在拉 harness / 装依赖那堆几分钟的步骤之前），5 秒就能给出结论。

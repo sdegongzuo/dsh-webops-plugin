@@ -40,7 +40,29 @@ jobs:
 
     steps:
       - name: 签出本仓
+        # 显式签出 `$env:TAG` 指向的 ref，理由同 `release-desktop.yml` 的同名步骤：
+        # checkout 默认只在 `push: tags` 下等于该 tag，`workflow_dispatch` 会签出 UI 选的
+        # 分支（默认 main）⇒ 「补发某个已存在的 tag」会变成「拿 main 的代码冒充旧 tag」。
+        # ⚠️ 因此 dispatch 的 `tag` 输入**必须带 `v` 前缀**（与推 tag 时的 `github.ref_name` 同形）；
+        # 写漏了 checkout 会直接报「找不到该 ref」——这是有意的，比静默发错包好。
         uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+
+      - name: 校验 tag 版本与 package.json 一致
+        # 与 `release-desktop.yml` 的同名步骤同一条理由（AGENTS.md 也写着「两个 workflow
+        # 第一步都断言」，此前这条只存在于桌面端那个 workflow 里，是个缺口）。
+        # `--version` 是**显式传**下去的，两个打包脚本都会拿它覆盖产物内 package.json 的
+        # version（各脚本末尾的 `const releasePkg = { ...pkg, version }`）。于是「tag 是 v0.2.9
+        # 而本仓 package.json 还停在 0.2.6」不会报任何错，只会让**仓里声明的版本**与
+        # **发出去的包**对不上 —— 之后「这个版本号到底发过没有」就无从判断了。
+        # 因为上面签出的就是该 tag，这里读工作区的 package.json 即「该 tag 的 package.json」。
+        shell: pwsh
+        run: |
+          $version = $env:TAG -replace '^v', ''
+          $pkg = (Get-Content package.json -Raw | ConvertFrom-Json).version
+          Write-Host "tag: $version / package.json: $pkg"
+          if ($pkg -ne $version) { throw "版本不一致：tag=$version package.json=$pkg —— 先把 package.json 的版本提上去（并推一个提交）再打 tag" }
 
       - name: 装 pnpm + Node
         uses: pnpm/action-setup@v4
