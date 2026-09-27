@@ -505,14 +505,6 @@ describe('发布链的身份契约：签出哪个 ref、版本对不对得上、
   const files = ['.github/workflows/release-desktop.yml', '.github/workflows/release.yml'] as const
   const HARNESS_CLONE = 'git remote add origin https://github.com/deepseek-ai/deepseek-harness.git'
 
-  /** 取 `anchor` 所在那一步的整段（同缩进的兄弟 step 之前为止）。 */
-  function stepBlock(workflow: string, anchor: string): string {
-    const at = workflow.indexOf(anchor)
-    if (at === -1) return ''
-    const next = workflow.indexOf('\n      - ', at)
-    return workflow.slice(workflow.lastIndexOf('- name:', at), next === -1 ? undefined : next)
-  }
-
   it.each(files)('%s：checkout 显式签出 $env:TAG（否则 dispatch 打的是 main 的代码）', (file) => {
     const workflow = yamlBody(readRepoFile(file))
     expect(workflow, 'checkout 没写 `with: ref:` —— workflow_dispatch 会签出 UI 选的分支，而不是输入里的 tag')
@@ -531,15 +523,25 @@ describe('发布链的身份契约：签出哪个 ref、版本对不对得上、
       .toBeLessThan(workflow.indexOf(HARNESS_CLONE))
   })
 
-  it.each(files)('%s：发布前真的跑门禁，且逐命令转嫁退出码', (file) => {
+  it.each(files)('%s：发布链里不许出现 `pnpm typecheck` / `pnpm test`（加过、跑不起来）', (file) => {
     const workflow = yamlBody(readRepoFile(file))
-    const gate = stepBlock(workflow, 'pnpm test')
-    expect(gate, '发布链没跑单测 —— 单测全红也能发版').not.toBe('')
-    expect(gate, '门禁缺 `pnpm typecheck`').toContain('pnpm typecheck')
-    // 只写 `pnpm typecheck\npnpm test` 是不够的：pwsh 默认不因原生命令非 0 而中断，
-    // GitHub 只在脚本末尾补一次「以末条命令的退出码结束」⇒ 前者挂了、后者过了会判成绿的。
-    const hooks = gate.match(/if \(\$LASTEXITCODE -ne 0\) \{ exit \$LASTEXITCODE \}/g) ?? []
-    expect(hooks.length, '门禁没逐命令转嫁退出码（typecheck 挂了、单测过了，这一步会被判成绿的）').toBe(2)
+    // 2026-09-27：给两个 workflow 都加过「发布前门禁」，被真实 run（36311263830）打回后回退。
+    // 原因**不是**门禁多余，而是这个环境里根本跑不起来：CI 的全新 checkout 里没有 harness 的
+    // 构建产物 —— 插件 devDependencies 那批 `@deepseek-ai/*` 是 `link:../deepseek-harness/…`，
+    // 而它们的 `package.json` 写的是 `main` → `lib/index.js`、`types` → `lib/types/index.d.ts`，
+    // 两个都是 `tsc -b` / tsdown 的产物、被根 `.gitignore` 的 `lib/` 排除。
+    // 本机因为反复构建一直留着 ⇒ **本机 `typecheck`/`test` 永远绿，CI 上直接炸**
+    // （实测 35×TS2307「Cannot find module '@deepseek-ai/…'」+ 64×TS7006 + 12×TS7031；
+    // `pnpm test` 同理，import 期就挂）。这是「本机通过 ≠ CI 会通过」的又一例。
+    //
+    // 要让它真能跑，得先在发布链里把 harness 的 workspace 产物建出来（clone + 它自己的
+    // `pnpm install` + `build:lib:host`）—— 等于给发布链加一条新的硬依赖，而这条链已经被
+    // 「新增构建期依赖」这一类改动坑过四次。正确做法是**另起一个不阻塞发布的 workflow**。
+    // ⇒ 这两条断言就是钉住这个结论：谁想再塞回来，先让本文件转红、先把上面这段读完。
+    expect(workflow, '发布链里出现了 `pnpm typecheck` —— CI 没有 harness 的构建产物，这一步必然红（详见本文件注释与 workflow 里的说明块）')
+      .not.toContain('pnpm typecheck')
+    expect(workflow, '发布链里出现了 `pnpm test` —— 同上，会在 import 期就挂')
+      .not.toContain('pnpm test')
   })
 
   it.each(files)('%s：同一个 ref 上不并跑两个 run', (file) => {

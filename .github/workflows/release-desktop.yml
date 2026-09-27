@@ -213,25 +213,25 @@ jobs:
         # 不必等 120 分钟的 dsh 打包跑完才报。
         run: pnpm install --no-frozen-lockfile
 
-      - name: 静态检查 + 单测（发布前门禁）
-        # 为什么要有：这两个 workflow 此前**一步测试都不跑** —— 插件包可以在单测全红的情况下
-        # 发出去。四道自检（verify:portable / ptc / settings / browser-host）只证
-        # 「包结构 + 生产链」，证不了「代码本身没回归」；单测才是那道网。
-        # 成本很低（本机 typecheck 7s、564 条单测 30s），放在构建之前，失败就不必再烧 20 分钟。
-        #
-        # ⚠️ 必须**逐命令转嫁退出码**：pwsh 默认不会因为原生命令非 0 就中断，
-        # 而 GitHub 只在脚本末尾补一次「以末条命令的退出码结束」—— 于是
-        # `pnpm typecheck` 挂了、`pnpm test` 过了，这一步会被判成**绿的**（真栽过这个坑）。
-        #
-        # ⚠️ `src/bundle-patch.test.ts` 会**读 workflow YAML 本身**做断言（harness 短路径、
-        # GITHUB_ENV、载荷守卫……）—— 改完 workflow 一定要在本机重跑 `pnpm test`，
-        # 否则这条门禁会在 CI 上替你把改动挡回来。
-        shell: pwsh
-        run: |
-          pnpm typecheck
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          pnpm test
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      # ⚠️ 这里**故意不跑** `pnpm typecheck` / `pnpm test` —— 2026-09-27 加过、被真实 run 打回、
+      # 然后回退。别凭直觉再塞回来，先把下面这段读完。
+      #
+      # CI 的全新 checkout 里**没有 harness 的构建产物**：插件 devDependencies 里那批
+      # `@deepseek-ai/*` 是 `link:../deepseek-harness/…`，而它们的 `package.json` 写的是
+      #   `main` → `lib/index.js`、`types` → `lib/types/index.d.ts`
+      # 两个都是 `tsc -b` / tsdown 的产物，被根 `.gitignore` 的 `lib/` 排除。本机因为反复构建
+      # 一直留着，于是**本机 `typecheck`/`test` 永远是绿的**；全新 checkout 上直接炸 ——
+      # run 36311263830 实测 `pnpm typecheck` 报 **35×TS2307（Cannot find module
+      # '@deepseek-ai/…'）+ 64×TS7006 + 12×TS7031**；`pnpm test` 同理，会在 import 期就挂。
+      #
+      # 所以这不是「加一步门禁」那么便宜：要跑起来得先在本 workflow 里把 harness 的 workspace
+      # 产物建出来（clone + 它自己的 pnpm install + `build:lib:host`），等于给发布链加一条
+      # **新的硬依赖**。而这条链已经被「新增构建期依赖」这一类改动坑过四次（见本文件里几处
+      # 「预热」「守卫」的注释）。
+      # ⇒ 结论：**单测与类型检查维持「推 tag 前本机必跑」**（见 AGENTS.md 自检纪律），不放进发布链。
+      # 真要 CI 门禁，正确做法是**另起一个不阻塞发布的 workflow**（push/PR 触发、自带 harness
+      # 预热），而不是塞进 release-desktop / release。
+      # 这条约束由 `src/bundle-patch.test.ts` 的「发布链的身份契约」锁着。
 
       - name: 构建插件
         run: pnpm build
