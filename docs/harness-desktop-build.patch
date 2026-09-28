@@ -93,7 +93,7 @@ index d406c27235..36bb70f4fb 100644
    if (!inside(appDir, sourceRoot)) {
      // Builder's source matcher slices the appDir prefix even for external FileSets.
 diff --git a/apps/desktop/src/main.ts b/apps/desktop/src/main.ts
-index a59a8a8b35..2fd0eeeacf 100644
+index a59a8a8b35..0c15196585 100644
 --- a/apps/desktop/src/main.ts
 +++ b/apps/desktop/src/main.ts
 @@ -1,7 +1,9 @@
@@ -120,7 +120,7 @@ index a59a8a8b35..2fd0eeeacf 100644
  import { claimDesktopSingleInstance } from './single-instance.ts'
  import { DesktopUpdateCoordinator } from './update-coordinator.ts'
 -import { serveWebDocument, authenticateWebHost, forwardWebRequest } from './web-document.ts'
-+import { serveWebDocument, authenticateLoopbackHost, forwardWebRequest } from './web-document.ts'
++import { serveWebDocument, authenticateLoopbackHost, exchangeProbe, jarProbe, forwardWebRequest } from './web-document.ts'
  import { DesktopFatalRecovery } from './fatal-recovery.ts'
  import { pruneCrashReports, RendererConsoleTail, writeCrashReport, type CrashReportSource } from './crash-report.ts'
  import { openWelcomeWindow } from './welcome-window.ts'
@@ -222,15 +222,23 @@ index a59a8a8b35..2fd0eeeacf 100644
    return { node, nodeBin, pnpm, dsh }
  }
  
-@@ -414,11 +497,20 @@ async function main(): Promise<void> {
+@@ -414,11 +497,28 @@ async function main(): Promise<void> {
      return {
        start: async () => {
          const ready = await host.start()
 -        hostCookie = await authenticateWebHost(ready.url)
 -        hostUrl = ready.url
-+        // 回环兜底：连不上就用另一个回环名再试一次（企业策略常常只放通其中一个），
-+        // 后续所有转发都用同一个名字 —— 见 web-document.ts 的 authenticateLoopbackHost。
-+        const authenticated = await authenticateLoopbackHost(ready.url)
++        // 回环兜底：连不上就换另一个回环名再试（企业策略常常只放通其中一个）。
++        // ⚠️ 判定必须**跨栈**：这个名字既喂给文档转发（Node `fetch`），也通过
++        // `streamBaseUrl` 喂给渲染进程自己的 WebSocket（Chromium 网络栈，读系统代理与
++        // 终端策略）。只按 Node 那条选过，就会出现「文档能打开、事件流永远重连」——
++        // 2026-09-28 实测的现场。所以两条栈都点头的名字才算数，见 web-document.ts 的
++        // WebHostProbe。
++        const authenticated = await authenticateLoopbackHost(ready.url, [
++          jarProbe('net.fetch', (input, init) => net.fetch(input, init),
++            async (url: string) => (await session.defaultSession.cookies.get({ url })).map(cookie => `${cookie.name}=${cookie.value}`).join('; ')),
++          exchangeProbe(),
++        ])
 +        hostCookie = authenticated.cookie
 +        hostUrl = authenticated.url
          if (ready.injections === undefined) throw new Error('Desktop Host did not provide boot injections')
@@ -246,7 +254,20 @@ index a59a8a8b35..2fd0eeeacf 100644
          stopAccount?.()
          const accountBackend = welcomeBackend.account
          stopAccount = accountBackend.watch((state) => {
-@@ -1277,17 +1369,29 @@ async function main(): Promise<void> {
+@@ -662,7 +762,11 @@ async function main(): Promise<void> {
+     return browserGuests.release(event.sender, lease)
+   })
+ 
+-  session.defaultSession.webRequest.onBeforeSendHeaders({ urls: ['ws://127.0.0.1/*'] }, (details, callback) => {
++  // 渲染进程的事件流是自己发起的 WebSocket（不是走 Node 的转发），所以握手 cookie 得由壳注入。
++  // 过滤名单必须覆盖**所有可能被选中的回环名**：兜底可能把 Host 定在 `localhost`（代理只放通
++  // 它），此时旧名单 `ws://127.0.0.1/*` 一条都匹配不上 —— 名字通了却没带上 cookie，握手被拒，
++  // 界面照样停在「重新连接中…」。真正「只喂给被选中的那台」由下面的 `requested.host !== target.host` 保证。
++  session.defaultSession.webRequest.onBeforeSendHeaders({ urls: ['ws://127.0.0.1/*', 'ws://localhost/*', 'ws://[::1]/*'] }, (details, callback) => {
+     if (hostUrl === undefined || hostCookie === undefined || details.webContentsId !== mainWindow?.webContents.id) {
+       callback({})
+       return
+@@ -1277,17 +1381,29 @@ async function main(): Promise<void> {
    publishUpdate(updateState)
  }
  
@@ -321,17 +342,24 @@ index cf03e38c36..878122bcd6 100644
 +  return existsSync(portableHome) ? portableHome : undefined
 +}
 diff --git a/apps/desktop/src/web-document.ts b/apps/desktop/src/web-document.ts
-index a74ea7c7ef..dde5b184b0 100644
+index a74ea7c7ef..0a410e8163 100644
 --- a/apps/desktop/src/web-document.ts
 +++ b/apps/desktop/src/web-document.ts
-@@ -35,6 +35,81 @@ export async function serveWebDocument(request: Request, root: string): Promise<
+@@ -35,16 +35,183 @@ export async function serveWebDocument(request: Request, root: string): Promise<
    })
  }
  
-+/** Authentication exchange failed for reasons that changing the host name cannot fix. */
++/**
++ * The Host's authentication exchange answered with something other than its 303 + cookie.
++ *
++ * 中文备注（本段是本地补丁，非上游原稿）：**带上状态码**。这个类原名下的注释写着「改主机名也修不了」，
++ * 于是调用方一见它就终止换名 —— 但**企业代理会代替 Host 给答复**（实测：对 `127.0.0.1` 回 403、
++ * 对 `localhost` 放行），此时它只说明「这个名字没通过」，仍该换下一个（2026-09-28 事故）。
++ * 状态码留在消息里，是为了让「全试完仍不行」的那条报错自带证据。
++ */
 +export class WebHostAuthenticationError extends Error {
-+  constructor() {
-+    super('Desktop Host authentication failed')
++  constructor(readonly status: number) {
++    super(`Desktop Host authentication failed (HTTP ${String(status)})`)
 +    this.name = 'WebHostAuthenticationError'
 +  }
 +}
@@ -365,11 +393,12 @@ index a74ea7c7ef..dde5b184b0 100644
 +/**
 + * Candidate URLs for `url`, its own host first; non-loopback hosts get no fallback.
 + *
-+ * 中文备注（本段是本地补丁，非上游原稿）：**每个消费者都要拿自己那条传输栈重跑一遍**。
-+ * shell 里有两个独立的 HTTP 客户端 —— 主窗口转发用 Node 的全局 `fetch`，欢迎页用 Electron 的
-+ * `net.fetch`（Chromium 网络栈，读系统代理与终端策略）。同一台机器上「Node 连得上
-+ * `127.0.0.1`、Chromium 连不上」是可能的，所以本函数导出去给两边各自解析，
-+ * 它的结论只在调用方那一条栈上成立，不能跨栈复用。
++ * 中文备注（本段是本地补丁，非上游原稿）：**候选名单是共享的，但「谁算通过」要按栈一起判**。
++ * shell 里有两个独立的 HTTP 客户端 —— 文档转发用 Node 的全局 `fetch`，渲染进程自己的
++ * WebSocket 与欢迎页走 Electron `net.fetch`（Chromium 网络栈，读系统代理与终端策略）。
++ * 同一台机器上「Node 连得上 `127.0.0.1`、Chromium 连不上」是可能的，所以本函数只给候选顺序，
++ * 通过与否由 {@link authenticateLoopbackHost} 拿**每一条要说话的栈**一起判定；名字一旦选出就
++ * 喂给每一条链 —— 只按其中一条选，会得到「文档转得动、事件流永远重连」这种半死不活的状态。
 + */
 +export function loopbackCandidates(url: string): string[] {
 +  let host: string
@@ -378,45 +407,133 @@ index a74ea7c7ef..dde5b184b0 100644
 +  return [url, ...LOOPBACK_HOSTS.filter(candidate => candidate !== host).map(candidate => withHost(url, candidate))]
 +}
 +
++/** 一个 HTTP 客户端要成功拿到 Host 内容所需的签名（Node `fetch` 与 Electron `net.fetch` 同形）。 */
++export type WebHostSend = (input: string, init?: RequestInit) => Promise<Response>
++
 +/**
-+ * Authenticate against whichever loopback host name actually reaches the Host.
++ * One HTTP client that has to be able to reach the chosen Host name.
 + *
-+ * The authentication exchange is already an HTTP round trip, so it doubles as the
-+ * probe: only a failure to **reach** the server moves on to the next candidate; a
-+ * negative answer from the server itself is final (retrying it would only relabel
-+ * it as a connectivity problem).
++ * 中文备注（本段是本地补丁，非上游原稿）：**为什么不是一个布尔而是一个列表**。
++ * 同一次启动里有两条互相独立的栈在同一条回环地址上说话：
++ *   - 文档转发（`forwardWebRequest`）走 Node 的全局 `fetch`；
++ *   - 渲染进程自己的 WebSocket / 事件流走 Chromium（`net.fetch` 同一条网络栈）。
++ * 两条栈对「这个名字通不通」的判断**可以不同**，因为只有 Chromium 那条读系统代理与
++ * 终端策略。2026-09-28 的实测：代理对 `127.0.0.1` 回 403、只放通 `localhost` ——
++ * 当时只按 Node 那条栈选名字，Node 顺利连上 `127.0.0.1`，于是渲染进程被喂了
++ * `ws://127.0.0.1:19387`，浏览器一律走代理吃 403，界面永远停在「重新连接中…」。
++ * ⇒ **名字必须让每一条要说话的栈都点头**；只按其中一条选，等于把另一条的路堵死。
++ */
++export interface WebHostProbe {
++  /** 失败信息里用来指明「是哪条栈不同意」。 */
++  readonly label: string
++  /** 在这条栈上认证候选地址；成功时返回后续请求要带上的 cookie。 */
++  readonly authenticate: (candidate: string) => Promise<string>
++}
++
++/**
++ * Authenticate against whichever loopback host name reaches the Host **on every stack**.
++ *
++ * The authentication exchange doubles as the probe, but **只有「握手成功」才算通** ——
++ * 连不上、被 Host 拒绝、被中间设备（企业代理 / 网关）拒绝，一律换下一个候选再试。
++ * 中文备注（本段是本地补丁，非上游原稿）：这里**不能**把「拿到了否定答复」当终局。
++ * 「服务端给了答复 = 这个名字通了」只在没有中间设备的世界里成立；一旦有企业代理，
++ * 它会**代替** Host 回一个 403 / 407 / 错误页，而「哪个回环名能过代理」正由代理的
++ * bypass 名单决定 —— 那恰恰是换名要试的东西。2026-09-28 的照单：代理对 `127.0.0.1`
++ * 回 403、只放通 `localhost`，而当时这段代码判 `!response.ok` 就抛，等于兜底完全没生效。
++ *
++ * 全部候选都失败时，错误里带上**每个候选各自的原因**（主机名 + 哪条栈 + 状态码 / 传输错误）——
++ * 只有一句笼统的「认证失败」是这次事故难以定位的一半原因。
 + *
 + * @param url - Authenticated URL reported by the owned Host process.
++ * @param probes - Transports that all have to accept the chosen name, in attempt order.
 + * @returns The URL that worked and its cookie — keep the pair together, every later
 + *   request is forwarded to that same host name.
 + */
-+export async function authenticateLoopbackHost(url: string): Promise<{ url: string; cookie: string }> {
-+  let lastError: unknown = new Error('Desktop Host is unreachable')
++export async function authenticateLoopbackHost(
++  url: string,
++  probes: readonly WebHostProbe[] = [exchangeProbe()],
++): Promise<{ url: string; cookie: string }> {
++  const failures: string[] = []
 +  for (const candidate of loopbackCandidates(url)) {
-+    try {
-+      return { url: candidate, cookie: await authenticateWebHost(candidate) }
-+    } catch (error: unknown) {
-+      if (error instanceof WebHostAuthenticationError) throw error
-+      lastError = error
++    const cookies: string[] = []
++    let refused: { probe: WebHostProbe; error: unknown } | undefined
++    for (const probe of probes) {
++      try {
++        cookies.push(await probe.authenticate(candidate))
++      } catch (error: unknown) {
++        refused = { probe, error }
++        break
++      }
 +    }
++    if (refused === undefined) return { url: candidate, cookie: cookies[0] ?? '' }
++    // 只有一个候选时标签是废话；多栈并存时它决定「该去查哪条链」。
++    const label = probes.length > 1 ? `${refused.probe.label}: ` : ''
++    failures.push(`${new URL(candidate).host} → ${label}${describeFailure(refused.error)}`)
 +  }
-+  throw lastError
++  throw new Error(`Desktop Host authentication failed (${failures.join('; ')})`)
++}
++
++/** 失败原因的一句话形式：状态码类只留 `HTTP 403`，其余留原文（含传输层错误消息）。 */
++function describeFailure(error: unknown): string {
++  if (error instanceof WebHostAuthenticationError) return `HTTP ${String(error.status)}`
++  return error instanceof Error ? error.message : String(error)
++}
++
++/**
++ * Probe for a client that carries the cookie on the 303 exchange itself (Node `fetch`).
++ * @param label - Stack name reported in failures.
++ * @param send - Transport of that stack; defaults to the Node global `fetch`.
++ * @returns Probe usable with {@link authenticateLoopbackHost}.
++ */
++export function exchangeProbe(label = 'node fetch', send: WebHostSend = fetch): WebHostProbe {
++  return { label, authenticate: candidate => authenticateWebHost(candidate, send) }
++}
++
++/**
++ * Probe for a client that keeps cookies in its own jar (Chromium `net.fetch`)。
++ *
++ * 这条栈**不接受 303 就算完**：它跟着跳转走到底（`net.fetch` 的默认行为），cookie 由会话
++ * cookie jar 持有。所以判据是「最终响应成功」+「jar 里真拿到了非空 cookie」——后者是必须的，
++ * 因为壳里给渲染进程注入 WS 握手 cookie 用的就是 jar 里那一份；jar 空 = 名字通了也白通。
++ *
++ * @param label - Stack name reported in failures.
++ * @param send - Transport of that stack (Electron `net.fetch`).
++ * @param cookies - Cookie reader for the jar, keyed by the candidate URL.
++ * @returns Probe usable with {@link authenticateLoopbackHost}.
++ */
++export function jarProbe(label: string, send: WebHostSend, cookies: (url: string) => Promise<string>): WebHostProbe {
++  return {
++    label,
++    authenticate: async (candidate) => {
++      const response = await send(candidate, { credentials: 'include' })
++      await response.body?.cancel()
++      if (!response.ok) throw new WebHostAuthenticationError(response.status)
++      const cookie = await cookies(candidate)
++      if (cookie === '') throw new Error('the session stored no cookie for this host name')
++      return cookie
++    },
++  }
 +}
 +
  /**
   * Exchange the Host launch URL for an authority-bound browser cookie.
   * @param url - Authenticated URL reported by the owned Host process.
-@@ -44,7 +119,7 @@ export async function authenticateWebHost(url: string): Promise<string> {
-   const response = await fetch(url, { redirect: 'manual' })
++ * @param send - Transport to authenticate with; defaults to the Node global `fetch`.
+  * @returns Cookie header for requests forwarded to that Host.
+  */
+-export async function authenticateWebHost(url: string): Promise<string> {
+-  const response = await fetch(url, { redirect: 'manual' })
++export async function authenticateWebHost(url: string, send: WebHostSend = fetch): Promise<string> {
++  const response = await send(url, { redirect: 'manual' })
    const cookie = response.headers.get('set-cookie')
    await response.body?.cancel()
 -  if (response.status !== 303 || cookie === null) throw new Error('Desktop Host authentication failed')
-+  if (response.status !== 303 || cookie === null) throw new WebHostAuthenticationError()
++  if (response.status !== 303 || cookie === null) throw new WebHostAuthenticationError(response.status)
    const end = cookie.indexOf(';')
    return end < 0 ? cookie : cookie.slice(0, end)
  }
 diff --git a/apps/desktop/src/welcome-backend.ts b/apps/desktop/src/welcome-backend.ts
-index a0bb4e9440..2bb9579253 100644
+index a0bb4e9440..34c48ab191 100644
 --- a/apps/desktop/src/welcome-backend.ts
 +++ b/apps/desktop/src/welcome-backend.ts
 @@ -2,6 +2,7 @@
@@ -427,7 +544,7 @@ index a0bb4e9440..2bb9579253 100644
  
  /** Metadata needed before the native entry or workspace becomes visible. */
  export interface WelcomeState {
-@@ -29,21 +30,56 @@ function record(value: unknown): value is Record<string, unknown> {
+@@ -29,21 +30,58 @@ function record(value: unknown): value is Record<string, unknown> {
    return typeof value === 'object' && value !== null && !Array.isArray(value)
  }
  
@@ -440,8 +557,11 @@ index a0bb4e9440..2bb9579253 100644
 + * 可以不同。只给主窗口做兜底的结果是：在「只放通 `localhost`」的机器上主窗口正常、
 + * 欢迎页却报 `desktop welcome: Web authentication failed`，因为它还在拿原始名字连。
 + *
-+ * 握手本身就是一次 HTTP 往返，所以它兼任探测：只有**连不上**才换下一个候选；
-+ * 服务端自己给出否定答复是终局（重试只会把它错报成连接问题）。
++ * 握手本身就是一次 HTTP 往返，所以它兼任探测：**只有握手成功才算通** —— 连不上、
++ * 被 Host 拒绝、被中间设备（企业代理 / 网关）拒绝，一律换下一个候选。不能把「拿到了否定答复」
++ * 当终局：企业代理会**代替** Host 回 403 / 407 / 错误页（2026-09-28 实测：代理对 `127.0.0.1`
++ * 回 403、只放通 `localhost`），而「哪个回环名能过代理」正是换名要试的东西。
++ * 全部失败时错误里带上每个候选各自的原因（主机名 + 状态码 / 传输错误）。
 + *
 + * @param hostUrl - URL reported by the owned Host process (token included).
 + * @param send - Transport used by every later welcome request; the probe must share it.
@@ -451,21 +571,20 @@ index a0bb4e9440..2bb9579253 100644
 +  hostUrl: string,
 +  send: (input: string, init?: RequestInit) => Promise<Response>,
 +): Promise<string> {
-+  let lastError: unknown = new Error('desktop welcome: Desktop Host is unreachable')
++  const failures: string[] = []
 +  for (const candidate of loopbackCandidates(hostUrl)) {
-+    let response: Response
++    const host = new URL(candidate).host
 +    try {
-+      response = await send(candidate, { credentials: 'include' })
++      const response = await send(candidate, { credentials: 'include' })
++      await response.body?.cancel()
++      if (response.ok) return new URL(candidate).origin
++      // 「拿到了答复」**不等于**「Host 答复了」—— 见上面的说明，仍要换下一个名字。
++      failures.push(`${host} → HTTP ${String(response.status)}`)
 +    } catch (error: unknown) {
-+      // 这个名字没连上（DNS / 连接被策略拒绝 / 代理拦掉）—— 换下一个。
-+      lastError = error
-+      continue
++      failures.push(`${host} → ${error instanceof Error ? error.message : String(error)}`)
 +    }
-+    await response.body?.cancel()
-+    if (!response.ok) throw new Error('desktop welcome: Web authentication failed')
-+    return new URL(candidate).origin
 +  }
-+  throw lastError
++  throw new Error(`desktop welcome: Web authentication failed (${failures.join('; ')})`)
 +}
 +
  /**
@@ -491,7 +610,7 @@ index a0bb4e9440..2bb9579253 100644
    const invoke = async (request: { namespace: string; method: string; args: Record<string, unknown> }): Promise<unknown> => {
      const rpcId = randomUUID()
      const method = `${request.namespace}/${request.method}`
-@@ -60,7 +96,8 @@ export async function connectDesktopWelcome(
+@@ -60,7 +98,8 @@ export async function connectDesktopWelcome(
      }
      return envelope.result.value
    }
@@ -502,17 +621,20 @@ index a0bb4e9440..2bb9579253 100644
      const settings = await invoke({ namespace: 'settings', method: 'describe', args: {} })
      if (!record(settings) || !Array.isArray(settings.namespaces)) throw new Error('desktop welcome: missing settings namespaces')
 diff --git a/apps/desktop/tests/main-startup.spec.ts b/apps/desktop/tests/main-startup.spec.ts
-index e47edce02d..a806153f94 100644
+index e47edce02d..a46d602a21 100644
 --- a/apps/desktop/tests/main-startup.spec.ts
 +++ b/apps/desktop/tests/main-startup.spec.ts
-@@ -16,7 +16,13 @@ import { writeCrashReport } from '../src/crash-report.ts'
+@@ -16,7 +16,16 @@ import { writeCrashReport } from '../src/crash-report.ts'
  type InvokeEvent = { sender?: unknown; senderFrame: { url: string } }
  type InvokeHandler = (event: InvokeEvent, ...args: unknown[]) => unknown
  
 -vi.mock('../src/web-document.ts', () => ({ authenticateWebHost: async () => 'test-cookie', serveWebDocument: vi.fn(), forwardWebRequest: vi.fn() }))
-+vi.mock('../src/web-document.ts', () => ({
++vi.mock('../src/web-document.ts', async importOriginal => ({
++  ...await importOriginal<typeof import('../src/web-document.ts')>(),
 +  // Loopback fallback returns the host name together with its cookie; the shell
 +  // forwards everything to whichever name actually reached the Host.
++  // 探测工厂（`exchangeProbe` / `jarProbe`）保持真身：它们是纯函数、不需要 Electron，
++  // 而 main.ts 会在调 `authenticateLoopbackHost` **之前**先构造它们。
 +  authenticateLoopbackHost: async (url: string) => ({ url, cookie: 'test-cookie' }),
 +  serveWebDocument: vi.fn(),
 +  forwardWebRequest: vi.fn(),
@@ -520,7 +642,7 @@ index e47edce02d..a806153f94 100644
  // Report persistence has its own unit tests; here it resolves within microtasks so the fatal
  // dialog never outlives the test that triggered it.
  vi.mock('../src/crash-report.ts', async importOriginal => ({
-@@ -298,7 +304,7 @@ vi.mock('node:fs/promises', async (importOriginal) => {
+@@ -298,7 +307,7 @@ vi.mock('node:fs/promises', async (importOriginal) => {
    }) }
  })
  vi.mock('../src/runtime-tree.ts', () => ({ readDesktopRuntime: () => ({ release: { version: '1.0.0' } }) }))
@@ -529,7 +651,19 @@ index e47edce02d..a806153f94 100644
  vi.mock('../src/project-manager.ts', () => ({
    DesktopProjectManager: class {
      readonly applyRelease = harness.applyRelease
-@@ -2030,7 +2036,8 @@ describe('desktop main startup', () => {
+@@ -886,6 +895,11 @@ describe('desktop main startup', () => {
+     await harness.hostStarted.promise
+     harness.hosts[0]!.ready.resolve()
+     await Promise.resolve(invoke(DESKTOP_IPC.boot))
++    // 兜底可能把 Host 定在 `localhost`（代理只放通它），过滤名单必须跟得上 ——
++    // 名单里没有那个名字时，`ws://localhost/...` 一条都匹配不上，cookie 注入不进来，
++    // 握手被拒，界面照样永远「重新连接中…」。
++    const patterns = (harness.socketHeaders.mock.calls[0]![0] as { urls: string[] }).urls
++    expect(patterns).toContain('ws://localhost/*')
+     const handler = harness.socketHeaders.mock.calls[0]![1] as (
+       details: { url: string; webContentsId: number; requestHeaders: Record<string, string> },
+       callback: (result: unknown) => void,
+@@ -2030,7 +2044,8 @@ describe('desktop main startup', () => {
      expect(harness.applyRelease).toHaveBeenCalledTimes(1)
      expect(harness.hosts[0]).toMatchObject({
        node: process.execPath,
@@ -540,7 +674,7 @@ index e47edce02d..a806153f94 100644
        profile: 'desktop-test-profile',
      })
 diff --git a/apps/desktop/tests/web-document.spec.ts b/apps/desktop/tests/web-document.spec.ts
-index 0fd9b591b1..8c8bcb5424 100644
+index 0fd9b591b1..da9b3ab383 100644
 --- a/apps/desktop/tests/web-document.spec.ts
 +++ b/apps/desktop/tests/web-document.spec.ts
 @@ -2,7 +2,7 @@ import { afterEach, expect, it, vi } from 'vitest'
@@ -548,11 +682,11 @@ index 0fd9b591b1..8c8bcb5424 100644
  import { tmpdir } from 'node:os'
  import { join } from 'node:path'
 -import { authenticateWebHost, forwardWebRequest, serveWebDocument } from '../src/web-document.ts'
-+import { authenticateLoopbackHost, authenticateWebHost, forwardWebRequest, serveWebDocument } from '../src/web-document.ts'
++import { authenticateLoopbackHost, authenticateWebHost, exchangeProbe, forwardWebRequest, jarProbe, serveWebDocument } from '../src/web-document.ts'
  
  const roots: string[] = []
  afterEach(async () => {
-@@ -35,6 +35,31 @@ it('requires the Host authentication exchange and retains only its cookie value'
+@@ -35,6 +35,121 @@ it('requires the Host authentication exchange and retains only its cookie value'
    await expect(authenticateWebHost('http://127.0.0.1:1234/')).rejects.toThrow('authentication failed')
  })
  
@@ -572,32 +706,145 @@ index 0fd9b591b1..8c8bcb5424 100644
 +  expect(urls).toEqual(['http://127.0.0.1:19387/?token=owned', 'http://localhost:19387/?token=owned'])
 +})
 +
-+it('does not relabel a rejected authentication handshake as unreachable', async () => {
-+  const fetch = vi.fn().mockResolvedValue(new Response('unauthorized', { status: 401 }))
++it('keeps trying the other loopback name when an intermediary answers on the Host behalf', async () => {
++  // 企业代理**代替** Host 回 403（不是拒绝连接）—— 只放通 `localhost` 的那类终端策略。
++  // `Response.ok` 对 3xx/4xx 都是 false，所以「拿到了答复」不能当成「Host 答复了」。
++  const urls: string[] = []
++  const fetch = vi.fn().mockImplementation(async (input: unknown) => {
++    const url = String(input)
++    urls.push(url)
++    if (url.includes('127.0.0.1')) return new Response('blocked by policy', { status: 403 })
++    return new Response(null, { status: 303, headers: { 'set-cookie': 'session=owned' } })
++  })
 +  vi.stubGlobal('fetch', fetch)
 +
 +  await expect(authenticateLoopbackHost('http://127.0.0.1:19387/?token=owned'))
-+    .rejects.toThrow('authentication failed')
-+  expect(fetch).toHaveBeenCalledTimes(1)
++    .resolves.toEqual({ url: 'http://localhost:19387/?token=owned', cookie: 'session=owned' })
++  expect(urls).toEqual(['http://127.0.0.1:19387/?token=owned', 'http://localhost:19387/?token=owned'])
++})
++
++it('reports what each loopback name answered when none of them works', async () => {
++  const fetch = vi.fn().mockResolvedValue(new Response('unauthorized', { status: 401 }))
++  vi.stubGlobal('fetch', fetch)
++
++  // 全试完仍不行时，报错必须自带证据（主机名 + 状态码）—— 只有一句「认证失败」无从下手。
++  let failure: Error | undefined
++  try {
++    await authenticateLoopbackHost('http://127.0.0.1:19387/?token=owned')
++  } catch (error: unknown) {
++    failure = error as Error
++  }
++  expect(failure).toBeInstanceOf(Error)
++  expect(failure?.message).toContain('127.0.0.1:19387 → ')
++  expect(failure?.message).toContain('localhost:19387 → ')
++  expect(failure?.message.match(/HTTP 401/gu)).toHaveLength(2)
++  expect(fetch).toHaveBeenCalledTimes(2)
++})
++
++it('rejects a loopback name only one transport stack can reach', async () => {
++  // 2026-09-28 现场：Node 那条栈连得上 `127.0.0.1`（它不读企业代理），而 Chromium 那条
++  // （渲染进程自己的 WebSocket、以及欢迎页）被代理回 403。只按 Node 选名字，界面就永远
++  // 停在「重新连接中…」—— 文档转得动、事件流一条也建不起来。
++  const calls: string[] = []
++  const fetch = vi.fn().mockImplementation(async (input: unknown) => {
++    calls.push(`node:${String(input)}`)
++    return new Response(null, { status: 303, headers: { 'set-cookie': 'session=owned' } })
++  })
++  vi.stubGlobal('fetch', fetch)
++  const chromium = vi.fn().mockImplementation(async (input: unknown) => {
++    const url = String(input)
++    calls.push(`net:${url}`)
++    // 代理代替 Host 回 403：拿到答复 ≠ Host 答复了。
++    return url.includes('127.0.0.1') ? new Response('blocked by policy', { status: 403 }) : new Response('app', { status: 200 })
++  })
++  const jars = vi.fn(async () => 'session=owned')
++
++  await expect(authenticateLoopbackHost('http://127.0.0.1:19387/?token=owned', [
++    jarProbe('net.fetch', chromium, jars),
++    exchangeProbe(),
++  ])).resolves.toEqual({ url: 'http://localhost:19387/?token=owned', cookie: 'session=owned' })
++
++  // 被 Chromium 拒掉之后，同一个候选不再浪费一次 Node 请求；换到 `localhost` 两条栈都要点头。
++  expect(calls).toEqual([
++    'net:http://127.0.0.1:19387/?token=owned',
++    'net:http://localhost:19387/?token=owned',
++    'node:http://localhost:19387/?token=owned',
++  ])
++})
++
++it('refuses a name the Chromium stack answered without storing a cookie', async () => {
++  // 名字通了但 jar 是空的 = 壳没有 cookie 可注入 WS 握手，渲染进程照样连不上。
++  const fetch = vi.fn()
++  vi.stubGlobal('fetch', fetch)
++  const chromium = vi.fn(async () => new Response('app', { status: 200 }))
++  const jars = vi.fn(async () => '')
++
++  await expect(authenticateLoopbackHost('http://127.0.0.1:19387/?token=owned', [
++    jarProbe('net.fetch', chromium, jars),
++    exchangeProbe(),
++  ])).rejects.toThrow('the session stored no cookie for this host name')
++  expect(chromium).toHaveBeenCalledTimes(2)
++  expect(fetch).not.toHaveBeenCalled()
++})
++
++it('names the transport stack that refused each loopback name', async () => {
++  vi.stubGlobal('fetch', vi.fn(async () => new Response(null, { status: 303, headers: { 'set-cookie': 'session=owned' } })))
++  const chromium = vi.fn(async () => new Response('blocked by policy', { status: 407 }))
++
++  let failure: Error | undefined
++  try {
++    await authenticateLoopbackHost('http://127.0.0.1:19387/?token=owned', [
++      jarProbe('net.fetch', chromium, async () => 'session=owned'),
++      exchangeProbe(),
++    ])
++  } catch (error: unknown) {
++    failure = error as Error
++  }
++  // 「是哪条栈不同意」必须留在报错里 —— 两条栈的排查方向完全不同。
++  expect(failure?.message).toContain('127.0.0.1:19387 → net.fetch: HTTP 407')
++  expect(failure?.message).toContain('localhost:19387 → net.fetch: HTTP 407')
 +})
 +
  it('forwards upload bytes and cancellation with Host credentials while keeping the response streaming', async () => {
    const body = new ReadableStream({ start(controller) { controller.enqueue(new TextEncoder().encode('stream')); controller.close() } })
    const fetch = vi.fn().mockResolvedValue(new Response(body, { headers: { 'content-encoding': 'gzip', 'set-cookie': 'private' } }))
 diff --git a/apps/desktop/tests/welcome-host.spec.ts b/apps/desktop/tests/welcome-host.spec.ts
-index 3c2066ae34..924c19879e 100644
+index 3c2066ae34..7ee8a726db 100644
 --- a/apps/desktop/tests/welcome-host.spec.ts
 +++ b/apps/desktop/tests/welcome-host.spec.ts
-@@ -90,8 +90,31 @@ describe('desktop welcome Web operations', () => {
+@@ -90,8 +90,53 @@ describe('desktop welcome Web operations', () => {
      await expect(backend.read()).rejects.toThrow('Web RPC failed')
    })
  
 -  it('refuses an unauthenticated Web launch', async () => {
-+  it('refuses an unauthenticated Web launch without trying another host name', async () => {
++  it('keeps trying the next name when an intermediary answers on the Host behalf', async () => {
++    // 代理代替 Host 回 403（`ok === false`）时**不能**当终局 —— 它只说明这个名字没通过。
++    // 2026-09-28 真机照单：代理对 `127.0.0.1` 回 403、对 `localhost` 放行。
++    const attempts: string[] = []
++    const send = vi.fn<Parameters<typeof connectDesktopWelcome>[1]>(async (input) => {
++      attempts.push(input)
++      if (input.includes('127.0.0.1')) return new Response('blocked by policy', { status: 403 })
++      return new Response('index')
++    })
++
++    await expect(connectDesktopWelcome(url, send)).resolves.toBeDefined()
++    expect(attempts).toEqual([url, 'http://localhost:19387/?token=fixture'])
++  })
++
++  it('reports every host name it tried when none of them authenticates', async () => {
      const send = vi.fn<Parameters<typeof connectDesktopWelcome>[1]>(async () => new Response(null, { status: 401 }))
-     await expect(connectDesktopWelcome(url, send)).rejects.toThrow('Web authentication failed')
-+    // 服务端明确拒绝说明这个名字是通的；换名字只会打到别的服务，也会把「被拒」错报成「连不上」。
-+    expect(send).toHaveBeenCalledTimes(1)
+-    await expect(connectDesktopWelcome(url, send)).rejects.toThrow('Web authentication failed')
++    let failure: Error | undefined
++    try {
++      await connectDesktopWelcome(url, send)
++    } catch (error: unknown) {
++      failure = error as Error
++    }
++    expect(failure).toBeInstanceOf(Error)
++    expect(failure?.message).toContain('Web authentication failed')
++    expect(failure?.message).toContain('127.0.0.1:19387 → HTTP 401')
++    expect(failure?.message).toContain('localhost:19387 → HTTP 401')
++    expect(send).toHaveBeenCalledTimes(2)
 +  })
 +
 +  it('falls back to the next loopback name when this transport stack cannot reach the announced one', async () => {
@@ -622,16 +869,22 @@ index 3c2066ae34..924c19879e 100644
    })
  })
 diff --git a/apps/desktop/tests/welcome-startup.spec.ts b/apps/desktop/tests/welcome-startup.spec.ts
-index 7518cc74af..abd4b89743 100644
+index 7518cc74af..62b0b7418a 100644
 --- a/apps/desktop/tests/welcome-startup.spec.ts
 +++ b/apps/desktop/tests/welcome-startup.spec.ts
-@@ -1,4 +1,4 @@
+@@ -1,4 +1,10 @@
 -vi.mock('../src/web-document.ts', () => ({ authenticateWebHost: async () => 'test-cookie', serveWebDocument: vi.fn(), forwardWebRequest: vi.fn() }))
-+vi.mock('../src/web-document.ts', () => ({ authenticateWebHost: async () => 'test-cookie', authenticateLoopbackHost: async (url: string) => ({ url, cookie: 'test-cookie' }), serveWebDocument: vi.fn(), forwardWebRequest: vi.fn() }))
++vi.mock('../src/web-document.ts', async importOriginal => ({
++  ...await importOriginal<typeof import('../src/web-document.ts')>(),
++  authenticateWebHost: async () => 'test-cookie',
++  authenticateLoopbackHost: async (url: string) => ({ url, cookie: 'test-cookie' }),
++  serveWebDocument: vi.fn(),
++  forwardWebRequest: vi.fn(),
++}))
  /** Welcome startup uses the Host before transitioning to the workspace. */
  
  import { afterEach, expect, it, vi } from 'vitest'
-@@ -101,7 +101,7 @@ vi.mock('electron', () => ({
+@@ -101,7 +107,7 @@ vi.mock('electron', () => ({
  // The Windows tray relabels through Menu as well; keep the menu call counts below platform-neutral.
  vi.mock('../src/tray.ts', () => ({ DesktopTray: class { relabel() {} dispose() {} } }))
  
