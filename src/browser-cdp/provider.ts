@@ -2751,14 +2751,48 @@ interface HitTestOutcome {
 }
 
 /**
+ * 「这个元素该怎么自我介绍」的取名片段（P0-a）。
+ *
+ * 用法：`${READABLE_NAME_SNIPPET}` 插在某条页面脚本里当立即执行的箭头函数，
+ * 入参是要取名的元素，返回 ≤60 字的名字，取不到就返回空串。
+ *
+ * **为什么是字符串片段而不是函数**：下面两条脚本跑在**不同**的 `Runtime.evaluate`
+ * 调用里，彼此没有共享作用域，也就没法共用一个具名函数 —— 只能各内联一份。
+ * ⚠️ **改这段等于同时改两处**：两条脚本对同一个物体报出两个不同的名字，
+ * 比都报不出来更糟（模型会以为那是两个东西）。
+ *
+ * **为什么要往上爬祖先链（而不是只读自己）**：真站的浮层常常是「没有 `aria-label`、
+ * 也不是 `[role=dialog]`」的定位容器（知乎登录浮层就是 `DIV.Modal-wrapper`，且它命中时
+ * `[role=dialog]` 的 `closest` 命中数为 0），而**盖住落点的那一层往往没有自己的文本**
+ *（`Modal-backdrop` 就是空的）。只读自己等于把最常见的那种形状丢掉 —— 这正是
+ * P0-a 的实测成因（`docs/上下文膨胀-实施方案.md` §5.2）。
+ *
+ * **为什么有「向上 5 层、且到 `<body>` 为止」的上限**：再往上就在读页面根了，拿回来的是
+ * 整页正文的前 60 字 —— 那不是浮层的名字，是一条比空串更误导的噪声。
+ */
+const READABLE_NAME_SNIPPET = '(el) => {'
+  + ' const labeled = el.getAttribute("aria-label") || el.getAttribute("alt") || "";'
+  + ' if (labeled.trim().length > 0) return labeled.trim().slice(0, 60);'
+  + ' for (let cursor = el, hops = 0;'
+  + '      cursor && cursor.nodeType === 1 && cursor !== document.body && hops < 5;'
+  + '      cursor = cursor.parentElement, hops++) {'
+  + '   const text = String(cursor.textContent || "").replace(/\\s+/g, " ").trim();'
+  + '   if (text.length > 0) return text.slice(0, 60);'
+  + ' }'
+  + ' return "";'
+  + ' }'
+
+/**
  * 落点命中校验：问一句「这个视口坐标上最顶层的元素是谁」。
  *
  * 为什么是 `elementFromPoint` 而不是比 rect：它就是浏览器派发鼠标事件时用的那一套命中测试，
  * 「两个盒子重叠」在 CSS 里根本不等于「挡住」（祖先、`pointer-events: none`、负 z-index
  * 都是重叠但打得中）。用真实命中测试才不会把能点中的目标误报成被遮挡。
  */
-const HIT_TEST_FUNCTION = 'function (point) {'
+export const HIT_TEST_FUNCTION = 'function (point) {'
   + ' const element = this;'
+  // P0-a：取名口径与浮层探测同源，改这里要一并改 READABLE_NAME_SNIPPET 的另一处调用点。
+  + ' const nameOf = ' + READABLE_NAME_SNIPPET + ';'
   + ' const top = document.elementFromPoint(Math.round(point.x), Math.round(point.y));'
   + ' let href = null;'
   + ' try { href = (element.href && String(element.href).length > 0) ? String(element.href) : element.getAttribute("href"); } catch (e) { href = null; }'
@@ -2767,8 +2801,8 @@ const HIT_TEST_FUNCTION = 'function (point) {'
   + ' let node = null;'
   + ' if (hit === "other" && top !== null) {'
   + '   const role = top.getAttribute("role") || String(top.tagName || "").toLowerCase();'
-  + '   let name = top.getAttribute("aria-label") || top.getAttribute("alt") || "";'
-  + '   if (name.length === 0) name = String(top.textContent || "").trim().slice(0, 60);'
+  // 盖住人的那一层常常自己没文本（遮罩就是空的），所以名字要从它或它附近的祖先读。
+  + '   const name = nameOf(top);'
   + '   const hint = top.id ? "#" + top.id'
   + '     : (typeof top.className === "string" && top.className.trim().length > 0'
   + '       ? "." + top.className.trim().split(/\\s+/)[0] : "");'
@@ -2796,9 +2830,11 @@ interface OverlayProbe {
  * `position:absolute; inset:0` 的根容器（没有 z-index）算成遮罩，单看面积会把长页面里的
  * 大块正文算成浮层。
  *
- * 命中 `role=dialog` / `aria-modal` / `<dialog>` 时用**它**的名字 —— 那才是模型能认出来的东西。
+ * 命中 `role=dialog` / `aria-modal` / `<dialog>` 时用**它**作为取名对象 —— 那才是模型能认出来的东西。
+ * 至于名字本身，两形状共用 {@link READABLE_NAME_SNIPPET}：不再要求「必须是 dialog 才读文本」。
  */
-const OVERLAY_PROBE_EXPRESSION = '(() => {'
+export const OVERLAY_PROBE_EXPRESSION = '(() => {'
+  + ' const nameOf = ' + READABLE_NAME_SNIPPET + ';'
   + ' const vw = window.innerWidth, vh = window.innerHeight;'
   + ' if (!vw || !vh) return null;'
   + ' const top = document.elementFromPoint(Math.round(vw / 2), Math.round(vh / 2));'
@@ -2818,8 +2854,7 @@ const OVERLAY_PROBE_EXPRESSION = '(() => {'
   + ' const dialog = node.closest(\'[role="dialog"], [aria-modal="true"], dialog\');'
   + ' const target = dialog || node;'
   + ' const role = target.getAttribute("role") || String(target.tagName || "").toLowerCase();'
-  + ' let name = target.getAttribute("aria-label") || "";'
-  + ' if (name.length === 0 && dialog) name = String(target.textContent || "").trim().slice(0, 60);'
+  + ' const name = nameOf(target);'
   + ' const hint = target.id ? "#" + target.id'
   + '   : (typeof target.className === "string" && target.className.trim().length > 0'
   + '     ? "." + target.className.trim().split(/\\s+/)[0] : "");'
