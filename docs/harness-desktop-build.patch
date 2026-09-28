@@ -93,7 +93,7 @@ index d406c27235..36bb70f4fb 100644
    if (!inside(appDir, sourceRoot)) {
      // Builder's source matcher slices the appDir prefix even for external FileSets.
 diff --git a/apps/desktop/src/main.ts b/apps/desktop/src/main.ts
-index a59a8a8b35..0c0c2e8962 100644
+index a59a8a8b35..2fd0eeeacf 100644
 --- a/apps/desktop/src/main.ts
 +++ b/apps/desktop/src/main.ts
 @@ -1,7 +1,9 @@
@@ -222,7 +222,7 @@ index a59a8a8b35..0c0c2e8962 100644
    return { node, nodeBin, pnpm, dsh }
  }
  
-@@ -414,8 +497,11 @@ async function main(): Promise<void> {
+@@ -414,11 +497,20 @@ async function main(): Promise<void> {
      return {
        start: async () => {
          const ready = await host.start()
@@ -235,8 +235,18 @@ index a59a8a8b35..0c0c2e8962 100644
 +        hostUrl = authenticated.url
          if (ready.injections === undefined) throw new Error('Desktop Host did not provide boot injections')
          injections = ready.injections
-         welcomeBackend = await connectDesktopWelcome(ready.url, (input, init) => net.fetch(input, init), async () => (await session.defaultSession.cookies.get({ url: ready.url })).map(cookie => `${cookie.name}=${cookie.value}`).join('; '))
-@@ -1277,17 +1363,29 @@ async function main(): Promise<void> {
+-        welcomeBackend = await connectDesktopWelcome(ready.url, (input, init) => net.fetch(input, init), async () => (await session.defaultSession.cookies.get({ url: ready.url })).map(cookie => `${cookie.name}=${cookie.value}`).join('; '))
++        // ⚠️ 欢迎页**不能**沿用上面那个结论：它走的是另一条传输栈（Electron `net.fetch`，
++        // 读系统代理与终端策略），而上面是 Node 的全局 `fetch`。两条栈对「哪个回环名字通」
++        // 的判断可以不同，所以把原始 URL 交给它、由它按自己的栈重解析一遍
++        // （见 welcome-backend.ts 的 authenticateReachableHost）。
++        welcomeBackend = await connectDesktopWelcome(ready.url,
++          (input, init) => net.fetch(input, init),
++          async (url: string) => (await session.defaultSession.cookies.get({ url })).map(cookie => `${cookie.name}=${cookie.value}`).join('; '))
+         stopAccount?.()
+         const accountBackend = welcomeBackend.account
+         stopAccount = accountBackend.watch((state) => {
+@@ -1277,17 +1369,29 @@ async function main(): Promise<void> {
    publishUpdate(updateState)
  }
  
@@ -311,10 +321,10 @@ index cf03e38c36..878122bcd6 100644
 +  return existsSync(portableHome) ? portableHome : undefined
 +}
 diff --git a/apps/desktop/src/web-document.ts b/apps/desktop/src/web-document.ts
-index a74ea7c7ef..e29953ddf2 100644
+index a74ea7c7ef..dde5b184b0 100644
 --- a/apps/desktop/src/web-document.ts
 +++ b/apps/desktop/src/web-document.ts
-@@ -35,6 +35,73 @@ export async function serveWebDocument(request: Request, root: string): Promise<
+@@ -35,6 +35,81 @@ export async function serveWebDocument(request: Request, root: string): Promise<
    })
  }
  
@@ -352,8 +362,16 @@ index a74ea7c7ef..e29953ddf2 100644
 +  return url.endsWith('/') ? text : text.replace(/\/+$/, '')
 +}
 +
-+/** Candidate URLs for `url`, its own host first; non-loopback hosts get no fallback. */
-+function loopbackCandidates(url: string): string[] {
++/**
++ * Candidate URLs for `url`, its own host first; non-loopback hosts get no fallback.
++ *
++ * 中文备注（本段是本地补丁，非上游原稿）：**每个消费者都要拿自己那条传输栈重跑一遍**。
++ * shell 里有两个独立的 HTTP 客户端 —— 主窗口转发用 Node 的全局 `fetch`，欢迎页用 Electron 的
++ * `net.fetch`（Chromium 网络栈，读系统代理与终端策略）。同一台机器上「Node 连得上
++ * `127.0.0.1`、Chromium 连不上」是可能的，所以本函数导出去给两边各自解析，
++ * 它的结论只在调用方那一条栈上成立，不能跨栈复用。
++ */
++export function loopbackCandidates(url: string): string[] {
 +  let host: string
 +  try { host = new URL(url).hostname.replace(/^\[|\]$/g, '').toLowerCase() } catch { return [url] }
 +  if (!isLoopback(host)) return [url]
@@ -388,7 +406,7 @@ index a74ea7c7ef..e29953ddf2 100644
  /**
   * Exchange the Host launch URL for an authority-bound browser cookie.
   * @param url - Authenticated URL reported by the owned Host process.
-@@ -44,7 +111,7 @@ export async function authenticateWebHost(url: string): Promise<string> {
+@@ -44,7 +119,7 @@ export async function authenticateWebHost(url: string): Promise<string> {
    const response = await fetch(url, { redirect: 'manual' })
    const cookie = response.headers.get('set-cookie')
    await response.body?.cancel()
@@ -397,6 +415,92 @@ index a74ea7c7ef..e29953ddf2 100644
    const end = cookie.indexOf(';')
    return end < 0 ? cookie : cookie.slice(0, end)
  }
+diff --git a/apps/desktop/src/welcome-backend.ts b/apps/desktop/src/welcome-backend.ts
+index a0bb4e9440..2bb9579253 100644
+--- a/apps/desktop/src/welcome-backend.ts
++++ b/apps/desktop/src/welcome-backend.ts
+@@ -2,6 +2,7 @@
+ 
+ import { randomUUID } from 'node:crypto'
+ import { desktopAccountBackend, type DesktopAccountBackend } from './account-backend.ts'
++import { loopbackCandidates } from './web-document.ts'
+ 
+ /** Metadata needed before the native entry or workspace becomes visible. */
+ export interface WelcomeState {
+@@ -29,21 +30,56 @@ function record(value: unknown): value is Record<string, unknown> {
+   return typeof value === 'object' && value !== null && !Array.isArray(value)
+ }
+ 
++/**
++ * Authenticate against whichever loopback host name this transport stack can actually reach.
++ *
++ * 中文备注（本段是本地补丁，非上游原稿）：**回环兜底必须用调用方自己的 `send` 重跑一遍**，
++ * 不能沿用 shell 主窗口那条线的结论。主窗口转发走 Node 的全局 `fetch`，欢迎页走 Electron 的
++ * `net.fetch`（Chromium 网络栈，读系统代理与终端策略）—— 两者对「哪个回环名字通」的判断
++ * 可以不同。只给主窗口做兜底的结果是：在「只放通 `localhost`」的机器上主窗口正常、
++ * 欢迎页却报 `desktop welcome: Web authentication failed`，因为它还在拿原始名字连。
++ *
++ * 握手本身就是一次 HTTP 往返，所以它兼任探测：只有**连不上**才换下一个候选；
++ * 服务端自己给出否定答复是终局（重试只会把它错报成连接问题）。
++ *
++ * @param hostUrl - URL reported by the owned Host process (token included).
++ * @param send - Transport used by every later welcome request; the probe must share it.
++ * @returns The origin that answered, for both RPC and cookie lookups.
++ */
++async function authenticateReachableHost(
++  hostUrl: string,
++  send: (input: string, init?: RequestInit) => Promise<Response>,
++): Promise<string> {
++  let lastError: unknown = new Error('desktop welcome: Desktop Host is unreachable')
++  for (const candidate of loopbackCandidates(hostUrl)) {
++    let response: Response
++    try {
++      response = await send(candidate, { credentials: 'include' })
++    } catch (error: unknown) {
++      // 这个名字没连上（DNS / 连接被策略拒绝 / 代理拦掉）—— 换下一个。
++      lastError = error
++      continue
++    }
++    await response.body?.cancel()
++    if (!response.ok) throw new Error('desktop welcome: Web authentication failed')
++    return new URL(candidate).origin
++  }
++  throw lastError
++}
++
+ /**
+  * Authenticate the native HTTP client through the Web application's launch URL.
+- * @param authenticatedUrl - URL supplied by the running Desktop Host.
++ * @param hostUrl - URL supplied by the running Desktop Host; its own host name is tried first.
+  * @param send - Electron session fetch, retaining the Web authentication cookie.
++ * @param cookies - Electron session cookie reader, keyed by the host name that answered.
+  * @returns metadata reads and write-only credential operations over standard RPC.
+  */
+ export async function connectDesktopWelcome(
+-  authenticatedUrl: string,
++  hostUrl: string,
+   send: (input: string, init?: RequestInit) => Promise<Response>,
+-  cookies: () => Promise<string> = () => Promise.resolve(''),
++  cookies: (url: string) => Promise<string> = () => Promise.resolve(''),
+ ): Promise<DesktopWelcomeBackend> {
+-  const origin = new URL(authenticatedUrl).origin
+-  const authenticated = await send(authenticatedUrl, { credentials: 'include' })
+-  await authenticated.body?.cancel()
+-  if (!authenticated.ok) throw new Error('desktop welcome: Web authentication failed')
++  const origin = await authenticateReachableHost(hostUrl, send)
+   const invoke = async (request: { namespace: string; method: string; args: Record<string, unknown> }): Promise<unknown> => {
+     const rpcId = randomUUID()
+     const method = `${request.namespace}/${request.method}`
+@@ -60,7 +96,8 @@ export async function connectDesktopWelcome(
+     }
+     return envelope.result.value
+   }
+-  const account = desktopAccountBackend(origin, invoke, cookies)
++  // Cookie lookups follow the host name that answered, not the one the Host announced.
++  const account = desktopAccountBackend(origin, invoke, () => cookies(origin))
+   const settingsAndReference = async () => {
+     const settings = await invoke({ namespace: 'settings', method: 'describe', args: {} })
+     if (!record(settings) || !Array.isArray(settings.namespaces)) throw new Error('desktop welcome: missing settings namespaces')
 diff --git a/apps/desktop/tests/main-startup.spec.ts b/apps/desktop/tests/main-startup.spec.ts
 index e47edce02d..a806153f94 100644
 --- a/apps/desktop/tests/main-startup.spec.ts
@@ -480,6 +584,43 @@ index 0fd9b591b1..8c8bcb5424 100644
  it('forwards upload bytes and cancellation with Host credentials while keeping the response streaming', async () => {
    const body = new ReadableStream({ start(controller) { controller.enqueue(new TextEncoder().encode('stream')); controller.close() } })
    const fetch = vi.fn().mockResolvedValue(new Response(body, { headers: { 'content-encoding': 'gzip', 'set-cookie': 'private' } }))
+diff --git a/apps/desktop/tests/welcome-host.spec.ts b/apps/desktop/tests/welcome-host.spec.ts
+index 3c2066ae34..924c19879e 100644
+--- a/apps/desktop/tests/welcome-host.spec.ts
++++ b/apps/desktop/tests/welcome-host.spec.ts
+@@ -90,8 +90,31 @@ describe('desktop welcome Web operations', () => {
+     await expect(backend.read()).rejects.toThrow('Web RPC failed')
+   })
+ 
+-  it('refuses an unauthenticated Web launch', async () => {
++  it('refuses an unauthenticated Web launch without trying another host name', async () => {
+     const send = vi.fn<Parameters<typeof connectDesktopWelcome>[1]>(async () => new Response(null, { status: 401 }))
+     await expect(connectDesktopWelcome(url, send)).rejects.toThrow('Web authentication failed')
++    // 服务端明确拒绝说明这个名字是通的；换名字只会打到别的服务，也会把「被拒」错报成「连不上」。
++    expect(send).toHaveBeenCalledTimes(1)
++  })
++
++  it('falls back to the next loopback name when this transport stack cannot reach the announced one', async () => {
++    const rpc: string[] = []
++    const send = vi.fn<Parameters<typeof connectDesktopWelcome>[1]>(async (input, init) => {
++      // 「只放通 localhost」的终端策略：被拦的名字在传输层直接失败，而不是回一个错误码。
++      if (input.includes('127.0.0.1')) throw new TypeError('fetch failed')
++      if (init?.method !== 'POST') return new Response('index')
++      rpc.push(input)
++      const { rpcId } = JSON.parse(init.body as string) as { rpcId: string }
++      return Response.json({
++        type: 'server-response', rpcId,
++        result: { ok: true, value: { namespaces: [{ ns: 'locale', value: { preference: 'zh' } }] } },
++      })
++    })
++
++    const backend = await connectDesktopWelcome(url, send)
++
++    expect(await backend.readLocalePreference()).toBe('zh')
++    // 探测与后续请求必须落在同一个名字上，否则 RPC 会发给那个连不通的名字。
++    expect(rpc).toEqual(['http://localhost:19387/api/settings/describe'])
+   })
+ })
 diff --git a/apps/desktop/tests/welcome-startup.spec.ts b/apps/desktop/tests/welcome-startup.spec.ts
 index 7518cc74af..abd4b89743 100644
 --- a/apps/desktop/tests/welcome-startup.spec.ts
