@@ -1,5 +1,5 @@
 diff --git a/apps/desktop/scripts/electron-builder-config.mjs b/apps/desktop/scripts/electron-builder-config.mjs
-index bab440ea61..069aaa9b5c 100644
+index 1fb787803c..29439e3532 100644
 --- a/apps/desktop/scripts/electron-builder-config.mjs
 +++ b/apps/desktop/scripts/electron-builder-config.mjs
 @@ -136,13 +136,17 @@ export function createElectronBuilderConfig(
@@ -24,7 +24,7 @@ index bab440ea61..069aaa9b5c 100644
        // Windows tray bitmaps; macOS keeps the Dock and ships no menu bar icon.
        ...(packagesWindows ? [{ from: fileURLToPath(new URL('../resources/tray-windows.ico', import.meta.url)), to: 'tray.ico' }] : []),
 diff --git a/apps/desktop/scripts/prepare-dsh.ts b/apps/desktop/scripts/prepare-dsh.ts
-index 377c300efb..0c6245ef02 100644
+index 442e01757e..1ac26d4601 100644
 --- a/apps/desktop/scripts/prepare-dsh.ts
 +++ b/apps/desktop/scripts/prepare-dsh.ts
 @@ -127,7 +127,11 @@ async function main(): Promise<void> {
@@ -39,7 +39,7 @@ index 377c300efb..0c6245ef02 100644
 +    await packagingStep(process.env.DSH_DESKTOP_PACKAGING_RUN_DIR, 'runtime:install', () => runPnpm(['install', '--prod']))
      const packageSet = readDesktopCorePackageSet(BUILD_ROOT, release.version)
      const targetName = resolveDesktopBuildTarget()
-     const target = { platform: process.platform, arch: targetName.endsWith('arm64') ? 'arm64' : 'x64' }
+     const target = { platform: process.platform, arch: desktopTargetPlatform(targetName).arch }
 diff --git a/apps/desktop/scripts/smoke-packaged-runtime.ts b/apps/desktop/scripts/smoke-packaged-runtime.ts
 index 106830b5ad..3926678927 100644
 --- a/apps/desktop/scripts/smoke-packaged-runtime.ts
@@ -93,10 +93,10 @@ index d406c27235..36bb70f4fb 100644
    if (!inside(appDir, sourceRoot)) {
      // Builder's source matcher slices the appDir prefix even for external FileSets.
 diff --git a/apps/desktop/src/main.ts b/apps/desktop/src/main.ts
-index a59a8a8b35..0c15196585 100644
+index b4b8153b7f..73b3f17e6e 100644
 --- a/apps/desktop/src/main.ts
 +++ b/apps/desktop/src/main.ts
-@@ -1,7 +1,9 @@
+@@ -2,7 +2,9 @@ import type { ProductEventMap, ProductEvent } from '@deepseek-ai/dsh-client-prod
  import { WINDOWS_TITLEBAR_HEIGHT } from './windows-layout.ts'
  /** Electron shell: desktop project ownership, custom protocol, windows, and lifecycle. */
  
@@ -106,7 +106,7 @@ index a59a8a8b35..0c15196585 100644
  import { join } from 'node:path'
  import { fileURLToPath } from 'node:url'
  import {
-@@ -21,7 +23,7 @@ import {
+@@ -22,7 +24,7 @@ import {
    type IpcMainInvokeEvent,
    type MenuItemConstructorOptions,
  } from 'electron'
@@ -115,16 +115,16 @@ index a59a8a8b35..0c15196585 100644
  import { DesktopProjectManager } from './project-manager.ts'
  import { DesktopHostFatalError, DesktopHostProcess, DesktopHostUncleanExitError } from './host-process.ts'
  import { DesktopPlatformView, PLATFORM_IPC, platformBounds } from './platform-view.ts'
-@@ -32,7 +34,7 @@ import { DESKTOP_IPC, SCHEME, assertDesktopSender, type DesktopUpdateState } fro
- import { desktopUpdateReadyConfirmation, formatDesktopMessage, resolveDesktopLocale, resolveDesktopStartupLocale } from './locale.ts'
+@@ -35,7 +37,7 @@ import { desktopUpdateReadyConfirmation, formatDesktopMessage, resolveDesktopLoc
  import { claimDesktopSingleInstance } from './single-instance.ts'
  import { DesktopUpdateCoordinator } from './update-coordinator.ts'
+ import { DesktopCommandManager } from './command-management.ts'
 -import { serveWebDocument, authenticateWebHost, forwardWebRequest } from './web-document.ts'
 +import { serveWebDocument, authenticateLoopbackHost, exchangeProbe, jarProbe, forwardWebRequest } from './web-document.ts'
  import { DesktopFatalRecovery } from './fatal-recovery.ts'
  import { pruneCrashReports, RendererConsoleTail, writeCrashReport, type CrashReportSource } from './crash-report.ts'
  import { openWelcomeWindow } from './welcome-window.ts'
-@@ -56,6 +58,78 @@ import { DesktopQuitConfirmation } from './quit-confirmation.ts'
+@@ -60,6 +62,78 @@ import { DesktopQuitConfirmation } from './quit-confirmation.ts'
  import { DesktopTray } from './tray.ts'
  import { DesktopBackgroundNotice } from './background-notice.ts'
  
@@ -203,7 +203,7 @@ index a59a8a8b35..0c15196585 100644
  let focusPrimaryWindow = (): void => {}
  let stopForRecovery = async (): Promise<void> => {}
  let shuttingDown = false
-@@ -151,8 +225,17 @@ function runtimeResources(): RuntimeResources {
+@@ -155,8 +229,17 @@ function runtimeResources(): RuntimeResources {
    const pnpm = (development ? process.env.DSH_DESKTOP_PNPM_ENTRY : undefined)
      ?? (development ? join(app.getAppPath(), 'node_modules', 'pnpm', 'bin', 'pnpm.mjs')
        : join(process.resourcesPath, 'runtime', 'pnpm', 'bin', 'pnpm.mjs'))
@@ -222,7 +222,7 @@ index a59a8a8b35..0c15196585 100644
    return { node, nodeBin, pnpm, dsh }
  }
  
-@@ -414,11 +497,28 @@ async function main(): Promise<void> {
+@@ -448,11 +531,28 @@ async function main(): Promise<void> {
      return {
        start: async () => {
          const ready = await host.start()
@@ -251,10 +251,10 @@ index a59a8a8b35..0c15196585 100644
 +        welcomeBackend = await connectDesktopWelcome(ready.url,
 +          (input, init) => net.fetch(input, init),
 +          async (url: string) => (await session.defaultSession.cookies.get({ url })).map(cookie => `${cookie.name}=${cookie.value}`).join('; '))
+         analyticsEnabled = await welcomeBackend.analyticsEnabled().catch(() => false)
+         if (!reportedLaunch) { reportedLaunch = true; void track('desktop_app_launch', {}) }
          stopAccount?.()
-         const accountBackend = welcomeBackend.account
-         stopAccount = accountBackend.watch((state) => {
-@@ -662,7 +762,11 @@ async function main(): Promise<void> {
+@@ -707,7 +807,11 @@ async function main(): Promise<void> {
      return browserGuests.release(event.sender, lease)
    })
  
@@ -267,7 +267,7 @@ index a59a8a8b35..0c15196585 100644
      if (hostUrl === undefined || hostCookie === undefined || details.webContentsId !== mainWindow?.webContents.id) {
        callback({})
        return
-@@ -1277,17 +1381,29 @@ async function main(): Promise<void> {
+@@ -1333,17 +1437,29 @@ async function main(): Promise<void> {
    publishUpdate(updateState)
  }
  
@@ -533,10 +533,10 @@ index a74ea7c7ef..0a410e8163 100644
    return end < 0 ? cookie : cookie.slice(0, end)
  }
 diff --git a/apps/desktop/src/welcome-backend.ts b/apps/desktop/src/welcome-backend.ts
-index a0bb4e9440..34c48ab191 100644
+index 54ab46d85e..28512376f9 100644
 --- a/apps/desktop/src/welcome-backend.ts
 +++ b/apps/desktop/src/welcome-backend.ts
-@@ -2,6 +2,7 @@
+@@ -3,6 +3,7 @@ import type { ProductEvent } from '@deepseek-ai/dsh-client-product-analytics/typ
  
  import { randomUUID } from 'node:crypto'
  import { desktopAccountBackend, type DesktopAccountBackend } from './account-backend.ts'
@@ -544,7 +544,7 @@ index a0bb4e9440..34c48ab191 100644
  
  /** Metadata needed before the native entry or workspace becomes visible. */
  export interface WelcomeState {
-@@ -29,21 +30,58 @@ function record(value: unknown): value is Record<string, unknown> {
+@@ -34,21 +35,58 @@ function record(value: unknown): value is Record<string, unknown> {
    return typeof value === 'object' && value !== null && !Array.isArray(value)
  }
  
@@ -607,10 +607,10 @@ index a0bb4e9440..34c48ab191 100644
 -  await authenticated.body?.cancel()
 -  if (!authenticated.ok) throw new Error('desktop welcome: Web authentication failed')
 +  const origin = await authenticateReachableHost(hostUrl, send)
-   const invoke = async (request: { namespace: string; method: string; args: Record<string, unknown> }): Promise<unknown> => {
-     const rpcId = randomUUID()
-     const method = `${request.namespace}/${request.method}`
-@@ -60,7 +98,8 @@ export async function connectDesktopWelcome(
+   const invoke = async (
+     request: { namespace: string; method: string; args: Record<string, unknown> },
+     signal?: AbortSignal,
+@@ -68,7 +106,8 @@ export async function connectDesktopWelcome(
      }
      return envelope.result.value
    }
@@ -621,7 +621,7 @@ index a0bb4e9440..34c48ab191 100644
      const settings = await invoke({ namespace: 'settings', method: 'describe', args: {} })
      if (!record(settings) || !Array.isArray(settings.namespaces)) throw new Error('desktop welcome: missing settings namespaces')
 diff --git a/apps/desktop/tests/main-startup.spec.ts b/apps/desktop/tests/main-startup.spec.ts
-index e47edce02d..a46d602a21 100644
+index b6b6fd476f..73f02a8732 100644
 --- a/apps/desktop/tests/main-startup.spec.ts
 +++ b/apps/desktop/tests/main-startup.spec.ts
 @@ -16,7 +16,16 @@ import { writeCrashReport } from '../src/crash-report.ts'
@@ -642,16 +642,16 @@ index e47edce02d..a46d602a21 100644
  // Report persistence has its own unit tests; here it resolves within microtasks so the fatal
  // dialog never outlives the test that triggered it.
  vi.mock('../src/crash-report.ts', async importOriginal => ({
-@@ -298,7 +307,7 @@ vi.mock('node:fs/promises', async (importOriginal) => {
-   }) }
- })
+@@ -317,7 +326,7 @@ vi.mock('../src/login-shell-environment.ts', async importOriginal => ({
+   readDesktopLoginShellEnvironment: harness.loginShell,
+ }))
  vi.mock('../src/runtime-tree.ts', () => ({ readDesktopRuntime: () => ({ release: { version: '1.0.0' } }) }))
 -vi.mock('../src/paths.ts', () => ({ resolveDesktopPaths: () => ({ profile: 'desktop-test-profile' }) }))
 +vi.mock('../src/paths.ts', () => ({ resolveDesktopPaths: () => ({ profile: 'desktop-test-profile' }), resolvePortableDshHome: () => undefined }))
  vi.mock('../src/project-manager.ts', () => ({
    DesktopProjectManager: class {
      readonly applyRelease = harness.applyRelease
-@@ -886,6 +895,11 @@ describe('desktop main startup', () => {
+@@ -913,6 +922,11 @@ describe('desktop main startup', () => {
      await harness.hostStarted.promise
      harness.hosts[0]!.ready.resolve()
      await Promise.resolve(invoke(DESKTOP_IPC.boot))
@@ -663,7 +663,7 @@ index e47edce02d..a46d602a21 100644
      const handler = harness.socketHeaders.mock.calls[0]![1] as (
        details: { url: string; webContentsId: number; requestHeaders: Record<string, string> },
        callback: (result: unknown) => void,
-@@ -2030,7 +2044,8 @@ describe('desktop main startup', () => {
+@@ -2095,7 +2109,8 @@ describe('desktop main startup', () => {
      expect(harness.applyRelease).toHaveBeenCalledTimes(1)
      expect(harness.hosts[0]).toMatchObject({
        node: process.execPath,
@@ -809,11 +809,19 @@ index 0fd9b591b1..da9b3ab383 100644
    const body = new ReadableStream({ start(controller) { controller.enqueue(new TextEncoder().encode('stream')); controller.close() } })
    const fetch = vi.fn().mockResolvedValue(new Response(body, { headers: { 'content-encoding': 'gzip', 'set-cookie': 'private' } }))
 diff --git a/apps/desktop/tests/welcome-host.spec.ts b/apps/desktop/tests/welcome-host.spec.ts
-index 3c2066ae34..7ee8a726db 100644
+index dea2905583..cb70d68123 100644
 --- a/apps/desktop/tests/welcome-host.spec.ts
 +++ b/apps/desktop/tests/welcome-host.spec.ts
-@@ -90,8 +90,53 @@ describe('desktop welcome Web operations', () => {
+@@ -93,7 +93,6 @@ describe('desktop welcome Web operations', () => {
      await expect(backend.read()).rejects.toThrow('Web RPC failed')
+   })
+ 
+-
+   it('submits native analytics through authenticated RPC with a bounded request', async () => {
+     const host = transport()
+     const backend = await connectDesktopWelcome(url, host.send)
+@@ -106,8 +105,53 @@ describe('desktop welcome Web operations', () => {
+     expect(JSON.parse(init!.body as string)).toMatchObject({ payload: { args: { event } } })
    })
  
 -  it('refuses an unauthenticated Web launch', async () => {
@@ -869,7 +877,7 @@ index 3c2066ae34..7ee8a726db 100644
    })
  })
 diff --git a/apps/desktop/tests/welcome-startup.spec.ts b/apps/desktop/tests/welcome-startup.spec.ts
-index 7518cc74af..62b0b7418a 100644
+index 9848c7fb26..c62bf0719a 100644
 --- a/apps/desktop/tests/welcome-startup.spec.ts
 +++ b/apps/desktop/tests/welcome-startup.spec.ts
 @@ -1,4 +1,10 @@
@@ -890,11 +898,11 @@ index 7518cc74af..62b0b7418a 100644
  
 -vi.mock('../src/paths.ts', () => ({ resolveDesktopPaths: () => ({ profile: '/profile' }) }))
 +vi.mock('../src/paths.ts', () => ({ resolveDesktopPaths: () => ({ profile: '/profile' }), resolvePortableDshHome: () => undefined }))
- vi.mock('../src/project-manager.ts', () => ({ DesktopProjectManager: class {
-   applyRelease = vi.fn(async () => {})
-   canRecoverProfile = vi.fn(() => true)
+ vi.mock('../src/login-shell-environment.ts', async importOriginal => ({
+   ...await importOriginal<typeof import('../src/login-shell-environment.ts')>(),
+   readDesktopLoginShellEnvironment: async (base: NodeJS.ProcessEnv) => ({ environment: base, failures: [] }),
 diff --git a/packages/sandbox/sandbox-local/src/index.ts b/packages/sandbox/sandbox-local/src/index.ts
-index 5f180668cf..0c1864384a 100644
+index 45028746ff..c929f42495 100644
 --- a/packages/sandbox/sandbox-local/src/index.ts
 +++ b/packages/sandbox/sandbox-local/src/index.ts
 @@ -148,6 +148,41 @@ interface AclTempCapability {
@@ -939,7 +947,7 @@ index 5f180668cf..0c1864384a 100644
  /**
   * The runner chain per platform — selection is BY PLATFORM first, probes
   * second: a platform's chain is probed in preference order only when it has
-@@ -560,13 +595,15 @@ export class LocalSandboxProvider extends SandboxProvider {
+@@ -566,13 +601,15 @@ export class LocalSandboxProvider extends SandboxProvider {
     * Pin the source loader and TypeScript paths to this installation, independently
     * of target cwd or environment overrides.
     * The prefix stays `[node, runner, ...]` — a future native-exe runner keeps
