@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import { Context } from '@deepseek-ai/cordis'
 import BrowserRuntime, { BrowserError } from './index.ts'
 import type {
@@ -183,6 +183,28 @@ async function mountWithProvider(
   const provider = makeProvider('cdp', true)
   browser.registerProvider(provider)
   return { browser, provider }
+}
+
+/**
+ * 挂一个 Runtime + provider，并拿到「收编一个弹窗」的通报口。
+ *
+ * 家族用例要造真实的父子关系，而 `adoptChild` 住在租约表里（私有）；唯一公开的入口就是
+ * provider 的 `onSessionAdopted` 通报 —— 走它，测试才是在验接线而不是绕过接线。
+ */
+async function mountWithAdoptingProvider(): Promise<{
+  browser: BrowserRuntime
+  provider: StubProvider
+  adopt: (child: string, opener: string | undefined) => void
+}> {
+  const browser = await mountBrowser()
+  const provider = makeProvider('cdp', true)
+  let notify: ((targetId: string, openerTargetId: string | undefined) => void) | undefined
+  provider.onSessionAdopted = (listener) => {
+    notify = listener
+    return () => { notify = undefined }
+  }
+  browser.registerProvider(provider)
+  return { browser, provider, adopt: (child, opener) => { notify?.(child, opener) } }
 }
 
 describe('BrowserRuntime provider selection', () => {
@@ -468,7 +490,7 @@ describe('BrowserRuntime tab ownership', () => {
     // 领走之后这个标签归 B：A 拿着已经用掉的码也再进不来。
     // （「码只能用一次」本身在 lease.test.ts 里直接对注册表断言，这里只验端到端的主路径。）
     await expect(browser.tabs({ kind: 'claim', sessionId: alice.id, handoffCode: code }, ALICE))
-      .rejects.toThrow(expect.objectContaining({ code: 'BROWSER_TAB_OCCUPIED' }))
+      .rejects.toThrow(expect.objectContaining({ code: 'BROWSER_HANDOFF_INVALID' }))
   })
 
   it('refuses to release, hand over or close a tab that still has a call in flight', async () => {
@@ -503,30 +525,139 @@ describe('BrowserRuntime tab ownership', () => {
   })
 
   it('recycles an expired lease: the page is kept, the epoch is dropped, the owner must re-claim', async () => {
-    // 租期 1ms：等一小会儿再查一次，惰性过期就会命中（不依赖定时器真的准点唤醒）。
-    const { browser, provider } = await mountWithProvider({ tabLeaseIdleMs: 1 })
-    const expired: string[] = []
-    browser.onLeaseRelease((_providerId, targetId) => { expired.push(targetId) })
+    // 控制单调时钟，避免全套并行测试中「领取后隔了 1ms 就再次到期」的偶发失败。
+    let now = 0
+    const clock = vi.spyOn(performance, 'now').mockImplementation(() => now)
+    try {
+      const { browser, provider } = await mountWithProvider({ tabLeaseIdleMs: 1_000 })
+      const expired: string[] = []
+      browser.onLeaseRelease((_providerId, targetId) => { expired.push(targetId) })
 
-    const session = await browser.open({}, ALICE)
-    await new Promise(resolve => setTimeout(resolve, 20))
-    await browser.tabs({ kind: 'list' }, ALICE)
+      const session = await browser.open({}, ALICE)
+      now = 1_001
+      await browser.tabs({ kind: 'list' }, ALICE)
 
-    expect(expired).toEqual([session.id])
-    // 纪元当场作废：新主人（甚至原主人自己）都不可能沿用旧 ref。
-    expect(provider.invalidated).toContain(session.id)
-    // 页面保留 —— 回收的是占用，不是标签。
-    expect(provider.sessions.has(session.id)).toBe(true)
-    await expect(browser.tabs({ kind: 'list', scope: 'available' }, ALICE))
-      .resolves.toMatchObject({ tabs: [{ sessionId: session.id, lease: { state: 'available' } }] })
-    await expect(browser.observe({ kind: 'snapshot', sessionId: session.id }, ALICE))
-      .rejects.toThrow(expect.objectContaining({ code: 'BROWSER_TAB_NOT_HELD' }))
-    // 重新领取之后又能用了（「先领取、再重拍快照」这条恢复路径）。
-    await expect(browser.tabs({ kind: 'claim', sessionId: session.id }, ALICE)).resolves.toMatchObject({
-      action: 'claim',
+      expect(expired).toEqual([session.id])
+      // 纪元当场作废：新主人（甚至原主人自己）都不可能沿用旧 ref。
+      expect(provider.invalidated).toContain(session.id)
+      // 页面保留 —— 回收的是占用，不是标签。
+      expect(provider.sessions.has(session.id)).toBe(true)
+      await expect(browser.tabs({ kind: 'list', scope: 'available' }, ALICE))
+        .resolves.toMatchObject({ tabs: [{ sessionId: session.id, lease: { state: 'available' } }] })
+      await expect(browser.observe({ kind: 'snapshot', sessionId: session.id }, ALICE))
+        .rejects.toThrow(expect.objectContaining({ code: 'BROWSER_TAB_NOT_HELD' }))
+      // 重新领取之后又能用了（「先领取、再重拍快照」这条恢复路径）。
+      await expect(browser.tabs({ kind: 'claim', sessionId: session.id }, ALICE)).resolves.toMatchObject({
+        action: 'claim',
+      })
+      await expect(browser.observe({ kind: 'snapshot', sessionId: session.id }, ALICE))
+        .resolves.toMatchObject({ kind: 'snapshot' })
+      await browser.dispose()
+    } finally {
+      clock.mockRestore()
+    }
+  })
+
+  it('activate reports only this conversation\'s tabs, not the whole controlled list', async () => {
+    const { browser, provider } = await mountWithProvider()
+    const alice = await browser.open({}, ALICE)
+    const bob = await browser.open({}, BOB)
+
+    // provider 的 activate 回执带的是全量受控标签（这是它的正常行为）。
+    const raw = await provider.tabs({ kind: 'activate', sessionId: alice.id })
+    expect(raw.tabs.map(tab => tab.sessionId).sort()).toEqual([alice.id, bob.id].sort())
+
+    // 受控入口必须按归属过滤：A 激活自己的标签，不能顺回 B 的 id / 标题 / 地址。
+    const result = await browser.tabs({ kind: 'activate', sessionId: alice.id }, ALICE)
+    expect(result.action).toBe('activate')
+    expect(result.sessionId).toBe(alice.id)
+    expect(result.tabs.map(tab => tab.sessionId)).toEqual([alice.id])
+    // 命令确实发出去了 —— 过滤不能变成「什么都不做」。
+    expect(provider.calls).toContain('tabs:activate')
+    // 清单复用 provider 这次回执里已经取到的全量清单，不多付一次 `list` 往返。
+    expect(provider.calls.filter(call => call === 'tabs:list')).toEqual([])
+  })
+
+  it('keeps only this conversation\'s tabs in the opened_tabs receipt', async () => {
+    const { browser, provider } = await mountWithProvider()
+    const alice = await browser.open({}, ALICE)
+    const bob = await browser.open({}, BOB)
+    // provider 侧按「全局会话差集」给清单，它不认识调用方：B 的标签与人工新建的都进来了。
+    provider.mutate = () => Promise.resolve({
+      kind: 'mutation' as const,
+      sessionId: alice.id,
+      action: 'wait' as const,
+      epoch: SESSION.epoch,
+      url: SESSION.url,
+      title: SESSION.title,
+      navigated: false,
+      openedTabs: [
+        { sessionId: bob.id, url: 'https://bob.example/', title: 'B 的页面' },
+        { sessionId: 'human-made', url: 'https://user.example/', title: '用户自己开的' },
+      ],
     })
-    await expect(browser.observe({ kind: 'snapshot', sessionId: session.id }, ALICE))
+
+    const result = await browser.mutate({ kind: 'wait', sessionId: alice.id, timeMs: 1 }, ALICE)
+    // 别人的标签、以及没有受控父（不猜 owner）的标签，都不该出现在 A 的回执里。
+    expect(result.openedTabs).toBeUndefined()
+  })
+
+  it('keeps a popup of its own in the opened_tabs receipt (no over-filtering)', async () => {
+    const { browser, provider, adopt } = await mountWithAdoptingProvider()
+    const alice = await browser.open({}, ALICE)
+    // 弹窗继承归属：这个新标签归 A，回执里必须留着（过滤不能矫枉过正）。
+    provider.sessions.set('popup', { sessionId: 'popup', url: 'https://pop.example/', title: '弹窗' })
+    adopt('popup', alice.id)
+    provider.mutate = () => Promise.resolve({
+      kind: 'mutation' as const,
+      sessionId: alice.id,
+      action: 'click' as const,
+      epoch: SESSION.epoch,
+      url: SESSION.url,
+      title: SESSION.title,
+      navigated: false,
+      openedTabs: [{ sessionId: 'popup', url: 'https://pop.example/', title: '弹窗' }],
+    })
+
+    const result = await browser.mutate({ kind: 'click', sessionId: alice.id, ref: 'e1' }, ALICE)
+    expect(result.openedTabs?.map(tab => tab.sessionId)).toEqual(['popup'])
+  })
+
+  it('invalidates every migrated tab, not just the requested one (§3.2)', async () => {
+    const { browser, provider, adopt } = await mountWithAdoptingProvider()
+    const parent = await browser.open({}, ALICE)
+    // 挂一张弹窗子标签（走真实的收编通报，不直接摸租约表）。
+    provider.sessions.set('popup', { sessionId: 'popup', url: 'https://pop.example/', title: '弹窗' })
+    adopt('popup', parent.id)
+
+    const released = await browser.tabs({ kind: 'release', sessionId: parent.id }, ALICE)
+    // 释放是整族一起的，ref 作废也必须是整族：只作废父，子标签会带着 A 的旧 ref 落到 B 手里。
+    expect(released.affectedSessionIds?.slice().sort()).toEqual(['popup', parent.id].sort())
+    expect(provider.invalidated.slice().sort()).toEqual(['popup', parent.id].sort())
+
+    provider.invalidated.length = 0
+    const claimed = await browser.tabs({ kind: 'claim', sessionId: parent.id }, BOB)
+    // 领取同样带走整个家族。
+    expect(claimed.affectedSessionIds?.slice().sort()).toEqual(['popup', parent.id].sort())
+    expect(provider.invalidated.slice().sort()).toEqual(['popup', parent.id].sort())
+    // 子标签确实跟着换了主人。
+    await expect(browser.observe({ kind: 'snapshot', sessionId: 'popup' }, BOB))
       .resolves.toMatchObject({ kind: 'snapshot' })
+    await expect(browser.observe({ kind: 'snapshot', sessionId: 'popup' }, ALICE))
+      .rejects.toThrow(expect.objectContaining({ code: 'BROWSER_TAB_NOT_HELD' }))
+  })
+
+  it('leaves the popup cache alone when re-claiming your own tab (idempotent)', async () => {
+    const { browser, provider, adopt } = await mountWithAdoptingProvider()
+    const parent = await browser.open({}, ALICE)
+    provider.sessions.set('popup', { sessionId: 'popup', url: 'https://pop.example/', title: '弹窗' })
+    adopt('popup', parent.id)
+
+    const before = provider.invalidated.length
+    const again = await browser.tabs({ kind: 'claim', sessionId: parent.id }, ALICE)
+    // 幂等领取没有换主人 ⇒ 一个 ref 都不作废，也没有要清理的缓存。
+    expect(provider.invalidated.length).toBe(before)
+    expect(again.affectedSessionIds).toEqual([])
   })
 })
 

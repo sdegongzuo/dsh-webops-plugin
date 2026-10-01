@@ -182,7 +182,26 @@ describe('TabLeaseRegistry handoff', () => {
     // 码被消费掉了：表里不再留它的哈希。
     expect(registry.storedHandoffHash(PROVIDER, 't1')).toBeUndefined()
     // 原主人拿着同一个码也重放不了。
-    expectCode(() => registry.claim(PROVIDER, 't1', ALICE, code), 'BROWSER_TAB_OCCUPIED')
+    expectCode(() => registry.claim(PROVIDER, 't1', ALICE, code), 'BROWSER_HANDOFF_INVALID')
+  })
+
+  it('已消费的移交码不能通过同 owner 幂等领取重放', () => {
+    const { registry } = makeRegistry()
+    registry.register(PROVIDER, 't1', ALICE)
+    const code = registry.handoff(PROVIDER, 't1', ALICE)
+    registry.claim(PROVIDER, 't1', BOB, code)
+    expectCode(() => registry.claim(PROVIDER, 't1', BOB, code), 'BROWSER_HANDOFF_INVALID')
+    expect(registry.claim(PROVIDER, 't1', BOB)).toBe(false)
+  })
+
+  it('过期码不能作为普通空闲领取的凭据，拒绝后仍可无代码领取', () => {
+    const { registry, clock } = makeRegistry({ handoffTtlMs: 1_000 })
+    registry.register(PROVIDER, 't1', ALICE)
+    const code = registry.handoff(PROVIDER, 't1', ALICE)
+    clock.advance(1_001)
+    expectCode(() => registry.claim(PROVIDER, 't1', BOB, code), 'BROWSER_HANDOFF_INVALID')
+    expect(registry.listAvailable(PROVIDER)).toEqual(['t1'])
+    expect(registry.claim(PROVIDER, 't1', BOB)).toBe(true)
   })
 
   it('turns an expired handoff into an idle tab and tells the host to drop the epoch', () => {
@@ -210,7 +229,7 @@ describe('TabLeaseRegistry idle recycling', () => {
     registry.register(PROVIDER, 't1', ALICE)
     const generation = registry.beginCall(PROVIDER, 't1', ALICE)
 
-    // 执行中的调用跨越截止点：不得回收（§3.1.4）。
+    // 执行中的调用跨越截止点：不得回收（§3.1）。
     clock.advance(5_000)
     expect(registry.listHeld(PROVIDER, ALICE).map(view => view.targetId)).toEqual(['t1'])
     expect(released).toEqual([])
@@ -284,6 +303,117 @@ describe('TabLeaseRegistry popup families', () => {
     registry.adoptChild(PROVIDER, 't2', 't1')
 
     registry.release(PROVIDER, 't1', ALICE)
+    expect(registry.listAvailable(PROVIDER).sort()).toEqual(['t1', 't2'])
+  })
+
+  it('names every member the migration touches, so callers can invalidate each one', () => {
+    const { registry } = makeRegistry()
+    registry.register(PROVIDER, 't1', ALICE)
+    registry.adoptChild(PROVIDER, 't2', 't1')
+
+    expect(registry.familyTargets(PROVIDER, 't1').sort()).toEqual(['t1', 't2'])
+    // 从子标签问，答案是同一个家族。
+    expect(registry.familyTargets(PROVIDER, 't2').sort()).toEqual(['t1', 't2'])
+    // 没有记录的标签：只有自己（调用方据此不会误伤别人）。
+    expect(registry.familyTargets(PROVIDER, 'nope')).toEqual(['nope'])
+  })
+
+  it('reports the owner for receipt filtering, and no owner for an unregistered tab', () => {
+    const { registry } = makeRegistry()
+    registry.register(PROVIDER, 't1', ALICE)
+
+    expect(registry.ownerOf(PROVIDER, 't1')).toBe(ALICE)
+    // 空闲的标签没有主人 —— 回执过滤不能把它算给任何人（§5.2 不猜 owner）。
+    registry.release(PROVIDER, 't1', ALICE)
+    expect(registry.ownerOf(PROVIDER, 't1')).toBeUndefined()
+    expect(registry.ownerOf(PROVIDER, 'human-made')).toBeUndefined()
+  })
+
+  it('refuses to release the parent while a popup of it is mid-call (§5.1)', () => {
+    const { registry } = makeRegistry()
+    registry.register(PROVIDER, 't1', ALICE)
+    registry.adoptChild(PROVIDER, 't2', 't1')
+    const generation = registry.beginCall(PROVIDER, 't2', ALICE)
+
+    // 只查请求目标的话，这一下会把正在跑调用的子标签一起放走。
+    expectCode(() => registry.release(PROVIDER, 't1', ALICE), 'BROWSER_TAB_BUSY')
+    expect(registry.listHeld(PROVIDER, ALICE).map(view => view.targetId).sort()).toEqual(['t1', 't2'])
+
+    // 调用结束后才允许释放，而且是整族一起。
+    registry.endCall(PROVIDER, 't2', generation)
+    registry.release(PROVIDER, 't1', ALICE)
+    expect(registry.listAvailable(PROVIDER).sort()).toEqual(['t1', 't2'])
+  })
+
+  it('refuses to hand off or close the parent while a popup of it is mid-call (§5.1)', () => {
+    const { registry } = makeRegistry()
+    registry.register(PROVIDER, 't1', ALICE)
+    registry.adoptChild(PROVIDER, 't2', 't1')
+    const generation = registry.beginCall(PROVIDER, 't2', ALICE)
+
+    expectCode(() => registry.handoff(PROVIDER, 't1', ALICE), 'BROWSER_TAB_BUSY')
+    expectCode(() => registry.assertClosable(PROVIDER, 't1', ALICE), 'BROWSER_TAB_BUSY')
+    expect(registry.listHeld(PROVIDER, ALICE).map(view => view.targetId).sort()).toEqual(['t1', 't2'])
+
+    registry.endCall(PROVIDER, 't2', generation)
+    expect(typeof registry.handoff(PROVIDER, 't1', ALICE)).toBe('string')
+  })
+
+  it('recycles a family that expires together exactly once', () => {
+    const { registry, clock } = makeRegistry({ idleMs: 1_000 })
+    const released: string[] = []
+    registry.onRelease((_providerId, targetId, reason) => { released.push(`${targetId}:${reason}`) })
+    registry.register(PROVIDER, 't1', ALICE)
+    registry.adoptChild(PROVIDER, 't2', 't1')
+
+    // 父子同时到期：第一条 retire 已经把整族转走了，第二条不该再跑一遍回收
+    // （那只会白白再推进一次代次，通知也不该重复）。
+    clock.advance(1_001)
+    expect(released.sort()).toEqual(['t1:idle', 't2:idle'])
+    expect(registry.listAvailable(PROVIDER).sort()).toEqual(['t1', 't2'])
+  })
+
+  it('家族长调用结束后获得完整租期，旧截止不得立即回收（§3.1）', () => {
+    const { registry, clock } = makeRegistry({ idleMs: 1_000 })
+    const released: string[] = []
+    registry.onRelease((_providerId, targetId, reason) => { released.push(`${targetId}:${reason}`) })
+    registry.register(PROVIDER, 't1', ALICE)
+    registry.adoptChild(PROVIDER, 't2', 't1')
+    // 子标签正在跑一次长调用（它自己不会到期：activeCalls 非零不算超时）。
+    const generation = registry.beginCall(PROVIDER, 't2', ALICE)
+
+    // 父标签到期：整族跳过，不能把执行中的子标签放给任何人。
+    clock.advance(5_000)
+    expect(registry.listHeld(PROVIDER, ALICE).map(view => view.targetId).sort()).toEqual(['t1', 't2'])
+    expect(released).toEqual([])
+
+    // 调用收尾后，整族获得完整的新租期；父标签旧期限不能立刻回收刚续期的子标签。
+    registry.endCall(PROVIDER, 't2', generation)
+    expect(registry.listHeld(PROVIDER, ALICE).map(view => view.targetId).sort()).toEqual(['t1', 't2'])
+    expect(released).toEqual([])
+    clock.advance(999)
+    expect(registry.listHeld(PROVIDER, ALICE).map(view => view.targetId).sort()).toEqual(['t1', 't2'])
+    expect(released).toEqual([])
+    clock.advance(1)
+    expect(released.sort()).toEqual(['t1:idle', 't2:idle'])
+    expect(registry.listAvailable(PROVIDER).sort()).toEqual(['t1', 't2'])
+  })
+
+  it('父子并发调用以最后一个实际完成时刻统一续期', () => {
+    const { registry, clock } = makeRegistry({ idleMs: 1_000 })
+    registry.register(PROVIDER, 't1', ALICE)
+    registry.adoptChild(PROVIDER, 't2', 't1')
+    const parentGeneration = registry.beginCall(PROVIDER, 't1', ALICE)
+    const childGeneration = registry.beginCall(PROVIDER, 't2', ALICE)
+    clock.advance(1_500)
+    registry.endCall(PROVIDER, 't1', parentGeneration)
+    clock.advance(1_500)
+    expect(registry.listHeld(PROVIDER, ALICE)).toHaveLength(2)
+    registry.endCall(PROVIDER, 't2', childGeneration)
+    expect(registry.listHeld(PROVIDER, ALICE).map(view => view.remainingMs)).toEqual([1_000, 1_000])
+    clock.advance(999)
+    expect(registry.listHeld(PROVIDER, ALICE)).toHaveLength(2)
+    clock.advance(1)
     expect(registry.listAvailable(PROVIDER).sort()).toEqual(['t1', 't2'])
   })
 })

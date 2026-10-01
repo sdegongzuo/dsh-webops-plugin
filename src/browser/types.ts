@@ -583,6 +583,14 @@ export interface BrowserTabsResult {
    * 不进标题。持码的对话在下一次 `claim` 里消费它。
    */
   readonly handoffCode?: string
+  /**
+   * 本次占用迁移**实际波及**的全部标签 id（含请求目标）。
+   *
+   * claim / release / handoff 是以弹窗家族为单位迁移的，所以这里通常不止一个 id。调用方
+   * 按这张清单逐个作废 ref 与清理快照缓存 —— 只处理 `sessionId` 会给新主人留下旧主人的
+   * 缓存与 ref（方案 §3.2）。超时回收走 `onLeaseRelease` 逐标签通知，不填这个字段。
+   */
+  readonly affectedSessionIds?: readonly string[]
 }
 
 /** P2：从会话的 console 环形缓冲读取条目。 */

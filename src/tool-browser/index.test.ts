@@ -45,6 +45,11 @@ interface Harness {
   snapshotResponse: BrowserSnapshot
   /** 设置后 `mutate` 结果带上 `openedTabs`（模拟点击弹出了新标签页）。 */
   openedTabs: BrowserTabInfo[] | undefined
+  /**
+   * 设置后 `tabs` 回执带上 `affectedSessionIds`（模拟「迁移波及了整个弹窗家族」）。
+   * 用来验证工具层按这张清单**逐个**丢本地大纲，而不是只丢请求目标那一个。
+   */
+  affectedTabs: readonly string[] | undefined
   /** 置 true 让 `mutate` 报 `navigated:true`（模拟点击跳走了页面）。 */
   mutateNavigated: boolean
   /** 设置后 `mutate` / `observe` / `execute` / `revalidate` 的结果带上它（P2 的脏标记）。 */
@@ -108,6 +113,7 @@ function mount(): Harness {
     failLocate: undefined,
     snapshotResponse: SNAPSHOT,
     openedTabs: undefined,
+    affectedTabs: undefined,
     mutateNavigated: false,
     pageChanged: undefined,
     reboundRefs: undefined,
@@ -178,6 +184,7 @@ function mount(): Harness {
           ...args.sessionId !== undefined ? { sessionId: args.sessionId } : {},
           tabs,
           ...args.kind === 'handoff' ? { handoffCode: 'code-abc' } : {},
+          ...harness.affectedTabs !== undefined ? { affectedSessionIds: harness.affectedTabs } : {},
         })
       },
       mutate: (args: { kind: string; sessionId?: string; ref?: string; value?: string; key?: string; deltaX?: number; deltaY?: number; timeMs?: number; text?: string }) => {
@@ -1922,6 +1929,26 @@ describe('调用方身份与占用门禁（工具层）', () => {
     // 归属变了 ⇒ 本地那份大纲属于上一任，必须丢掉（否则 find 会拿旧大纲喂 ref）。
     await expect(tool(harness, 'webpage_find').execute({ session_id: 's1', query: 'Submit' }, exec()))
       .rejects.toThrow(expect.objectContaining({ code: 'BROWSER_SNAPSHOT_REQUIRED' }))
+  })
+
+  it('drops the outline cache of every tab the migration touched, not just the requested one', async () => {
+    const harness = mount()
+    // 父子两个标签都拍过快照 —— 本地缓存里各有一份大纲。
+    await tool(harness, 'webpage_snapshot').execute({ session_id: 's1' }, exec())
+    await tool(harness, 'webpage_snapshot').execute({ session_id: 'popup' }, exec())
+    await expect(tool(harness, 'webpage_find').execute({ session_id: 'popup', query: 'Submit' }, exec()))
+      .resolves.toBeDefined()
+
+    // 释放父标签：租约是整个弹窗家族一起迁的，所以回执列出两个 id。
+    harness.affectedTabs = ['s1', 'popup']
+    await tool(harness, 'webpage_tabs').execute({ action: 'release', session_id: 's1' }, exec())
+
+    const required = expect.objectContaining({ code: 'BROWSER_SNAPSHOT_REQUIRED' })
+    await expect(tool(harness, 'webpage_find').execute({ session_id: 's1', query: 'Submit' }, exec()))
+      .rejects.toThrow(required)
+    // 只清请求目标的话，这一下会拿到旧主人的大纲 —— 那就是「不用重拍快照也能检索」的后门。
+    await expect(tool(harness, 'webpage_find').execute({ session_id: 'popup', query: 'Submit' }, exec()))
+      .rejects.toThrow(required)
   })
 
   it('guards the local outline search too: webpage_find asks the lease before searching', async () => {

@@ -226,7 +226,10 @@ export class BrowserRuntime extends Service {
           // 检查和领取之间没有 await，竞争者不能抢入；不领取移交中的或人工新建的标签。
           this.lease.claim(provider.id, tab.sessionId, owner.ownerId)
           try {
-            provider.invalidateSession?.(tab.sessionId)
+            // 领取是家族级的，ref 作废也家族级（复用的标签可能带着上次留下的弹窗）。
+            for (const id of this.lease.familyTargets(provider.id, tab.sessionId)) {
+              provider.invalidateSession?.(id)
+            }
             return await this.withLease(tab.sessionId, caller, async () => {
               await provider.tabs({ kind: 'activate', sessionId: tab.sessionId }, signal)
               const snapshot = await provider.observe({ kind: 'snapshot', sessionId: tab.sessionId }, signal)
@@ -307,40 +310,49 @@ export class BrowserRuntime extends Service {
         const claimed = this.lease.claim(provider.id, request.sessionId, owner.ownerId, request.handoffCode)
         // 归属变了 ⇒ 上一任拍的 ref 全部作废，新主人必须重新拍快照才能动手。
         // 幂等重领（自己还持有）**不**作废：那会凭空废掉模型手上的号（§3.2）。
-        if (claimed) provider.invalidateSession?.(request.sessionId)
+        // 幂等重领（自己还持有）不作废 ⇒ 也没有「受影响的标签」要清缓存。
+        const affected = claimed ? this.invalidateFamily(provider, request.sessionId) : []
         return {
           action: 'claim',
           sessionId: request.sessionId,
           tabs: await this.heldTabs(provider, owner.ownerId, signal),
+          affectedSessionIds: affected,
         }
       }
       case 'release': {
         this.lease.release(provider.id, request.sessionId, owner.ownerId)
-        provider.invalidateSession?.(request.sessionId)
+        // 释放是**整个弹窗家族**一起转空闲的，所以 ref 也要逐个作废：只作废请求目标，
+        // 子标签会带着旧主人的 ref 落到新主人手里（§3.2）。
+        const affected = this.invalidateFamily(provider, request.sessionId)
         return {
           action: 'release',
           sessionId: request.sessionId,
           tabs: await this.heldTabs(provider, owner.ownerId, signal),
+          affectedSessionIds: affected,
         }
       }
       case 'handoff': {
         const handoffCode = this.lease.handoff(provider.id, request.sessionId, owner.ownerId)
-        // 发起方**立刻**失去操作权，所以它的 ref 也在这一刻作废。
-        provider.invalidateSession?.(request.sessionId)
+        // 发起方**立刻**失去操作权，所以它的 ref 也在这一刻作废 —— 同样覆盖整个家族。
+        const affected = this.invalidateFamily(provider, request.sessionId)
         return {
           action: 'handoff',
           sessionId: request.sessionId,
           tabs: await this.heldTabs(provider, owner.ownerId, signal),
           handoffCode,
+          affectedSessionIds: affected,
         }
       }
       case 'activate': {
         this.lease.assertHeld(provider.id, request.sessionId, owner.ownerId)
         const result = await provider.tabs(request, signal)
+        // 回执清单按归属过滤：provider 的 activate 回执带的是**全量**受控标签，直接透传会
+        // 让 A 激活自己的标签就拿到 B 的 id、标题与地址。与 `list` / `close` 同口径。
+        // 全量清单从这次回执里取，不再多付一次 `list`。
         return {
           action: 'activate',
-          ...result.sessionId !== undefined ? { sessionId: result.sessionId } : {},
-          tabs: result.tabs,
+          sessionId: result.sessionId ?? request.sessionId,
+          tabs: await this.heldTabs(provider, owner.ownerId, signal, result.tabs),
         }
       }
       case 'close': {
@@ -352,7 +364,8 @@ export class BrowserRuntime extends Service {
         return {
           action: 'close',
           sessionId: request.sessionId,
-          tabs: await this.heldTabs(provider, owner.ownerId, signal),
+          // 同样是关闭后的清单：关掉的那个已经从 `held` 里摘掉了，不会再出现在回执里。
+          tabs: await this.heldTabs(provider, owner.ownerId, signal, result.tabs),
         }
       }
     }
@@ -370,7 +383,37 @@ export class BrowserRuntime extends Service {
     caller: BrowserCaller | undefined,
     signal?: AbortSignal,
   ): Promise<BrowserMutationResult> {
-    return this.withLease(request.sessionId, caller, (provider) => provider.mutate(request, signal))
+    return this.withLease(request.sessionId, caller, async (provider, ownerId) => {
+      const result = await provider.mutate(request, signal)
+      return this.filterOpenedTabs(provider, ownerId, result)
+    })
+  }
+
+  /**
+   * 回执里的「本次操作新开出来的标签」只留**本对话**的。
+   *
+   * provider 是用「动作前后全局会话集合的差集」算这张清单的（见 `collectOpenedTabs`），
+   * 它不认识调用方：A 在 wait / click 期间，B 并发开的标签、以及用户人工新建的标签都会
+   * 落进 A 的回执，标题与地址一并泄露。租约表认识主人，所以在这里过滤 —— 没有记录的
+   * （人工新建、不猜 owner）同样不回（§5.2）。
+   */
+  private filterOpenedTabs(
+    provider: BrowserProvider,
+    ownerId: string,
+    result: BrowserMutationResult,
+  ): BrowserMutationResult {
+    const opened = result.openedTabs
+    if (opened === undefined || opened.length === 0) return result
+    const mine = opened.filter(tab => this.lease.ownerOf(provider.id, tab.sessionId) === ownerId)
+    // 一条都没被滤掉（弹窗继承链路正常，弹出的本来就是自己的）⇒ 原样返回，不造新对象。
+    if (mine.length === opened.length) return result
+    if (mine.length === 0) {
+      // 与 provider 同口径：一个都不剩时**不带**这个字段，而不是给个空数组。
+      const without = { ...result }
+      delete without.openedTabs
+      return without
+    }
+    return { ...result, openedTabs: mine }
   }
 
   /**
@@ -525,16 +568,33 @@ export class BrowserRuntime extends Service {
     }
   }
 
+  /**
+   * 作废一个标签**连同它的弹窗家族**的 ref 纪元，返回被作废的标签 id。
+   *
+   * 租约的 claim / release / handoff 都是以家族为单位迁移的，ref 纪元作废必须跟同样的
+   * 粒度：只作废请求目标，子标签就带着旧主人的 ref 落到新主人手里（方案 §3.2）。
+   */
+  private invalidateFamily(provider: BrowserProvider, targetId: string): string[] {
+    const affected = this.lease.familyTargets(provider.id, targetId)
+    for (const id of affected) provider.invalidateSession?.(id)
+    return affected
+  }
+
   /** 本对话占用的标签：以占用表为准，用 provider 的清单补标题 / 地址 / 前台状态。 */
   private async heldTabs(
     provider: BrowserProvider,
     ownerId: string,
     signal?: AbortSignal,
+    /**
+     * 已经取到的 provider 全量清单。provider 的 activate / close 回执里就带着它，传进来可
+     * 以省掉一次 `list` 往返（过滤逻辑完全一样）。
+     */
+    listed?: readonly BrowserTabInfo[],
   ): Promise<readonly BrowserTabInfo[]> {
     const held = this.lease.listHeld(provider.id, ownerId)
     if (held.length === 0) return []
-    const listed = await provider.tabs({ kind: 'list' }, signal)
-    const byId = new Map(listed.tabs.map(tab => [tab.sessionId, tab]))
+    const tabs = listed ?? (await provider.tabs({ kind: 'list' }, signal)).tabs
+    const byId = new Map(tabs.map(tab => [tab.sessionId, tab]))
     return held.flatMap((view) => {
       const tab = byId.get(view.targetId)
       // 台账里有、provider 清单里没有：标签已经被关掉了（或连接断了）。不回给模型 ——

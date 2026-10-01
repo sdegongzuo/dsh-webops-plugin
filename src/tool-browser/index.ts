@@ -1823,10 +1823,14 @@ function registerTabs(ctx: Context, cache: SnapshotCache): void {
       const result = await ctx.browser.tabs(request, callerOf(exec), exec.signal)
       // 归属一变，本地缓存的那份大纲就属于上一个主人了：claimed 的人不该看到它，
       // released / handed off 的人也不该留着它（门禁虽然拦得住，但留着只会误导）。
-      if ((result.action === 'close' || result.action === 'claim'
-        || result.action === 'release' || result.action === 'handoff')
-        && result.sessionId !== undefined) {
-        cache.delete(result.sessionId)
+      // 逐个删 `affectedSessionIds`：迁移是整个弹窗家族一起做的，只删请求目标会把旧主人
+      // 拍的子标签快照留给新主人 —— 它能跳过「先拍快照」这一步，直接检索别人的大纲（§3.2）。
+      // `close` 不填这个字段（只摘目标一条记录），所以用 `sessionId` 兜底。
+      if (result.action === 'close' || result.action === 'claim'
+        || result.action === 'release' || result.action === 'handoff') {
+        const affected = result.affectedSessionIds
+          ?? (result.sessionId !== undefined ? [result.sessionId] : [])
+        for (const id of affected) cache.delete(id)
       }
       return {
         action: result.action,

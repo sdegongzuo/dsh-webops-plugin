@@ -298,17 +298,23 @@ export class TabLeaseRegistry {
   }
 
   /**
-   * 结束一次调用。最后一个执行中的调用结束时**重置空闲截止**（网站或 CDP 失败也算 ——
+   * 结束一次调用。家族中最后一个执行中的调用结束时**统一重置空闲截止**（网站或 CDP 失败也算 ——
    * 「还活着」这件事与调用成不成功无关）。
    *
    * 代次对不上（期间换过主人）时整条忽略：既不动别人租期的计数，也不给它续期。
    */
   endCall(providerId: string, targetId: string, generation: number): void {
-    const entry = this.entries.get(leaseKey(providerId, targetId))
+    const key = leaseKey(providerId, targetId)
+    const entry = this.entries.get(key)
     if (entry === undefined || entry.generation !== generation) return
     entry.activeCalls = Math.max(0, entry.activeCalls - 1)
-    if (entry.activeCalls === 0 && entry.state === 'held') {
-      entry.deadline = this.clock.now() + this.config.idleMs
+    if (entry.activeCalls === 0 && entry.state === 'held' && !this.familyBusy(key)) {
+      // 回收以家族为单位，续期也必须一致；否则父标签的旧截止会释放刚续期的子标签。
+      const deadline = this.clock.now() + this.config.idleMs
+      for (const memberKey of this.familyOf(key)) {
+        const member = this.entries.get(memberKey)
+        if (member?.state === 'held' && member.ownerId === entry.ownerId) member.deadline = deadline
+      }
     }
     this.armTimer()
   }
@@ -316,13 +322,16 @@ export class TabLeaseRegistry {
   /**
    * 释放占用，**保留页面**。释放后标签进入空闲清单，等着谁领取。
    *
-   * @throws `BROWSER_TAB_BUSY`：还有执行中的调用 —— 让人把操作做完再说。
+   * 同族标签（弹窗父子）一起转空闲，所以**全族**都不能有执行中的调用 —— 只查请求目标
+   * 会把正在跑调用的子标签一并放走（§5.1）。
+   *
+   * @throws `BROWSER_TAB_BUSY`：本标签或它的弹窗家族里还有执行中的调用。
    */
   release(providerId: string, targetId: string, ownerId: string): void {
     this.expire()
     const key = leaseKey(providerId, targetId)
     const entry = this.requireHeld(key, targetId, ownerId, 'release')
-    this.assertIdle(entry, targetId, 'release')
+    this.assertFamilyIdle(key, 'release')
     this.setAvailable(key, entry)
     this.armTimer()
   }
@@ -332,14 +341,17 @@ export class TabLeaseRegistry {
    *
    * 明文只在这一刻存在，表里只有它的哈希；发起方自己也不该留着它。
    *
+   * 同族标签跟着一起移交（父子共用一个码、一个截止时间），所以活动调用的检查也是**全族**
+   * 的：子标签正在跑调用时移交父标签，等于把那条调用连同操作权一起送人（§5.1）。
+   *
    * @returns 明文移交码。
-   * @throws `BROWSER_TAB_BUSY`：还有执行中的调用（实施方案 §5.1）。
+   * @throws `BROWSER_TAB_BUSY`：本标签或它的弹窗家族里还有执行中的调用（实施方案 §5.1）。
    */
   handoff(providerId: string, targetId: string, ownerId: string): string {
     this.expire()
     const key = leaseKey(providerId, targetId)
-    const entry = this.requireHeld(key, targetId, ownerId, 'handoff')
-    this.assertIdle(entry, targetId, 'handoff')
+    this.requireHeld(key, targetId, ownerId, 'handoff')
+    this.assertFamilyIdle(key, 'handoff')
     const code = mintHandoffCode()
     const now = this.clock.now()
     // 同族的标签（弹窗父子）跟着一起移交：父子共用一个码、一个截止时间。
@@ -365,8 +377,8 @@ export class TabLeaseRegistry {
    */
   assertClosable(providerId: string, targetId: string, ownerId: string): void {
     this.expire()
-    const entry = this.requireHeld(leaseKey(providerId, targetId), targetId, ownerId, 'close')
-    this.assertIdle(entry, targetId, 'close')
+    this.requireHeld(leaseKey(providerId, targetId), targetId, ownerId, 'close')
+    this.assertFamilyIdle(leaseKey(providerId, targetId), 'close')
   }
 
   /**
@@ -388,6 +400,15 @@ export class TabLeaseRegistry {
         `session "${targetId}" is not in the controlled tab ledger, so it cannot be claimed — `
         + 'it was closed, or this plugin never owned it. Open your own tab with webpage_open.',
         'BROWSER_TAB_NOT_HELD',
+      )
+    }
+    // 带码领取只能消费当前有效的移交；不能退回普通空闲领取或同 owner 的幂等领取。
+    if (handoffCode !== undefined && entry.state !== 'handoff') {
+      throw new BrowserError(
+        `the handoff code for session "${targetId}" is wrong, expired, or was already used. `
+        + 'Codes are single-use and short-lived — ask the previous owner for a NEW one instead of '
+        + 'retrying this code.',
+        'BROWSER_HANDOFF_INVALID',
       )
     }
     if (entry.state === 'held') {
@@ -514,15 +535,65 @@ export class TabLeaseRegistry {
    */
   private assertIdle(entry: LeaseEntry, targetId: string, action: string): void {
     if (entry.activeCalls === 0) return
+    // `release` 直接加 `ed` 会拼出 "releaseed"，`close` 加 `d` 才是 "closed"（既有文案）。
+    const past = action.endsWith('e') ? `${action}d` : `${action}ed`
     throw new BrowserError(
       `session "${targetId}" has ${String(entry.activeCalls)} call(s) still running, so it cannot be `
-      + `${action}ed right now. This IS retryable: wait for those calls to finish and send the same `
+      + `${past} right now. This IS retryable: wait for those calls to finish and send the same `
       + 'request again — the plugin will not interrupt an operation in flight.',
       'BROWSER_TAB_BUSY',
     )
   }
 
-  /** 转空闲（释放占用，保留页面）。 */
+  /**
+   * 释放 / 移交 / 关闭前的**全族**活动调用检查。
+   *
+   * 单看请求目标是不够的：迁移是以家族为单位做的，只查目标会让「子标签正在跑调用」这一
+   * 事实被漏掉 —— 调用还在旧 owner 名下跑着，操作权却已经易主（§5.1）。
+   *
+   * @throws `BROWSER_TAB_BUSY`：家族里任一条记录还有执行中的调用（文案点名那个标签）。
+   */
+  private assertFamilyIdle(key: string, action: string): void {
+    for (const memberKey of this.familyOf(key)) {
+      const member = this.entries.get(memberKey)
+      if (member === undefined) continue
+      this.assertIdle(member, splitLeaseKey(memberKey).targetId, action)
+    }
+  }
+
+  /** 家族里是否还有执行中的调用（含自己）。 */
+  private familyBusy(key: string): boolean {
+    for (const memberKey of this.familyOf(key)) {
+      const member = this.entries.get(memberKey)
+      if (member !== undefined && member.activeCalls > 0) return true
+    }
+    return false
+  }
+
+  /**
+   * 与本标签同族（弹窗父子）的全部标签 id，**含自己**。
+   *
+   * 受控入口用它做「迁移波及了谁」的查询：ref 纪元作废与快照缓存清理都必须**逐个**做，
+   * 只作废请求目标会给新主人留下旧主人的 ref（§3.2）。成员关系不随迁移变化，所以迁移
+   * 前后取都一样。
+   */
+  familyTargets(providerId: string, targetId: string): string[] {
+    return this.familyOf(leaseKey(providerId, targetId)).map(key => splitLeaseKey(key).targetId)
+  }
+
+  /** 当前主人；空闲 / 移交待领 / 没有记录时是 `undefined`。回执过滤用（不猜无主标签）。 */
+  ownerOf(providerId: string, targetId: string): string | undefined {
+    return this.entries.get(leaseKey(providerId, targetId))?.ownerId
+  }
+
+  /**
+   * 转空闲（释放占用，保留页面）。
+   *
+   * ⚠ 这里**不发** `onRelease` 通知 —— 那条通知的语义是「占用被自动回收」（超时 / 移交码
+   * 过期），订阅方靠它补做超时路径上的清理。显式 `release` / `handoff` 由受控入口按
+   * `familyTargets()` 逐个作废 ref 与缓存（`BrowserTabsResult.affectedSessionIds`），
+   * 两头各走各的，不重叠。以后新增订阅者时别在这里补发 —— 那会双触发。
+   */
   private setAvailable(key: string, entry: LeaseEntry): void {
     // 同族一起转：弹窗父子共用状态，留一个 held 会造出「半个主人」。
     for (const memberKey of this.familyOf(key)) {
@@ -588,18 +659,37 @@ export class TabLeaseRegistry {
    */
   private expire(): void {
     const now = this.clock.now()
+    const dueIdle: string[] = []
+    const dueHandoff: string[] = []
     for (const key of [...this.entries.keys()]) {
       const entry = this.entries.get(key)
       if (entry === undefined) continue
       if (entry.state === 'held') {
-        // activeCalls 非零时**不得**超时释放（§3.1.4）：一次跨越截止时间的长调用不能被截断。
-        if (entry.activeCalls > 0 || !Number.isFinite(entry.deadline) || entry.deadline > now) continue
-        this.retire(key, entry, 'idle')
+        if (!Number.isFinite(entry.deadline) || entry.deadline > now) continue
+        dueIdle.push(key)
         continue
       }
       if (entry.state === 'handoff' && Number.isFinite(entry.deadline) && entry.deadline <= now) {
-        this.retire(key, entry, 'handoff-expired')
+        dueHandoff.push(key)
       }
+    }
+    // activeCalls 非零时**不得**超时释放（§3.1）：一次跨越截止时间的长调用不能被截断。
+    // 判据是**全族**的：回收以家族为单位（弹窗父子一起转空闲），只看自己到期没到期会
+    // 把正在跑调用的子标签一起放走，让旧调用与新主人的操作重叠。整族跳过而不是只跳过
+    // 忙的那一条 —— 留下「半个家族」等于造出半个主人。
+    for (const key of dueIdle) {
+      const entry = this.entries.get(key)
+      if (entry === undefined || this.familyBusy(key)) continue
+      // 同一族里可能好几条一起到期：第一条 `retire` 已经把整族转走了，后面的不该再跑一遍
+      // （那会白白再推进一次代次）。
+      if (entry.state !== 'held') continue
+      this.retire(key, entry, 'idle')
+    }
+    // 移交码过期不涉及活动调用：能进入 handoff 状态本身就说明当时全族都是闲的。
+    for (const key of dueHandoff) {
+      const entry = this.entries.get(key)
+      if (entry === undefined) continue
+      this.retire(key, entry, 'handoff-expired')
     }
     this.armTimer()
   }
@@ -633,10 +723,15 @@ export class TabLeaseRegistry {
    * 定时器风暴，而这里真正需要的只是「下一次该醒来的时刻」。
    */
   private armTimer(): void {
+    const now = this.clock.now()
     let next = Number.POSITIVE_INFINITY
-    for (const entry of this.entries.values()) {
+    for (const [key, entry] of this.entries) {
       if (!Number.isFinite(entry.deadline)) continue
       if (entry.state === 'held' && entry.activeCalls > 0) continue
+      // 已经过期却还在表里 = 家族里有调用在跑（expire 整族跳过）。这时**不能**按 1ms 重排
+      // 定时器：那会变成每毫秒一轮全表遍历的空转。交给 endCall 唤醒 —— 调用收尾时那里会
+      // 重排定时器，那时家族不再忙，这一轮到期就会真正被回收。
+      if (entry.deadline <= now && this.familyBusy(key)) continue
       if (entry.deadline < next) next = entry.deadline
     }
     if (this.timer !== undefined) {
