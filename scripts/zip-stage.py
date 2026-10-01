@@ -19,6 +19,9 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 def main() -> int:
+    # Windows CI 的管道默认可能是 cp1252；中文路径、日志及错误统一按 UTF-8 输出。
+    sys.stdout.reconfigure(encoding='utf-8')
+    sys.stderr.reconfigure(encoding='utf-8')
     ap = argparse.ArgumentParser()
     ap.add_argument('--stage', default='.desktop-stage')
     ap.add_argument('--out', required=True)
