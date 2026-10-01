@@ -7,6 +7,8 @@
  * 用法：
  *   node scripts/package-plugin-update.mjs [--version 0.2.8] [--out dist/xxx.zip]
  *   node scripts/package-plugin-update.mjs --probe-token XXX   # 自检专用：注入一行可识别的打印
+ *   node scripts/package-plugin-update.mjs --lib-dir <本次构建目录> --stage-root <暂存父目录> --keep-stage
+ *       # 使用指定构建并保留暂存文件；目标 zip 必须尚不存在，不传 --force。
  *
  * 产出（默认 `dist/dsh-webops-plugin-update-v<ver>.zip`），内部结构对应便携包根目录：
  *   home\profiles\desktop\node_modules\dsh-webops-plugin\{lib\, package.json, cordis.patch.yml}
@@ -41,15 +43,19 @@ const readArg = (name) => {
   return at === -1 ? undefined : args[at + 1]
 }
 const probeToken = readArg('probe-token')
+const keepStage = args.includes('--keep-stage')
+const libDir = resolve(readArg('lib-dir') ?? join(ROOT, 'lib'))
+const stageRoot = resolve(readArg('stage-root') ?? tmpdir())
 
 const pkg = JSON.parse(readFileSync(join(ROOT, 'package.json'), 'utf8'))
 const version = readArg('version') ?? pkg.version
 const out = resolve(readArg('out') ?? join(DIST, `${PLUGIN_NAME}-update-v${version}.zip`))
 
 // 产物来自 `lib/`（tsdown 输出），没 build 就打出来的是上一版的代码，且不会报错。
-for (const rel of ['lib/index.js', 'lib/client.js', 'cordis.patch.yml']) {
-  if (!existsSync(join(ROOT, rel))) {
-    console.error(`package-plugin-update: 缺少 ${rel} —— 先跑 pnpm build`)
+for (const path of [join(libDir, 'index.js'), join(libDir, 'client.js'), join(ROOT, 'cordis.patch.yml'),
+  ...['host.cjs', 'action-overlay.cjs', 'action-overlay.html', 'tabbar.html', 'tabbar-preload.cjs'].map(name => join(libDir, 'browser-electron', name))]) {
+  if (!existsSync(path)) {
+    console.error(`package-plugin-update: 缺少 ${path} —— 先构建插件`)
     process.exit(1)
   }
 }
@@ -63,14 +69,17 @@ if (existsSync(out) && args.includes('--force')) {
   console.warn(`package-plugin-update: --force，已移除旧的 ${out}`)
 }
 
-const stage = mkdtempSync(join(tmpdir(), 'dsh-plugin-update-'))
+mkdirSync(stageRoot, { recursive: true })
+const stage = mkdtempSync(join(stageRoot, 'dsh-plugin-update-'))
 const profileInZip = join(stage, 'home', 'profiles', 'desktop')
 const pluginDir = join(profileInZip, 'node_modules', PLUGIN_NAME)
 mkdirSync(pluginDir, { recursive: true })
 
-cpSync(join(ROOT, 'lib'), join(pluginDir, 'lib'), { recursive: true })
+cpSync(libDir, join(pluginDir, 'lib'), { recursive: true, filter: source => resolve(source) !== join(libDir, 'fake-llm') })
 cpSync(join(ROOT, 'cordis.patch.yml'), join(pluginDir, 'cordis.patch.yml'))
 const releasePkg = { ...pkg, version }
+releasePkg.exports = { ...pkg.exports }
+delete releasePkg.exports['./fake-llm']
 delete releasePkg.devDependencies
 delete releasePkg.scripts
 writeFileSync(join(pluginDir, 'package.json'), `${JSON.stringify(releasePkg, null, 2)}\n`)
@@ -150,4 +159,5 @@ console.log(`\n产物: ${out}`)
 console.log(`体积: ${String(Math.round(statSync(out).size / 1024))} KB（整包 zip 是 472MB）`)
 console.log(`sha256: ${sha256}`)
 
-rmSync(stage, { recursive: true, force: true })
+if (keepStage) console.log(`暂存目录保留：${stage}`)
+else rmSync(stage, { recursive: true, force: true })

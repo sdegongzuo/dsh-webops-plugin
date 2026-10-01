@@ -166,7 +166,7 @@ export function startPackagedDesktopHost(options) {
   const ready = new Promise((resolve, reject) => {
     const timer = setTimeout(() => {
       reject(new Error(`desktop-host ${String(options.timeoutMs ?? 60_000)}ms 内没发 ready：${stderr.trim().slice(0, 400)}`))
-      child.kill('SIGTERM')
+      if (options.gracefulOnly !== true) child.kill('SIGTERM')
     }, options.timeoutMs ?? 60_000)
     const fail = error => {
       clearTimeout(timer)
@@ -194,6 +194,9 @@ export function startPackagedDesktopHost(options) {
     const exited = new Promise(resolve => { child.once('close', resolve) })
     const wait = ms => new Promise(resolve => { setTimeout(resolve, ms) })
     await Promise.race([exited, wait(10_000)])
+    if (options.gracefulOnly === true && child.exitCode === null && child.signalCode === null) {
+      throw new Error(`desktop-host 未响应正常退出；保留 PID=${String(child.pid)}，未强制终止。`)
+    }
     if (child.exitCode === null && child.signalCode === null) {
       child.kill('SIGTERM')
       await Promise.race([exited, wait(5_000)])

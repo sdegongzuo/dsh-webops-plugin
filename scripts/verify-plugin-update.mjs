@@ -3,6 +3,8 @@
  *
  * 用法：
  *   node scripts/verify-plugin-update.mjs --dir <已解压的便携版目录> [--version 0.2.8]
+ *   node scripts/verify-plugin-update.mjs --dir <便携目录> --lib-dir <本次构建目录> --scratch-root <D盘目录> --keep
+ *       # 保留全部证据，只正常退出自建宿主，不执行目录删除与强制终止。
  *   node scripts/verify-plugin-update.mjs --dir <已解压的便携版目录> --in-place
  *       # 追加「真实用户路径」：用 pwsh Expand-Archive 把增量包解压到包根目录覆盖，
  *       # 并断言 home 里除插件目录外的文件 byte-for-byte 不变（会话 / 设置 / 凭据安全）。
@@ -35,6 +37,12 @@ const readArg = (name) => {
   return at === -1 ? undefined : args[at + 1]
 }
 const keep = args.includes('--keep')
+const libDir = resolve(readArg('lib-dir') ?? join(ROOT, 'lib'))
+const scratchRoot = resolve(readArg('scratch-root') ?? tmpdir())
+if (keep && args.includes('--in-place')) {
+  console.error('verify-plugin-update: --keep 不支持含删除还原逻辑的 --in-place；使用独立 profile 三轮验证。')
+  process.exit(1)
+}
 const dir = readArg('dir')
 if (dir === undefined) {
   console.error('用法: node scripts/verify-plugin-update.mjs --dir <已解压的便携版目录> [--version x.y.z]')
@@ -61,7 +69,8 @@ const check = (ok, message) => {
   if (!ok) failures += 1
 }
 
-const scratch = mkdtempSync(join(tmpdir(), 'dsh-plugin-update-verify-'))
+mkdirSync(scratchRoot, { recursive: true })
+const scratch = mkdtempSync(join(scratchRoot, 'dsh-plugin-update-verify-'))
 const zipPath = join(scratch, 'update.zip')
 const unzipped = join(scratch, 'unzipped')
 const profile = join(scratch, 'desktop')
@@ -72,7 +81,8 @@ const home = join(scratch, 'home')
 console.log('\n[1/4] 生成带自检探针的增量包')
 const packed = spawnSync(
   process.execPath,
-  [join(ROOT, 'scripts', 'package-plugin-update.mjs'), '--version', version, '--out', zipPath, '--probe-token', probeToken],
+  [join(ROOT, 'scripts', 'package-plugin-update.mjs'), '--version', version, '--out', zipPath, '--probe-token', probeToken,
+    '--lib-dir', libDir, '--stage-root', scratch, ...(keep ? ['--keep-stage'] : [])],
   { encoding: 'utf8', cwd: ROOT },
 )
 console.log((packed.stdout ?? '').trim())
@@ -114,8 +124,11 @@ function inventory(root) {
   return out
 }
 
-const shippedLib = inventory(join(ROOT, 'lib'))
+const shippedLib = inventory(libDir)
+for (const rel of shippedLib.keys()) if (rel.startsWith('fake-llm/')) shippedLib.delete(rel)
 const zippedLib = inventory(join(pluginInZip, 'lib'))
+check(![...zippedLib.keys()].some(rel => rel.startsWith('fake-llm/')), '生产增量包不含 fake-llm 测试模块')
+check(!Object.hasOwn(JSON.parse(readFileSync(join(pluginInZip, 'package.json'), 'utf8')).exports, './fake-llm'), '生产 manifest 不导出 fake-llm')
 const missing = [...shippedLib.keys()].filter(rel => !zippedLib.has(rel))
 const differing = [...shippedLib.entries()]
   .filter(([rel, hash]) => rel !== 'client.js' && zippedLib.get(rel) !== hash)
@@ -143,7 +156,7 @@ mkdirSync(home, { recursive: true })
 // 后面的对话轮次会因为「没有可用模型」而失败 —— 那个症状离现场很远，不值得再查一次。
 check(existsSync(join(profile, 'cordis.patch.yml')), '出厂 profile patch 随 profile 拷贝进了工作目录')
 process.env.DSH_HOME = home
-rmSync(join(home, '.credentials.yaml.lock'), { force: true })
+// home 是本次新建目录；不需要删除凭据锁文件。
 
 const shippedPluginDir = join(srcProfile, 'node_modules', PLUGIN_NAME)
 
@@ -151,7 +164,7 @@ const shippedPluginDir = join(srcProfile, 'node_modules', PLUGIN_NAME)
 async function boot(label, profileDir = profile) {
   let host
   try {
-    host = startPackagedDesktopHost({ runtimeDir, profileDir, env: process.env, timeoutMs: 180_000 })
+    host = startPackagedDesktopHost({ runtimeDir, profileDir, env: process.env, timeoutMs: 180_000, gracefulOnly: keep })
   } catch (error) {
     // 起宿主**之前**的端口预检会在这里抛（见 run-packaged-host 的 assertHostPortFree）。
     // 那一类失败（19387 被别的 dsh 实例占着）以前要等宿主起来后报「N required plugins

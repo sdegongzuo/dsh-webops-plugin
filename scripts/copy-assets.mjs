@@ -13,6 +13,9 @@ import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..')
+const at = process.argv.indexOf('--out-dir')
+if (at !== -1 && !process.argv[at + 1]) throw new Error('copy-assets: --out-dir 需要目标目录')
+const outDir = resolve(at === -1 ? join(ROOT, 'lib') : process.argv[at + 1])
 
 /** 需要原样搬运的资产：源路径 → 产物路径（都相对仓库根）。 */
 const ASSETS = [
@@ -24,8 +27,8 @@ const ASSETS = [
 ]
 
 for (const [from, to] of ASSETS) {
-  const target = join(ROOT, to)
+  const target = join(outDir, to.slice('lib/'.length))
   mkdirSync(dirname(target), { recursive: true })
   copyFileSync(join(ROOT, from), target)
-  console.log(`copy-assets: ${from} → ${to}`)
+  console.log(`copy-assets: ${from} → ${target}`)
 }
