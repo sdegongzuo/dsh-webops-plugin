@@ -526,8 +526,9 @@ class FakeSocket implements CdpSocket {
  * （`ElectronBrowserProvider.ensureTabOpenedChannel` 收到 `{type:'opened'}` 就是这么调的）。
  */
 class AdoptableProvider extends CdpBrowserProvider {
-  adopt(target: CdpTarget): Promise<unknown> {
-    return this.adoptSession(target)
+  /** `opener` 省略 = 无受控父标签（宿主标签条「+」开的页面），归属不继承。 */
+  adopt(target: CdpTarget, opener?: string): Promise<unknown> {
+    return this.adoptSession(target, opener)
   }
 }
 
@@ -1829,6 +1830,115 @@ describe('CdpBrowserProvider.mutate (P1)', () => {
     await provider.open({})
     await expect(provider.mutate({ kind: 'wait', sessionId: 'tab-1', until: 'stable', timeMs: 10 }))
       .rejects.toThrow(expect.objectContaining({ code: 'BROWSER_PROTOCOL_ERROR' }))
+  })
+})
+
+/**
+ * 多会话防冲突 · A4：收编通报 + 归属变化时的 ref 纪元作废。
+ *
+ * provider 这一层只负责**报事实**（谁被收编、它是谁弹的；谁的归属变了），裁决在能力缝隙。
+ * 这两件事一旦有一件没做到，上层看到的是「弹窗不进任何人的名下」或「新主人拿到旧 ref」，
+ * 而两者都不会报错 —— 所以必须单独钉住。
+ */
+describe('归属通报与 ref 纪元作废（多会话防冲突 · A4）', () => {
+  let chrome: FakeChrome
+  let provider: AdoptableProvider
+
+  beforeEach(async () => {
+    chrome = new FakeChrome()
+    chrome.axeNodes = PAGE_TREE
+    provider = new AdoptableProvider({ navigationTimeoutMs: 200 }, chrome.transport())
+    await provider.open({})
+  })
+
+  it('收编成功后通报 (targetId, openerTargetId)；无父标签的通报带 undefined', async () => {
+    const seen: { targetId: string; opener: string | undefined }[] = []
+    provider.onSessionAdopted((targetId, openerTargetId) => { seen.push({ targetId, opener: openerTargetId }) })
+
+    // 页面弹窗：宿主通报里带 openerTabId。
+    await provider.adopt(popupTarget(), 'tab-1')
+    // 标签条「+」开的页面：宿主通报里没有这个字段。
+    await provider.adopt({ ...popupTarget(), id: 'tab-9' })
+
+    expect(seen).toEqual([
+      { targetId: 'popup-9', opener: 'tab-1' },
+      { targetId: 'tab-9', opener: undefined },
+    ])
+  })
+
+  it('通报发生在会话已登记之后（订阅方当场就能看见它）', async () => {
+    // 钉住 `adoptSession` 里「先 `sessions.set`、再通报」那句注释。
+    //
+    // 能被抓住的前提是 `tabs(list)` 的快照取在**同步段**内：`activeTargetId` 没挂时
+    // `listTabs` 在第一个 await 之前就把 `[...sessions.values()]` 读完了 —— 所以订阅方
+    // 在监听函数里同步调它，拿到的就是「通报那一刻」的表。把这句通报挪到 `sessions.set`
+    // 之前，这里立刻红；若哪天 `listTabs` 前面多出一个 await，这条用例就会退化成装饰品。
+    let listedInsideListener: Promise<boolean> | undefined
+    const stop = provider.onSessionAdopted((targetId) => {
+      listedInsideListener = provider.tabs({ kind: 'list' })
+        .then(result => result.tabs.some(tab => tab.sessionId === targetId))
+    })
+
+    await provider.adopt(popupTarget(), 'tab-1')
+    stop()
+
+    expect(await listedInsideListener).toBe(true)
+  })
+
+  it('收编失败时一条通报都不发（通报的是事实，不是意图）', async () => {
+    // 连接都建不起来就不该有人被告知「这个标签归你了」—— 否则能力缝隙会为一张
+    // 根本不存在的标签建立占用记录，之后谁都领不走它。
+    const failing = new AdoptableProvider({ navigationTimeoutMs: 200 }, {
+      ...chrome.transport(),
+      connect: () => Promise.reject(new Error('target is gone')),
+    })
+    const seen: string[] = []
+    failing.onSessionAdopted(targetId => { seen.push(targetId) })
+
+    await expect(failing.adopt(popupTarget(), 'tab-1')).rejects.toThrow('target is gone')
+    expect(seen).toEqual([])
+  })
+
+  it('退订后不再收到通报', async () => {
+    const seen: string[] = []
+    const stop = provider.onSessionAdopted(targetId => { seen.push(targetId) })
+
+    await provider.adopt(popupTarget(), 'tab-1')
+    stop()
+    await provider.adopt({ ...popupTarget(), id: 'tab-9' })
+
+    expect(seen).toEqual(['popup-9'])
+  })
+
+  it('invalidateSession 作废该会话的 ref 纪元，旧 ref 立刻报 BROWSER_STALE_REF', async () => {
+    const snapshot = await provider.observe({ kind: 'snapshot', sessionId: 'tab-1' })
+    if (snapshot.kind !== 'snapshot') throw new Error('expected a snapshot')
+    const ref = snapshot.refs[0]?.ref as string
+
+    provider.invalidateSession('tab-1')
+
+    await expect(provider.mutate({ kind: 'click', sessionId: 'tab-1', ref }))
+      .rejects.toThrow(expect.objectContaining({ code: 'BROWSER_STALE_REF' }))
+  })
+
+  it('invalidateSession 只动被点名的会话；未知 id 是 no-op', async () => {
+    const stale = await provider.observe({ kind: 'snapshot', sessionId: 'tab-1' })
+    if (stale.kind !== 'snapshot') throw new Error('expected a snapshot')
+    const staleRef = stale.refs[0]?.ref as string
+
+    // 第二个会话：它的 ref 必须不受影响（作废是「点名作废」，不是清空全表）。
+    const other = await provider.open({})
+    const kept = await provider.observe({ kind: 'snapshot', sessionId: other.id })
+    if (kept.kind !== 'snapshot') throw new Error('expected a snapshot')
+    const keptRef = kept.refs[0]?.ref as string
+
+    expect(() => { provider.invalidateSession('tab-1') }).not.toThrow()
+    expect(() => { provider.invalidateSession('never-opened') }).not.toThrow()
+
+    await expect(provider.mutate({ kind: 'click', sessionId: 'tab-1', ref: staleRef }))
+      .rejects.toThrow(expect.objectContaining({ code: 'BROWSER_STALE_REF' }))
+    await expect(provider.mutate({ kind: 'click', sessionId: other.id, ref: keptRef }))
+      .resolves.toMatchObject({ action: 'click' })
   })
 })
 

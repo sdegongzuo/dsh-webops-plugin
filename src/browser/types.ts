@@ -77,6 +77,37 @@ export type BrowserErrorCode =
    * 交还**不**恢复任何旧 ref）。
    */
   | 'BROWSER_HUMAN_HOLDING'
+  /**
+   * 多会话占用：这次工具调用没有拿到宿主对话身份（`exec.agent.id` 缺失）。
+   *
+   * **不是模型能自己修的错误** —— 身份来自宿主执行上下文，不是工具参数。模型侧唯一的
+   * 动作是报告「这个运行环境没有传递调用方身份」；补身份属于宿主/插件装配的修复。
+   * 因此它**绝不**回落到「没有身份就全部放行」：那会让门禁在缺身份时静默失效。
+   */
+  | 'BROWSER_CALLER_REQUIRED'
+  /**
+   * 多会话占用：目标标签不归本对话所有（别人占着、空闲待领、移交待领，或标签根本
+   * 不在受控台账里）。**可恢复**：对空闲标签先 `webpage_tabs(action=claim)`，
+   * 领取成功后重拍一次完整快照再操作。
+   */
+  | 'BROWSER_TAB_NOT_HELD'
+  /**
+   * 多会话占用：领取竞争失败 —— 就在这次调用之前，另一个对话已经把该标签领走。
+   *
+   * 与 `BROWSER_TAB_NOT_HELD` 分开的理由只有一个：**恢复动作不同**。那个是「去领取」，
+   * 这个是「别争了，换一个空闲标签或等对方释放」。合成一个码会让模型对着同一个标签
+   * 反复重试领取。
+   */
+  | 'BROWSER_TAB_OCCUPIED'
+  /**
+   * 多会话占用：标签上有正在执行的调用，此刻不能释放 / 移交 / 关闭。
+   * **可重试**：等执行中的调用结束后重发即可。
+   */
+  | 'BROWSER_TAB_BUSY'
+  /**
+   * 多会话占用：移交码错误、已过期或已被消费。**不可重放旧码** —— 向原持有者要一个新码。
+   */
+  | 'BROWSER_HANDOFF_INVALID'
 
 /** 能力缝隙与 provider 唯一抛出的错误类型。 */
 /**
@@ -475,27 +506,83 @@ export interface BrowserMutationResult {
   readonly unconfirmed?: boolean
 }
 
+/**
+ * 调用方身份 —— **宿主执行上下文给的**，不是模型参数。
+ *
+ * 为什么必须是独立的参数而不是请求体里的字段：请求体整体来自模型 JSON；只要身份能从
+ * 请求体里给，模型就能伪造成别人去操作别人的标签，门禁等于没有。所以它由工具层从
+ * `exec.agent.id` 提取，沿调用链单独传递。
+ */
+export interface BrowserCaller {
+  readonly ownerId: string
+}
+
+/** 一个受控标签当前的占用状态（见实施方案 §2.2）。 */
+export type BrowserTabLeaseState =
+  /** 归某个对话独占；只有它自己看得见、只有它能操作。 */
+  | 'held'
+  /** 空闲待领：清单里只披露标签 id，领取后才可读写。 */
+  | 'available'
+  /** 移交待领：不入普通清单，凭一次性移交码领取。 */
+  | 'handoff'
+
+/** 标签占用信息，随清单一起回给调用方。 */
+export interface BrowserTabLease {
+  readonly state: BrowserTabLeaseState
+  /** 距空闲释放 / 移交码过期还有多少毫秒；`available` 没有期限，故缺席。 */
+  readonly remainingMs?: number
+}
+
 /** 标签页清单里的一项（本插件自己开的受控标签页）。 */
 export interface BrowserTabInfo {
   readonly sessionId: string
-  readonly url: string
-  readonly title: string
+  /**
+   * 地址与标题。**空闲清单（`scope: 'available'`）里缺席** —— 领取之前不向其他对话
+   * 披露别人页面上有什么，这是「只显示标签 id」那条规则的机器可读形态。
+   */
+  readonly url?: string
+  readonly title?: string
   /** 是否在前台；provider 判断不了时省略（外部 Chrome 没有可靠的「活动标签」信号）。 */
   readonly active?: boolean
+  /** 占用状态与剩余租期；未登记的标签缺席。 */
+  readonly lease?: BrowserTabLease
 }
 
-/** 标签页管理请求：清单 / 切前台 / 关闭。 */
+/**
+ * 标签页管理请求。
+ *
+ * `list` / `activate` / `close` 是 provider 动作（`activate` / `close` 只管本 provider
+ * 自己开的标签）；`claim` / `release` / `handoff` 是**占用动作**，由能力缝隙在本地裁决，
+ * 一个 CDP 命令都不发（`release` 只额外作废 ref 纪元）。
+ */
 export type BrowserTabsRequest =
-  | { readonly kind: 'list' }
+  | {
+    readonly kind: 'list'
+    /** `held`（默认）= 本对话占用的；`available` = 本运行实例里空闲待领的。 */
+    readonly scope?: 'held' | 'available'
+  }
+  | {
+    readonly kind: 'claim'
+    readonly sessionId: string
+    /** 移交待领时必须带码；空闲标签不该带（带了也不改变占用记录）。 */
+    readonly handoffCode?: string
+  }
+  | { readonly kind: 'release'; readonly sessionId: string }
+  | { readonly kind: 'handoff'; readonly sessionId: string }
   | { readonly kind: 'activate'; readonly sessionId: string }
   | { readonly kind: 'close'; readonly sessionId: string }
 
 /** 标签页管理结果；`tabs` 是动作落地后的清单。 */
 export interface BrowserTabsResult {
-  readonly action: 'list' | 'activate' | 'close'
-  /** activate / close 的目标会话 id。 */
+  readonly action: 'list' | 'activate' | 'close' | 'claim' | 'release' | 'handoff'
+  /** activate / close / claim / release / handoff 的目标会话 id。 */
   readonly sessionId?: string
   readonly tabs: readonly BrowserTabInfo[]
+  /**
+   * `handoff` 才有：一次性移交码。**只在这条回执里出现一次** —— 不写日志、不进指标、
+   * 不进标题。持码的对话在下一次 `claim` 里消费它。
+   */
+  readonly handoffCode?: string
 }
 
 /** P2：从会话的 console 环形缓冲读取条目。 */
@@ -747,6 +834,25 @@ export interface BrowserProvider {
    * `resolve` 仍然对旧号报 stale；成功的号与 snapshot 当时相同。
    */
   revalidate(request: BrowserRevalidateRequest, signal?: AbortSignal): Promise<BrowserRevalidateResult>
+  /**
+   * 订阅「收编了一个非 `open()` 创建的受控标签」（页面弹窗、宿主标签条的「+」）。
+   *
+   * 能力缝隙用它把**占用归属**从父标签继承给子标签（实施方案 §5.2）。`openerTargetId`
+   * 为 `undefined` 时表示这一页没有受控父标签（人工新建）—— 那时**不登记**，标签留在
+   * 台账之外：不猜主人的代价是它只能由创建者重新 open，猜错的代价是把别人的页面交出去。
+   *
+   * @returns 退订函数。
+   */
+  onSessionAdopted?(listener: (targetId: string, openerTargetId: string | undefined) => void): () => void
+  /**
+   * 占用归属变了（释放 / 移交 / 空闲超时回收）：把该会话的 ref 纪元与快照缓存作废。
+   *
+   * **为什么必须由能力缝隙来通知**：租约表住在 `ctx.browser` 这一层，provider 看不见它；
+   * 而 ref 纪元住在 provider 手里。归属一变就作废纪元，是「换了 owner 必须重拍快照」
+   * 这条规则的执行点 —— 少了它，新 owner 会拿到一个「表面可用、实际属于上一个对话」
+   * 的 ref。可选：没有 ref 纪元的 provider 不必实现。
+   */
+  invalidateSession?(sessionId: string): void
   /** 归还一个会话：关闭它的标签页并释放连接。 */
   close(sessionId: string): Promise<void>
   /** 释放 provider 持有的全部资源（连接、标签页、进程）。可省略。 */

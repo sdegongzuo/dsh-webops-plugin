@@ -206,7 +206,17 @@ export interface BridgeControl {
  * 「+」按钮开的标签不走 `open` 命令，父进程的会话注册表看不见它们 —— 宿主在
  * dom-ready 后补发 `{ type: 'opened' }`（无 command id），从这里通知上层收编。
  */
-export type TabOpenedListener = (tabId: string, url: string, title: string) => void
+export type TabOpenedListener = (
+  tabId: string,
+  url: string,
+  title: string,
+  /**
+   * 弹出这个标签的受控标签 id。**只有页面弹窗（`setWindowOpenHandler`）才有** ——
+   * 标签条「+」开的标签是人工新建的，不带它。上层据此把标签占用从父继承给子，
+   * 没有父就不登记（不猜主人，实施方案 §5.2）。
+   */
+  openerTabId?: string,
+) => void
 
 /**
  * 窗口宿主通道的公共面。
@@ -692,8 +702,10 @@ export class ElectronWindowBridge implements TabHostChannel {
       const tabId = String(message['tabId'])
       const url = typeof message['url'] === 'string' ? message['url'] : ''
       const title = typeof message['title'] === 'string' ? message['title'] : ''
-      noteLoaded('browser-electron', `bridge: opened announcement tabId=${tabId} url=${url}`)
-      for (const listener of [...this.tabOpenedListeners]) listener(tabId, url, title)
+      // 弹窗归属：`openerTabId` 是**页面弹窗**才有的字段；标签条「+」开的标签没有它。
+      const openerTabId = typeof message['openerTabId'] === 'string' ? message['openerTabId'] : undefined
+      noteLoaded('browser-electron', `bridge: opened announcement tabId=${tabId} url=${url}${openerTabId === undefined ? '' : ` opener=${openerTabId}`}`)
+      for (const listener of [...this.tabOpenedListeners]) listener(tabId, url, title, openerTabId)
       return
     }
 

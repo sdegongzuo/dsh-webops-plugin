@@ -398,7 +398,10 @@ function openTab(url, size, options) {
   view.webContents.setWindowOpenHandler(({ url }) => {
     if (!/^https?:/i.test(url ?? '')) return { action: 'deny' }
     try {
-      openTab(url, undefined, { announce: true })
+      // 带上 `openerTabId`：父进程据此把**标签占用**从父标签继承到子标签（实施方案 §5.2）。
+      // 不带的话弹窗会变成一个无主的标签 —— 既不在任何对话的清单里、也领不走，
+      // 只能靠人重新开一个。
+      openTab(url, undefined, { announce: true, openerTabId: id })
     } catch {
       // 开不出来就只拒绝：页面侧表现为 window.open 返回 null，与弹窗拦截一致。
     }
@@ -483,6 +486,9 @@ function openTab(url, size, options) {
         tabId: id,
         url: view.webContents.getURL(),
         title: view.webContents.getTitle(),
+        // 只有页面弹窗知道自己是谁弹的；标签条「+」开的标签不带这个字段 —— 人工新建的
+        // 页面不猜主人，父进程会把它留在台账之外（实施方案 §5.2）。
+        ...options.openerTabId === undefined ? {} : { openerTabId: options.openerTabId },
       })
     }).catch(() => undefined)
   }

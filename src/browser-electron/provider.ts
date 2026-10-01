@@ -85,11 +85,14 @@ export class ElectronBrowserProvider extends CdpBrowserProvider {
   private ensureTabOpenedChannel(): void {
     const transport = this.windowTransport
     if (transport === undefined) return
-    this.tabOpenedChannel ??= transport.onTabOpened((tabId, url, title) => {
+    this.tabOpenedChannel ??= transport.onTabOpened((tabId, url, title, openerTabId) => {
       // open 命令自己开的标签不会发通报（宿主侧只对非命令创建的标签 announce），
       // 所以这里不存在「把 open 的会话再收编一遍」的去重问题。
-      noteLoaded('browser-electron', `provider: adopting opened tab ${tabId} url=${url}`)
-      void this.adoptSession({ id: tabId, type: 'page', url, title, webSocketDebuggerUrl: tabHandle(tabId) }).then(
+      noteLoaded('browser-electron', `provider: adopting opened tab ${tabId} url=${url}${openerTabId === undefined ? '' : ` opener=${openerTabId}`}`)
+      void this.adoptSession(
+        { id: tabId, type: 'page', url, title, webSocketDebuggerUrl: tabHandle(tabId) },
+        openerTabId,
+      ).then(
         (session) => noteLoaded('browser-electron', `provider: adopted ${session.id} url=${session.url}`),
         (error: unknown) => noteLoaded('browser-electron', `provider: adopt failed for ${tabId}: ${error instanceof Error ? error.message : String(error)}`),
       )

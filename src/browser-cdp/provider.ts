@@ -358,6 +358,11 @@ export class CdpBrowserProvider implements BrowserProvider {
    * —— 在此之前 `markTakeover` 只有单测调用（见 `state.ts` 的文件头）。
    */
   protected readonly stateRegistry = new TargetStateRegistry()
+  /**
+   * 「收编了一个非 open 创建的标签」的订阅者。能力缝隙据此把**标签占用**从父标签继承到
+   * 子标签（实施方案 §5.2）—— 租约表住在能力缝隙那一层，provider 看不见它，只能通报事实。
+   */
+  private readonly adoptListeners = new Set<(targetId: string, openerTargetId: string | undefined) => void>()
   private probe: { readonly at: number; readonly ok: boolean } | undefined
   private probing: Promise<boolean> | undefined
 
@@ -504,10 +509,15 @@ export class CdpBrowserProvider implements BrowserProvider {
    *   页面慢就交给模型自己再 snapshot。
    *
    * @param target - 已存在目标的摘要（id / url / title / 句柄）。
+   * @param openerTargetId - 弹出它的受控父标签（页面弹窗才有；省略 = 无父，人工新建）。
    * @param signal - 取消信号。
    * @returns 收编好的会话。
    */
-  protected async adoptSession(target: CdpTarget, signal?: AbortSignal): Promise<BrowserSession> {
+  protected async adoptSession(
+    target: CdpTarget,
+    openerTargetId: string | undefined,
+    signal?: AbortSignal,
+  ): Promise<BrowserSession> {
     const connection = await this.transport.connect(target.webSocketDebuggerUrl, signal)
     const session: SessionState = {
       targetId: target.id,
@@ -554,7 +564,33 @@ export class CdpBrowserProvider implements BrowserProvider {
     // 与 `open()` 同理：收编发生在这个页面加载的尾巴上，那些换文档事件不是「模型之外有人动过」——
     // 模型这时还没见过这个页面。
     session.dirty.reset()
+    // 会话**先登记在 provider 里**（上面 `sessions.set`），再通报收编 —— 通报的订阅方
+    // （能力缝隙）需要立刻能对同一个 id 记账，顺序反了会让「刚收编就被操作」落空。
+    for (const listener of [...this.adoptListeners]) listener(session.targetId, openerTargetId)
     return this.toSession(session)
+  }
+
+  /**
+   * 订阅「收编了一个非 `open()` 创建的标签」（页面弹窗 / 标签条「+」）。
+   *
+   * 通报的只有**事实**（谁被收编了、它是谁弹的），归属裁决在能力缝隙那一层。
+   */
+  onSessionAdopted(listener: (targetId: string, openerTargetId: string | undefined) => void): () => void {
+    this.adoptListeners.add(listener)
+    return () => this.adoptListeners.delete(listener)
+  }
+
+  /**
+   * 占用归属变了（释放 / 移交 / 空闲超时回收 → 见实施方案 §3.2）：作废该会话的 ref 纪元。
+   *
+   * **同步**是有意的：作废只是把 provider 侧的纪元表清掉，不发页面命令 —— 它必须能在
+   * 「另一个对话已经领走了」那一瞬立刻生效，否则新主人会拿到一个「表面可用、实际属于
+   * 上一个对话」的 ref。
+   */
+  invalidateSession(sessionId: string): void {
+    const session = this.sessions.get(sessionId)
+    if (session === undefined) return
+    session.refs.invalidate()
   }
 
   /**

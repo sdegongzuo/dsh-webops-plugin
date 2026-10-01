@@ -186,9 +186,14 @@ class FakeHost implements TabHostChannel {
     for (const listener of [...this.takeoverListeners]) listener(tabId, active)
   }
 
-  /** 推一条「宿主自己开的新标签」通报（宿主发的是无 command id 的 `{ type: 'opened' }`）。 */
-  emitTabOpened(tabId: string, url: string, title = ''): void {
-    for (const listener of [...this.tabOpenedListeners]) listener(tabId, url, title)
+  /**
+   * 推一条「宿主自己开的新标签」通报（宿主发的是无 command id 的 `{ type: 'opened' }`）。
+   *
+   * `openerTabId` 只有**页面弹窗**才有（`host.cjs` 的 `setWindowOpenHandler` 填的）；
+   * 标签条「+」开的标签不带这个字段 —— 缺省 `undefined` 就是在模拟后者。
+   */
+  emitTabOpened(tabId: string, url: string, title = '', openerTabId?: string): void {
+    for (const listener of [...this.tabOpenedListeners]) listener(tabId, url, title, openerTabId)
   }
 
   /** 模拟整条通道断开。 */
@@ -356,6 +361,39 @@ describe('ElectronWindowTransport', () => {
       const bridge = ElectronWindowBridge.forTesting(fakeChild(), client, { electronPath: 'x', hostScript: 'y' })
       await expect(bridge.list()).resolves.toEqual([])
       expect(bridge.isClosed).toBe(false)
+      await teardown(client, server)
+    })
+
+    it('解析 opened 通报里的 openerTabId，缺字段的（标签条「+」）报 undefined', async () => {
+      // 这一层是 `FakeHost` 覆盖不到的：`transportFor()` 直接把假宿主当 host channel 用，
+      // 绕过了 `ElectronWindowBridge.dispatch` 的消息解析。归属继承的入口正好在这里 ——
+      // 解析时把 `openerTabId` 当未知字段丢掉，弹窗就会被当成人工新建的页面
+      // （不进任何人的名下，也进不了可领取清单），而且全程不报错。
+      const { server, client } = await socketPair((socket) => {
+        socket.setEncoding('utf8')
+        socket.on('data', (chunk: string) => {
+          for (const line of chunk.split('\n')) {
+            if (line.trim() === '') continue
+            const command = JSON.parse(line) as { id: number }
+            // ① 页面弹窗：host.cjs 的 `setWindowOpenHandler` 会带 openerTabId。
+            socket.write(`${JSON.stringify({ type: 'opened', tabId: 't9', url: 'https://example.com/pop', title: 'Pop', openerTabId: 't1' })}\n`)
+            // ② 标签条「+」开的标签：同一条通报，但没有这个字段。
+            socket.write(`${JSON.stringify({ type: 'opened', tabId: 't10', url: 'https://example.com/new', title: 'New' })}\n`)
+            socket.write(`${JSON.stringify({ type: 'list', id: command.id, tabs: [] })}\n`)
+          }
+        })
+      })
+      const bridge = ElectronWindowBridge.forTesting(fakeChild(), client, { electronPath: 'x', hostScript: 'y' })
+      const seen: { tabId: string; opener: string | undefined }[] = []
+      bridge.onTabOpened((tabId, _url, _title, openerTabId) => { seen.push({ tabId, opener: openerTabId }) })
+
+      // 借一次 `list` 把「先写通报、后写应答」这段排定好，避免断言跑在数据到达之前。
+      await expect(bridge.list()).resolves.toEqual([])
+
+      expect(seen).toEqual([
+        { tabId: 't9', opener: 't1' },
+        { tabId: 't10', opener: undefined },
+      ])
       await teardown(client, server)
     })
   })
@@ -567,14 +605,30 @@ describe('弹窗标签收编（tab opened 通报）', () => {
   it('transport 把宿主的 opened 通报分发给订阅者，退订后不再收到', async () => {
     const host = new FakeHost()
     const transport = transportFor(host)
-    const seen: { tabId: string; url: string; title: string }[] = []
-    const unsubscribe = await transport.onTabOpened((tabId, url, title) => { seen.push({ tabId, url, title }) })
+    const seen: { tabId: string; url: string; title: string; openerTabId: string | undefined }[] = []
+    const unsubscribe = await transport.onTabOpened((tabId, url, title, openerTabId) => { seen.push({ tabId, url, title, openerTabId }) })
 
-    host.emitTabOpened('t2', 'https://news.ycombinator.com/', 'Hacker News')
+    // 页面弹窗（带 opener）与标签条「+」（不带）各来一条：第 4 个参数必须原样透传，
+    // 不能因为「缺省就是 undefined」而被 bridge 丢成永远 undefined ——
+    // 丢了的话归属继承全链路静默失效（弹窗会被当成人工新建，进不了可领取清单）。
+    host.emitTabOpened('t2', 'https://news.ycombinator.com/', 'Hacker News', 't1')
     unsubscribe()
-    host.emitTabOpened('t3', 'https://example.com/', '')
+    host.emitTabOpened('t3', 'https://example.com/', '', 't1')
 
-    expect(seen).toEqual([{ tabId: 't2', url: 'https://news.ycombinator.com/', title: 'Hacker News' }])
+    expect(seen).toEqual([
+      { tabId: 't2', url: 'https://news.ycombinator.com/', title: 'Hacker News', openerTabId: 't1' },
+    ])
+  })
+
+  it('没有 opener 的通报（标签条「+」）同样透传，值为 undefined', async () => {
+    const host = new FakeHost()
+    const transport = transportFor(host)
+    const seen: (string | undefined)[] = []
+    await transport.onTabOpened((_tabId, _url, _title, openerTabId) => { seen.push(openerTabId) })
+
+    host.emitTabOpened('t4', 'https://example.com/', 'Example')
+
+    expect(seen).toEqual([undefined])
   })
 
   it('provider 收编通报的新标签：tabs(list) 能列出它，url 用页面真实值', async () => {
@@ -587,7 +641,8 @@ describe('弹窗标签收编（tab opened 通报）', () => {
 
     host.emitTabOpened('t9', 'https://news.ycombinator.com/', 'Hacker News')
     // 收编是异步的（连接 → enable → 等加载 → 读元信息）；轮询到出现为止。
-    let listed: { sessionId: string; url: string }[] = []
+    // `url` 现在是可选的（空闲清单不披露地址），这里只取它有没有值。
+    let listed: { sessionId: string; url: string | undefined }[] = []
     for (let i = 0; i < 50; i++) {
       const result = await provider.tabs({ kind: 'list' })
       listed = result.tabs.map(t => ({ sessionId: t.sessionId, url: t.url }))
@@ -619,6 +674,46 @@ describe('弹窗标签收编（tab opened 通报）', () => {
     // +1 是 evaluate 本身；再 +1 是 2026-09-17 补的导航检测 —— 表达式能改地址
     // （`location.href = …`），不探一次就会报 navigated=false，让模型拿着已废的 ref 继续点。
     expect(host.commands.filter(c => c.tabId === 't9').length).toBe(before + 2)
+  })
+
+  it('把通报里的 openerTabId 一路带到归属通报（onSessionAdopted）', async () => {
+    // 这是「弹窗归属继承」在 provider 侧的最后一跳：宿主说「t9 是 t1 弹的」，
+    // provider 收编完必须把这个事实原样报出去，能力缝隙才好把 t9 登记成 t1 的子标签。
+    // 这里断的是 4 号参数真的穿过了 transport → provider（而不是在某一层被当默认值吃掉）。
+    const host = new FakeHost()
+    wireFakePage(host, { t9: { url: 'https://news.ycombinator.com/', title: 'Hacker News' } })
+    const provider = new ElectronBrowserProvider({}, transportFor(host), true)
+    const adopted: { targetId: string; opener: string | undefined }[] = []
+    provider.onSessionAdopted((targetId, openerTargetId) => { adopted.push({ targetId, opener: openerTargetId }) })
+    await provider.open({})
+    await new Promise(resolve => setTimeout(resolve, 0))
+
+    host.emitTabOpened('t9', 'https://news.ycombinator.com/', 'Hacker News', 't1')
+
+    // 收编是异步的（连接 → enable → 等加载）；轮询到通报为止，别让用例靠时序侥幸。
+    for (let i = 0; i < 50 && adopted.length === 0; i++) {
+      await new Promise(resolve => setTimeout(resolve, 20))
+    }
+    expect(adopted).toEqual([{ targetId: 't9', opener: 't1' }])
+  })
+
+  it('标签条「+」开的标签（无 opener）通报成 undefined，不会被猜成某个父标签', async () => {
+    // 反向验证：缺省值不能被当成「唯一受控标签就是父」。宿主没给 opener，
+    // 归属就是不继承 —— 猜一个父标签等于把人工新建的页面塞进别人手里。
+    const host = new FakeHost()
+    wireFakePage(host)
+    const provider = new ElectronBrowserProvider({}, transportFor(host), true)
+    const adopted: (string | undefined)[] = []
+    provider.onSessionAdopted((_targetId, openerTargetId) => { adopted.push(openerTargetId) })
+    await provider.open({})
+    await new Promise(resolve => setTimeout(resolve, 0))
+
+    host.emitTabOpened('t9', 'https://example.com/', 'Example')
+
+    for (let i = 0; i < 50 && adopted.length === 0; i++) {
+      await new Promise(resolve => setTimeout(resolve, 20))
+    }
+    expect(adopted).toEqual([undefined])
   })
 })
 

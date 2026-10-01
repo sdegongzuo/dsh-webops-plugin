@@ -4,6 +4,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import type { ToolDefinition, ToolRunContext } from '@deepseek-ai/dsh-tools'
 import { validateJsonSchemaValue } from '@deepseek-ai/dsh-tools'
 import { apply, BROWSER_TOOL_CAPABILITIES, name as pluginName, TOOL_BROWSER_SECTION_ORDER } from './index.ts'
+import { BrowserError } from '../browser/index.ts'
 import type {
   BrowserObservation,
   BrowserPageChanged,
@@ -31,7 +32,11 @@ interface Harness {
   readonly tools: Map<string, ToolDefinition>
   readonly sections: { name: string; order: number; text: unknown }[]
   readonly browserCalls: { method: string; args: unknown }[]
+  /** 每次调用的**第二个参数**（调用方身份）：门禁的判据就是它传没传对。 */
+  readonly callers: { method: string; caller: unknown }[]
   readonly savedImages: { name?: string; mediaType: string; bytes: number }[]
+  /** 设置后 `assertHeld` 一律失败（模拟「这个标签不归你」），用于验证本地检索也过门禁。 */
+  heldError: Error | undefined
   /** 设置后 `observe` 一律失败，用来验证工具层不吞异常。 */
   failObserve: Error | undefined
   /** 设置后 `locate` 一律失败，用来验证工具层不吞异常。 */
@@ -90,12 +95,15 @@ function mount(): Harness {
   const tools = new Map<string, ToolDefinition>()
   const sections: { name: string; order: number; text: unknown }[] = []
   const browserCalls: { method: string; args: unknown }[] = []
+  const callers: { method: string; caller: unknown }[] = []
   const savedImages: { name?: string; mediaType: string; bytes: number }[] = []
   const harness: Harness = {
     tools,
     sections,
     browserCalls,
+    callers,
     savedImages,
+    heldError: undefined,
     failObserve: undefined,
     failLocate: undefined,
     snapshotResponse: SNAPSHOT,
@@ -122,6 +130,9 @@ function mount(): Harness {
         return () => undefined
       },
     },
+    // `apply()` 用它挂「占用到期 → 丢本地大纲缓存」的订阅；桩不跑 generator，只回一个
+    // disposer —— 卸载行为不在这个测试的射程内（真实生命周期由 provider 那套测）。
+    effect: () => () => undefined,
     attachments: {
       saveImage: (input: { data: Uint8Array; mediaType: string; name?: string }) => {
         savedImages.push({
@@ -139,20 +150,34 @@ function mount(): Harness {
       },
     },
     browser: {
-      open: (args: unknown) => {
+      // 门禁的同步查询口（`webpage_find` 用：纯本地检索也必须先过占用）。
+      assertHeld: (_sessionId: string, caller: unknown) => {
+        callers.push({ method: 'assertHeld', caller })
+        if (harness.heldError !== undefined) throw harness.heldError
+      },
+      onLeaseRelease: () => () => undefined,
+      open: (args: unknown, caller?: unknown) => {
+        callers.push({ method: 'open', caller })
         browserCalls.push({ method: 'open', args })
         return Promise.resolve(SESSION)
       },
-      navigate: (args: unknown) => {
+      navigate: (args: unknown, caller?: unknown) => {
+        callers.push({ method: 'navigate', caller })
         browserCalls.push({ method: 'navigate', args })
         return Promise.resolve(SESSION)
       },
-      tabs: (args: { kind: string; sessionId?: string }) => {
+      tabs: (args: { kind: string; sessionId?: string; scope?: string }, caller?: unknown) => {
+        callers.push({ method: 'tabs', caller })
         browserCalls.push({ method: 'tabs', args })
+        // `scope=available` 的清单**只给标签 id** —— 领取前不披露别人的标题与地址。
+        const tabs = args.scope === 'available'
+          ? [{ sessionId: 'idle-1' }]
+          : [{ sessionId: 's1', url: SESSION.url, title: SESSION.title, active: true }]
         return Promise.resolve({
           action: args.kind,
           ...args.sessionId !== undefined ? { sessionId: args.sessionId } : {},
-          tabs: [{ sessionId: 's1', url: SESSION.url, title: SESSION.title, active: true }],
+          tabs,
+          ...args.kind === 'handoff' ? { handoffCode: 'code-abc' } : {},
         })
       },
       mutate: (args: { kind: string; sessionId?: string; ref?: string; value?: string; key?: string; deltaX?: number; deltaY?: number; timeMs?: number; text?: string }) => {
@@ -170,7 +195,8 @@ function mount(): Harness {
           ...harness.openedTabs !== undefined ? { openedTabs: harness.openedTabs } : {},
         })
       },
-      observe: (args: { kind: string; sessionId?: string }) => {
+      observe: (args: { kind: string; sessionId?: string }, caller?: unknown) => {
+        callers.push({ method: 'observe', caller })
         browserCalls.push({ method: 'observe', args })
         if (harness.failObserve !== undefined) return Promise.reject(harness.failObserve)
         const observation: BrowserObservation = args.kind === 'snapshot' ? harness.snapshotResponse : SCREENSHOT
@@ -279,8 +305,17 @@ function mount(): Harness {
   return harness
 }
 
-/** 一个够用的执行上下文桩：工具只读 `signal`。 */
+/**
+ * 一个够用的执行上下文桩：工具读 `signal` 与**调用方身份** `agent.id`。
+ *
+ * 身份这一项是必须的：宿主对话 id 是标签占用的唯一依据，缺了它 `ctx.browser` 一律拒绝。
+ */
 function exec(): ToolRunContext {
+  return { signal: new AbortController().signal, agent: { id: 'alice' } } as unknown as ToolRunContext
+}
+
+/** 一个**没有**身份的执行上下文：用于验证「缺身份就拒绝，且不派发页面命令」。 */
+function execWithoutAgent(): ToolRunContext {
   return { signal: new AbortController().signal } as unknown as ToolRunContext
 }
 
@@ -369,6 +404,10 @@ describe('registration', () => {
     const ctx = {
       tools: { register: (definition: ToolDefinition) => { tools.set(definition.name, definition); return () => undefined }, get: () => undefined },
       systemPrompt: { section: () => () => undefined },
+      // `apply()` 会挂「占用到期 → 丢本地大纲缓存」的订阅；这一条测的是「关掉某几个工具」，
+      // 用最小桩把那一步兜住即可。
+      browser: { onLeaseRelease: () => () => undefined },
+      effect: () => () => undefined,
     } as unknown as Context
     apply(ctx, {
       snapshot: false, screenshot: false, tabs: false,
@@ -523,7 +562,8 @@ describe('webpage_tabs and the P1 mutation tools', () => {
   it('rejects tabs actions that miss their session id or use an unknown action', async () => {
     const definition = tool(harness, 'webpage_tabs')
     await expect(definition.execute({ action: 'activate' }, exec())).rejects.toThrow(/session_id/u)
-    await expect(definition.execute({ action: 'reboot', session_id: 's1' }, exec())).rejects.toThrow(/list, activate, close/u)
+    await expect(definition.execute({ action: 'reboot', session_id: 's1' }, exec()))
+      .rejects.toThrow(/list, claim, release, handoff, activate, close/u)
   })
 
   it('forwards click with the ref and reports the resulting epoch', async () => {
@@ -1775,5 +1815,91 @@ describe('T-C 前缀成本守卫', () => {
       expect(prose, `描述散文里应仍有 ${needle}：它没有结构性断言保护，删掉不会触发任何门禁`)
         .toContain(needle)
     }
+  })
+})
+
+/** 用工具自己的 render 把结果渲染成模型看到的那段文本。 */
+function renderText(harness: Harness, toolName: string, args: Record<string, unknown>, value: unknown): string {
+  const definition = tool(harness, toolName)
+  const blocks = definition.output.render(args, value as never) as { text?: string }[]
+  return blocks.map(block => block.text ?? '').join('\n')
+}
+
+/**
+ * 多会话占用在**工具层**只有两件职责：把宿主身份原样带下去、把门禁的拒绝原样转给模型。
+ * 归属裁决本身在 `ctx.browser`（见 `src/browser/index.test.ts`）—— 这里测的是「不缺位也不越权」：
+ * 不自己编身份、不自己放行、不把别人的页面内容渲染出来。
+ */
+describe('调用方身份与占用门禁（工具层）', () => {
+  it('passes the host conversation id (exec.agent.id) straight down to the browser service', async () => {
+    const harness = mount()
+    await tool(harness, 'webpage_open').execute({}, exec())
+    await tool(harness, 'webpage_tabs').execute({ action: 'list' }, exec())
+
+    expect(harness.callers).toEqual([
+      { method: 'open', caller: { ownerId: 'alice' } },
+      { method: 'tabs', caller: { ownerId: 'alice' } },
+    ])
+  })
+
+  it('never invents an identity when the host provides none', async () => {
+    const harness = mount()
+    await tool(harness, 'webpage_open').execute({}, execWithoutAgent()).catch(() => undefined)
+
+    // 传下去的是 `undefined`，由 `ctx.browser` 抛 BROWSER_CALLER_REQUIRED ——
+    // 工具层绝不替它编一个（那等于把门禁交给被门禁的对象）。
+    expect(harness.callers).toEqual([{ method: 'open', caller: undefined }])
+  })
+
+  it('exposes no owner-shaped argument: identity can never come from the model', () => {
+    const harness = mount()
+    expect(JSON.stringify(tool(harness, 'webpage_tabs').parameters)).not.toMatch(/owner/iu)
+  })
+
+  it('keeps the idle list anonymous — ids only, no titles or urls', async () => {
+    const harness = mount()
+    const args = { action: 'list', scope: 'available' }
+    const value = await tool(harness, 'webpage_tabs').execute(args, exec())
+    const text = renderText(harness, 'webpage_tabs', args, value)
+
+    expect(text).toContain('idle-1')
+    expect(text).not.toContain(SESSION.title)
+    expect(text).not.toContain('https://')
+  })
+
+  it('renders the one-time handoff code and says the access is already gone', async () => {
+    const harness = mount()
+    const args = { action: 'handoff', session_id: 's1' }
+    const value = await tool(harness, 'webpage_tabs').execute(args, exec())
+    const text = renderText(harness, 'webpage_tabs', args, value)
+
+    expect(text).toContain('code-abc')
+    expect(text).toMatch(/ONE-TIME HANDOFF CODE/u)
+    // 「移交即刻失去操作权」必须写在回执里，否则模型会继续拿旧 session 干活。
+    expect(text).toMatch(/lost write access/u)
+  })
+
+  it('forwards claim with the handoff code and drops the local outline cache', async () => {
+    const harness = mount()
+    await tool(harness, 'webpage_snapshot').execute({ session_id: 's1' }, exec())
+    await tool(harness, 'webpage_tabs').execute({ action: 'claim', session_id: 's1', handoff_code: 'code-abc' }, exec())
+
+    expect(harness.browserCalls).toContainEqual({
+      method: 'tabs',
+      args: { kind: 'claim', sessionId: 's1', handoffCode: 'code-abc' },
+    })
+    // 归属变了 ⇒ 本地那份大纲属于上一任，必须丢掉（否则 find 会拿旧大纲喂 ref）。
+    await expect(tool(harness, 'webpage_find').execute({ session_id: 's1', query: 'Submit' }, exec()))
+      .rejects.toThrow(expect.objectContaining({ code: 'BROWSER_SNAPSHOT_REQUIRED' }))
+  })
+
+  it('guards the local outline search too: webpage_find asks the lease before searching', async () => {
+    const harness = mount()
+    await tool(harness, 'webpage_snapshot').execute({ session_id: 's1' }, exec())
+    harness.heldError = new BrowserError('another conversation holds this tab', 'BROWSER_TAB_NOT_HELD')
+
+    await expect(tool(harness, 'webpage_find').execute({ session_id: 's1', query: 'Submit' }, exec()))
+      .rejects.toThrow(expect.objectContaining({ code: 'BROWSER_TAB_NOT_HELD' }))
+    expect(harness.callers.at(-1)).toEqual({ method: 'assertHeld', caller: { ownerId: 'alice' } })
   })
 })
