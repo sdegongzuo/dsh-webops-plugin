@@ -1,7 +1,7 @@
 /**
  * 把 `src/` 下的非 TS 运行时资产复制到 `lib/`。
  *
- * 目前只有一件：`src/browser-electron/host.cjs`。它是**被 spawn 的 Electron 应用入口**，
+ * 资产以 ASSETS 清单为准，其中 `src/browser-electron/host.cjs` 是**被 spawn 的 Electron 应用入口**，
  * 必须与 `lib/browser-electron/index.js` 同目录 —— `index.ts` 用
  * `new URL('./host.cjs', import.meta.url)` 找它，而发布产物里只有 `lib/`。
  *
