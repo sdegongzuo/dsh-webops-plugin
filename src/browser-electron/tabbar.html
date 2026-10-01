@@ -193,15 +193,15 @@
     control = { tabId: state.tabId ?? '', holder: state.holder === 'human' ? 'human' : 'agent' }
     const human = control.holder === 'human'
     const hasTab = control.tabId !== ''
-    holderLabel.textContent = hasTab ? (human ? '现在轮到你了' : '现在由 agent 操作') : ''
+    holderLabel.textContent = hasTab ? (human ? '当前标签由你操作' : '当前标签由 agent 操作') : ''
     holderLabel.dataset.holder = control.holder
-    controlButton.textContent = human ? '交还' : '接管'
+    controlButton.textContent = human ? '交还此标签' : '接管此标签'
     controlButton.dataset.holder = control.holder
     // 唯一会置灰的情形：没有前台标签，没什么可接管。
     controlButton.disabled = !hasTab
     controlButton.title = human
-      ? '交还：把页面还给 agent。它需要重新拍一次快照才能继续操作 —— 接管期间作废的 ref 不会恢复。'
-      : '接管：把页面交给你自己操作。当前由 agent 控制，你在页面里的键盘输入暂时不生效（鼠标不受限）。'
+      ? '交还当前标签给 agent；其他标签不受影响。agent 需要重新拍快照才能继续操作。'
+      : '只接管当前标签，其他标签不受影响。接管后可在此页面输入。'
   }
 
   window.dshTabBar?.onControlState(renderControl)
@@ -210,7 +210,7 @@
     if (control.tabId === '') return
     // 只发指令，**不在这里改 UI** —— 等主进程把真实状态推回来（见 preload 的注释：
     // 乐观更新会在切换失败时让界面说谎，而「现在到底归谁」正是这个功能唯一的输出）。
-    window.dshTabBar?.control(control.holder === 'human' ? 'hand' : 'take')
+    window.dshTabBar?.control(control.holder === 'human' ? 'hand' : 'take', control.tabId)
   })
 
   // 回车 = 导航：trim 后不含 `://` 就补 `https://`；空串忽略；导航后让输入框失焦。

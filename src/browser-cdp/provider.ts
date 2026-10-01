@@ -786,6 +786,9 @@ export class CdpBrowserProvider implements BrowserProvider {
     const session = this.sessions.get(sessionId)
     // 幂等：重复关闭不是错误。
     if (session === undefined) return
+    this.assertWritable(session)
+    // 宿主最后一次裁决通过并实际关闭后才摘账，接管拒绝不能被吞掉。
+    await this.transport.closeTarget(session.targetId)
     this.sessions.delete(sessionId)
     // §6.5：会话没了，它的控制权簿记也一并清掉，别把接管窗口留在表里。
     this.stateRegistry.forget(sessionId)
@@ -797,7 +800,6 @@ export class CdpBrowserProvider implements BrowserProvider {
     session.dirty.dispose()
     session.connection.close()
     // 标签页可能已经被用户手动关掉了，那正是我们想要的结果，不算失败。
-    await this.transport.closeTarget(session.targetId).catch(() => undefined)
   }
 
   /**
@@ -810,6 +812,7 @@ export class CdpBrowserProvider implements BrowserProvider {
     }
     if (request.kind === 'activate') {
       const session = this.require(request.sessionId)
+      this.assertWritable(session)
       const activate = this.transport.activateTarget
       if (activate === undefined) {
         throw new BrowserError(
@@ -2144,6 +2147,8 @@ export class CdpBrowserProvider implements BrowserProvider {
         { objectId, functionDeclaration: FILL_FUNCTION, arguments: [{ value }], returnByValue: true },
         { signal, timeoutMs: this.config.commandTimeoutMs },
       )
+      await this.transport.projectTyping?.(session.targetId, objectId).catch(() => undefined)
+      this.assertWritable(session)
       if (outcome.result?.value === 'editable') {
         // 上一步已聚焦 + 全选，这里由浏览器原生输入管线写入（理由见 FILL_FUNCTION 注释）。
         await session.connection.send(
@@ -2174,6 +2179,8 @@ export class CdpBrowserProvider implements BrowserProvider {
         { objectId, functionDeclaration: 'function () { this.focus(); }', returnByValue: true },
         { signal, timeoutMs: this.config.commandTimeoutMs },
       )
+      await this.transport.projectTyping?.(session.targetId, objectId).catch(() => undefined)
+      this.assertWritable(session)
       const options = { signal, timeoutMs: this.config.commandTimeoutMs }
       await session.connection.send('Input.dispatchKeyEvent', {
         type: 'keyDown',

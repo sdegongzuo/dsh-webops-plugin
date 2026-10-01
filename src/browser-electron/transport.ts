@@ -50,6 +50,11 @@ export function tabIdFromHandle(handle: string): string | undefined {
  * 否则「第一次探测时 Electron 还没装好」会把整个 provider 永久钉死。
  */
 export class ElectronWindowTransport implements CdpTransport {
+  /** 效果由窗口宿主绘制，失败不影响真实输入。 */
+  async projectTyping(targetId: string, objectId: string): Promise<void> {
+    const bridge = await this.requireBridge()
+    await bridge.command(targetId, 'Dsh.projectTyping', { objectId })
+  }
   private bridge: Promise<TabHostChannel> | undefined
   private readonly commandTimeoutMs: number
   private readonly keepAlive: boolean

@@ -93,9 +93,20 @@
  * @module dsh-webops-plugin/browser-electron/host
  */
 
-const { app, BaseWindow, WebContentsView, ipcMain, Menu } = require('electron')
+const { app, BaseWindow, BrowserWindow, WebContentsView, ipcMain, Menu } = require('electron')
+const { createActionOverlay } = require('./action-overlay.cjs')
 const net = require('node:net')
 const path = require('node:path')
+
+// 实测按需启用独立网页窗口的 CDP；默认关闭，仅监听本机，不改变工具通道。
+const diagnosticPort = process.env.DSH_BROWSER_WINDOW_CDP_PORT
+if (diagnosticPort !== undefined) {
+  if (!/^\d+$/.test(diagnosticPort) || Number(diagnosticPort) < 1 || Number(diagnosticPort) > 65535) {
+    throw new Error('DSH_BROWSER_WINDOW_CDP_PORT 必须是 1–65535 的端口号')
+  }
+  app.commandLine.appendSwitch('remote-debugging-address', '127.0.0.1')
+  app.commandLine.appendSwitch('remote-debugging-port', diagnosticPort)
+}
 
 /** 标签行高度（像素）。 */
 const TAB_STRIP_HEIGHT = 40
@@ -144,6 +155,36 @@ const tabs = new Map()
 let shell
 /** 标签条视图：独立 `WebContentsView`，永远保持最顶层。 */
 let tabBar
+let actionOverlay
+let actionRevision = 0
+
+/** 视觉反馈最多等 200ms，不改变输入命令的结果，也不读取或传输输入内容。 */
+async function projectAction(entry, params, typing = false) {
+  const revision = actionRevision
+  if (entry.id !== activeTabId || entry.holder !== 'agent' || actionOverlay === undefined) return
+  let timer
+  try {
+    const probe = typing
+      ? entry.debugger.sendCommand('Runtime.callFunctionOn', {
+        objectId: params.objectId, returnByValue: true,
+        functionDeclaration: 'function(){const r=this.getBoundingClientRect();return {x:r.x+r.width/2,y:r.y+r.height/2,width:innerWidth,height:innerHeight}}',
+      })
+      : entry.debugger.sendCommand('Runtime.evaluate', {
+        expression: '({width:innerWidth,height:innerHeight})', returnByValue: true,
+      })
+    const result = await Promise.race([probe, new Promise(resolve => { timer = setTimeout(resolve, 200) })])
+    const geometry = result?.result?.value
+    if (geometry === undefined || revision !== actionRevision || entry.id !== activeTabId || entry.holder !== 'agent') return
+    actionOverlay.project(entry.id, typing ? geometry : params,
+      typing ? 'typing' : params.type === 'mousePressed' ? 'clicking' : params.type === 'mouseWheel' ? 'scrolling' : 'moving', geometry)
+  } catch { /* 效果失败不影响工具动作。 */ }
+  finally { clearTimeout(timer) }
+}
+
+function clearAction() {
+  actionRevision++
+  actionOverlay?.clear()
+}
 let activeTabId
 let sequence = 0
 let connection
@@ -204,6 +245,7 @@ function sendNavState() {
 function sendControlState() {
   if (tabBar === undefined || tabBar.webContents.isDestroyed()) return
   const entry = activeTabId !== undefined ? tabs.get(activeTabId) : undefined
+  actionOverlay?.setControl(entry?.id, entry?.holder)
   tabBar.webContents.send('dsh-control-state', {
     tabId: entry === undefined ? '' : entry.id,
     holder: entry === undefined ? 'agent' : entry.holder,
@@ -226,6 +268,7 @@ function setHolder(tabId, holder) {
   const entry = tabs.get(tabId)
   if (entry === undefined || entry.holder === holder) return
   entry.holder = holder
+  clearAction()
   send({ type: 'control', tabId, holder })
   sendControlState()
 }
@@ -326,6 +369,7 @@ function ensureShell(size) {
       sandbox: true,
     },
   })
+  actionOverlay = createActionOverlay(BrowserWindow, shell, path.join(__dirname, 'action-overlay.html'), TAB_BAR_HEIGHT)
   shell.contentView.addChildView(tabBar)
   layout()
   void tabBar.webContents.loadFile(path.join(__dirname, 'tabbar.html'))
@@ -338,6 +382,8 @@ function ensureShell(size) {
   shell.on('restore', layout)
   shell.on('show', layout)
   shell.on('closed', () => {
+    clearAction()
+    actionOverlay = undefined
     shell = undefined
     // 壳没了，标签页跟着全没；把剩下的一并通报给父进程。
     for (const id of [...tabs.keys()]) {
@@ -466,11 +512,13 @@ function openTab(url, size, options) {
 
   // 标题与地址随时会变，标签条要跟着变。
   view.webContents.on('page-title-updated', () => { sendTabBar() })
+  view.webContents.on('did-start-navigation', (_event, _url, _inPlace, isMainFrame) => { if (isMainFrame && id === activeTabId) clearAction() })
   view.webContents.on('did-navigate', () => { sendTabBar() })
   view.webContents.on('did-navigate-in-page', () => { sendTabBar() })
   view.webContents.on('did-finish-load', () => { sendTabBar() })
 
   tabs.set(id, entry)
+  clearAction()
   activeTabId = id
   layout()
   sendTabBar()
@@ -501,6 +549,7 @@ function openTab(url, size, options) {
  */
 function activateTab(id) {
   if (!tabs.has(id)) return
+  clearAction()
   activeTabId = id
   layout()
   sendTabBar()
@@ -513,6 +562,7 @@ function activateTab(id) {
 function closeTab(id) {
   const entry = tabs.get(id)
   if (entry === undefined) return
+  if (id === activeTabId) clearAction()
   tabs.delete(id)
   if (activeTabId === id) {
     const next = [...tabs.keys()].at(-1)
@@ -665,6 +715,16 @@ async function handle(command) {
       }
       try {
         await entry.ready
+        // 在最后投递边界裁决，防止父进程检查后、异步准备期间发生接管。
+        if (entry.holder === 'human' && (command.method.startsWith('Input.') || command.method === 'Page.navigate')) {
+          throw new Error(`BROWSER_HUMAN_HOLDING: tab ${entry.id} is under human control`)
+        }
+        // 私有宿主方法不发送给 Chromium；仅按已解析的节点投影输入位置。
+        if (command.method === 'Dsh.projectTyping') {
+          await projectAction(entry, command.params ?? {}, true)
+          send({ type: 'cdp', id: command.id, result: {} })
+          return
+        }
         // 给命令包一层超时：超时与真正的命令失败走同一个 catch，复用 cdp 错误消息。
         // timer 必须在 promise settle 后 clearTimeout，别留悬挂的 setTimeout；
         // 否则 [V33]（命令永久挂起）会让宿主里的 await 永远悬着，父进程侧 pending 已删也没用。
@@ -681,12 +741,19 @@ async function handle(command) {
           clearTimeout(timer)
         }
         send({ type: 'cdp', id: command.id, result: result === undefined ? {} : result })
+        if (command.method === 'Input.dispatchMouseEvent' && command.params?.type !== 'mouseReleased') {
+          void projectAction(entry, command.params ?? {})
+        }
       } catch (error) {
         send({ type: 'cdp', id: command.id, error: { message: String(error?.message ?? error) } })
       }
       return
     }
     case 'activate': {
+      if (tabs.get(command.tabId)?.holder === 'human') {
+        send({ type: 'activated', id: command.id, error: { message: 'BROWSER_HUMAN_HOLDING: tab is under human control' } })
+        return
+      }
       activateTab(command.tabId)
       send({ type: 'activated', id: command.id, tabId: command.tabId })
       return
@@ -732,6 +799,10 @@ async function handle(command) {
       return
     }
     case 'close': {
+      if (tabs.get(command.tabId)?.holder === 'human') {
+        send({ type: 'closed', id: command.id, error: { message: 'BROWSER_HUMAN_HOLDING: tab is under human control' } })
+        return
+      }
       closeTab(command.tabId)
       send({ type: 'closed', id: command.id, tabId: command.tabId })
       return
@@ -798,9 +869,9 @@ app.whenReady().then(() => {
   // 注意这里**不校验**发起方是谁：标签条是插件自己的 view（`sandbox: true` + 只开
   // `dshTabBar` 一个口子），页面内容拿不到这个通道。
   ipcMain.on('dsh-control', (_event, payload) => {
-    if (activeTabId === undefined) return
-    const { action } = payload ?? {}
-    setHolder(activeTabId, action === 'take' ? 'human' : 'agent')
+    const { action, tabId } = payload ?? {}
+    if (typeof tabId !== 'string' || !tabs.has(tabId) || (action !== 'take' && action !== 'hand')) return
+    setHolder(tabId, action === 'take' ? 'human' : 'agent')
   })
 
   // BaseWindow 没有 webContents，默认菜单的「切换开发者工具」打在空处。

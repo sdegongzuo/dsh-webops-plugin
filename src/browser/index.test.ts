@@ -186,6 +186,54 @@ async function mountWithProvider(
 }
 
 describe('BrowserRuntime provider selection', () => {
+  it('复用快照失败退还占用，下一次调用仍可领取原标签', async () => {
+    const { browser, provider } = await mountWithProvider()
+    const first = await browser.open({ url: SESSION.url }, ALICE)
+    await browser.tabs({ kind: 'release', sessionId: first.id }, ALICE)
+    const observe = provider.observe
+    provider.observe = async () => { throw new Error('快照失败') }
+    await expect(browser.open({ url: SESSION.url }, BOB)).rejects.toThrow('快照失败')
+    expect((await browser.tabs({ kind: 'list', scope: 'available' }, ALICE)).tabs).toHaveLength(1)
+    provider.observe = observe
+    expect((await browser.open({ url: SESSION.url }, ALICE)).id).toBe(first.id)
+    await browser.dispose()
+  })
+  it('同网址的空闲受控标签领取复用，保留页面且不再 open 或 navigate', async () => {
+    const { browser, provider } = await mountWithProvider()
+    const first = await browser.open({url:'https://example.com/'}, ALICE)
+    await browser.tabs({kind:'release',sessionId:first.id}, ALICE)
+    provider.calls.length = 0
+    const reused = await browser.open({url:'https://EXAMPLE.com:443'}, BOB)
+    expect(reused.id).toBe(first.id)
+    expect(provider.sessions.size).toBe(1)
+    expect(provider.calls).toEqual(['tabs:list','tabs:activate',`observe:${first.id}`])
+    expect(() => browser.assertHeld(first.id, ALICE)).toThrow(expect.objectContaining({code:'BROWSER_TAB_NOT_HELD'}))
+    expect(() => browser.assertHeld(first.id, BOB)).not.toThrow()
+    await browser.dispose()
+  })
+  it('占用中、移交中、未登记以及网址不同的标签不复用', async () => {
+    const { browser, provider } = await mountWithProvider()
+    const held = await browser.open({url:SESSION.url}, ALICE)
+    const second = await browser.open({url:SESSION.url}, BOB)
+    expect(second.id).not.toBe(held.id)
+    await browser.tabs({kind:'handoff',sessionId:held.id}, ALICE)
+    await browser.tabs({kind:'release',sessionId:second.id}, BOB)
+    provider.sessions.set('human',{sessionId:'human',url:'https://different.example/'})
+    const different = await browser.open({url:'https://different.example/'}, ALICE)
+    expect(different.id).not.toBe('human')
+    expect(different.id).not.toBe(second.id)
+    await browser.dispose()
+  })
+  it('两个会话同时打开同网址时，只有一个领取现有空闲标签', async () => {
+    const { browser, provider } = await mountWithProvider()
+    const first = await browser.open({url:SESSION.url}, ALICE)
+    await browser.tabs({kind:'release',sessionId:first.id}, ALICE)
+    const opened = await Promise.all([browser.open({url:SESSION.url}, ALICE),browser.open({url:SESSION.url}, BOB)])
+    expect(new Set(opened.map(tab => tab.id)).size).toBe(2)
+    expect(opened.map(tab => tab.id)).toContain(first.id)
+    expect(provider.sessions.size).toBe(2)
+    await browser.dispose()
+  })
   it('auto-selects the only usable provider and unregisters it through the returned disposer', async () => {
     const browser = await mountBrowser()
     const dispose = browser.registerProvider(makeProvider('cdp', true))

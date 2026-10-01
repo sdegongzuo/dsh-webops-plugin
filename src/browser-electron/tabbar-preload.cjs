@@ -70,7 +70,7 @@ contextBridge.exposeInMainWorld('dshTabBar', {
    * 只作用于当前前台标签 —— 那是主进程侧定的语义，页面这边不自作主张。
    * @param {'take' | 'hand'} action - 要执行的动作。
    */
-  control: (action) => { ipcRenderer.send('dsh-control', { action }) },
+  control: (action, tabId) => { ipcRenderer.send('dsh-control', { action, tabId }) },
   /**
    * 订阅控制权状态（`{ tabId, holder }`）；注册时会立刻用最近一次快照回调一次，
    * 模式与 `onTabs` 相同。

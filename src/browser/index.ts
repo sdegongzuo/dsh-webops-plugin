@@ -198,7 +198,7 @@ export class BrowserRuntime extends Service {
   }
 
   /**
-   * 开一个**新**标签页，并把它登记给调用方。
+   * 相同网址的空闲受控标签优先领取复用，否则新建并登记给调用方。
    *
    * 登记必须在返回 session id 之前完成：只要模型看到了 id，它就能用，而中间那一瞬
    * 谁都用不了的窗口没有意义。登记失败则关掉刚开的标签（§5.1），不留孤儿。
@@ -214,6 +214,37 @@ export class BrowserRuntime extends Service {
   ): Promise<BrowserSession> {
     const owner = this.requireCaller(caller)
     const provider = this.resolve()
+    const available = new Set(this.lease.listAvailable(provider.id))
+    if (available.size > 0 && request.url !== undefined) {
+      let target: string | undefined
+      try { target = new URL(request.url.trim()).href } catch { /* 非法 URL 留给 provider 的地址策略拒绝。 */ }
+      if (target !== undefined) {
+        const listed = await provider.tabs({ kind: 'list' }, signal)
+        for (const tab of listed.tabs) {
+          if (!available.has(tab.sessionId) || tab.url !== target
+            || this.lease.view(provider.id, tab.sessionId)?.state !== 'available') continue
+          // 检查和领取之间没有 await，竞争者不能抢入；不领取移交中的或人工新建的标签。
+          this.lease.claim(provider.id, tab.sessionId, owner.ownerId)
+          try {
+            provider.invalidateSession?.(tab.sessionId)
+            return await this.withLease(tab.sessionId, caller, async () => {
+              await provider.tabs({ kind: 'activate', sessionId: tab.sessionId }, signal)
+              const snapshot = await provider.observe({ kind: 'snapshot', sessionId: tab.sessionId }, signal)
+              if (snapshot.kind !== 'snapshot') throw new BrowserError('reused tab did not return a snapshot', 'BROWSER_PROTOCOL_ERROR')
+              return { id: tab.sessionId, url: snapshot.url, title: snapshot.title, epoch: snapshot.epoch }
+            })
+          } catch (error) {
+            // 失败只退还本次领取的租约，不覆盖期间发生的释放或移交。
+            // 调用计数已在 finally 归零；无 await，核对与退还之间不会换主。
+            try {
+              this.lease.assertHeld(provider.id, tab.sessionId, owner.ownerId)
+              this.lease.release(provider.id, tab.sessionId, owner.ownerId)
+            } catch { /* 已不归本调用者持有，保留新状态。 */ }
+            throw error
+          }
+        }
+      }
+    }
     const session = await provider.open(request, signal)
     try {
       this.lease.register(provider.id, session.id, owner.ownerId)

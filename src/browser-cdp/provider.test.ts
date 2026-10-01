@@ -2531,6 +2531,12 @@ describe('§6.5 控制权（人工接管按钮）', () => {
       .rejects.toThrow(expect.objectContaining({ code: 'BROWSER_HUMAN_HOLDING' }))
     await expect(provider.execute({ sessionId, method: 'Runtime.evaluate', params: { expression: '1' } }))
       .rejects.toThrow(expect.objectContaining({ code: 'BROWSER_HUMAN_HOLDING' }))
+    await expect(provider.tabs({ kind: 'activate', sessionId }))
+      .rejects.toThrow(expect.objectContaining({ code: 'BROWSER_HUMAN_HOLDING' }))
+    await expect(provider.tabs({ kind: 'close', sessionId }))
+      .rejects.toThrow(expect.objectContaining({ code: 'BROWSER_HUMAN_HOLDING' }))
+    await expect(provider.close(sessionId))
+      .rejects.toThrow(expect.objectContaining({ code: 'BROWSER_HUMAN_HOLDING' }))
 
     // 这一半才是「零静默」：不是「拒是拒了、但已经点下去了」—— 与写前门同一条纪律。
     expect(chrome.calls.slice(mark)).toEqual([])
@@ -2543,6 +2549,16 @@ describe('§6.5 控制权（人工接管按钮）', () => {
     const during = await provider.observe({ kind: 'snapshot', sessionId })
     expect(during.kind).toBe('snapshot')
     await expect(provider.tabs({ kind: 'list' })).resolves.toMatchObject({ action: 'list' })
+  })
+  it('输入投影等待期间接管，恢复执行也不得投递按键', async () => {
+    const transport = chrome.transport()
+    transport.projectTyping = async () => { provider.setControlHolder('tab-1', 'human') }
+    provider = new HolderProvider({ navigationTimeoutMs: 200 }, transport)
+    const { sessionId, ref } = await openWithRef()
+    const mark = chrome.calls.length
+    await expect(provider.mutate({ kind: 'press', sessionId, ref, key: 'Enter' }))
+      .rejects.toThrow(expect.objectContaining({ code: 'BROWSER_HUMAN_HOLDING' }))
+    expect(chrome.calls.slice(mark).some(call => call.method === 'Input.dispatchKeyEvent')).toBe(false)
   })
 
   it('交还后恢复可写，但接管前的 ref 一律失效 —— 必须重拍快照（J6）', async () => {
@@ -2588,7 +2604,8 @@ describe('§6.5 控制权（人工接管按钮）', () => {
   it('会话关掉后，它的接管窗口与簿记一起清掉（不留悬账）', async () => {
     const { sessionId } = await openWithRef()
     provider.setControlHolder(sessionId, 'human')
-
+    await expect(provider.close(sessionId)).rejects.toThrow(expect.objectContaining({ code: 'BROWSER_HUMAN_HOLDING' }))
+    provider.setControlHolder(sessionId, 'agent')
     await provider.close(sessionId)
 
     // 会话没了，再切它的 holder 应当是静默 no-op（而不是抛「未知会话」之类的噪音）。

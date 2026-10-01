@@ -93,13 +93,13 @@ index d406c27235..36bb70f4fb 100644
    if (!inside(appDir, sourceRoot)) {
      // Builder's source matcher slices the appDir prefix even for external FileSets.
 diff --git a/apps/desktop/src/main.ts b/apps/desktop/src/main.ts
-index b4b8153b7f..73b3f17e6e 100644
+index b4b8153b7f..c9e07ae48a 100644
 --- a/apps/desktop/src/main.ts
 +++ b/apps/desktop/src/main.ts
 @@ -2,7 +2,9 @@ import type { ProductEventMap, ProductEvent } from '@deepseek-ai/dsh-client-prod
  import { WINDOWS_TITLEBAR_HEIGHT } from './windows-layout.ts'
  /** Electron shell: desktop project ownership, custom protocol, windows, and lifecycle. */
- 
+
 +import { existsSync } from 'node:fs'
  import { readFile, writeFile } from 'node:fs/promises'
 +import { createRequire } from 'node:module'
@@ -127,7 +127,7 @@ index b4b8153b7f..73b3f17e6e 100644
 @@ -60,6 +62,78 @@ import { DesktopQuitConfirmation } from './quit-confirmation.ts'
  import { DesktopTray } from './tray.ts'
  import { DesktopBackgroundNotice } from './background-notice.ts'
- 
+
 +// 让 host 子进程（以及跑在里面的插件）知道 shell 主 exe 在哪 —— 便携版没有独立的
 +// electron.exe，browser-electron 的窗口宿主只能用这个 exe 起第二个实例。
 +//
@@ -221,7 +221,7 @@ index b4b8153b7f..73b3f17e6e 100644
 +    ?? (development ? join(app.getAppPath(), '.desktop-build', 'development', 'project') : join(process.resourcesPath, 'dsh'))
    return { node, nodeBin, pnpm, dsh }
  }
- 
+
 @@ -448,11 +531,28 @@ async function main(): Promise<void> {
      return {
        start: async () => {
@@ -257,7 +257,7 @@ index b4b8153b7f..73b3f17e6e 100644
 @@ -707,7 +807,11 @@ async function main(): Promise<void> {
      return browserGuests.release(event.sender, lease)
    })
- 
+
 -  session.defaultSession.webRequest.onBeforeSendHeaders({ urls: ['ws://127.0.0.1/*'] }, (details, callback) => {
 +  // 渲染进程的事件流是自己发起的 WebSocket（不是走 Node 的转发），所以握手 cookie 得由壳注入。
 +  // 过滤名单必须覆盖**所有可能被选中的回环名**：兜底可能把 Host 定在 `localhost`（代理只放通
@@ -267,10 +267,22 @@ index b4b8153b7f..73b3f17e6e 100644
      if (hostUrl === undefined || hostCookie === undefined || details.webContentsId !== mainWindow?.webContents.id) {
        callback({})
        return
-@@ -1333,17 +1437,29 @@ async function main(): Promise<void> {
+@@ -1318,9 +1422,8 @@ async function main(): Promise<void> {
+       refresh: async () => { await Promise.all([checkPolicyManually(), updateSchedule.check(true)]) },
+       download: downloadUpdate, install: version => updates.install(version),
+     })
+-    void mandatoryPolicy.check('launch').then((state) => {
+-      if (app.isPackaged && state.error === 'authentication-required' && !isQuitting()) queuePolicyAuthentication()
+-    }).catch((error: unknown) => { console.error(error) })
++    // 启动检查保留；首次进入不弹飞书登录。用户主动检查更新时才询问登录。
++    void mandatoryPolicy.check('launch').catch((error: unknown) => { console.error(error) })
+   }
+   automaticCheck()
+   await reconcileBackend().catch(() => undefined)
+@@ -1333,17 +1436,29 @@ async function main(): Promise<void> {
    publishUpdate(updateState)
  }
- 
+
 -const ownsDesktopInstance = claimDesktopSingleInstance(app, () => { focusPrimaryWindow() })
 +// 窗口宿主模式：便携版里 browser-electron 用主 exe 起第二个实例来开浏览器窗口，
 +// 靠 `DSH_BROWSER_ELECTRON_HOST` 把宿主脚本的绝对路径传进来
@@ -279,7 +291,7 @@ index b4b8153b7f..73b3f17e6e 100644
 +// 必须在 `claimDesktopSingleInstance` **之前**接管：先抢了单实例锁的话第二个实例会直接退出。
 +// 宿主只管开窗口，不碰 profile、也不开主窗口。
 +const browserHostScript = process.env.DSH_BROWSER_ELECTRON_HOST
- 
+
 -if (ownsDesktopInstance) void app.whenReady().then(main).catch(async (error: unknown) => {
 -  const message = error instanceof Error ? error.message : String(error)
 -  console.error(error)
@@ -316,12 +328,12 @@ index cf03e38c36..878122bcd6 100644
 +++ b/apps/desktop/src/paths.ts
 @@ -1,6 +1,7 @@
  /** Filesystem ownership for the Electron-managed desktop installation. */
- 
+
 -import { join } from 'node:path'
 +import { existsSync } from 'node:fs'
 +import { dirname, join, resolve } from 'node:path'
  import { resolveDshHome } from '@deepseek-ai/dsh-home-paths'
- 
+
  /** Stable desktop installation paths under the shared Harness home. */
 @@ -20,3 +21,17 @@ export function resolveDesktopPaths(dshHome: string = resolveDshHome()): Desktop
      lock: join(dshHome, 'profiles', 'desktop', 'lock'),
@@ -348,7 +360,7 @@ index a74ea7c7ef..0a410e8163 100644
 @@ -35,16 +35,183 @@ export async function serveWebDocument(request: Request, root: string): Promise<
    })
  }
- 
+
 +/**
 + * The Host's authentication exchange answered with something other than its 303 + cookie.
 + *
@@ -537,17 +549,17 @@ index 54ab46d85e..28512376f9 100644
 --- a/apps/desktop/src/welcome-backend.ts
 +++ b/apps/desktop/src/welcome-backend.ts
 @@ -3,6 +3,7 @@ import type { ProductEvent } from '@deepseek-ai/dsh-client-product-analytics/typ
- 
+
  import { randomUUID } from 'node:crypto'
  import { desktopAccountBackend, type DesktopAccountBackend } from './account-backend.ts'
 +import { loopbackCandidates } from './web-document.ts'
- 
+
  /** Metadata needed before the native entry or workspace becomes visible. */
  export interface WelcomeState {
 @@ -34,21 +35,58 @@ function record(value: unknown): value is Record<string, unknown> {
    return typeof value === 'object' && value !== null && !Array.isArray(value)
  }
- 
+
 +/**
 + * Authenticate against whichever loopback host name this transport stack can actually reach.
 + *
@@ -621,13 +633,13 @@ index 54ab46d85e..28512376f9 100644
      const settings = await invoke({ namespace: 'settings', method: 'describe', args: {} })
      if (!record(settings) || !Array.isArray(settings.namespaces)) throw new Error('desktop welcome: missing settings namespaces')
 diff --git a/apps/desktop/tests/main-startup.spec.ts b/apps/desktop/tests/main-startup.spec.ts
-index b6b6fd476f..73f02a8732 100644
+index b6b6fd476f..48243b2479 100644
 --- a/apps/desktop/tests/main-startup.spec.ts
 +++ b/apps/desktop/tests/main-startup.spec.ts
 @@ -16,7 +16,16 @@ import { writeCrashReport } from '../src/crash-report.ts'
  type InvokeEvent = { sender?: unknown; senderFrame: { url: string } }
  type InvokeHandler = (event: InvokeEvent, ...args: unknown[]) => unknown
- 
+
 -vi.mock('../src/web-document.ts', () => ({ authenticateWebHost: async () => 'test-cookie', serveWebDocument: vi.fn(), forwardWebRequest: vi.fn() }))
 +vi.mock('../src/web-document.ts', async importOriginal => ({
 +  ...await importOriginal<typeof import('../src/web-document.ts')>(),
@@ -651,7 +663,74 @@ index b6b6fd476f..73f02a8732 100644
  vi.mock('../src/project-manager.ts', () => ({
    DesktopProjectManager: class {
      readonly applyRelease = harness.applyRelease
-@@ -913,6 +922,11 @@ describe('desktop main startup', () => {
+@@ -531,47 +540,20 @@ describe('desktop main startup', () => {
+     expect(console.error).toHaveBeenLastCalledWith(expect.objectContaining({ message: 'overlay unavailable' }))
+   })
+
+-  it('shows one explained startup login before Host readiness and joins concurrent checks without reopening it', async () => {
++  it('首次启动隐藏飞书登录，主动检查更新才询问', async () => {
+     harness.embeddedPolicy = { origin: 'https://policy.example.com', authentication: 'feishu-test', allowedAuthOrigins: ['https://login.example.com'],
+       allowedPageOrigins: ['https://downloads.example.com'], intervalMs: 1000, jitter: 0 }
+     vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async () =>
+       Response.json({ error: { code: 'UNAUTHENTICATED' } }, { status: 401 })))
+-    const explanation = Promise.withResolvers<{ response: number }>()
+-    const explained = Promise.withResolvers<undefined>()
+-    const login = Promise.withResolvers<'cancelled'>()
+-    const entered = Promise.withResolvers<undefined>()
+-    harness.dialog.showMessageBox.mockImplementationOnce(() => { explained.resolve(undefined); return explanation.promise })
+-    testAuth.login.mockImplementationOnce(() => { entered.resolve(undefined); return login.promise })
+-    const checks: Promise<unknown>[] = []
+-    try {
+-      await import('../src/main.ts')
+-      await explained.promise
+-      expect(harness.hosts).toHaveLength(0)
+-      expect(harness.dialog.showMessageBox).toHaveBeenCalledOnce()
+-      expect(harness.dialog.showMessageBox).toHaveBeenCalledWith(expect.objectContaining({
+-        message: en.policyLoginRequired, buttons: [en.policyLogin, en.later], cancelId: 1,
+-      }))
+-      checks.push(Promise.resolve(invoke(DESKTOP_IPC.updatesOpen, 'app')))
+-      expect(harness.dialog.showMessageBox).toHaveBeenCalledOnce()
+-      expect(testAuth.login).not.toHaveBeenCalled()
+-      explanation.resolve({ response: 0 })
+-      await entered.promise
+-      checks.push(Promise.resolve(invoke(DESKTOP_IPC.updatesOpen, 'app')))
+-      expect(testAuth.focus).toHaveBeenCalled()
+-      expect(testAuth.login).toHaveBeenCalledOnce()
+-      expect(harness.dialog.showMessageBox).toHaveBeenCalledOnce()
+-      login.resolve('cancelled')
+-      await Promise.all(checks)
+-      await vi.advanceTimersByTimeAsync(10_000)
+-      expect(testAuth.login).toHaveBeenCalledOnce()
+-      const messages = harness.dialog.showMessageBox.mock.calls.map(call => (call.at(-1) as { message: string }).message)
+-      expect(messages.filter(message => message === en.policyLoginRequired)).toHaveLength(1)
+-      expect(messages).toContain('You’re up to date!')
+-    } finally {
+-      explanation.resolve({ response: 1 })
+-      login.resolve('cancelled')
+-      await Promise.allSettled(checks)
+-    }
++    await readyForUpdate()
++    await vi.advanceTimersByTimeAsync(0)
++    expect(harness.dialog.showMessageBox).not.toHaveBeenCalled()
++    expect(testAuth.login).not.toHaveBeenCalled()
++    await invoke(DESKTOP_IPC.updatesOpen, 'app')
++    expect(harness.dialog.showMessageBox).toHaveBeenCalledWith(expect.objectContaining({
++      message: en.policyLoginRequired, buttons: [en.policyLogin, en.later], cancelId: 1,
++    }))
++    expect(testAuth.login).not.toHaveBeenCalled()
+   })
+
+   it.each(['returned', 'cancelled', 'failed'] as const)('requires explicit test login and handles %s without downloading', async (outcome) => {
+@@ -582,7 +564,7 @@ describe('desktop main startup', () => {
+     await readyForUpdate()
+     await vi.advanceTimersByTimeAsync(0)
+     expect(testAuth.login).not.toHaveBeenCalled()
+-    expect(harness.dialog.showMessageBox).toHaveBeenCalledWith(expect.objectContaining({ message: en.policyLoginRequired }))
++    expect(harness.dialog.showMessageBox).not.toHaveBeenCalled()
+     harness.dialog.showMessageBox.mockClear()
+     testAuth.login.mockImplementationOnce(async () => {
+       request.mockImplementation(async () => Response.json({ code: 0, data: { biz_code: 0, biz_data: null } }))
+@@ -913,6 +895,11 @@ describe('desktop main startup', () => {
      await harness.hostStarted.promise
      harness.hosts[0]!.ready.resolve()
      await Promise.resolve(invoke(DESKTOP_IPC.boot))
@@ -663,7 +742,7 @@ index b6b6fd476f..73f02a8732 100644
      const handler = harness.socketHeaders.mock.calls[0]![1] as (
        details: { url: string; webContentsId: number; requestHeaders: Record<string, string> },
        callback: (result: unknown) => void,
-@@ -2095,7 +2109,8 @@ describe('desktop main startup', () => {
+@@ -2095,7 +2082,8 @@ describe('desktop main startup', () => {
      expect(harness.applyRelease).toHaveBeenCalledTimes(1)
      expect(harness.hosts[0]).toMatchObject({
        node: process.execPath,
@@ -683,13 +762,13 @@ index 0fd9b591b1..da9b3ab383 100644
  import { join } from 'node:path'
 -import { authenticateWebHost, forwardWebRequest, serveWebDocument } from '../src/web-document.ts'
 +import { authenticateLoopbackHost, authenticateWebHost, exchangeProbe, forwardWebRequest, jarProbe, serveWebDocument } from '../src/web-document.ts'
- 
+
  const roots: string[] = []
  afterEach(async () => {
 @@ -35,6 +35,121 @@ it('requires the Host authentication exchange and retains only its cookie value'
    await expect(authenticateWebHost('http://127.0.0.1:1234/')).rejects.toThrow('authentication failed')
  })
- 
+
 +it('falls back to another loopback name when the announced one cannot be reached', async () => {
 +  const urls: string[] = []
 +  const fetch = vi.fn().mockImplementation(async (input: unknown) => {
@@ -815,7 +894,7 @@ index dea2905583..cb70d68123 100644
 @@ -93,7 +93,6 @@ describe('desktop welcome Web operations', () => {
      await expect(backend.read()).rejects.toThrow('Web RPC failed')
    })
- 
+
 -
    it('submits native analytics through authenticated RPC with a bounded request', async () => {
      const host = transport()
@@ -823,7 +902,7 @@ index dea2905583..cb70d68123 100644
 @@ -106,8 +105,53 @@ describe('desktop welcome Web operations', () => {
      expect(JSON.parse(init!.body as string)).toMatchObject({ payload: { args: { event } } })
    })
- 
+
 -  it('refuses an unauthenticated Web launch', async () => {
 +  it('keeps trying the next name when an intermediary answers on the Host behalf', async () => {
 +    // 代理代替 Host 回 403（`ok === false`）时**不能**当终局 —— 它只说明这个名字没通过。
@@ -890,12 +969,12 @@ index 9848c7fb26..c62bf0719a 100644
 +  forwardWebRequest: vi.fn(),
 +}))
  /** Welcome startup uses the Host before transitioning to the workspace. */
- 
+
  import { afterEach, expect, it, vi } from 'vitest'
 @@ -101,7 +107,7 @@ vi.mock('electron', () => ({
  // The Windows tray relabels through Menu as well; keep the menu call counts below platform-neutral.
  vi.mock('../src/tray.ts', () => ({ DesktopTray: class { relabel() {} dispose() {} } }))
- 
+
 -vi.mock('../src/paths.ts', () => ({ resolveDesktopPaths: () => ({ profile: '/profile' }) }))
 +vi.mock('../src/paths.ts', () => ({ resolveDesktopPaths: () => ({ profile: '/profile' }), resolvePortableDshHome: () => undefined }))
  vi.mock('../src/login-shell-environment.ts', async importOriginal => ({
@@ -908,7 +987,7 @@ index 45028746ff..c929f42495 100644
 @@ -148,6 +148,41 @@ interface AclTempCapability {
    grant: AclWriteGrant
  }
- 
+
 +/**
 + * The node executable the windows-acl runner argv is prefixed with.
 + *

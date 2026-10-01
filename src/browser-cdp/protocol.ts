@@ -56,6 +56,8 @@ export type CdpSocketFactory = (url: string) => CdpSocket
 
 /** 传输层契约：只有这五个动作。 */
 export interface CdpTransport {
+  /** 可选的宿主效果层；只传节点句柄，不传输入内容。 */
+  projectTyping?(targetId: string, objectId: string): Promise<void>
   /** 探测调试端点，返回浏览器版本信息。失败即「端点不可达」。 */
   version(signal?: AbortSignal): Promise<CdpVersion>
   /** 列出当前所有 target。 */
