@@ -12,6 +12,12 @@
 
 ## 0. 一句话
 
+### 区域裁剪坐标（2026-10-01 补验）
+
+Windows 200% 缩放、Chrome 154.0.8037.92 与打包态 Electron 的 MDN 复验：`DOMSnapshot.captureSnapshot.layout.bounds` 使用设备坐标，而 `cssLayoutViewport`、`getBoundingClientRect()` 与区域参数使用 CSS 坐标。实测同一标题的 x 分别为 576 与 288；布局视口宽度分别为 2044 与 1022。区域求交前按同次 `layoutViewport.clientWidth / cssLayoutViewport.clientWidth` 转换 CSS 区域，不能直接混用，也不能把比例固定为 2。缺 CSS 指标时保留旧坐标路径。
+
+修复后的真实对话只用 1 次完整快照、2 次视口区域快照，分别读到 Syntax/Parameters 与 Return value；`locate` 复核返回值章节 y=98、位于视口内。原始对照证据保留在 `D:/dsh-build/context-sequential-20261001/MDN-DPI-live.json`；测试覆盖滚动视口与指定 CSS 矩形两条裁剪路径。此记录描述本次环境，不外推所有浏览器的缩放行为。
+
 **CDP 的状态作用域是逐 domain、甚至逐命令不同的，不能一概而论。**
 判据不是「哪个 domain」，而是「**这条命令写的是不是 target 级行为状态**」。
 

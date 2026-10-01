@@ -1,4 +1,4 @@
-import { mkdtemp, readdir, readFile, rm } from 'node:fs/promises'
+import { mkdtemp, readdir, readFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { beforeEach, describe, expect, it } from 'vitest'
@@ -174,6 +174,7 @@ class FakeChrome {
     { backendNodeId: 8, bounds: [0, 50, 200, 30] },
     { backendNodeId: 9, bounds: [0, 90, 200, 30] },
   ]
+  layoutMetricsOverride: unknown
 
   /** 记录一条命令并给出它的结果。 */
   handle(socket: FakeSocket, method: string, params: Record<string, unknown>): unknown {
@@ -305,6 +306,7 @@ class FakeChrome {
           },
         }
       case 'Page.getLayoutMetrics':
+        if (this.layoutMetricsOverride !== undefined) return this.layoutMetricsOverride
         return {
           visualViewport: {
             pageX: 0,
@@ -788,6 +790,25 @@ describe('CdpBrowserProvider', () => {
     expect(regional.refs.some(entry => entry.name === 'Submit')).toBe(true)
     expect(regional.outline).not.toContain('Email')
     expect(regional.outsideRegion).toBe(1)
+  })
+
+  it('高 DPI 下滚动后的视口和 CSS 区域盒与布局快照使用同一坐标系', async () => {
+    await provider.open({})
+    await provider.observe({ kind: 'snapshot', sessionId: 'tab-1' })
+    chrome.layoutMetricsOverride = {
+      cssLayoutViewport: { pageX: 0, pageY: 800, clientWidth: 500, clientHeight: 300 },
+      layoutViewport: { pageX: 0, pageY: 1600, clientWidth: 1000, clientHeight: 600 },
+    }
+    chrome.layoutBoxes = [
+      { backendNodeId: 8, bounds: [0, 100, 200, 30] },
+      { backendNodeId: 9, bounds: [0, 1700, 200, 30] },
+    ]
+    for (const region of [{ viewport: true }, { box: { x: 0, y: 800, width: 500, height: 300 } }]) {
+      const result = await provider.observe({ kind: 'snapshot', sessionId: 'tab-1', region })
+      if (result.kind !== 'snapshot') throw new Error('expected a snapshot')
+      expect(result.outline).toContain('Submit')
+      expect(result.outline).not.toContain('Email')
+    }
   })
 
   it('increments the epoch on every snapshot so earlier refs go stale', async () => {
@@ -1496,7 +1517,7 @@ describe('CdpBrowserProvider.mutate (P1)', () => {
     } finally {
       if (saved === undefined) delete process.env[METRICS_ENV]
       else process.env[METRICS_ENV] = saved
-      await rm(directory, { recursive: true, force: true })
+      // 按文件删除规则保留独立验收目录。
     }
   })
 
@@ -1524,7 +1545,7 @@ describe('CdpBrowserProvider.mutate (P1)', () => {
     } finally {
       if (saved === undefined) delete process.env[METRICS_ENV]
       else process.env[METRICS_ENV] = saved
-      await rm(directory, { recursive: true, force: true })
+      // 按文件删除规则保留独立验收目录。
     }
   })
 

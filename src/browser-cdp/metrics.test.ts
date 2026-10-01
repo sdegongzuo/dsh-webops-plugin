@@ -1,23 +1,15 @@
-import { mkdtemp, readFile, rm } from 'node:fs/promises'
+import { mkdtemp, readFile } from 'node:fs/promises'
 import { existsSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { afterEach, describe, expect, it } from 'vitest'
+import { describe, expect, it } from 'vitest'
 import { METRICS_ENV, StaleRefMetrics } from './metrics.ts'
 import { RefRegistry } from './refs.ts'
 
-/** 每个用例自己的落盘目录；用完删掉，别把临时文件留成下一轮的假阳性。 */
-const directories: string[] = []
-
+/** 每个用例使用独立新目录，保留落盘证据，不复用上一轮文件。 */
 async function tempDirectory(): Promise<string> {
-  const directory = await mkdtemp(join(tmpdir(), 'dsh-metrics-'))
-  directories.push(directory)
-  return directory
+  return await mkdtemp(join(tmpdir(), 'dsh-metrics-'))
 }
-
-afterEach(async () => {
-  while (directories.length > 0) await rm(directories.pop() as string, { recursive: true, force: true })
-})
 
 describe('StaleRefMetrics', () => {
   it('is a no-op for an empty directory — 不建目录、不写文件、不抛错', async () => {

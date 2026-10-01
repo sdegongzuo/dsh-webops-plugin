@@ -1704,12 +1704,17 @@ export class CdpBrowserProvider implements BrowserProvider {
     signal?: AbortSignal,
   ): Promise<Set<number>> {
     const options = { signal, timeoutMs: this.config.commandTimeoutMs }
-    let area: BoxRect | undefined = region.box
-    if (area === undefined) {
-      const metrics = await session.connection.send<LayoutMetricsResult>('Page.getLayoutMetrics', {}, options)
-      area = viewportBoxFromMetrics(metrics)
-    }
+    const metrics = await session.connection.send<LayoutMetricsResult>('Page.getLayoutMetrics', {}, options)
+    let area: BoxRect | undefined = region.box ?? viewportBoxFromMetrics(metrics)
     if (area === undefined) return new Set()
+    // 高 DPI 的真实 Chrome 布局快照使用设备坐标，而区域参数使用 CSS 坐标。
+    // 从同次布局指标取比例，不把系统缩放固定成 2；缺 CSS 指标时沿用旧协议坐标。
+    const css = metrics.cssLayoutViewport ?? metrics.cssVisualViewport
+    const layout = metrics.layoutViewport ?? metrics.visualViewport
+    const scale = css?.clientWidth !== undefined && css.clientWidth > 0
+      && layout?.clientWidth !== undefined && layout.clientWidth > 0
+      ? layout.clientWidth / css.clientWidth : 1
+    area = { x: area.x * scale, y: area.y * scale, width: area.width * scale, height: area.height * scale }
     const captured = await session.connection.send<CaptureSnapshotResult>(
       'DOMSnapshot.captureSnapshot',
       { computedStyles: [] },

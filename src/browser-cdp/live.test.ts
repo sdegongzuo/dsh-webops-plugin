@@ -24,7 +24,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { createServer } from 'node:http'
 import type { Server } from 'node:http'
 import type { AddressInfo } from 'node:net'
-import { mkdtemp, rm, stat } from 'node:fs/promises'
+import { mkdtemp, stat } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Context } from '@deepseek-ai/cordis'
@@ -139,7 +139,8 @@ describe.runIf(PROBE.run)(`live Chrome at ${ENDPOINT}`, () => {
     // 浏览器对夹具保持 keep-alive，直接 close 会一直等到超时。
     server.closeAllConnections()
     await new Promise<void>(resolve => server.close(() => { resolve() }))
-    await rm(home, { recursive: true, force: true })
+    // 保留真实截图证据；清理须由用户按文件删除规则手动执行。
+    console.info(`[live] 验收目录保留：${home}`)
   })
 
   it('reports the endpoint as available', () => {
