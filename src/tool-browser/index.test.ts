@@ -369,6 +369,7 @@ describe('registration', () => {
     const harness = mount()
     const wait = String(tool(harness, 'webpage_wait').description)
     expect(wait).toContain('text from the CURRENT reply')
+    expect(wait).toContain('one such wait confirms submission too')
     expect(wait).not.toContain('Use until=stable after sending a chat message')
     const snapshot = String(tool(harness, 'webpage_snapshot').description)
     expect(snapshot).toContain('For reply text after webpage_wait use region_viewport')
@@ -378,6 +379,7 @@ describe('registration', () => {
     expect(text).toContain('not text already present from a previous reply')
     expect(text).toContain('read the reply with a regional snapshot')
     expect(text).toContain('Revalidate the input ref before the next message')
+    expect(text).toContain('do not separately wait for an echo')
     expect(text).not.toContain('use after a chat send')
   })
 
