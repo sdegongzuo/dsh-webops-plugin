@@ -327,6 +327,37 @@ function tool(harness: Harness, toolName: string): ToolDefinition {
 }
 
 describe('registration', () => {
+  it('导航恢复与低成本观察的契约保留在系统提示中', () => {
+    const section = mount().sections[0]
+    const text = (section?.text as (context: { scope?: undefined }) => string)({ scope: undefined })
+    expect(text).toContain('navigated=true, take a FULL webpage_snapshot')
+    expect(text).not.toContain('navigated=true, or a ref call')
+    expect(text).toContain('webpage_wait(text=...)')
+    expect(text).toContain('webpage_find and a regional snapshot (region_ref)')
+    expect(text).toContain('truncated=true')
+    expect(text).toContain('outline you hold no longer matches')
+    expect(text).toContain('Revalidate does not release human control')
+  })
+
+  it('精简描述仍保留仅在文案中的关键契约', () => {
+    const harness = mount()
+    const anchors: Record<string, string[]> = {
+      webpage_snapshot: ['does NOT invalidate other refs', 'webpage_find', 'truncated=true'],
+      webpage_tabs: ['one-time code', 'ends your access', 'kills every ref'],
+      webpage_revalidate: ['document_changed', 'node_gone', 'identity_mismatch', 'not_archived', 'SAME number'],
+      webpage_execute: ['BROWSER_EXECUTE_NOT_ALLOWED', 'BROWSER_EXECUTE_RESULT_UNSERIALIZABLE', 'side effects NOT rolled back'],
+      webpage_wait: ['exactly ONE condition', 'satisfied=false', 'timeout_ms'],
+    }
+    for (const [name, phrases] of Object.entries(anchors)) {
+      for (const phrase of phrases) expect(String(tool(harness, name).description), name).toContain(phrase)
+    }
+    const snapshot = tool(harness, 'webpage_snapshot')
+    expect(JSON.stringify(snapshot.parameters)).toContain('region_ref')
+    expect(JSON.stringify(snapshot.parameters)).toContain('max_lines')
+    expect(JSON.stringify(snapshot.output.schema)).toContain('truncated')
+    expect(JSON.stringify(snapshot.output.schema)).toContain('rebound_refs')
+  })
+
   it('exposes exactly the P0 read-only tools, the P1 operation tools, the P2 collectors and the P3 locators', () => {
     expect([...mount().tools.keys()].sort()).toEqual([
       'webpage_click',
