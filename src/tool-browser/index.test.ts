@@ -365,6 +365,22 @@ describe('registration', () => {
     expect(JSON.stringify(snapshot.output.schema)).toContain('rebound_refs')
   })
 
+  it('流式回复等待当前轮新文本，完成后局部观察，不默认全页重拍', () => {
+    const harness = mount()
+    const wait = String(tool(harness, 'webpage_wait').description)
+    expect(wait).toContain('text from the CURRENT reply')
+    expect(wait).not.toContain('Use until=stable after sending a chat message')
+    const snapshot = String(tool(harness, 'webpage_snapshot').description)
+    expect(snapshot).toContain('For reply text after webpage_wait use region_viewport')
+    expect(snapshot).not.toContain('use it before deciding anything')
+    const section = harness.sections[0]
+    const text = (section?.text as (context: { scope?: undefined }) => string)({ scope: undefined })
+    expect(text).toContain('not text already present from a previous reply')
+    expect(text).toContain('read the reply with a regional snapshot')
+    expect(text).toContain('Revalidate the input ref before the next message')
+    expect(text).not.toContain('use after a chat send')
+  })
+
   it('exposes exactly the P0 read-only tools, the P1 operation tools, the P2 collectors and the P3 locators', () => {
     expect([...mount().tools.keys()].sort()).toEqual([
       'webpage_click',
@@ -760,6 +776,8 @@ describe('webpage_tabs and the P1 mutation tools', () => {
     const jsButton = render({ ...base, target: { role: 'button', name: '展开' } })
     expect(jsButton).toContain('no href')
     expect(jsButton).toContain('webpage_snapshot')
+    expect(jsButton).toContain('region_viewport=true')
+    expect(jsButton).toContain('webpage_wait(text=...)')
 
     // ④ 反向：导航了、或根本不是 click，就都不许出现这段。
     expect(render({ ...base, navigated: true, target })).not.toContain('did NOT navigate')
@@ -776,6 +794,11 @@ describe('webpage_tabs and the P1 mutation tools', () => {
       signals: { readyState: 'loading', dom: 'busy', network: 'busy' },
     })
     expect(busy).toContain('webpage_wait(text=')
+    const ready = render({ ...base, action: 'wait', satisfied: true })
+    expect(ready).toContain('read updated text with webpage_snapshot(region_viewport=true)')
+    const changedDocument = render({ ...base, action: 'wait', satisfied: true,
+      page_changed: { navigated: 1, within_document: 0 } })
+    expect(changedDocument).not.toContain('read updated text with webpage_snapshot(region_viewport=true)')
     // 反向：页面其实已经安静时，不该再劝它换姿势。
     const quiet = render({
       ...base,
