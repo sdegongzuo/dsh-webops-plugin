@@ -99,7 +99,7 @@ index b4b8153b7f..c9e07ae48a 100644
 @@ -2,7 +2,9 @@ import type { ProductEventMap, ProductEvent } from '@deepseek-ai/dsh-client-prod
  import { WINDOWS_TITLEBAR_HEIGHT } from './windows-layout.ts'
  /** Electron shell: desktop project ownership, custom protocol, windows, and lifecycle. */
-
+ 
 +import { existsSync } from 'node:fs'
  import { readFile, writeFile } from 'node:fs/promises'
 +import { createRequire } from 'node:module'
@@ -127,7 +127,7 @@ index b4b8153b7f..c9e07ae48a 100644
 @@ -60,6 +62,78 @@ import { DesktopQuitConfirmation } from './quit-confirmation.ts'
  import { DesktopTray } from './tray.ts'
  import { DesktopBackgroundNotice } from './background-notice.ts'
-
+ 
 +// 让 host 子进程（以及跑在里面的插件）知道 shell 主 exe 在哪 —— 便携版没有独立的
 +// electron.exe，browser-electron 的窗口宿主只能用这个 exe 起第二个实例。
 +//
@@ -221,7 +221,7 @@ index b4b8153b7f..c9e07ae48a 100644
 +    ?? (development ? join(app.getAppPath(), '.desktop-build', 'development', 'project') : join(process.resourcesPath, 'dsh'))
    return { node, nodeBin, pnpm, dsh }
  }
-
+ 
 @@ -448,11 +531,28 @@ async function main(): Promise<void> {
      return {
        start: async () => {
@@ -257,7 +257,7 @@ index b4b8153b7f..c9e07ae48a 100644
 @@ -707,7 +807,11 @@ async function main(): Promise<void> {
      return browserGuests.release(event.sender, lease)
    })
-
+ 
 -  session.defaultSession.webRequest.onBeforeSendHeaders({ urls: ['ws://127.0.0.1/*'] }, (details, callback) => {
 +  // 渲染进程的事件流是自己发起的 WebSocket（不是走 Node 的转发），所以握手 cookie 得由壳注入。
 +  // 过滤名单必须覆盖**所有可能被选中的回环名**：兜底可能把 Host 定在 `localhost`（代理只放通
@@ -282,7 +282,7 @@ index b4b8153b7f..c9e07ae48a 100644
 @@ -1333,17 +1436,29 @@ async function main(): Promise<void> {
    publishUpdate(updateState)
  }
-
+ 
 -const ownsDesktopInstance = claimDesktopSingleInstance(app, () => { focusPrimaryWindow() })
 +// 窗口宿主模式：便携版里 browser-electron 用主 exe 起第二个实例来开浏览器窗口，
 +// 靠 `DSH_BROWSER_ELECTRON_HOST` 把宿主脚本的绝对路径传进来
@@ -291,7 +291,7 @@ index b4b8153b7f..c9e07ae48a 100644
 +// 必须在 `claimDesktopSingleInstance` **之前**接管：先抢了单实例锁的话第二个实例会直接退出。
 +// 宿主只管开窗口，不碰 profile、也不开主窗口。
 +const browserHostScript = process.env.DSH_BROWSER_ELECTRON_HOST
-
+ 
 -if (ownsDesktopInstance) void app.whenReady().then(main).catch(async (error: unknown) => {
 -  const message = error instanceof Error ? error.message : String(error)
 -  console.error(error)
@@ -328,12 +328,12 @@ index cf03e38c36..878122bcd6 100644
 +++ b/apps/desktop/src/paths.ts
 @@ -1,6 +1,7 @@
  /** Filesystem ownership for the Electron-managed desktop installation. */
-
+ 
 -import { join } from 'node:path'
 +import { existsSync } from 'node:fs'
 +import { dirname, join, resolve } from 'node:path'
  import { resolveDshHome } from '@deepseek-ai/dsh-home-paths'
-
+ 
  /** Stable desktop installation paths under the shared Harness home. */
 @@ -20,3 +21,17 @@ export function resolveDesktopPaths(dshHome: string = resolveDshHome()): Desktop
      lock: join(dshHome, 'profiles', 'desktop', 'lock'),
@@ -360,7 +360,7 @@ index a74ea7c7ef..0a410e8163 100644
 @@ -35,16 +35,183 @@ export async function serveWebDocument(request: Request, root: string): Promise<
    })
  }
-
+ 
 +/**
 + * The Host's authentication exchange answered with something other than its 303 + cookie.
 + *
@@ -549,17 +549,17 @@ index 54ab46d85e..28512376f9 100644
 --- a/apps/desktop/src/welcome-backend.ts
 +++ b/apps/desktop/src/welcome-backend.ts
 @@ -3,6 +3,7 @@ import type { ProductEvent } from '@deepseek-ai/dsh-client-product-analytics/typ
-
+ 
  import { randomUUID } from 'node:crypto'
  import { desktopAccountBackend, type DesktopAccountBackend } from './account-backend.ts'
 +import { loopbackCandidates } from './web-document.ts'
-
+ 
  /** Metadata needed before the native entry or workspace becomes visible. */
  export interface WelcomeState {
 @@ -34,21 +35,58 @@ function record(value: unknown): value is Record<string, unknown> {
    return typeof value === 'object' && value !== null && !Array.isArray(value)
  }
-
+ 
 +/**
 + * Authenticate against whichever loopback host name this transport stack can actually reach.
 + *
@@ -639,7 +639,7 @@ index b6b6fd476f..48243b2479 100644
 @@ -16,7 +16,16 @@ import { writeCrashReport } from '../src/crash-report.ts'
  type InvokeEvent = { sender?: unknown; senderFrame: { url: string } }
  type InvokeHandler = (event: InvokeEvent, ...args: unknown[]) => unknown
-
+ 
 -vi.mock('../src/web-document.ts', () => ({ authenticateWebHost: async () => 'test-cookie', serveWebDocument: vi.fn(), forwardWebRequest: vi.fn() }))
 +vi.mock('../src/web-document.ts', async importOriginal => ({
 +  ...await importOriginal<typeof import('../src/web-document.ts')>(),
@@ -666,7 +666,7 @@ index b6b6fd476f..48243b2479 100644
 @@ -531,47 +540,20 @@ describe('desktop main startup', () => {
      expect(console.error).toHaveBeenLastCalledWith(expect.objectContaining({ message: 'overlay unavailable' }))
    })
-
+ 
 -  it('shows one explained startup login before Host readiness and joins concurrent checks without reopening it', async () => {
 +  it('首次启动隐藏飞书登录，主动检查更新才询问', async () => {
      harness.embeddedPolicy = { origin: 'https://policy.example.com', authentication: 'feishu-test', allowedAuthOrigins: ['https://login.example.com'],
@@ -719,7 +719,7 @@ index b6b6fd476f..48243b2479 100644
 +    }))
 +    expect(testAuth.login).not.toHaveBeenCalled()
    })
-
+ 
    it.each(['returned', 'cancelled', 'failed'] as const)('requires explicit test login and handles %s without downloading', async (outcome) => {
 @@ -582,7 +564,7 @@ describe('desktop main startup', () => {
      await readyForUpdate()
@@ -762,13 +762,13 @@ index 0fd9b591b1..da9b3ab383 100644
  import { join } from 'node:path'
 -import { authenticateWebHost, forwardWebRequest, serveWebDocument } from '../src/web-document.ts'
 +import { authenticateLoopbackHost, authenticateWebHost, exchangeProbe, forwardWebRequest, jarProbe, serveWebDocument } from '../src/web-document.ts'
-
+ 
  const roots: string[] = []
  afterEach(async () => {
 @@ -35,6 +35,121 @@ it('requires the Host authentication exchange and retains only its cookie value'
    await expect(authenticateWebHost('http://127.0.0.1:1234/')).rejects.toThrow('authentication failed')
  })
-
+ 
 +it('falls back to another loopback name when the announced one cannot be reached', async () => {
 +  const urls: string[] = []
 +  const fetch = vi.fn().mockImplementation(async (input: unknown) => {
@@ -894,7 +894,7 @@ index dea2905583..cb70d68123 100644
 @@ -93,7 +93,6 @@ describe('desktop welcome Web operations', () => {
      await expect(backend.read()).rejects.toThrow('Web RPC failed')
    })
-
+ 
 -
    it('submits native analytics through authenticated RPC with a bounded request', async () => {
      const host = transport()
@@ -902,7 +902,7 @@ index dea2905583..cb70d68123 100644
 @@ -106,8 +105,53 @@ describe('desktop welcome Web operations', () => {
      expect(JSON.parse(init!.body as string)).toMatchObject({ payload: { args: { event } } })
    })
-
+ 
 -  it('refuses an unauthenticated Web launch', async () => {
 +  it('keeps trying the next name when an intermediary answers on the Host behalf', async () => {
 +    // 代理代替 Host 回 403（`ok === false`）时**不能**当终局 —— 它只说明这个名字没通过。
@@ -969,12 +969,12 @@ index 9848c7fb26..c62bf0719a 100644
 +  forwardWebRequest: vi.fn(),
 +}))
  /** Welcome startup uses the Host before transitioning to the workspace. */
-
+ 
  import { afterEach, expect, it, vi } from 'vitest'
 @@ -101,7 +107,7 @@ vi.mock('electron', () => ({
  // The Windows tray relabels through Menu as well; keep the menu call counts below platform-neutral.
  vi.mock('../src/tray.ts', () => ({ DesktopTray: class { relabel() {} dispose() {} } }))
-
+ 
 -vi.mock('../src/paths.ts', () => ({ resolveDesktopPaths: () => ({ profile: '/profile' }) }))
 +vi.mock('../src/paths.ts', () => ({ resolveDesktopPaths: () => ({ profile: '/profile' }), resolvePortableDshHome: () => undefined }))
  vi.mock('../src/login-shell-environment.ts', async importOriginal => ({
@@ -987,7 +987,7 @@ index 45028746ff..c929f42495 100644
 @@ -148,6 +148,41 @@ interface AclTempCapability {
    grant: AclWriteGrant
  }
-
+ 
 +/**
 + * The node executable the windows-acl runner argv is prefixed with.
 + *
