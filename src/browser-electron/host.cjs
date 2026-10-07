@@ -123,6 +123,16 @@ const DEVTOOLS_SETTLE_TIMEOUT_MS = 3000
  */
 const CDP_COMMAND_TIMEOUT_MS = 30000
 
+/** 仅拦人工的按下/字符事件；Electron 44 下 CDP press 在此钩子只产生 keyUp。 */
+function shouldBlockPageInput(holder, input) {
+  return holder === 'agent' && (input?.type === 'keyDown' || input?.type === 'char')
+}
+
+/** 页面由 agent 持有时，拒绝会改页面内容或历史状态的原生编辑菜单命令。 */
+function shouldBlockEditAction(holder, action) {
+  return holder === 'agent' && ['undo', 'redo', 'cut', 'paste'].includes(action)
+}
+
 /**
  * 往 stdout 宣布一条**诊断**行。父进程只认 `type === 'listening'`，其它行原样忽略
  * （见 `bridge.ts` 的 `parseAnnouncedAddress`），所以加它不动协议。
@@ -273,6 +283,16 @@ function setHolder(tabId, holder) {
   sendControlState()
 }
 
+/** 原生编辑菜单不保证经过页面的 before-input-event；agent 持有时禁止向页面派发菜单编辑。 */
+function runEditAction(action) {
+  const page = [...tabs.values()].find(tab => tab.view.webContents.isFocused())
+  if (shouldBlockEditAction(page?.holder, action)) return
+  const target = page?.view.webContents
+    ?? (tabBar !== undefined && !tabBar.webContents.isDestroyed() && tabBar.webContents.isFocused()
+      ? tabBar.webContents : undefined)
+  target?.[action]?.()
+}
+
 /**
  * 地址栏输入的最小规范化：`trim()` 后若不含 `://` 就补 `https://` 前缀。
  * 空串原样返回（调用方按「忽略」处理）。
@@ -420,8 +440,8 @@ function openTab(url, size, options) {
     // 「这次 detach 是我们自己为了开 DevTools 让位」—— 见下面的监听器与 `toggleDevTools`。
     // 用状态位区分，不靠 reason（Electron 给的 reason 恒为 `target closed`）。
     lettingGo: false,
-    // §6.5 控制权：谁在操作这个页面。`agent`（默认）时吞掉人工在这个视图里的键盘输入；
-    // `human` 时放开，并且父进程侧会作废 ref 纪元、拒掉 agent 的写操作。
+    // §6.5 控制权：谁在操作这个页面。agent 时原生 overlay 拦鼠标且输入钩子拦键盘；
+    // human 时放开，并且父进程侧会作废 ref 纪元、拒掉 agent 的写操作。
     // 与 `lettingGo` 一样是**幂等状态位**，不是计数器。
     holder: 'agent',
   }
@@ -453,40 +473,13 @@ function openTab(url, size, options) {
     }
     return { action: 'deny' }
   })
-  // §6.5 控制权：holder 为 'agent' 时吞掉人工在这个**页面视图**里的输入。
-  //
-  // ⚠ 实测（Electron 44 / Windows，2026-09-19 探针）：`before-input-event` 是**键盘专属**
-  // —— 鼠标（人工点击走渲染进程、CDP `Input.dispatchMouseEvent` 走调试器）**一次都不触发**。
-  // 所以 A 档原本设想的「吞掉人工输入」实际只覆盖键盘，鼠标拦不住，判据 J4 据此改窄成
-  // 「键盘 + 状态条提示」。这也是**不用页面内遮罩层**兜鼠标的原因：往页面里注一层吞事件的
-  // div 会污染 AX 树与快照（方案 §6.5 探针的退路已经否掉）。
-  //
-  // 带 Ctrl / Alt / Meta 的组合**一律放行**：那些是宿主级操作（Ctrl+Shift+I 开 DevTools、
-  // Ctrl+R 刷新、Ctrl+W 关标签），不是「在页面里打字」。吞掉它们等于把人锁死在页面里，
-  // 与 J7「人永远不会被锁在外面」的立意相反。Shift 不在此列 —— 它是打字的一部分。
-  //
-  // ⚠ 这**不会**连带吞掉 agent 自己的键盘输入 —— 但**前提是只吞「按下」**，
-  // 这一条是实测逼出来的（Electron 44 / Windows，探针 v3，各变体逐个跑）：
-  //
-  //   | 注入方式                                  | 钩子收到的 type | 页面收到 keydown |
-  //   |---|---|---|
-  //   | 人工 `sendInputEvent('keyDown')`           | `keyDown`       | 被吞（正是我们要的） |
-  //   | CDP `dispatchKeyEvent('keyDown')` + text   | 只有 `keyUp`    | ✅ 照常 |
-  //   | CDP `dispatchKeyEvent('keyDown')` 命名键    | 只有 `keyUp`    | ✅ 照常 |
-  //
-  // 所以「无条件 `preventDefault()`」会连 agent 的 `keyUp` 一起吞掉，让 `webpage_press`
-  // 缺一条腿（页面里依赖 keyup 的逻辑收不到）。只吞 `keyDown` / `char` 才两全：
-  // 人按不动页面，agent 的按键完整（keydown + keyup 都到）。
-  //
-  // **已知边界（实测，不可达故不处理）**：CDP 的 `rawKeyDown` 在钩子里报的 type **就是
-  // `keyDown`**，与人工按键无法区分 —— 想吞它就得连人工的 keyDown 一起吞，没有第三条路。
-  // 它目前不可达：`webpage_execute` 明确拒绝 `Input.*`（`execute.ts:75`），而 `press`
-  // 只用 `keyDown` / `keyUp`。**哪天有人放开 `Input.*` 白名单，这条边界就会变成真缺陷。**
+  // §6.5 控制权：键盘在 Chromium 输入边界拦截，鼠标由独立原生 overlay 消费。
+  // 不豁免 Ctrl/Alt/Meta：否则 Ctrl+V、Shift+Insert 和浏览器快捷键仍能改变 agent 页面。
+  // 只拦 keyDown / char，保留 keyUp；Electron 44 实测 CDP 注入只触发此钩子的 keyUp，
+  // 所以 agent 的 webpage_press 仍可用。char 拦截同时覆盖经键盘事件提交的输入法字符。
   view.webContents.on('before-input-event', (event, input) => {
-    if (entry.holder !== 'agent') return
-    if (input.control || input.alt || input.meta) return
-    // 只吞「按下」与「字符」—— 这两类才是「在页面里操作」。
-    if (input.type !== 'keyDown' && input.type !== 'char') return
+    // 拦截快捷键（含粘贴）、Shift+Insert、普通按键及字符输入；放行 keyUp 以保持 CDP 按键完整。
+    if (!shouldBlockPageInput(entry.holder, input)) return
     event.preventDefault()
   })
 
@@ -879,7 +872,18 @@ app.whenReady().then(() => {
   // 只在打开那一瞬让位，见 `toggleDevTools`。
   Menu.setApplicationMenu(Menu.buildFromTemplate([
     { role: 'fileMenu' },
-    { role: 'editMenu' },
+    {
+      label: '编辑',
+      submenu: [
+        { label: '撤销', accelerator: 'CmdOrCtrl+Z', click: () => runEditAction('undo') },
+        { label: '重做', accelerator: 'CmdOrCtrl+Shift+Z', click: () => runEditAction('redo') },
+        { type: 'separator' },
+        { label: '剪切', accelerator: 'CmdOrCtrl+X', click: () => runEditAction('cut') },
+        { label: '复制', click: () => runEditAction('copy') },
+        { label: '粘贴', accelerator: 'CmdOrCtrl+V', click: () => runEditAction('paste') },
+        { label: '全选', click: () => runEditAction('selectAll') },
+      ],
+    },
     {
       label: 'View',
       submenu: [
@@ -968,4 +972,4 @@ app.whenReady().then(() => {
 
 // 供单测使用：地址规范化与导航处理不依赖 Electron 运行时，导出后单测可以直接钉住
 // 「规范化补 https://」与「无活动标签时忽略」；作为 Electron 入口运行时无副作用。
-module.exports = { normalizeAddress, handleNav }
+module.exports = { normalizeAddress, handleNav, shouldBlockPageInput, shouldBlockEditAction }

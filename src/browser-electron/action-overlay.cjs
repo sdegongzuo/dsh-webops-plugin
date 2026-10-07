@@ -5,6 +5,7 @@ function createActionOverlay(BrowserWindow, parent, file, topInset) {
     skipTaskbar: true, hasShadow: false, resizable: false,
     webPreferences: { nodeIntegration: false, contextIsolation: true, sandbox: true },
   })
+  window.setFocusable(false)
   window.setIgnoreMouseEvents(true)
   let ready = false
   let sequence = 0
@@ -12,14 +13,19 @@ function createActionOverlay(BrowserWindow, parent, file, topInset) {
   let current
   let controlTab
   const refreshControl = () => {
-    if (!ready || window.isDestroyed()) return
+    if (window.isDestroyed()) return
     if (controlTab === undefined || !parent.isVisible() || parent.isMinimized()) {
+      window.setIgnoreMouseEvents(true)
       window.hide()
       return
     }
+    // 独立原生窗口盖住网页内容区并接收人工鼠标输入；它不在页面 DOM/AX 树中。
+    // showInactive + focusable:false 保持网页焦点，CDP 输入仍直接送给页面。
+    window.setIgnoreMouseEvents(false)
     layout()
     window.showInactive()
-    void window.webContents.executeJavaScript('window.setAgentControl(true)').catch(() => window.hide())
+    // 渲染层出错也保持原生窗口覆盖并接收鼠标；隐藏会让输入穿透到 agent 页面。
+    if (ready) void window.webContents.executeJavaScript('window.setAgentControl(true)').catch(() => {})
   }
   const clear = () => {
     sequence++

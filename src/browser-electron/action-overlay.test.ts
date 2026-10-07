@@ -10,13 +10,19 @@ describe('独立操作效果层', () => {
     let focused = true
     let parentVisible = true
     let ignored = false
+    let focusable = true
+    let failScripts = false
     let bounds: unknown
     class Window {
       webContents = {
         on: (event: string, handler: () => void) => { if (event === 'did-finish-load') handler() },
-        executeJavaScript: async (script: string) => { scripts.push(script) },
+        executeJavaScript: async (script: string) => {
+          scripts.push(script)
+          if (failScripts) throw new Error('renderer unavailable')
+        },
       }
       setIgnoreMouseEvents(value: boolean) { ignored = value }
+      setFocusable(value: boolean) { focusable = value }
       isDestroyed() { return false }
       hide() { visible = false }
       showInactive() { visible = true }
@@ -31,17 +37,18 @@ describe('独立操作效果层', () => {
       getContentBounds: () => ({ x: 20, y: 30, width: 800, height: 676 }),
     }
     const overlay = createActionOverlay(Window, parent, '效果.html', 76)
-    return { overlay, handlers, scripts, blur: () => { focused = false },
+    return { overlay, handlers, scripts, failScripts: () => { failScripts = true }, blur: () => { focused = false },
       show: (value: boolean) => { parentVisible = value; handlers.get(value ? 'show' : 'hide')?.() },
-      state: () => ({ visible, ignored, bounds }) }
+      state: () => ({ visible, ignored, focusable, bounds }) }
   }
-  it('按 CSS 视口投影、穿透鼠标且不抢焦点；接管清除效果', () => {
+  it('agent 控制时拦截鼠标且不抢焦点；接管时恢复鼠标穿透', () => {
     const f = fixture()
+    f.overlay.setControl('t1', 'agent')
     f.overlay.project('t1', { x: 200, y: 150 }, 'clicking', { width: 400, height: 300 })
     expect(f.scripts.join('\n')).toContain('"x":50,"y":50')
-    expect(f.state()).toEqual({ visible: true, ignored: true, bounds: { x: 20, y: 106, width: 800, height: 600 } })
-    f.overlay.clear()
-    expect(f.state().visible).toBe(false)
+    expect(f.state()).toEqual({ visible: true, ignored: false, focusable: false, bounds: { x: 20, y: 106, width: 800, height: 600 } })
+    f.overlay.setControl('t1', 'human')
+    expect(f.state()).toMatchObject({ visible: false, ignored: true, focusable: false })
     expect(f.overlay.currentTab).toBeUndefined()
   })
   it('切到其他 app 后保留 agent 控制光晕，不抢回焦点', () => {
@@ -52,6 +59,7 @@ describe('独立操作效果层', () => {
     f.handlers.get('blur')?.()
     f.overlay.project('t1', { x: 20, y: 20 }, 'typing', { width: 400, height: 300 })
     expect(f.state().visible).toBe(true)
+    expect(f.state().ignored).toBe(false)
     expect(f.scripts.filter(script => script.includes('window.projectAction'))).toHaveLength(2)
     f.overlay.clear()
   })
@@ -60,10 +68,18 @@ describe('独立操作效果层', () => {
     f.overlay.setControl('t1', 'agent')
     f.overlay.clear()
     expect(f.state().visible).toBe(true)
+    expect(f.state().ignored).toBe(false)
     f.blur(); f.handlers.get('blur')?.()
     expect(f.state().visible).toBe(true)
     f.overlay.setControl('t1', 'human')
-    expect(f.state().visible).toBe(false)
+    expect(f.state()).toMatchObject({ visible: false, ignored: true })
+  })
+  it('效果层脚本失败时仍保持原生鼠标拦截窗可见', async () => {
+    const f = fixture()
+    f.failScripts()
+    f.overlay.setControl('t1', 'agent')
+    await Promise.resolve()
+    expect(f.state()).toMatchObject({ visible: true, ignored: false, focusable: false })
   })
   it('后台隐藏后再次显示和恢复，无需新工具调用也恢复光晕', () => {
     const f = fixture()

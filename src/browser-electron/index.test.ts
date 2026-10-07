@@ -43,9 +43,11 @@ moduleWithLoad._load = (request, parent, isMain) =>
 const hostModule = nodeRequire('./host.cjs') as {
   normalizeAddress: (input: unknown) => string
   handleNav: (action: string, url?: string) => void
+  shouldBlockPageInput: (holder: 'agent' | 'human', input: { type?: string; control?: boolean; shift?: boolean; alt?: boolean; meta?: boolean }) => boolean
+  shouldBlockEditAction: (holder: 'agent' | 'human' | undefined, action: string) => boolean
 }
 moduleWithLoad._load = nativeLoad
-const { normalizeAddress, handleNav } = hostModule
+const { normalizeAddress, handleNav, shouldBlockPageInput, shouldBlockEditAction } = hostModule
 
 /** 一个可编程的假窗口宿主（一个壳窗口、多个标签页）。 */
 class FakeHost implements TabHostChannel {
@@ -960,6 +962,26 @@ describe('地址栏（host.cjs 内联逻辑）', () => {
     expect(() => handleNav('forward')).not.toThrow()
     expect(() => handleNav('reload')).not.toThrow()
     expect(() => handleNav('unknown')).not.toThrow()
+  })
+})
+
+describe('页面人工键盘输入隔离', () => {
+  it('拦截包括 Ctrl+V、Ctrl+A/C 与 Shift+Insert 在内的按下事件和字符，只放行 keyUp', () => {
+    expect(shouldBlockPageInput('agent', { type: 'keyDown', control: true })).toBe(true)
+    expect(shouldBlockPageInput('agent', { type: 'keyDown', shift: true })).toBe(true)
+    expect(shouldBlockPageInput('agent', { type: 'char' })).toBe(true)
+    expect(shouldBlockPageInput('agent', { type: 'keyUp' })).toBe(false)
+    expect(shouldBlockPageInput('human', { type: 'char' })).toBe(false)
+  })
+
+  it('agent 持有时屏蔽原生编辑菜单的写操作，保留复制和全选；human 持有时恢复', () => {
+    for (const action of ['undo', 'redo', 'cut', 'paste']) {
+      expect(shouldBlockEditAction('agent', action)).toBe(true)
+      expect(shouldBlockEditAction('human', action)).toBe(false)
+    }
+    expect(shouldBlockEditAction('agent', 'copy')).toBe(false)
+    expect(shouldBlockEditAction('agent', 'selectAll')).toBe(false)
+    expect(shouldBlockEditAction(undefined, 'paste')).toBe(false)
   })
 })
 

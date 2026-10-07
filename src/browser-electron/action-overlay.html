@@ -1,7 +1,7 @@
 <!doctype html>
 <html lang="zh-CN"><meta charset="utf-8"><title>操作效果</title>
 <style>
-html,body{margin:0;width:100%;height:100%;overflow:hidden;background:transparent;pointer-events:none}
+html,body{margin:0;width:100%;height:100%;overflow:hidden;background:transparent;pointer-events:auto}
 #wash{position:absolute;inset:0;opacity:0;background:#5594fa12;box-shadow:inset 0 0 80px #5594fa66,inset 0 0 0 3px #5594fa77}
 #wash.controlled{opacity:1}
 /* 仅记录操作坐标供诊断，不绘制鼠标、水波纹或动画。 */
@@ -10,6 +10,12 @@ html,body{margin:0;width:100%;height:100%;overflow:hidden;background:transparent
 <div id="wash" aria-hidden="true"></div>
 <div id="cursor" aria-hidden="true"></div>
 <script>
+// agent 持有期间，这个独立窗口覆盖网页区域并消费人工输入；事件不会进入页面 DOM。
+// CDP 注入走 Chromium 调试器，不经过此原生窗口，仍可正常驱动网页。
+for(const type of ['pointerdown','pointerup','pointermove','click','dblclick','auxclick','contextmenu','dragstart','drag','dragover','drop','touchstart','touchmove','touchend']){
+  window.addEventListener(type,event=>{event.preventDefault();event.stopImmediatePropagation()}, {capture:true,passive:false})
+}
+window.addEventListener('wheel',event=>{event.preventDefault();event.stopImmediatePropagation()}, {capture:true,passive:false})
 const cursor=document.getElementById('cursor')
 cursor.hidden=true
 window.setAgentControl=active=>{document.getElementById('wash').className=active?'controlled':'';if(!active)cursor.hidden=true}
