@@ -22,7 +22,10 @@
  *
  * 两层拆分（避免每次发版都重编译 dsh）：
  *   第 1 层 base = dsh 桌面端本体（app/，几百 MB，只在升级 dsh 时重建）；
- *   第 2 层 overlay = home/profiles/desktop/ 里的插件（几十 KB，每次发版都换）。
+ *   第 2 层 overlay = home/profiles/desktop/ 里的插件（每次发版都换）。两块：
+ *     · 本插件（lib/ + cordis.patch.yml，~几百 KB）；
+ *     · vendor/plugins/manifest.json 登记的第三方插件（sha512 校验后从 npm tarball
+ *       物化，解包 ~16MB——大头是 better-sidebar 预打包的 editor/mermaid chunk）。
  *   `--cache-base` 把本次的 app/ 存到 `.desktop-base/<dsh 版本>/app`，之后不带 `--app` 跑就
  *   按版本挑一份复用，只重新生成 overlay 并重新压缩。
  *
@@ -92,6 +95,22 @@ const CACHE_MARKER = 'cache.json'
 const PROJECT_NAME = '@deepseek-ai/dsh-desktop-runtime'
 const DESKTOP_PROFILE_BUNDLES = ['@deepseek-ai/dsh-base', '@deepseek-ai/dsh-web-app']
 const WORKSPACE_SETTINGS = 'nodeLinker: hoisted\nautoInstallPeers: false\nstrictDepBuilds: true\n'
+
+/**
+ * 随包出厂的第三方插件登记表（vendor/plugins/manifest.json，单一真相源）。
+ * 登记进 manifest 的插件自动进 profile 的 dependencies + bundles，tarball 由
+ * materialize-vendored-plugins.mjs 物化（sha512 与 npm registry dist.integrity
+ * 逐字节一致才落盘）。新加插件只需：放 tgz、登记 manifest、跑自检——本脚本不再改。
+ */
+function readVendoredPlugins() {
+  const manifestPath = join(ROOT, 'vendor', 'plugins', 'manifest.json')
+  if (!existsSync(manifestPath)) {
+    console.error(`package-desktop-portable: 缺少 ${manifestPath} —— 随包第三方插件的登记表不存在（见 docs/打包与发版.md §3）`)
+    process.exit(1)
+  }
+  const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'))
+  return manifest.plugins.map((plugin) => ({ name: plugin.name, version: plugin.version }))
+}
 
 const args = process.argv.slice(2)
 const readArg = (name) => {
@@ -558,6 +577,7 @@ if (leftover.length > 0) {
 //    bundles 必须以前两个内置 bundle 开头（project-manager.ts:169）。
 const profileDir = join(STAGE, 'home', 'profiles', 'desktop')
 mkdirSync(profileDir, { recursive: true })
+const vendoredPlugins = readVendoredPlugins()
 writeFileSync(
   join(profileDir, 'package.json'),
   `${JSON.stringify(
@@ -565,15 +585,23 @@ writeFileSync(
       name: PROJECT_NAME,
       private: true,
       version: '0.0.0',
-      dependencies: { [pluginName]: version },
-      dsh: { profile: { bundles: [...DESKTOP_PROFILE_BUNDLES, pluginName] } },
+      // 依赖必须是**精确版本**（project-manager.ts:160-162 会校验）——vendor manifest
+      // 里的 version 就是精确版本，直接派生，不在这里手写第二份。
+      dependencies: {
+        [pluginName]: version,
+        ...Object.fromEntries(vendoredPlugins.map((plugin) => [plugin.name, plugin.version])),
+      },
+      // bundles 必须以前两个内置 bundle 开头（project-manager.ts:169），本插件与
+      // vendored 插件按登记顺序追加在后（better-sidebar 的防双挂载守卫只看得见
+      // 自己前面的行，所以聚合类 bundle 若将来登记，要排在 better-sidebar 之前）。
+      dsh: { profile: { bundles: [...DESKTOP_PROFILE_BUNDLES, pluginName, ...vendoredPlugins.map((plugin) => plugin.name)] } },
     },
     null,
     2,
   )}\n`,
 )
 writeFileSync(join(profileDir, 'pnpm-workspace.yaml'), WORKSPACE_SETTINGS)
-console.log('  + home/profiles/desktop/package.json')
+console.log(`  + home/profiles/desktop/package.json（含 ${vendoredPlugins.length} 个 vendor 第三方插件）`)
 
 // 2.5) **不再写** `desktop-runtime-state.json`（2026-09-18，适配 dsh 0.1.6-alpha.2）。
 //
@@ -640,6 +668,21 @@ delete releasePkg.scripts
 writeFileSync(join(pluginDir, 'package.json'), `${JSON.stringify(releasePkg, null, 2)}\n`)
 console.log(`  + home/profiles/desktop/node_modules/${pluginName}/`)
 
+// 3.5) vendored 第三方插件：sha512 校验 + 纯 Node 解包物化。解包/校验逻辑只在
+//      materialize-vendored-plugins.mjs 里留一份实现，这里只负责调用——坏包（被篡改/
+//      截断/身份不符）在那边爆，打包出的 zip 不带坏插件。STAGE 的 profile 是全新的，
+//      脚本「目录已存在就报错」的防覆盖语义在这里天然不会触发。
+const materialize = spawnSync(
+  process.execPath,
+  [join(ROOT, 'scripts', 'materialize-vendored-plugins.mjs'), '--profile-dir', profileDir],
+  { stdio: 'inherit' },
+)
+if (materialize.status !== 0) {
+  console.error('package-desktop-portable: vendored 插件物化失败（vendor 完整性校验或解包出错），中止打包')
+  process.exit(1)
+}
+console.log(`  + home/profiles/desktop/node_modules/{${vendoredPlugins.map((plugin) => plugin.name).join(', ')}}（vendor 物化）`)
+
 // 4) 启动器：把 DSH_HOME 指到包内，配置就随包走
 //    （apps/desktop/src/paths.ts:26 默认参数 resolveDshHome() 读 $DSH_HOME）
 //
@@ -686,6 +729,8 @@ writeFileSync(
     '【插件】',
     `  ${pluginName} 已经预装在 home\\profiles\\desktop\\node_modules\\ 下，`,
     '  并在该 profile 的 dsh.profile.bundles 里登记过，开箱即用。',
+    `  另随包预置第三方插件：${vendoredPlugins.map((plugin) => `${plugin.name} v${plugin.version}`).join('、')}。`,
+    '  （清单、版本与出处见仓库 vendor/plugins/manifest.json；卸载/升级方法与普通 dsh 插件相同。）',
     '',
     '【第一次打开：填一个模型 API Key】',
     '  home\\profiles\\desktop\\cordis.patch.yml 已经预置好云知声 MaaS（https://maas.unisound.com，',

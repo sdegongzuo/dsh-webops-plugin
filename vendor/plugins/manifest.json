@@ -1,0 +1,53 @@
+{
+  "note": "预置进便携包的第三方插件与运行时依赖（npm 官方 tarball）。提取逻辑见 scripts/materialize-vendored-plugins.mjs；sha512 与 npm registry dist.integrity 逐字节一致，改包必须连校验值一起换。",
+  "plugins": [
+    {
+      "name": "dsh-context",
+      "version": "0.65.0",
+      "client": true,
+      "tarball": "dsh-context-0.65.0.tgz",
+      "integrity": "sha512-yXEmTFjndyMsk1yAtuhrWJI7G42lF7x5DhWJFQBYqdg4VT2OiS9HfgcL4xRwfw7ur669kUPdoHb7gf8hsd4Vwg==",
+      "source": "https://registry.npmjs.org/dsh-context/-/dsh-context-0.65.0.tgz",
+      "repo": "https://github.com/bowenliang123/dsh-context",
+      "portableNote": "Context 上下文面板与 /context 命令（透视上下文组成、演进、压缩与剪枝），侧栏一级入口可见",
+      "runtimeDependencies": ["zod"]
+    },
+    {
+      "name": "dsh-better-sidebar",
+      "version": "0.24.1",
+      "client": true,
+      "tarball": "dsh-better-sidebar-0.24.1.tgz",
+      "integrity": "sha512-X5tdu07Ub0isxruG559o46891F7MjxM+CzR6QoGpHZtN5J8gz6FA8Dq632lLI77c4IjL2GP+N6PuWaDnoKPuPQ==",
+      "source": "https://registry.npmjs.org/dsh-better-sidebar/-/dsh-better-sidebar-0.24.1.tgz",
+      "repo": "https://github.com/omdsh-dev/DSH-better-sidebar",
+      "portableNote": "开放侧边栏底座：文件树/编辑器、文件变动(Git diff)、任务管理、侧边对话；自带 dsh.bundle.patch（单条 insert + 防双挂载守卫），进 bundles 后由 profile boot 自动合并，无需手写 cordis.patch.yml 挂载行",
+      "runtimeDependencies": ["ws", "yaml"]
+    }
+  ],
+  "dependencies": [
+    {
+      "name": "zod",
+      "version": "4.6.5",
+      "tarball": "zod-4.6.5.tgz",
+      "integrity": "sha512-v5l/aFXZQeai4awLbOpSoHecE9UiMrnfx75tEXLjNonXVARxQ5mOeipTjROUchszUNCqnE+hqAMujRsRHsut2Q==",
+      "source": "https://registry.npmjs.org/zod/-/zod-4.6.5.tgz",
+      "satisfies": "dsh-context@0.65.0 dependencies.zod ^4.4.3"
+    },
+    {
+      "name": "ws",
+      "version": "8.22.0",
+      "tarball": "ws-8.22.0.tgz",
+      "integrity": "sha512-Ydggc987+RO0AnWtZ/7Wq9FtNvcrL1b/RO0ud9mWjUPgDrsAAwQSF51sm2hm1XofbU/4jkpGEsLFsZZxU+1DOg==",
+      "source": "https://registry.npmjs.org/ws/-/ws-8.22.0.tgz",
+      "satisfies": "dsh-better-sidebar@0.24.1 dependencies.ws ^8.18.0"
+    },
+    {
+      "name": "yaml",
+      "version": "2.9.1",
+      "tarball": "yaml-2.9.1.tgz",
+      "integrity": "sha512-3NxN8+78OdzbT7C/WjGsyfPAtJaN3FNDsWxv7Y7mcDsT/oOmgW8BpyQQFFBnvZE3j9Y2Sdz1ULFLezL7Eb2yFw==",
+      "source": "https://registry.npmjs.org/yaml/-/yaml-2.9.1.tgz",
+      "satisfies": "dsh-better-sidebar@0.24.1 dependencies.yaml ^2.9.1"
+    }
+  ]
+}

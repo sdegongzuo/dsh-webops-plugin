@@ -91,8 +91,8 @@ import { spawn } from 'node:child_process'
 import { createServer } from 'node:http'
 import { cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join, resolve } from 'node:path'
-import { pathToFileURL } from 'node:url'
+import { join, dirname, resolve } from 'node:path'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 import { materializeRuntimeDir } from './desktop-runtime.mjs'
 import { harnessRoot } from './local-env.mjs'
 import { fetchHostPath, startPackagedDesktopHost } from './run-packaged-host.mjs'
@@ -278,6 +278,18 @@ const BUILTIN_BUNDLES = ['@deepseek-ai/dsh-base', '@deepseek-ai/dsh-web-app']
 const scratchBase = mkdtempSync(join(tmpdir(), 'dsh-verify-profile-'))
 const workProfileDir = join(scratchBase, options.profile)
 
+// vendor 登记的第三方插件（单一真相源 vendor/plugins/manifest.json，与打包脚本共用）。
+// 这些插件随包出厂，「插件被静默抹掉」的回归护栏必须把它们一并罩住。
+// ⚠ 只断言 manifest 的 runtimeDependencies 已嵌套物化——package.json 的 dependencies
+//   大多是构建期打进 client/lib chunk 的（better-sidebar 的 codemirror/mermaid 等 30 个），
+//   运行时并不解析，不按它断言（否则等于逼 vendor 一堆用不上的包）。
+const vendorManifestPath = join(dirname(fileURLToPath(import.meta.url)), '..', 'vendor', 'plugins', 'manifest.json')
+const vendoredPlugins = existsSync(vendorManifestPath)
+  ? JSON.parse(readFileSync(vendorManifestPath, 'utf8')).plugins
+  : []
+const vendoredNames = vendoredPlugins.map((plugin) => plugin.name)
+check(vendoredNames.length > 0, `vendor manifest 登记了随包第三方插件：${vendoredNames.join(', ') || '（无！）'}`)
+
 // 这里原先断言「打包态把 profileResolution 传成 runtime」（app-boot 按它决定从哪里解析宿主包）。
 // 上游 0.1.7 把那个概念整个删了 —— 现在没有 link/runtime 两条路，打包态一律从随包 runtime 解析，
 // 源码里也没有可锚的判据（判据与实测见文件上方那段注释）。**宁可不写，也不要编一条假断言**：
@@ -297,6 +309,9 @@ if (existsSync(profileDir)) {
   check(new Set(bundles).size === bundles.length, 'profile bundles 无重复')
   const activePlugins = bundles.slice(BUILTIN_BUNDLES.length)
   check(activePlugins.includes('dsh-webops-plugin'), `本插件在 activePlugins 里：${JSON.stringify(activePlugins)}`)
+  for (const name of vendoredNames) {
+    check(activePlugins.includes(name), `随包第三方插件在 activePlugins 里：${name}`)
+  }
 
   const nmDir = join(profileDir, 'node_modules')
   const shipped = existsSync(nmDir) ? readdirSync(nmDir) : []
@@ -321,6 +336,10 @@ if (existsSync(profileDir)) {
     check(after.dependencies?.['dsh-webops-plugin'] !== undefined,
       'applyRelease 之后插件仍在 dependencies 里（这就是「静默抹掉」的回归护栏）')
     check((after.dsh?.profile?.bundles ?? []).includes('dsh-webops-plugin'), 'applyRelease 之后插件仍在 bundles 里')
+    for (const name of vendoredNames) {
+      check(after.dependencies?.[name] !== undefined, `applyRelease 之后随包第三方插件仍在 dependencies 里：${name}`)
+      check((after.dsh?.profile?.bundles ?? []).includes(name), `applyRelease 之后随包第三方插件仍在 bundles 里：${name}`)
+    }
 
     const pluginDirInCopy = join(workProfileDir, 'node_modules', 'dsh-webops-plugin')
     const entry = lstatSync(pluginDirInCopy)
@@ -342,6 +361,22 @@ console.log(`\n[3/5] 便携版内容（profile=${options.profile}）`)
 
 const shippedPluginDir = join(profileDir, 'node_modules', 'dsh-webops-plugin')
 check(existsSync(shippedPluginDir), '插件已物化到 profile 的 node_modules')
+
+// vendor 第三方插件的静态检查：真实目录（非 symlink，用户机器上没有 checkout 可指）、
+// 有 package.json、有插件清单或 bundle patch 之一、manifest 声明的运行时依赖已嵌套物化。
+for (const plugin of vendoredPlugins) {
+  const vendoredDir = join(profileDir, 'node_modules', plugin.name)
+  const entry = existsSync(vendoredDir) ? lstatSync(vendoredDir) : undefined
+  check(entry?.isDirectory() === true && entry?.isSymbolicLink() === false,
+    `随包第三方插件已物化为真实目录：${plugin.name}`)
+  check(existsSync(join(vendoredDir, 'package.json')), `随包第三方插件有 package.json：${plugin.name}`)
+  check(existsSync(join(vendoredDir, 'dsh.plugin.json')) || existsSync(join(vendoredDir, 'cordis.patch.yml')),
+    `随包第三方插件有 dsh.plugin.json 或 cordis.patch.yml：${plugin.name}`)
+  for (const depName of plugin.runtimeDependencies ?? []) {
+    check(existsSync(join(vendoredDir, 'node_modules', depName)),
+      `随包第三方插件的运行时依赖已嵌套物化：${plugin.name}/node_modules/${depName}`)
+  }
+}
 
 if (existsSync(shippedPluginDir)) {
   const shippedPatch = readFileSync(join(shippedPluginDir, 'cordis.patch.yml'), 'utf8')
