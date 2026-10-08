@@ -61,7 +61,7 @@ for (const path of [join(libDir, 'index.js'), join(libDir, 'client.js'), join(RO
 }
 if (existsSync(out) && !args.includes('--force')) {
   console.error(`package-plugin-update: 目标已存在 ${out}`)
-  console.error('package-plugin-update: 确认要覆盖就加 --force（与 package-desktop-portable 的删旧重写不同，这里默认拒绝，防止把一份验证过的更新包悄悄冲掉）')
+  console.error('package-plugin-update: 保留模式默认拒绝覆盖（AGENTS.md 文件删除禁令；防把一份验证过的更新包悄悄冲掉）。换一个未存在的 --out 路径；--force 会删除旧文件重写，本仓文件规则禁止实际运行。')
   process.exit(1)
 }
 if (existsSync(out) && args.includes('--force')) {
@@ -144,8 +144,8 @@ writeFileSync(
   { encoding: 'utf8' },
 )
 
-mkdirSync(DIST, { recursive: true })
-const zipped = spawnSync('python', [join(ROOT, 'scripts', 'zip-stage.py'), '--stage', stage, '--out', out], { encoding: 'utf8' })
+mkdirSync(dirname(out), { recursive: true })
+const zipped = spawnSync('python', [join(ROOT, 'scripts', 'zip-stage.py'), '--stage', stage, '--out', out, '--no-overwrite'], { encoding: 'utf8' })
 console.log((zipped.stdout ?? '').trim())
 if (zipped.status !== 0 || !existsSync(out)) {
   console.error(`package-plugin-update: 压缩失败（exit=${String(zipped.status)}）`)

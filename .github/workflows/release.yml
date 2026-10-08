@@ -116,25 +116,37 @@ jobs:
       # 的构建产物（`@deepseek-ai/*` 的 `main`/`types` 都指向被 gitignore 的 `lib/`），
       # 跑必然炸 —— 实测 35×TS2307。完整理由与证据见 `release-desktop.yml` 同位置的注释块，
       # 以及 `src/bundle-patch.test.ts` 的「发布链的身份契约」。
-      - name: 构建
-        run: pnpm build
+      #
+      # ⚠️ 也**故意不走** `pnpm build`：它展开是 `tsdown && node scripts/copy-assets.mjs`，
+      # 而 tsdown 配置里第一个 bundle `clean: true` —— 等于先整目录删除 lib/ 再重建。
+      # 本仓文件规则禁止任何删除分支；这里显式 `--no-clean`（CLI 覆盖配置），产物与
+      # 既有文件并存，chunk 名带内容哈希不会互相覆盖，client 那半本来就是 clean: false。
+      - name: 构建（no-clean，不删除既有产物）
+        run: |
+          pnpm exec tsdown --no-clean
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          node scripts/copy-assets.mjs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      - name: 打插件便携包 + 增量更新包
+      - name: 打插件便携包 + 增量更新包（保留安全模式）
         # 两个产物，面向两种用户：
         #   · dsh-webops-plugin-v<ver>-win-x64-portable.zip —— 纯插件包，走 `dsh plugin add`，
         #     给「自己有一份 dsh」的人；
         #   · dsh-webops-plugin-update-v<ver>.zip —— **只含 overlay** 的几十 KB 增量包，
         #     给「已经在用便携版桌面端」的人：解压覆盖到便携包根目录即可，不必重下 472MB
         #     （整包 97% 是每次发版都不变的 dsh 本体）。
-        # 增量包的可行性依据在 scripts/package-plugin-update.mjs 头部：
-        # 启动时 `applyRelease()` 不跑包管理器，只换 node_modules 下插件目录就能生效。
+        # 两个脚本都显式走**保留安全模式**：--lib-dir 指本轮构建、--stage-root 用 runner 的
+        # 唯一临时目录（mkdtemp 出新目录，不删不复用）、--keep-stage 留暂存证据、--out 是
+        # 全新 checkout 里必然不存在的确定路径 —— 任何既有目标都会让脚本报错而非覆盖。
         shell: pwsh
         run: |
           $version = $env:TAG -replace '^v', ''
-          Write-Host "version: $version"
-          node scripts/package-portable.mjs $version
+          $libDir = Join-Path $env:GITHUB_WORKSPACE 'lib'
+          $stageRoot = Join-Path $env:RUNNER_TEMP 'webops-package-stage'
+          Write-Host "version: $version / libDir: $libDir / stageRoot: $stageRoot"
+          node scripts/package-portable.mjs $version --lib-dir $libDir --stage-root $stageRoot --keep-stage --out (Join-Path dist "dsh-webops-plugin-v$version-win-x64-portable.zip")
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          node scripts/package-plugin-update.mjs --version $version
+          node scripts/package-plugin-update.mjs --version $version --lib-dir $libDir --stage-root $stageRoot --keep-stage --out (Join-Path dist "dsh-webops-plugin-update-v$version.zip")
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
           # 按**确定的文件名**取，不用 `Get-ChildItem dist/*.zip | Select-Object -First 1`：
@@ -212,9 +224,10 @@ jobs:
           $notes | Out-File -FilePath dist/notes.md -Encoding utf8
 
       - name: 发布 Release
-        # **幂等**：理由同 `release-desktop.yml` 的同名步骤 —— `gh release create` 撞上
-        # 「同名 Release 已存在」会 exit 1，哪怕这一步之前的构建全都成功了（症状极具误导性）。
-        # 已存在时不新建，改为把终态对齐（覆盖两个附件 / 更新说明与标题 / 确保已发布）。
+        # 保留式发布：**只在 Release 不存在时新建**。旧写法里「已存在就 upload --clobber
+        # 覆盖附件」的分支已按本仓文件规则移除 —— 覆盖 = 先删旧资产再传新的，属于删除
+        # 分支；且已发布 tag 保持原提交与原附件（docs/打包与发版.md §10）。撞上同名
+        # Release 说明版本号被复用，明确失败让发版人换新版本号，而不是悄悄替换历史产物。
         shell: pwsh
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -229,15 +242,11 @@ jobs:
 
           gh release view "$env:TAG" *> $null
           if ($LASTEXITCODE -eq 0) {
-            Write-Host "Release $env:TAG 已存在 —— 覆盖上传产物并更新说明（不新建）。"
-            gh release upload "$env:TAG" $pluginZip $updateZip --clobber
-            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-            gh release edit "$env:TAG" --title "$env:TAG" --notes-file dist/notes.md --draft=false
-            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-            Write-Host "已对齐：附件为本次生成的两个 zip。"
-          } else {
-            gh release create "$env:TAG" --title "$env:TAG" --notes-file dist/notes.md $pluginZip $updateZip
+            Write-Error "Release $env:TAG 已存在 —— 保留式发布不覆盖既有附件、不重指已发布 tag；请换一个新版本号重新发布。"
+            exit 1
           }
+          gh release create "$env:TAG" --title "$env:TAG" --notes-file dist/notes.md $pluginZip $updateZip
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: 收尾小结（无论成败都写）
         # 理由同 `release-desktop.yml` 的同名步骤：没有 `upload-artifact` ⇒ 失败的 run
@@ -260,5 +269,5 @@ jobs:
             }
           }
           if (-not $any) { $lines += "- 产物**没产出** —— 失败发生在打包之前，是真失败。" }
-          else { $lines += "> 若这次 run 显示失败，先看**哪一步**红：只有末步「发布 Release」红才是发布动作的问题（见 docs/打包与发版.md §13）。" }
+          else { $lines += "> 若这次 run 显示失败，先看**哪一步**红：只有末步「发布 Release」红才是发布动作的问题（见 docs/打包与发版.md §11）。" }
           $lines | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8

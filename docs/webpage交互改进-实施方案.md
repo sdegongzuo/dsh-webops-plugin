@@ -13,7 +13,9 @@
 | 功能 | 保持的行为 |
 |---|---|
 | 旧 ref | 节点消失或文档变化使用 BROWSER_STALE_REF，提供恢复路径，不透出裸节点错误 |
-| click | elementFromPoint 校验落点；遮挡回执优先于 href/Enter 指引；无跳转时返回目标与下一步，不自动补 Enter/Escape |
+| click | elementFromPoint 校验落点；命中遮挡**在派发前拒绝**（BROWSER_TARGET_OCCLUDED，零页面副作用，2026-10-07 独立验收）；无跳转时返回目标与下一步，不自动补 Enter/Escape |
+| locate | centered 是测得的「真居中」事实（元素中心对齐视口中心，±16px 容差；超视口的轴按完全覆盖判），「看得见」不算居中；视口测不到或为零时恒 false；smooth 动画重测到居中为止（有界 ≤600ms） |
+| 零视口窗口 | innerWidth/innerHeight=0（最小化 / 隐藏）时 click / scroll / locate 一律拒绝（BROWSER_WINDOW_NOT_VISIBLE），不派发任何事件、不代恢复（host.cjs 退化读数守卫是唯一权威） |
 | fill | 保留现有 setter 路径；带联想的搜索框指导 fill 后对同一 ref 按 Enter，不自动点提交按钮 |
 | scroll | 后台标签先激活或明确拒绝；wheel 使用 2 秒专用等待，允许返回“已投递未确认”，总体 3 秒内返回 |
 | 历史导航 | url 与 history 恰好一个；back/forward 使用 CDP 历史接口，reload 使用 Page.reload；尽头明确报失败 |
@@ -37,7 +39,7 @@ execute 的 timeout_ms 只缩短等待，范围 1–30000；provider 取请求�
 |---|---|---|
 | hit=none 与探测失败分别进入回执 | provider.ts 的 hitTest/describeClick；browser/types.ts；tool-browser/index.ts | 空点明确报“落点没有元素”；异常或无有效结果报“无法获取落点信息”，不能静默等同于无遮挡 |
 | 夹具覆盖真实浮层形状 | 既有交互夹具与 overlay-probe 测试 | 无 role、无 aria-label、fixed wrapper、无文本 backdrop、中央表单；两条取名路径各自能测到 |
-| 桌面端遮挡稳定性 | 固定目录 Electron GUI | 同页连续 3 次点击被盖目标，3 次均报告遮挡；关闭浮层后一次点击实际生效 |
+| 桌面端遮挡稳定性 | 固定目录 Electron GUI | 同页连续 3 次点击被盖目标，3 次均在派发前拒绝（BROWSER_TARGET_OCCLUDED、页面计数不变）；关闭浮层后一次点击实际生效 |
 | 完整浮层回归 | 本文 §5 场景 E | 顶部提示、遮挡、关闭后点击、截断 find 全部通过 |
 
 取名基础逻辑已经实现，不重复安排重写。若现有 60 字片段仍无法识别浮层用途，再验证优先 heading/legend/form 标签的改进。

@@ -73,9 +73,19 @@ export function BrowserDock(props: BrowserDockProps) {
       ) : (
         <>
           {observation.url === undefined ? null : (
-            <code data-dsh-browser-url style={{ wordBreak: 'break-all', opacity: 0.9 }}>
-              {observation.url}
-            </code>
+            <>
+              <code data-dsh-browser-url style={{ wordBreak: 'break-all', opacity: 0.9 }}>
+                {observation.url}
+              </code>
+              {/* 标题与地址同源（回执自报），必须跟当前页面一致；缺标题时明示「未命名页面」。 */}
+              <span
+                data-dsh-browser-title
+                title={observation.title ?? t('untitled')}
+                style={{ maxWidth: 280, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', opacity: 0.9 }}
+              >
+                {observation.title ?? t('untitled')}
+              </span>
+            </>
           )}
           <span style={{ opacity: 0.6 }}>
             {`${t('snapshot')} ${String(observation.snapshots)} · ${t('screenshot')} ${String(observation.screenshots)}`}

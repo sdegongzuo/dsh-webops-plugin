@@ -29,7 +29,6 @@ import type {
   BrowserMutationResult,
   BrowserMutationTarget,
   BrowserNavigateRequest,
-  BrowserOcclusion,
   BrowserNetworkRequest,
   BrowserNetworkResult,
   BrowserObservation,
@@ -306,8 +305,13 @@ interface LayoutMetricsResult {
 
 /** `DOMSnapshot.captureSnapshot` 的布局树。 */
 interface CaptureSnapshotResult {
+  readonly strings?: readonly string[]
   readonly documents?: readonly {
-    readonly nodes?: { readonly backendNodeId?: readonly number[] }
+    readonly nodes?: {
+      readonly backendNodeId?: readonly number[]
+      readonly parentIndex?: readonly number[]
+      readonly nodeName?: readonly number[]
+    }
     readonly layout?: {
       readonly nodeIndex?: readonly number[]
       readonly bounds?: readonly (readonly number[])[]
@@ -1072,6 +1076,7 @@ export class CdpBrowserProvider implements BrowserProvider {
         method: request.method,
         epoch: session.refs.currentEpoch,
         url: session.url,
+        title: session.title,
         navigated: true,
         ...this.dirtyField(session),
         result: capped.payload,
@@ -1107,6 +1112,7 @@ export class CdpBrowserProvider implements BrowserProvider {
         method: request.method,
         epoch: session.refs.currentEpoch,
         url: session.url,
+        title: session.title,
         navigated,
         ...this.dirtyField(session),
         value: capped.payload,
@@ -1120,6 +1126,7 @@ export class CdpBrowserProvider implements BrowserProvider {
       method: request.method,
       epoch: session.refs.currentEpoch,
       url: session.url,
+      title: session.title,
       navigated: false,
       ...this.dirtyField(session),
       result: capped.payload,
@@ -1188,13 +1195,34 @@ export class CdpBrowserProvider implements BrowserProvider {
       }
       const scroll = request.scroll ?? false
       // 守卫 3 落在 elementViewportBox 的零尺寸校验里（见上，选 BROWSER_PROTOCOL_ERROR 的理由）。
-      const box = await this.elementViewportBox(session, objectId, signal, scroll)
+      // locate 是只读观察：零布局失败要和「可能已派发的动作失败」分开描述（2026-10-07 计划项 5），
+      // 明确告诉模型页面上什么都没改过，避免它把定位失败当成一次已生效的写操作。
+      let box
+      try {
+        box = await this.elementViewportBox(session, objectId, signal, scroll, scroll ? 'centred' : 'visible')
+      } catch (error) {
+        if (error instanceof BrowserError && error.code === 'BROWSER_PROTOCOL_ERROR'
+          && error.message.includes('layout box')) {
+          throw new BrowserError(
+            `the element for ref "${request.ref}" has no usable layout box (display:none or not laid out); `
+            + 'this was a read-only measurement and NOTHING was changed on the page',
+            'BROWSER_PROTOCOL_ERROR',
+            { cause: error.cause },
+          )
+        }
+        throw error
+      }
       if (request.highlight === true) await this.paintHighlight(session, objectId, signal)
       else if (session.highlightPainted) await this.clearHighlight(session, signal)
       const inViewport = box.viewportWidth === undefined || box.viewportHeight === undefined
         ? undefined
         : box.x + box.width > 0 && box.y + box.height > 0
           && box.x < box.viewportWidth && box.y < box.viewportHeight
+      // centered 是**测得事实**不是请求回显（2026-10-07 独立验收）：scroll=true 且最终一次
+      // 测量「元素中心对齐视口中心」才算居中成功 —— 「元素中心落在视口内」只是看得见，
+      // smooth 动画刚进视口的中间帧会被它谎报成已居中。测不到视口尺寸（undefined）或视口
+      // 为零时无法证明居中，一律 false，绝不默认成功（旧实现 `?? true` 正是漏报口）。
+      const centered = scroll ? boxCenteredInViewport(box) === true : false
       return {
         kind: 'locate',
         sessionId: session.targetId,
@@ -1204,7 +1232,8 @@ export class CdpBrowserProvider implements BrowserProvider {
         y: box.y,
         width: box.width,
         height: box.height,
-        centered: scroll,
+        centered,
+        scrollRequested: scroll,
         ...inViewport !== undefined ? { inViewport } : {},
       }
     } finally {
@@ -1403,13 +1432,22 @@ export class CdpBrowserProvider implements BrowserProvider {
     let outsideRegion: number | undefined
     if (region?.ref !== undefined) {
       const target = session.refs.resolve(region.ref)
-      const partial = await session.connection.send<AxTreeResult>(
-        'Accessibility.getPartialAXTree',
-        { backendNodeId: target.backendNodeId },
-        options,
-      )
-      nodes = partial.nodes ?? []
       const full = await session.connection.send<AxTreeResult>('Accessibility.getFullAXTree', {}, options)
+      if (target.anchor === true) {
+        // heading 本身的 partial AX 不含后续兄弟正文；按真实 DOM 章节范围筛完整 AX。
+        const objectId = await this.resolveObjectId(session, region.ref, signal)
+        try {
+          const keep = await this.backendIdsInHeadingSection(session, target.backendNodeId, full.nodes ?? [], signal)
+          nodes = filterAxTreeByBackendIds(full.nodes ?? [], keep)
+        } finally {
+          this.releaseObject(session, objectId, signal)
+        }
+      } else {
+        const partial = await session.connection.send<AxTreeResult>(
+          'Accessibility.getPartialAXTree', { backendNodeId: target.backendNodeId }, options,
+        )
+        nodes = partial.nodes ?? []
+      }
       const fullRows = buildOutline(full.nodes ?? [], resolveSnapshotLimits(this.config.snapshotLimits, maxLines)).rows.length
       const partRows = buildOutline(nodes, resolveSnapshotLimits(this.config.snapshotLimits, maxLines)).rows.length
       outsideRegion = Math.max(0, fullRows - partRows)
@@ -1456,6 +1494,23 @@ export class CdpBrowserProvider implements BrowserProvider {
       // 折叠前的完整大纲：`webpage_find` 的检索底稿。折叠标记承诺「用 find 拿全部实例的 ref」，
       // 前提是 find 手上那份底稿里一个实例都不少（`rows` 本来就是全量的，这里只是把它渲染出来）。
       fullOutline: renderOutline(outline, publication.refs, { unfoldRepeats: true }),
+      // 正文读取（项 3）：底稿行的未裁切全文与同级 statictext 块文本（稀疏 {行号, 文本}，
+      // 行号与 fullOutline 逐行对齐）—— find(full_text=true) 按行号取用。原文可能含换行，
+      // 不能 join 成字符串；不进模型上下文，只有 find 按需读取。
+      ...outline.unfoldedLines.some(line => line.full !== undefined)
+        ? {
+          fullTexts: outline.unfoldedLines
+            .map((line, index) => ({ line: index, text: line.full ?? '' }))
+            .filter(entry => entry.text !== ''),
+        }
+        : {},
+      ...outline.unfoldedLines.some(line => line.block !== undefined)
+        ? {
+          textBlocks: outline.unfoldedLines
+            .map((line, index) => ({ line: index, text: line.block ?? '' }))
+            .filter(entry => entry.text !== ''),
+        }
+        : {},
       refs: session.refs.list(),
       truncated: publication.truncated,
       outlineLines: outline.lines.length,
@@ -1697,6 +1752,57 @@ export class CdpBrowserProvider implements BrowserProvider {
     return { ok: true, target: archived.target, restore: true }
   }
 
+  /** 从标题到下一个同级/更高级标题，限制在最近 section/article/main/body 内；只读真实 DOM。 */
+  private async backendIdsInHeadingSection(
+    session: SessionState, backendNodeId: number, axNodes: readonly AxNode[], signal?: AbortSignal,
+  ): Promise<Set<number>> {
+    const captured = await session.connection.send<CaptureSnapshotResult>(
+      'DOMSnapshot.captureSnapshot', { computedStyles: [] },
+      { signal, timeoutMs: this.config.commandTimeoutMs },
+    )
+    const levels = new Map<number, number>()
+    for (const node of axNodes) {
+      if (String(node.role?.value).toLowerCase() !== 'heading' || node.backendDOMNodeId === undefined) continue
+      const level = node.properties?.find(property => property.name === 'level')?.value?.value
+      levels.set(node.backendDOMNodeId, typeof level === 'number' ? level : 1)
+    }
+    for (const document of captured.documents ?? []) {
+      const ids = document.nodes?.backendNodeId ?? []
+      const start = ids.indexOf(backendNodeId)
+      if (start < 0) continue
+      const parents = document.nodes?.parentIndex ?? []
+      const names = document.nodes?.nodeName ?? []
+      const nameAt = (index: number): string => captured.strings?.[names[index] ?? -1]?.toUpperCase() ?? ''
+      let scope = parents[start] ?? -1
+      const seen = new Set<number>()
+      while (scope >= 0 && !seen.has(scope)) {
+        seen.add(scope)
+        if (['SECTION', 'ARTICLE', 'MAIN', 'BODY'].includes(nameAt(scope))) break
+        scope = parents[scope] ?? -1
+      }
+      const inScope = (index: number): boolean => {
+        if (scope < 0) return true
+        const visited = new Set<number>()
+        for (let parent = index; parent >= 0 && !visited.has(parent); parent = parents[parent] ?? -1) {
+          if (parent === scope) return true
+          visited.add(parent)
+        }
+        return false
+      }
+      const keep = new Set<number>()
+      const level = levels.get(backendNodeId) ?? (Number(nameAt(start).slice(1)) || 1)
+      for (let index = start; index < ids.length && inScope(index); index += 1) {
+        const id = ids[index]
+        if (id === undefined) continue
+        const nextLevel = levels.get(id)
+        if (index > start && nextLevel !== undefined && nextLevel <= level) break
+        keep.add(id)
+      }
+      return keep
+    }
+    throw new BrowserError('the heading anchor is absent from the current DOM; take a fresh snapshot', 'BROWSER_STALE_REF')
+  }
+
   /** 视口 / 几何矩形：用一次 captureSnapshot 的布局盒与区域求交，得到 backendNodeId 集合。 */
   private async backendIdsInRegion(
     session: SessionState,
@@ -1934,16 +2040,19 @@ export class CdpBrowserProvider implements BrowserProvider {
    *
    * 同一次调用顺带把视口尺寸带回来（`webpage_locate` 判 `in_viewport` 用，省一次往返）；
    * 老实现没有这两个字段，所以按可选读，读不到就是 `undefined`。
+   *
+   * `waitGoal` 决定 smooth 滚动重测的**停止条件**（2026-10-07 独立验收）：
+   * `'centred'`（locate scroll=true）等到「元素真居中」为止；`'visible'`（click / scroll）
+   * 只要元素与视口有交集就够 —— 动作只要求打得中，等居中是白付 600ms。
    */
   private async elementViewportBox(
     session: SessionState,
     objectId: string,
     signal?: AbortSignal,
     scroll = true,
+    waitGoal: 'visible' | 'centred' = 'visible',
   ): Promise<{ x: number; y: number; width: number; height: number; viewportWidth?: number; viewportHeight?: number }> {
-    const measure = ' const rect = this.getBoundingClientRect();'
-      + ' return { x: rect.x, y: rect.y, width: rect.width, height: rect.height,'
-      + ' viewportWidth: window.innerWidth, viewportHeight: window.innerHeight }; }'
+    const measure = LOCATE_MEASURE_SNIPPET
     const evaluated = await session.connection.send<EvaluateResult>(
       'Runtime.callFunctionOn',
       {
@@ -1953,6 +2062,67 @@ export class CdpBrowserProvider implements BrowserProvider {
           : `function () {${measure}`,
         returnByValue: true,
       },
+      { signal, timeoutMs: this.config.commandTimeoutMs },
+    )
+    let value = evaluated.result?.value
+    if (typeof value !== 'object' || value === null) {
+      throw new BrowserError('could not read the element box for interaction', 'BROWSER_PROTOCOL_ERROR')
+    }
+    let box = value as Record<string, unknown>
+    const x = box['x']
+    const y = box['y']
+    const width = box['width']
+    const height = box['height']
+    if (
+      typeof x !== 'number' || typeof y !== 'number'
+      || typeof width !== 'number' || typeof height !== 'number'
+      || !(width > 0) || !(height > 0)
+    ) {
+      throw new BrowserError('the element has no usable layout box to interact with', 'BROWSER_PROTOCOL_ERROR')
+    }
+    let result = {
+      x,
+      y,
+      width,
+      height,
+      ...typeof box['viewportWidth'] === 'number' ? { viewportWidth: box['viewportWidth'] as number } : {},
+      ...typeof box['viewportHeight'] === 'number' ? { viewportHeight: box['viewportHeight'] as number } : {},
+    }
+    // 零视口守卫（2026-10-07 独立验收）：窗口最小化 / 隐藏时 innerWidth/innerHeight = 0，
+    // 量到的坐标全是负数、后续的命中测试与鼠标派发都落不到真实内容上 —— 必须在这里
+    // 明确拒绝，不许把「量到了一串负数」当成可用的落点继续走。
+    this.assertUsableViewport(result.viewportWidth, result.viewportHeight)
+    if (scroll) {
+      // 2026-10-07 实测（Google locate y=5171 仍报「已居中」）：`scrollIntoView` 后**立即**
+      // 量到的是滚动前的旧布局 —— CSS `scroll-behavior: smooth` 的动画在渲染进程里推进，
+      // 同一次 evaluate 里的 getBoundingClientRect 不会等它。于是做**有界重测**，每次间隔
+      // 150ms，最多 4 次（总预算 ≤600ms），动画推进或提前到位都会提前结束。重测只读 rect，
+      // 不再触发 scrollIntoView。
+      // 停止条件（2026-10-07 独立验收修复）：`waitGoal='centred'` 时等到「真居中」为止 ——
+      // 旧条件「与视口无交集才重测」会在 smooth 动画刚把元素送进视口边缘时就停表，把
+      // 「看得见」谎报成「已居中」。`waitGoal='visible'` 维持「有交集即停」，click / scroll
+      // 只需要打得中，等居中是白付预算。
+      for (let attempt = 0; attempt < 4; attempt++) {
+        const settled = waitGoal === 'centred'
+          ? boxCenteredInViewport(result) !== false
+          : boxIntersectsViewport(result)
+        if (settled) break
+        await sleepForRetry(150, signal)
+        result = await this.measureViewportBox(session, objectId, signal)
+      }
+    }
+    return result
+  }
+
+  /** 只读一次 rect，不滚动（smooth 滚动重测用）。 */
+  private async measureViewportBox(
+    session: SessionState,
+    objectId: string,
+    signal?: AbortSignal,
+  ): Promise<{ x: number; y: number; width: number; height: number; viewportWidth?: number; viewportHeight?: number }> {
+    const evaluated = await session.connection.send<EvaluateResult>(
+      'Runtime.callFunctionOn',
+      { objectId, functionDeclaration: `function () {${LOCATE_MEASURE_SNIPPET}`, returnByValue: true },
       { signal, timeoutMs: this.config.commandTimeoutMs },
     )
     const value = evaluated.result?.value
@@ -1971,21 +2141,25 @@ export class CdpBrowserProvider implements BrowserProvider {
     ) {
       throw new BrowserError('the element has no usable layout box to interact with', 'BROWSER_PROTOCOL_ERROR')
     }
-    const viewportWidth = box['viewportWidth']
-    const viewportHeight = box['viewportHeight']
-    return {
+    const remeasured = {
       x,
       y,
       width,
       height,
-      ...typeof viewportWidth === 'number' ? { viewportWidth } : {},
-      ...typeof viewportHeight === 'number' ? { viewportHeight } : {},
+      ...typeof box['viewportWidth'] === 'number' ? { viewportWidth: box['viewportWidth'] as number } : {},
+      ...typeof box['viewportHeight'] === 'number' ? { viewportHeight: box['viewportHeight'] as number } : {},
     }
+    // 重测路径同样过零视口守卫：窗口可能在首测与重测之间被最小化，不守卫会把
+    // 零视口下的负坐标盒当作「重测结果」返回给 click / locate。
+    this.assertUsableViewport(remeasured.viewportWidth, remeasured.viewportHeight)
+    return remeasured
   }
 
   /**
    * 读一次视口尺寸（CSS 像素）。`webpage_scroll` 不带 ref 时用它算落点（视口中心）。
    * 读不到时退到 400×300 —— 滚轮事件落在视口内的任意一点都行，只有「落在视口外」才无效。
+   * 但**读到零**不是「读不到」：那是窗口最小化 / 不可见的测得事实，回落 400×300 会把滚轮
+   * 派发到虚构的视口中心制造假成功 —— 明确拒绝（2026-10-07 独立验收）。
    */
   private async viewportSize(session: SessionState, signal?: AbortSignal): Promise<{ width: number; height: number }> {
     const evaluated = await session.connection.send<EvaluateResult>(
@@ -1998,11 +2172,33 @@ export class CdpBrowserProvider implements BrowserProvider {
       const size = value as Record<string, unknown>
       const width = size['width']
       const height = size['height']
-      if (typeof width === 'number' && width > 0 && typeof height === 'number' && height > 0) {
-        return { width, height }
+      if (typeof width === 'number' && typeof height === 'number') {
+        this.assertUsableViewport(width, height)
+        if (width > 0 && height > 0) return { width, height }
       }
     }
     return { width: 400, height: 300 }
+  }
+
+  /**
+   * 零视口守卫（2026-10-07 独立验收：最小化窗口假成功）。
+   *
+   * 窗口最小化 / 隐藏时 `innerWidth`/`innerHeight` 报 0：布局坐标失去意义（实测全是负数）、
+   * 命中测试与鼠标派发都落不到真实内容上 —— click 曾回「成功」但页面计数不增，locate 拿
+   * 负坐标声称 in viewport。宿主在最小化期间刻意不跑 layout（host.cjs 退化读数守卫），
+   * 插件侧没有安全的恢复路径（切标签正是当年白屏事故的触发条件），所以只**明确拒绝** +
+   * 指路，绝不代恢复。视口尺寸缺读（`undefined`）不在此判 —— 那是「不知道」，不是「知道坏了」。
+   */
+  private assertUsableViewport(viewportWidth: number | undefined, viewportHeight: number | undefined): void {
+    if (viewportWidth === undefined || viewportHeight === undefined) return
+    if (viewportWidth > 0 && viewportHeight > 0) return
+    throw new BrowserError(
+      `the browser window currently reports a zero-size viewport (innerWidth=${String(viewportWidth)}, `
+      + `innerHeight=${String(viewportHeight)}) — the window is most likely minimized or hidden. `
+      + 'Layout coordinates, hit-testing and input dispatch are all meaningless in this state, and '
+      + 'NOTHING was sent to the page.',
+      'BROWSER_WINDOW_NOT_VISIBLE',
+    )
   }
 
   /**
@@ -2048,31 +2244,80 @@ export class CdpBrowserProvider implements BrowserProvider {
   /**
    * 点击：解析 ref → 滚到可视区 → **问一句落点上是谁** → 在元素中心派发真实的鼠标按下/抬起。
    *
-   * 落点校验（B1-d）见 {@link hitTest}：浮层盖住中心时事件打在遮罩上，而旧的回执只会说
-   * `click done` + `navigated=false`，模型据此去翻 console / network 猜原因。**事件照发**，
-   * 只是回执里如实写上 `occluded_by`。
+   * 落点校验（B1-d）见 {@link hitTest}。命中测试证实落点被别的元素盖住时（`hit === 'other'`）
+   * **在派发前拒绝**（2026-10-07 独立验收，`BROWSER_TARGET_OCCLUDED`）：旧实现「事件照发、
+   * 回执如实写 occluded_by」会把鼠标事件实际打到遮罩上 —— 真实对话复验里连续三次被盖点击
+   * 全部 DISPATCHED，页面可能被误触，这不是零副作用。命中测试**查不出来**（跨源 / CSP 拦下
+   * evaluate）时不拒绝：无证据不误拒，宁可放过一次遮挡，也不许把 click 打成失败。
    */
   private async click(session: SessionState, ref: string, signal?: AbortSignal): Promise<BrowserMutationResult> {
     const beforeUrl = session.url
     const target = session.refs.resolve(ref)
+    this.assertInteractive(target, 'webpage_click')
     const objectId = await this.resolveObjectId(session, ref, signal)
     let hit: HitTestOutcome | undefined
     try {
       const box = await this.elementViewportBox(session, objectId, signal)
       const point = { x: box.x + box.width / 2, y: box.y + box.height / 2 }
       hit = await this.hitTest(session, objectId, point, signal)
+      // 命中测试证实落点被别的元素盖住 → **派发前拒绝**（2026-10-07 独立验收：零页面
+      // 副作用）。旧实现「事件照发、回执如实」会把鼠标事件实际打到遮罩上 —— 真实对话
+      // 复验里连续三次被盖点击全部 DISPATCHED，页面可能被误触。命中测试查不出来
+      // （`undefined`）不拒绝：无证据不误拒，宁可放过一次遮挡。
+      if (hit?.hit === 'other') {
+        throw new BrowserError(this.occludedMessage(hit), 'BROWSER_TARGET_OCCLUDED')
+      }
+      // L2（2026-10-08 独立验收）：后台 reload 后的标签 `visibilityState=hidden` —— 布局、
+      // elementFromPoint 全都正常，但真实鼠标事件派给一个不可见页面后**页面收不到**：
+      // 回执 done、页面计数不动（submits=0）。innerWidth>0 与命中测试都判不出这个坑，
+      // 所以派发前把本标签切到前台并确认页面真的可见；
+      // 激活后仍不可见就在派发前拒绝，零副作用。
+      await this.ensureInputDispatchable(session, signal)
       const options = { signal, timeoutMs: this.config.commandTimeoutMs }
       await session.connection.send('Input.dispatchMouseEvent', {
         type: 'mousePressed', ...point, button: 'left', clickCount: 1,
       }, options)
       await session.connection.send('Input.dispatchMouseEvent', {
         type: 'mouseReleased', ...point, button: 'left', clickCount: 1,
-      }, options)
-    } finally {
+      }, options)    } finally {
       this.releaseObject(session, objectId, signal)
     }
     const result = await this.settleMutation(session, 'click', beforeUrl, true, signal)
     return this.describeClick(result, target, hit)
+  }
+
+  /** 被盖点击的拒绝理由：点名遮罩、说明为什么拒绝、给可执行的恢复路径（方案 §3.1）。 */
+  private occludedMessage(hit: HitTestOutcome): string {
+    const node = hit.node
+    const who = node === undefined || node === null
+      ? 'another element'
+      : [
+        node.role.length > 0 ? `role=${node.role}` : '',
+        node.name.length > 0 ? `name="${node.name}"` : '',
+        node.hint.length > 0 ? `hint=${node.hint}` : '',
+      ].filter(part => part.length > 0).join(' ') || 'another element'
+    return `the click was NOT dispatched: the target's centre is covered by ${who}. The mouse event would `
+      + 'have gone to that element instead of your target, and dispatching it anyway would change the '
+      + 'page without clicking what you asked for. Close the overlay or act on the element on top first '
+      + '(it is usually not in the ref table, so take a webpage_snapshot to find it), then re-snapshot '
+      + 'and click the target again. No mouse click was dispatched by this call (a scrollIntoView before '
+      + 'the occlusion check may have scrolled the page — that is the only possible side effect).'
+  }
+
+  /**
+   * 锚点只授予**读**权限（项 3 补正，2026-10-08）：click / fill / press 需要可操作元素，
+   * 拿只读锚点（heading 等文本定位锚）就地拒绝 —— 零副作用，也不给「点了但没点在东西上」的
+   * 模糊失败。读取路径（region_ref / locate / 截图 / revalidate / wait）不受影响。
+   */
+  private assertInteractive(target: RefTarget, action: string): void {
+    if (target.anchor !== true) return
+    throw new BrowserError(
+      `${action} needs an actionable element; ref=${target.ref} (${target.role} "${target.name}") is a `
+        + 'read-only text anchor for locating content. Use it with webpage_snapshot(region_ref=...), '
+        + 'webpage_locate or a screenshot; to interact, take a webpage_snapshot and use a '
+        + 'link/button/textbox ref instead. Nothing was dispatched.',
+      'BROWSER_READ_ONLY_ANCHOR',
+    )
   }
 
   /**
@@ -2109,7 +2354,9 @@ export class CdpBrowserProvider implements BrowserProvider {
     }
   }
 
-  /** 把「点的是谁」和「被谁挡了」并进回执。两者都只在 click 上出现。 */
+  /**
+   * 把「点的是谁」并进回执（被盖的点击在派发前就已被拒，这里只会见到命中目标或探测失败）。
+   */
   private describeClick(
     result: BrowserMutationResult,
     target: RefTarget,
@@ -2122,18 +2369,9 @@ export class CdpBrowserProvider implements BrowserProvider {
       name: target.name,
       ...usable !== undefined ? { href: usable } : {},
     }
-    const node = hit?.node
-    const occluded: BrowserOcclusion | undefined = node === undefined || node === null
-      ? undefined
-      : {
-        ...node.role.length > 0 ? { role: node.role } : {},
-        ...node.name.length > 0 ? { name: node.name } : {},
-        ...node.hint.length > 0 ? { hint: node.hint } : {},
-      }
     return {
       ...result,
       target: identity,
-      ...occluded !== undefined ? { occluded_by: occluded } : {},
     }
   }
 
@@ -2145,6 +2383,7 @@ export class CdpBrowserProvider implements BrowserProvider {
     signal?: AbortSignal,
   ): Promise<BrowserMutationResult> {
     const beforeUrl = session.url
+    this.assertInteractive(session.refs.resolve(ref), 'webpage_fill')
     const objectId = await this.resolveObjectId(session, ref, signal)
     try {
       const outcome = await session.connection.send<EvaluateResult>(
@@ -2177,6 +2416,7 @@ export class CdpBrowserProvider implements BrowserProvider {
   ): Promise<BrowserMutationResult> {
     const beforeUrl = session.url
     const keyInfo = describeKey(key)
+    this.assertInteractive(session.refs.resolve(ref), 'webpage_press')
     const objectId = await this.resolveObjectId(session, ref, signal)
     try {
       await session.connection.send(
@@ -2186,6 +2426,9 @@ export class CdpBrowserProvider implements BrowserProvider {
       )
       await this.transport.projectTyping?.(session.targetId, objectId).catch(() => undefined)
       this.assertWritable(session)
+      // L2（2026-10-08）：press 与 click 同一条真实输入路径 —— 后台 reload 后的键盘事件
+      // 同样落不进不可见页面（MDN 第二轮六次 press/click 回执成功都不导航）。同样先准备。
+      await this.ensureInputDispatchable(session, signal)
       const options = { signal, timeoutMs: this.config.commandTimeoutMs }
       await session.connection.send('Input.dispatchKeyEvent', {
         type: 'keyDown',
@@ -2269,6 +2512,62 @@ export class CdpBrowserProvider implements BrowserProvider {
     await activate.call(this.transport, session.targetId, signal)
   }
 
+  /** 读页面级可见性（L2）；读不到（evaluate 失败）返回 `undefined`，不做无证据的拒绝。 */
+  private async readVisibilityState(session: SessionState, signal?: AbortSignal): Promise<string | undefined> {
+    try {
+      const evaluated = await session.connection.send<EvaluateResult>(
+        'Runtime.evaluate',
+        { expression: 'document.visibilityState', returnByValue: true },
+        { signal, timeoutMs: this.config.commandTimeoutMs },
+      )
+      return typeof evaluated.result?.value === 'string' ? evaluated.result.value : undefined
+    } catch {
+      return undefined
+    }
+  }
+
+  /**
+   * 真实输入（click / press）的可见性准备（L2，2026-10-08）。
+   *
+   * 判据**只认页面级** `document.visibilityState`，不认 transport 的「前台标签」书签：
+   * 未经重载的后台标签输入本就落地（第 1 项 A/B 后台通过，不该被打扰）；弹窗书签也可能
+   * 与现实不符；而后台 reload 之后布局、命中测试、JS 全都正常，`visibilityState` 却是
+   * `hidden` —— 真实鼠标/键盘事件被 Chromium 丢进一个不可见页面后页面收不到（证据
+   * session-409fd63d：click/press 均 done，`window.ev.submits=0`，服务端无 /event；
+   * `webpage_tabs(action=activate)` 之后再点才生效）。hidden 时激活本标签、短窗重读，
+   * 仍不可见就在派发前拒绝 —— 零副作用，也不给「done 但没效果」的假回执。
+   *
+   * 边界：不能抢人工持有的标签（hold 门在更早的写入前检查里已拒）；不跨模型调用锁前台
+   * （这里只为本一次派发准备，之后的可见性由下一次动作自己重新确认）。
+   */
+  private async ensureInputDispatchable(session: SessionState, signal?: AbortSignal): Promise<void> {
+    const state = await this.readVisibilityState(session, signal)
+    if (state === undefined || state === 'visible') return
+    const activate = this.transport.activateTarget
+    if (activate === undefined) {
+      throw new BrowserError(
+        `session_id=${session.targetId} is not visible (visibilityState=${state}); real input only lands on a `
+          + `visible tab — run webpage_tabs(action=activate, session_id=${session.targetId}) first, then retry`,
+        'BROWSER_TAB_NOT_VISIBLE',
+      )
+    }
+    // 激活拒绝（包括准备期间人工接管）必须原码上抛，不能吞掉后误报不可见。
+    await activate.call(this.transport, session.targetId, signal)
+    let last = state
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      const probe = await this.readVisibilityState(session, signal)
+      if (probe === 'visible') return
+      if (probe !== undefined) last = probe
+      await delay(40, signal)
+    }
+    throw new BrowserError(
+      `session_id=${session.targetId} stayed visibilityState=${last} after activation — the browser window is `
+        + 'probably minimized or not shown. No input event was dispatched; show the window, activate the tab, '
+        + 'then retry.',
+      'BROWSER_TAB_NOT_VISIBLE',
+    )
+  }
+
   /**
    * 派发一次滚轮，并告诉调用方**有没有拿到回包**（B1-e）。
    *
@@ -2332,6 +2631,7 @@ export class CdpBrowserProvider implements BrowserProvider {
     const beforeUrl = session.url
     let satisfied = true
     let signals: BrowserMutationResult['signals']
+    let refState: 'hidden' | 'visible' | 'removed' | undefined
     if (wantsStable) {
       const outcome = await this.waitUntilStable(session, request.timeoutMs, signal)
       satisfied = outcome.satisfied
@@ -2360,15 +2660,36 @@ export class CdpBrowserProvider implements BrowserProvider {
       )
     } else {
       const ref = request.ref as string
+      const wantsHidden = request.refState === 'hidden'
+      if (request.refState !== undefined && !wantsRef) {
+        throw new BrowserError(
+          'webpage_wait ref_state requires ref (it refines what "gone" means for that element)',
+          'BROWSER_PROTOCOL_ERROR',
+        )
+      }
       // hidden 语义也吃 ref 纪元：旧 ref 在这里直接抛，不会傻等一个不存在的元素。
-      // 但「元素已脱离文档」正是本分支要等的结果，细门对它放行（allowDetached）。
+      // 但「元素已脱离文档」正是 removed 分支要等的结果，细门对它放行（allowDetached）。
       const objectId = await this.resolveObjectId(session, ref, signal, { allowDetached: true })
       try {
         satisfied = await this.pollUntil(
           async () => {
             const evaluated = await session.connection.send<EvaluateResult>(
               'Runtime.callFunctionOn',
-              { objectId, functionDeclaration: 'function () { return !this.isConnected; }', returnByValue: true },
+              {
+                objectId,
+                // removed（默认）：等脱离文档。hidden：元素还连着文档但已不可见 ——
+                // `checkVisibility()` 覆盖 display:none / visibility:hidden / content-visibility
+                // 及祖先隐藏；没有该 API 的老内核退回布局盒判定。注意 hidden 条件**不含**
+                // 已移除：流式页「等发送按钮消失」要的是被隐藏（本轮已提交、旧回答还在），
+                // 节点被移除是另一回事，不能混作成功。
+                functionDeclaration: wantsHidden
+                  ? 'function () { if (!this.isConnected) return false;'
+                    + ' if (typeof this.checkVisibility === "function") return !this.checkVisibility({ visibilityProperty: true });'
+                    + ' const r = this.getBoundingClientRect(); const v = getComputedStyle(this).visibility;'
+                    + ' return v === "hidden" || v === "collapse" || !(r.width > 0 && r.height > 0); }'
+                  : 'function () { return !this.isConnected; }',
+                returnByValue: true,
+              },
               { signal, timeoutMs: this.config.commandTimeoutMs },
             )
             return evaluated.result?.value === true
@@ -2376,12 +2697,43 @@ export class CdpBrowserProvider implements BrowserProvider {
           // 同上：hidden 分支的 probe 也是直接发命令，同样不能让工具失败。
           { timeoutMs: this.config.waitTimeoutMs, signal, swallowErrors: true },
         )
+        if (!satisfied) {
+          // 项 2（2026-10-07）：超时要说明元素**此刻**是什么状态 —— 还在但隐藏
+          // （display:none，盒子为 0）与还在且显示着，模型该走的下一步完全不同。
+          // 只等「移除」的条件对一个只被隐藏的元素永远不会成立，回执必须把这层讲破。
+          try {
+            const boxProbe = await session.connection.send<EvaluateResult>(
+              'Runtime.callFunctionOn',
+              {
+                objectId,
+                functionDeclaration: 'function () {'
+                  + ' if (!this.isConnected) return "removed";'
+                  + ' const r = this.getBoundingClientRect();'
+                  + ' const laidOut = r.width > 0 && r.height > 0'
+                  + '   && (typeof this.checkVisibility === "function" ? this.checkVisibility({ visibilityProperty: true })'
+                  + '     : !["hidden", "collapse"].includes(getComputedStyle(this).visibility));'
+                  + ' return laidOut ? "visible" : "hidden"; }',
+                returnByValue: true,
+              },
+              { signal, timeoutMs: this.config.commandTimeoutMs },
+            )
+            const state = boxProbe.result?.value
+            if (state === 'hidden' || state === 'visible' || state === 'removed') refState = state
+          } catch {
+            // 状态读不到就不附加（不把探测失败当成状态结论）。
+          }
+        }
       } finally {
         this.releaseObject(session, objectId, signal)
       }
     }
     const result = await this.settleMutation(session, 'wait', beforeUrl, false, signal)
-    return { ...result, satisfied, ...signals !== undefined ? { signals } : {} }
+    return {
+      ...result,
+      satisfied,
+      ...signals !== undefined ? { signals } : {},
+      ...refState !== undefined ? { refState } : {},
+    }
   }
 
   /**
@@ -2831,6 +3183,66 @@ const READABLE_NAME_SNIPPET = '(el) => {'
   + ' }'
 
 /**
+ * rect 测量脚本（locate / click / smooth 滚动重测共用）：视口坐标盒 + 视口尺寸一次带回。
+ * `elementViewportBox` 与 `measureViewportBox` 必须用同一份，否则重测口径漂移。
+ */
+const LOCATE_MEASURE_SNIPPET = ' const rect = this.getBoundingClientRect();'
+  + ' return { x: rect.x, y: rect.y, width: rect.width, height: rect.height,'
+  + ' viewportWidth: window.innerWidth, viewportHeight: window.innerHeight }; }'
+
+/** 元素盒与视口是否有交集。视口尺寸缺失时无法判定，按「有交集」处理（不触发重测）。 */
+function boxIntersectsViewport(box: {
+  x: number; y: number; width: number; height: number; viewportWidth?: number; viewportHeight?: number
+}): boolean {
+  if (box.viewportWidth === undefined || box.viewportHeight === undefined) return true
+  return box.x < box.viewportWidth && box.x + box.width > 0
+    && box.y < box.viewportHeight && box.y + box.height > 0
+}
+
+/**
+ * 居中容差（CSS 像素）。要盖住两类已知偏差：滚动条半宽（`innerWidth` 含滚动条而
+ * `getBoundingClientRect` 不含，垂直居中因此偏差 ≈ 滚动条宽的一半，Chromium 约 8px）
+ * 与亚像素取整。16px 远小于「smooth 动画刚进视口边缘」的偏离量，判不出假阳性。
+ */
+const CENTER_TOLERANCE_PX = 16
+
+/**
+ * 元素盒是否**真的居中**在视口里（`webpage_locate` 的 `centered` 判据）。
+ *
+ * 「元素中心落在视口内」只证明看得见，不证明居中 —— smooth 滚动动画刚把元素送进视口
+ * 边缘的中间帧会被它谎报成已居中（2026-10-07 独立验收）。这里按轴判真实对齐：
+ *
+ * - 元素该轴不超过视口：中心与视口中心对齐（±{@link CENTER_TOLERANCE_PX}）；
+ * - 元素该轴超过视口：滚动被文档边缘夹住，「居中的极限」是元素完全盖住该轴的视口范围
+ *   （此时 scrollIntoView 的 center 已把能滚的都滚了）。
+ *
+ * 视口尺寸缺读或 ≤0 时返回 `undefined` —— **无法判定**，调用方不得把 undefined 当成功。
+ */
+function boxCenteredInViewport(box: {
+  x: number; y: number; width: number; height: number; viewportWidth?: number; viewportHeight?: number
+}): boolean | undefined {
+  const vw = box.viewportWidth
+  const vh = box.viewportHeight
+  if (vw === undefined || vh === undefined || vw <= 0 || vh <= 0) return undefined
+  const centredX = box.width >= vw
+    ? box.x <= 0 && box.x + box.width >= vw
+    : Math.abs(box.x + box.width / 2 - vw / 2) <= CENTER_TOLERANCE_PX
+  const centredY = box.height >= vh
+    ? box.y <= 0 && box.y + box.height >= vh
+    : Math.abs(box.y + box.height / 2 - vh / 2) <= CENTER_TOLERANCE_PX
+  return centredX && centredY
+}
+
+/** smooth 滚动重测的间隔等待；signal 中止时立即返回（下一轮测量自己会带上中止的 signal）。 */
+function sleepForRetry(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise(resolve => {
+    if (signal?.aborted) return resolve()
+    const timer = setTimeout(resolve, ms)
+    signal?.addEventListener('abort', () => { clearTimeout(timer); resolve() }, { once: true })
+  })
+}
+
+/**
  * 落点命中校验：问一句「这个视口坐标上最顶层的元素是谁」。
  *
  * 为什么是 `elementFromPoint` 而不是比 rect：它就是浏览器派发鼠标事件时用的那一套命中测试，
@@ -2899,6 +3311,38 @@ export const OVERLAY_PROBE_EXPRESSION = '(() => {'
   + '   node = node.parentElement;'
   + ' }'
   + ' if (!node || node.nodeType !== 1 || node === document.body || node === document.documentElement) return null;'
+  // 项 6（2026-10-07 独立验收）：`/plain` 的正常布局是 `main.fixed{inset:0}` 盖满视口、
+  // 页头目录/章节链接在它**下面**（文档序在前、层叠在后）——「fixed + 覆盖 ≥60%」三条件
+  // 全中，旧判据把主内容区报成了 OVERLAY。`main` / `[role=main]` 是页面主内容地标，
+  // 语义上不是浮层，真遮罩从不长成 main：攀爬落到它就直接豁免。真正的模态对话框若在
+  // main 之上，攀爬会先落到对话框那层（elementFromPoint 命中的是它），不走这条豁免。
+  + ' const tagName = String(node.tagName || "").toLowerCase();'
+  + ' const mainRole = (node.getAttribute("role") || "").toLowerCase();'
+  + ' if (tagName === "main" || mainRole === "main") return null;'
+  // 项 6（2026-10-07）：「fixed + 覆盖 ≥60%」不等于遮挡 —— Google 的普通 main 就是 fixed
+  // 且盖满视口，被误报成 OVERLAY。遮挡的实义是「**别的**可操作控件真的点不到了」：采样
+  // 分层元素**之外**的控件，逐个问它中心的命中测试落点 ——
+  //   · 没有外部控件（可操作内容全在这层里）→ 正常 fixed main，不报；
+  //   · 任一外部控件的中心仍命中自身（或其后代）→ 页面没有被盖死，不报；
+  //   · 外部控件存在且全部被盖 → 真遮挡，照旧报（无 role / 无标签 backdrop 照样能报）。
+  + ' const outside = [];'
+  + ' const all = document.querySelectorAll("button, a, input, select, textarea, [role=\\"button\\"], [role=\\"link\\"]");'
+  + ' for (let i = 0; i < all.length && outside.length < 8; i++) {'
+  + '   const el = all[i];'
+  + '   if (node.contains(el)) continue;'
+  + '   const r = el.getBoundingClientRect();'
+  + '   if (r.right <= 0 || r.bottom <= 0 || r.left >= vw || r.top >= vh) continue;'
+  + '   outside.push(el);'
+  + ' }'
+  + ' if (outside.length === 0) return null;'
+  + ' for (let i = 0; i < outside.length; i++) {'
+  + '   const el = outside[i];'
+  + '   const r = el.getBoundingClientRect();'
+  + '   const cx = Math.round(Math.min(Math.max((r.left + r.right) / 2, 0), vw - 1));'
+  + '   const cy = Math.round(Math.min(Math.max((r.top + r.bottom) / 2, 0), vh - 1));'
+  + '   const hit = document.elementFromPoint(cx, cy);'
+  + '   if (hit === el || (hit !== null && el.contains(hit))) return null;'
+  + ' }'
   + ' const dialog = node.closest(\'[role="dialog"], [aria-modal="true"], dialog\');'
   + ' const target = dialog || node;'
   + ' const role = target.getAttribute("role") || String(target.tagName || "").toLowerCase();'

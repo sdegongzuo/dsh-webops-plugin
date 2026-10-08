@@ -41,6 +41,8 @@ interface Harness {
   failObserve: Error | undefined
   /** 设置后 `locate` 一律失败，用来验证工具层不吞异常。 */
   failLocate: Error | undefined
+  /** 设置后 `locate` 先等这么多毫秒再返回（验证回执的实测 duration_ms，项 7）。 */
+  locateDelay: number | undefined
   /** snapshot 观察的返回体；find 的缓存测试会换上多行大纲的版本。 */
   snapshotResponse: BrowserSnapshot
   /** 设置后 `mutate` 结果带上 `openedTabs`（模拟点击弹出了新标签页）。 */
@@ -108,6 +110,7 @@ function mount(): Harness {
     browserCalls,
     callers,
     savedImages,
+    locateDelay: undefined,
     heldError: undefined,
     failObserve: undefined,
     failLocate: undefined,
@@ -218,7 +221,7 @@ function mount(): Harness {
       locate: (args: { sessionId: string; ref: string; highlight?: boolean; scroll?: boolean }) => {
         browserCalls.push({ method: 'locate', args })
         if (harness.failLocate !== undefined) return Promise.reject(harness.failLocate)
-        return Promise.resolve({
+        const value = {
           kind: 'locate',
           sessionId: args.sessionId,
           epoch: 4,
@@ -228,8 +231,13 @@ function mount(): Harness {
           width: 100,
           height: 40,
           centered: args.scroll ?? false,
+          scrollRequested: args.scroll ?? false,
           inViewport: true,
-        })
+        }
+        const delay = harness.locateDelay ?? 0
+        return delay > 0
+          ? new Promise<typeof value>(resolve => setTimeout(() => resolve(value), delay))
+          : Promise.resolve(value)
       },
       revalidate: (args: { sessionId: string; refs: string[] }) => {
         browserCalls.push({ method: 'revalidate', args })
@@ -500,7 +508,7 @@ describe('argument and output contracts', () => {
     expect(harness.browserCalls).toEqual([
       { method: 'navigate', args: { sessionId: 's1', url: 'https://example.com/next' } },
     ])
-    expect(value).toEqual({ session_id: 's1', url: 'https://example.com/', title: 'Example', epoch: 4 })
+    expect(value).toEqual({ session_id: 's1', url: 'https://example.com/', title: 'Example', epoch: 4, durationMs: expect.any(Number) })
   })
 
   it('walks the browser history without webpage_execute (B2-b · J4)', async () => {
@@ -568,6 +576,7 @@ describe('argument and output contracts', () => {
         { ref: 'e2', role: 'button', name: 'Submit' },
       ],
       failed: [],
+      durationMs: expect.any(Number),
     })
   })
 
@@ -607,6 +616,7 @@ describe('webpage_tabs and the P1 mutation tools', () => {
     expect(listed).toEqual({
       action: 'list',
       tabs: [{ session_id: 's1', url: SESSION.url, title: SESSION.title, active: true }],
+      durationMs: expect.any(Number),
     })
 
     harness.browserCalls.length = 0
@@ -636,6 +646,7 @@ describe('webpage_tabs and the P1 mutation tools', () => {
       url: SESSION.url,
       title: SESSION.title,
       navigated: false,
+      durationMs: expect.any(Number),
     })
     expect(validateJsonSchemaValue(definition.output.schema, value)).toEqual([])
   })
@@ -757,14 +768,12 @@ describe('webpage_tabs and the P1 mutation tools', () => {
     }
     const target = { role: 'link', name: '外链标题', href: 'https://example.com/x' }
 
-    // ① 遮挡优先于 href —— 被盖住时「按 Enter」是错的指引，不许同时给。
-    const occluded = render({ ...base, target, occluded_by: { role: 'dialog', name: '登录后查看', hint: '#login-modal' } })
-    expect(occluded).toContain('occluded_by')
-    expect(occluded).toContain('role=dialog')
-    expect(occluded).toContain('#login-modal')
-    expect(occluded).toContain('DISPATCHED')
-    expect(occluded).toContain('do NOT go looking through console/network')
-    expect(occluded).not.toContain('press Enter')
+    // ① 被盖点击不再产生成功回执：命中测试证实遮挡时在派发前即拒（BROWSER_TARGET_OCCLUDED，
+    //    2026-10-07 独立验收要求零页面副作用），错误文本由 provider 生成，这里验回执层
+    //    不再出现「DISPATCHED 但被盖」的旧形态 —— 有 href 时直接给 href 指引。
+    const withHrefAfterOcclusionRemoval = render({ ...base, target })
+    expect(withHrefAfterOcclusionRemoval).not.toContain('DISPATCHED')
+    expect(withHrefAfterOcclusionRemoval).not.toContain('occluded_by')
 
     // ② 有 href：报清「点的是谁」，并给下一步。
     const withHref = render({ ...base, target })
@@ -834,7 +843,8 @@ describe('webpage_screenshot', () => {
     expect(validateJsonSchemaValue(definition.output.schema, value)).toEqual([])
 
     const blocks = definition.output.render({ session_id: 's1' }, value as never)
-    expect(blocks.map(block => block.type)).toEqual(['text', 'image'])
+    // 末尾多出的 text 块是 duration_ms（项 7，经 execute 才有）。
+    expect(blocks.map(block => block.type)).toEqual(['text', 'image', 'text'])
     expect(blocks[1]).toMatchObject({ type: 'image', attachment: { attachmentId: 'att-1' } })
     // 消息里只留引用：字节不进工具结果。
     expect(JSON.stringify(blocks)).not.toContain('data')
@@ -934,6 +944,44 @@ describe('webpage_console / webpage_network / webpage_execute', () => {
     expect(validateJsonSchemaValue(definition.output.schema, value)).toEqual([])
   })
 
+  it('rejects a malformed execute call as a PARAM error, not a page-state error (2026-10-08)', async () => {
+    // 独立验收：缺 params.expression 的调用过去打到 CDP 变 "Invalid parameters"，恢复建议
+    // 却说「页面状态拒绝、重拍快照」——模型反复无效刷新。参数错误必须在工具边界拦下，
+    // 并把正确结构写在消息里。
+    const definition = tool(harness, 'webpage_execute')
+
+    // params 整个缺失（expression 被误放在工具调用顶层就是这个形状）。
+    await expect(definition.execute({ session_id: 's1', method: 'Runtime.evaluate' }, exec()))
+      .rejects.toThrow(expect.objectContaining({
+        code: 'BROWSER_INVALID_PARAMS',
+        message: expect.stringContaining('params={"expression"') as unknown as string,
+      }))
+    await expect(definition.execute({ session_id: 's1', method: 'Runtime.evaluate' }, exec()))
+      .rejects.toThrow(/INSIDE params/u)
+
+    // params.expression 缺失 / 非字符串。
+    await expect(definition.execute({ session_id: 's1', method: 'Runtime.evaluate', params: {} }, exec()))
+      .rejects.toThrow(expect.objectContaining({ code: 'BROWSER_INVALID_PARAMS' }))
+    await expect(definition.execute({
+      session_id: 's1', method: 'Runtime.evaluate', params: { expression: 42 },
+    }, exec())).rejects.toThrow(expect.objectContaining({ code: 'BROWSER_INVALID_PARAMS' }))
+
+    // params 不是对象。
+    await expect(definition.execute({
+      session_id: 's1', method: 'Runtime.evaluate', params: '1+1' as never,
+    }, exec())).rejects.toThrow(expect.objectContaining({ code: 'BROWSER_INVALID_PARAMS' }))
+
+    // Page.navigate 缺 url。
+    await expect(definition.execute({ session_id: 's1', method: 'Page.navigate' }, exec()))
+      .rejects.toThrow(expect.objectContaining({
+        code: 'BROWSER_INVALID_PARAMS',
+        message: expect.stringContaining('params={"url"') as unknown as string,
+      }))
+
+    // 一条都没到 provider：参数校验是纯边界检查。
+    expect(harness.browserCalls).toEqual([])
+  })
+
   it('forwards timeout_ms only when the model passed one (B5-d · J8)', async () => {
     const definition = tool(harness, 'webpage_execute')
 
@@ -990,6 +1038,7 @@ describe('webpage_find / webpage_locate (P3)', () => {
       session_id: 's1',
       truncated: false,
       matches: [{ ref: 'e1', role: 'button', name: 'Submit', line: '- button "Submit" [ref=e1]' }],
+      durationMs: expect.any(Number),
     })
     expect(validateJsonSchemaValue(definition.output.schema, value)).toEqual([])
   })
@@ -1116,7 +1165,9 @@ describe('webpage_find / webpage_locate (P3)', () => {
       width: 100,
       height: 40,
       centered: false,
+      scroll_requested: false,
       in_viewport: true,
+      durationMs: expect.any(Number),
     })
     expect(validateJsonSchemaValue(definition.output.schema, value)).toEqual([])
   })
@@ -1141,11 +1192,168 @@ describe('webpage_find / webpage_locate (P3)', () => {
       width: 100,
       height: 40,
       centered: true,
+      scroll_requested: true,
     } as never)
 
     const text = String((blocks[0] as { text: string }).text)
     expect(text).toContain('100x40')
-    expect(text).toContain('measured fresh')
+    expect(text).toContain('fresh measurement')
+  })
+
+  it('#4 (2026-10-07) scroll=true 的回执不再出现 WITHOUT scrolling 的矛盾文案', () => {
+    const definition = tool(harness, 'webpage_locate')
+
+    // 居中生效：确认事实，且不再出现「没滚动」的旧文案。
+    const centred = String((definition.output.render({}, {
+      session_id: 's1', ref: 'e1', x: 10, y: 300, width: 100, height: 40,
+      centered: true, scroll_requested: true, in_viewport: true,
+    } as never)[0] as { text: string }).text)
+    expect(centred).toContain('scroll=true was requested and the fresh measurement confirms')
+    expect(centred).not.toContain('WITHOUT scrolling')
+    expect(centred).not.toContain('It is OUTSIDE the viewport')
+
+    // 请求了但没生效：如实说没居中，不许当成成功。
+    const notCentred = String((definition.output.render({}, {
+      session_id: 's1', ref: 'e1', x: 10, y: 5171, width: 100, height: 40,
+      centered: false, scroll_requested: true, in_viewport: false,
+    } as never)[0] as { text: string }).text)
+    expect(notCentred).toContain('the centring did NOT take effect')
+    expect(notCentred).toContain('It is OUTSIDE the viewport')
+
+    // 没请求滚动：保留 WITHOUT scrolling 的事实说明。
+    const notScrolled = String((definition.output.render({}, {
+      session_id: 's1', ref: 'e1', x: 10, y: 5171, width: 100, height: 40,
+      centered: false, scroll_requested: false, in_viewport: false,
+    } as never)[0] as { text: string }).text)
+    expect(notScrolled).toContain('WITHOUT scrolling')
+    expect(notScrolled).toContain('pass scroll=true')
+  })
+
+  it('#5 (2026-10-07) BrowserError 的 code 与恢复建议折进模型可见文本', async () => {
+    const definition = tool(harness, 'webpage_locate')
+
+    // 零布局错误：模型要看到独立错误码 + 「先观察可见性/布局」的恢复建议，
+    // 而不是一句裸文案后盲目重试或乱按 Enter（2026-10-07 Google 实测）。
+    harness.failLocate = new BrowserError('the element has no usable layout box to interact with', 'BROWSER_PROTOCOL_ERROR')
+    await expect(definition.execute({ session_id: 's1', ref: 'e1' }, exec()))
+      .rejects.toThrow(/^\[BROWSER_PROTOCOL_ERROR\] the element has no usable layout box/)
+    await expect(definition.execute({ session_id: 's1', ref: 'e1' }, exec()))
+      .rejects.toThrow(/Recovery: .*verify the element with webpage_locate or a fresh webpage_snapshot before retrying/)
+
+    // 旧 ref：仍报 BROWSER_STALE_REF（不是布局错误），且恢复建议跟着到模型。
+    harness.failLocate = new BrowserError('ref belongs to an obsolete epoch', 'BROWSER_STALE_REF')
+    await expect(definition.execute({ session_id: 's1', ref: 'e1' }, exec()))
+      .rejects.toThrow(/^\[BROWSER_STALE_REF\] ref belongs to an obsolete epoch/)
+    await expect(definition.execute({ session_id: 's1', ref: 'e1' }, exec()))
+      .rejects.toThrow(expect.objectContaining({ code: 'BROWSER_STALE_REF' }))
+
+    // 非 BrowserError 原样穿透，不加码不加建议。
+    harness.failLocate = new Error('plain harness failure')
+    await expect(definition.execute({ session_id: 's1', ref: 'e1' }, exec()))
+      .rejects.toThrow(/^plain harness failure$/)
+  })
+
+  it('#5 (2026-10-07) revalidate 回执只声明身份一致，不声明可见可点击', () => {
+    const blocks = tool(harness, 'webpage_revalidate').output.render({}, {
+      session_id: 's1',
+      epoch: 4,
+      restored: [{ ref: 'e1', role: 'button', name: 'A' }],
+      failed: [],
+    } as never)
+
+    const text = String((blocks[0] as { text: string }).text)
+    expect(text).toContain('only proves node identity')
+    expect(text).toContain('does NOT prove the element is visible, laid out, or clickable')
+  })
+
+  it('全页旧回答后区域观察的新回复成为 find 的最新正文，保留本轮长尾', async () => {
+    harness.snapshotResponse = { ...SNAPSHOT, outline: '- text "旧回答 OLD_REPLY"', fullTexts: [{ line: 0, text: '旧回答 OLD_REPLY' }] }
+    await tool(harness, 'webpage_snapshot').execute({ session_id: 's1' }, exec())
+    const full = `本轮新回答 ${'正文'.repeat(90)} NEW_REPLY_TAIL`
+    harness.snapshotResponse = { ...SNAPSHOT, outline: '- text "本轮新回答…"', fullTexts: [{ line: 0, text: full }] }
+    await tool(harness, 'webpage_snapshot').execute({ session_id: 's1', region_viewport: true }, exec())
+    const result = await tool(harness, 'webpage_find').execute({ session_id: 's1', query: '本轮新回答', full_text: true }, exec()) as { matches: { text?: string }[] }
+    expect(result.matches[0]?.text).toBe(full)
+    const old = await tool(harness, 'webpage_find').execute({ session_id: 's1', query: 'OLD_REPLY' }, exec()) as { matches: unknown[] }
+    expect(old.matches).toEqual([])
+  })
+
+  it('#3 (2026-10-07) find full_text=true 返回未裁切正文与代码块，缺数据明确报错', async () => {
+    const FULL = 'short outline line — but the cached full text carries a TAIL_MARKER_3F7 beyond 120 chars.'
+    harness.snapshotResponse = {
+      ...SNAPSHOT,
+      fullTexts: [{ line: 0, text: FULL }],
+      textBlocks: [{ line: 0, text: 'function checkData() {\n  if (ready) {\n    return true;\n  }\n}' }],
+    }
+    // find 只查缓存：先把带正文的快照拍进缓存。
+    await tool(harness, 'webpage_snapshot').execute({ session_id: 's1' }, exec())
+
+    // 不带 full_text：不加正文（默认行为不变）。
+    const plain = await tool(harness, 'webpage_find').execute({ session_id: 's1', query: 'Submit' }, exec()) as { matches: { text?: string; block?: string }[] }
+    expect(plain.matches[0]?.text).toBeUndefined()
+
+    // full_text=true：正文与整块都回来（代码换行/缩进保留）。
+    const value = await tool(harness, 'webpage_find')
+      .execute({ session_id: 's1', query: 'Submit', full_text: true }, exec()) as { matches: { text?: string; block?: string }[] }
+    expect(value.matches[0]?.text).toBe(FULL)
+    expect(value.matches[0]?.block).toBe('function checkData() {\n  if (ready) {\n    return true;\n  }\n}')
+    expect(validateJsonSchemaValue(tool(harness, 'webpage_find').output.schema, value)).toEqual([])
+
+    // 缓存没有正文（旧快照）：明说缺数据并给恢复路径，不许模型猜。
+    harness.snapshotResponse = SNAPSHOT
+    await tool(harness, 'webpage_snapshot').execute({ session_id: 's1' }, exec())
+    await expect(tool(harness, 'webpage_find')
+      .execute({ session_id: 's1', query: 'Submit', full_text: true }, exec()))
+      .rejects.toThrow(expect.objectContaining({ code: 'BROWSER_SNAPSHOT_REQUIRED' }))
+  })
+
+  it('#7 (2026-10-07) 回执附带单调时钟实测的 duration_ms，标注只代表本次工具调用', async () => {
+    // 约 80ms 的真实等待：duration_ms 要量到它（≥60），又不许虚报到配置 timeout 量级。
+    harness.locateDelay = 80
+    const definition = tool(harness, 'webpage_locate')
+    const value = await definition.execute({ session_id: 's1', ref: 'e1' }, exec())
+
+    const blocks = definition.output.render({ session_id: 's1' }, value as never)
+    const text = blocks.map(block => (block as { text?: string }).text ?? '').join('\n')
+    const match = text.match(/duration_ms=(\d+)/)
+    expect(match).not.toBeNull()
+    const duration = Number(match![1])
+    expect(duration).toBeGreaterThanOrEqual(60)
+    expect(duration).toBeLessThan(2000)
+    expect(text).toContain('this tool call')
+    // 项 7 边界修正（2026-10-08）：旧文案谎称「excludes site response time」——
+    // wait(10s) 等的就是站点时间。边界必须写对：不含模型思考，含调用内等待。
+    expect(text).toContain('excludes model thinking')
+    expect(text).toContain('includes all waits inside this call')
+    expect(text).not.toMatch(/excludes model thinking and site response time/)
+
+    // 没经过 execute 的纯渲染（如历史重放）不添数，也不伪造「未提供」。
+    const bare = definition.output.render({ session_id: 's1' }, {
+      session_id: 's1', ref: 'e1', x: 10, y: 20, width: 100, height: 40,
+      centered: false, scroll_requested: false, in_viewport: true,
+    } as never)
+    const bareText = bare.map(block => (block as { text?: string }).text ?? '').join('\n')
+    expect(bareText).not.toContain('duration_ms=')
+  })
+
+  it('#7 反向补丁：duration 走 value 字段，穿过 harness 的 JSON 快照 + deepFreeze 边界后仍能渲染', async () => {
+    // 打包态真实链路（2026-10-07 实测踩坑）：harness createSuccessResult 对 execute 的返回值
+    // 做 snapshotToolValue（JSON 快照）+ schema 校验 + deepFreeze，render 收到的是**克隆**。
+    // 早期 WeakMap<value> 方案在单测（同对象）里绿、在打包态必丢 —— 这里复刻真实边界。
+    harness.locateDelay = 30
+    const definition = tool(harness, 'webpage_locate')
+    const value = await definition.execute({ session_id: 's1', ref: 'e1' }, exec())
+
+    // ① 快照（JSON 往返）不能丢时长字段；
+    // ② 补过声明的输出 schema 必须接受它（additionalProperties:false 的工具多数存在）；
+    // ③ 冻结后的克隆交给 render，仍要产出 duration_ms 块。
+    const detached = JSON.parse(JSON.stringify(value)) as Record<string, unknown>
+    expect(validateJsonSchemaValue(definition.output.schema, detached)).toEqual([])
+    const frozen = Object.freeze(detached)
+    const blocks = definition.output.render({ session_id: 's1' }, frozen as never)
+    const text = blocks.map(block => (block as { text?: string }).text ?? '').join('\n')
+    expect(text).toMatch(/duration_ms=\d+/)
+    expect(text).toContain('this tool call')
   })
 })
 
@@ -1615,7 +1823,7 @@ describe('§6.2 ② 回执字段与文案（P2 最后一公里）', () => {
     const value = await tool(harness, 'webpage_snapshot').execute({ session_id: 's1' }, exec())
     const text = render('webpage_snapshot', value)
 
-    expect(text).toContain('PAGE CHANGED OUTSIDE THIS SESSION')
+    expect(text).toContain('PAGE CHANGED SINCE YOUR LAST SNAPSHOT')
     // 文案给**动作**不给状态：几次、从哪到哪、所以该干什么。
     expect(text).toContain('navigated 1 time(s) (https://a.test/one → https://a.test/two)')
     expect(text).toContain('2 in-page navigation(s)')
@@ -1648,7 +1856,7 @@ describe('§6.2 ② 回执字段与文案（P2 最后一公里）', () => {
     const value = await tool(harness, 'webpage_snapshot').execute({ session_id: 's1' }, exec())
     const text = render('webpage_snapshot', value)
 
-    expect(text).toContain('PAGE CHANGED OUTSIDE THIS SESSION')
+    expect(text).toContain('PAGE CHANGED SINCE YOUR LAST SNAPSHOT')
     expect(text).toContain('1 in-page navigation(s)')
     expect(text).toContain('webpage_revalidate')
     expect(text).toContain('BROWSER_STALE_REF')
@@ -1679,7 +1887,7 @@ describe('§6.2 ② 回执字段与文案（P2 最后一公里）', () => {
     const value = await tool(harness, 'webpage_click').execute({ session_id: 's1', ref: 'e1' }, exec())
     const text = render('webpage_click', value)
 
-    expect(text).toContain('PAGE CHANGED OUTSIDE THIS SESSION')
+    expect(text).toContain('PAGE CHANGED SINCE YOUR LAST SNAPSHOT')
     // 与「我这次动作导航了没」那段相邻：两条说的是同一件事的两个侧面，分开放会只读到一句。
     expect(text.indexOf('Refs from the latest snapshot')).toBeLessThan(text.indexOf('PAGE CHANGED'))
   })
@@ -1687,12 +1895,12 @@ describe('§6.2 ② 回执字段与文案（P2 最后一公里）', () => {
   it('execute / revalidate 的回执同样带上（逃生舱能跑任意页面代码；revalidate 的成功判据看不出重排）', async () => {
     harness.pageChanged = CHANGED
     const executed = await tool(harness, 'webpage_execute')
-      .execute({ session_id: 's1', method: 'Runtime.evaluate' }, exec())
-    expect(render('webpage_execute', executed)).toContain('PAGE CHANGED OUTSIDE THIS SESSION')
+      .execute({ session_id: 's1', method: 'Runtime.evaluate', params: { expression: '1' } }, exec())
+    expect(render('webpage_execute', executed)).toContain('PAGE CHANGED SINCE YOUR LAST SNAPSHOT')
 
     const revalidated = await tool(harness, 'webpage_revalidate')
       .execute({ session_id: 's1', refs: ['e1'] }, exec())
-    expect(render('webpage_revalidate', revalidated)).toContain('PAGE CHANGED OUTSIDE THIS SESSION')
+    expect(render('webpage_revalidate', revalidated)).toContain('PAGE CHANGED SINCE YOUR LAST SNAPSHOT')
   })
 
   it('仅地址抖动时，文案**不能**说成「ref 作废了」—— 那一档特意没作废纪元', async () => {
@@ -1756,7 +1964,7 @@ describe('§6.2 ② 回执字段与文案（P2 最后一公里）', () => {
     expect(validateJsonSchemaValue(tool(harness, 'webpage_click').output.schema, mutationValue)).toEqual([])
 
     const executeValue = await tool(harness, 'webpage_execute')
-      .execute({ session_id: 's1', method: 'Runtime.evaluate' }, exec())
+      .execute({ session_id: 's1', method: 'Runtime.evaluate', params: { expression: '1' } }, exec())
     expect(validateJsonSchemaValue(tool(harness, 'webpage_execute').output.schema, executeValue)).toEqual([])
 
     const revalidateValue = await tool(harness, 'webpage_revalidate')

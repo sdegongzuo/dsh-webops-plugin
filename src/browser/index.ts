@@ -50,7 +50,7 @@ import type {
   BrowserTabsResult,
 } from './types.ts'
 
-export { BrowserError, isBrowserError } from './types.ts'
+export { BrowserError, isBrowserError, presentBrowserError } from './types.ts'
 export { DEFAULT_TAB_HANDOFF_TTL_MS, DEFAULT_TAB_LEASE_IDLE_MS, TabLeaseRegistry } from './lease.ts'
 export type { TabLeaseReleaseReason, TabLeaseView } from './lease.ts'
 export type {

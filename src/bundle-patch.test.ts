@@ -575,3 +575,64 @@ describe('发布链的身份契约：签出哪个 ref、版本对不对得上、
     }
   })
 })
+
+/**
+ * 发版链的「保留式打包」契约（2026-10-08）。
+ *
+ * AGENTS.md 禁止任何实际删除（rm / clean / 覆盖旧产物），而发版链旧写法有两处违反：
+ *   1. `pnpm build` 展开 = tsdown（第一个 bundle `clean: true`）—— 先整目录删除 lib/；
+ *   2. 「发布 Release」一步在同名 Release 已存在时走 `gh release upload --clobber`
+ *      —— 先删旧附件再传新附件。
+ * `package-portable.mjs` 旧写法还有三处：起手删 `.portable-stage`、删同名 ZIP、收尾删 stage。
+ *
+ * 这里的断言一律跑在 `yamlBody()`（剥整行注释）之上：注释里引用「错误的写法」不能喂绿，
+ * 也不能因为注释里提到 `--clobber` 就误伤。
+ */
+describe('发版工作流的保留式打包（不删除、不覆盖）', () => {
+  const workflow = yamlBody(readRepoFile('.github/workflows/release.yml'))
+
+  it('构建显式 tsdown --no-clean，不走默认 clean 的 pnpm build', () => {
+    expect(workflow, '发布链没写 --no-clean —— tsdown 第一个 bundle clean: true 会整目录删除 lib/')
+      .toContain('tsdown --no-clean')
+    expect(workflow, '发布链还在跑 `pnpm build`（展开即 clean 构建）').not.toContain('run: pnpm build')
+  })
+
+  it('两个打包脚本都显式走保留安全模式：lib-dir / stage-root / keep-stage / out', () => {
+    for (const flag of ['--lib-dir', '--stage-root', '--keep-stage', '--out']) {
+      expect(workflow, `发布链没给打包脚本传 ${flag} —— 保留模式不完整`).toContain(flag)
+    }
+  })
+
+  it('发布步没有 --clobber：Release 已存在时明确失败，不覆盖附件', () => {
+    expect(workflow, '发布链还在用 --clobber 覆盖附件 —— 那是「先删旧资产再上传」的删除分支')
+      .not.toContain('--clobber')
+    expect(workflow, '没有先 gh release view 探测同名 Release').toContain('gh release view')
+    expect(workflow, '同名 Release 已存在时没有明确失败（应提示换新版本号）').toContain('换一个新版本号')
+  })
+})
+
+describe('package-portable 的保留安全模式', () => {
+  const script = readRepoFile('scripts/package-portable.mjs')
+
+  it('提供 --lib-dir / --stage-root / --out / --keep-stage，任一传入即进安全模式', () => {
+    for (const flag of ["'--lib-dir'", "'--stage-root'", "'--out'", "'--keep-stage'"]) {
+      expect(script, `脚本不认识 ${flag}`).toContain(flag)
+    }
+    expect(script, '安全模式判定丢了 —— 传了保留参数还会走删除分支').toContain('safeMode')
+  })
+
+  it('安全模式暂存目录用 mkdtemp 建唯一新目录，全程不清理', () => {
+    expect(script, '安全模式没用 mkdtemp —— 会和旧暂存目录复用/冲突').toContain('mkdtempSync')
+    // 兼容模式的删除必须被安全模式隔离：安全模式分支里不允许出现 rmSync。
+    const safeBranch = script.slice(script.indexOf('if (safeMode) {'), script.indexOf("} else {"))
+    expect(safeBranch, '安全模式分支里出现了 rmSync').not.toContain('rmSync')
+  })
+
+  it('安全模式拒绝已存在的输出（不覆盖旧 ZIP）', () => {
+    expect(script, '安全模式没有「目标已存在」检查 —— 会悄悄覆盖旧产物').toContain('目标已存在')
+  })
+
+  it('--help 打印用法而不是把 --help 当版本号', () => {
+    expect(script).toContain("'--help'")
+  })
+})

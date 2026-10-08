@@ -43,6 +43,7 @@ export type BrowserErrorCode =
   | 'BROWSER_NAVIGATION_FAILED'
   /** CDP 返回了错误，或返回了不符合协议的消息。 */
   | 'BROWSER_PROTOCOL_ERROR'
+  | 'BROWSER_INVALID_PARAMS'
   /** WebSocket 在命令完成前断开。 */
   | 'BROWSER_CONNECTION_LOST'
   /** 卸载时某个 provider 未能干净释放资源。 */
@@ -108,6 +109,23 @@ export type BrowserErrorCode =
    * 多会话占用：移交码错误、已过期或已被消费。**不可重放旧码** —— 向原持有者要一个新码。
    */
   | 'BROWSER_HANDOFF_INVALID'
+  /**
+   * 点击落点被其它元素盖住（`elementFromPoint` 命中测试证实事件会打在别人身上），
+   * 事件**没有派发**（2026-10-07 独立验收：派发前拒绝，零页面副作用）。
+   * **不可盲目重试** —— 页面没变，重发还是被拒。恢复路径：关掉浮层或先操作盖在上面的
+   * 控件（它通常不在 ref 表里），然后重拍 snapshot 再点目标。
+   */
+  | 'BROWSER_TARGET_OCCLUDED'
+  /**
+   * 窗口当前报告零尺寸视口（innerWidth/innerHeight = 0，通常是最小化或隐藏）。
+   * 此状态下布局坐标、命中测试与输入派发都没有意义（坐标全为负、事件落不到真实内容上），
+   * 动作**没有派发**（2026-10-07 独立验收：禁止假成功）。
+   * **可恢复**：把浏览器窗口恢复显示后重试；宿主在最小化期间刻意不重排（host.cjs 退化
+   * 读数守卫），插件侧没有安全的恢复路径，所以只拒绝 + 指路，不代恢复。
+   */
+  | 'BROWSER_WINDOW_NOT_VISIBLE'
+  | 'BROWSER_TAB_NOT_VISIBLE'
+  | 'BROWSER_READ_ONLY_ANCHOR'
 
 /** 能力缝隙与 provider 唯一抛出的错误类型。 */
 /**
@@ -160,6 +178,55 @@ export function isBrowserError(value: unknown): value is BrowserError {
 }
 
 /**
+ * 每个错误码的**可执行**恢复建议（2026-10-07 实测教训：模型只看得到 `error.message`，
+ * `code` 字段上游不透出 —— 布局错误后模型只能盲目重试或乱按 Enter）。按码给方向，
+ * 不在抛出点逐个拼句；具体细节（如哪个 CDP method 被拒）仍由抛出点写在 message 里。
+ */
+const BROWSER_ERROR_RECOVERY: Readonly<Partial<Record<BrowserErrorCode, string>>> = {
+  BROWSER_TARGET_NOT_FOUND: 'the session is gone; open the page again with webpage_open.',
+  BROWSER_SNAPSHOT_REQUIRED: 'take a webpage_snapshot first, then act on the fresh refs.',
+  BROWSER_STALE_REF: 'this ref is obsolete — take a fresh webpage_snapshot and use the new refs; do not retry this ref.',
+  BROWSER_URL_BLOCKED: 'use an http(s) URL without embedded credentials.',
+  BROWSER_ENDPOINT_UNREACHABLE: 'check that the browser is running and its debugging port is reachable.',
+  BROWSER_NAVIGATION_FAILED: 'check the URL; if the page is slow, retry once or report the site as unreachable.',
+  BROWSER_PROTOCOL_ERROR: 'the page state rejected this action — verify the element with webpage_locate or a fresh webpage_snapshot before retrying; do not blindly retry or press Enter.',
+  BROWSER_INVALID_PARAMS: 'fix the tool arguments exactly as described in the message — this is a malformed tool call, not a page problem; no snapshot, retry or page inspection can fix it.',
+  BROWSER_CONNECTION_LOST: 'the connection dropped; re-open the page with webpage_open.',
+  BROWSER_DEBUGGER_DETACHED: 'the debugger briefly detached (e.g. DevTools opened); this recovers automatically — retry once after a moment.',
+  BROWSER_STATE_CONTENDED: 'the state is held by someone else; do not retry the same write — coordinate or use force only if you mean to override.',
+  BROWSER_EXECUTE_RESULT_UNSERIALIZABLE: 'return a primitive value or a JSON string instead of a live DOM object.',
+  BROWSER_EXECUTE_NOT_ALLOWED: 'use one of the allowed CDP commands listed in the tool description.',
+  BROWSER_HUMAN_HOLDING: 'a human is holding this tab — do not retry; wait for them to release it, then take a fresh webpage_snapshot (old refs stay invalid).',
+  BROWSER_CALLER_REQUIRED: 'the runtime did not pass a caller identity; report this as an environment problem.',
+  BROWSER_TAB_NOT_HELD: 'claim the tab first with webpage_tabs(action=claim), then take a fresh webpage_snapshot.',
+  BROWSER_TAB_OCCUPIED: 'another conversation holds this tab — do not fight for it; use another tab or wait for release.',
+  BROWSER_TAB_BUSY: 'a call is still running on this tab; wait for it to finish, then retry.',
+  BROWSER_HANDOFF_INVALID: 'this handoff code is used or expired — ask the previous holder for a fresh code.',
+  BROWSER_TARGET_OCCLUDED: 'do not retry the same click — close the overlay or act on the element on top of the target first, then take a fresh webpage_snapshot and click the target again.',
+  BROWSER_WINDOW_NOT_VISIBLE: 'restore the browser window (un-minimize or show it), then retry; do not retry while the window stays hidden or minimized.',
+  BROWSER_TAB_NOT_VISIBLE: 'real mouse/keyboard input only lands on a visible tab (visibilityState=hidden) — activate the tab with webpage_tabs(action=activate), make sure the browser window itself is shown, then retry; do not dispatch input into a hidden tab.',
+  BROWSER_READ_ONLY_ANCHOR: 'this anchor only locates content for reading — use webpage_snapshot with region_ref, webpage_locate or a screenshot on it; to interact, take a fresh webpage_snapshot and use an actionable element (link/button/textbox) instead.',
+}
+
+/**
+ * 统一错误呈现：把 `code` 与恢复建议折进 message（上游 harness 只把 `error.message`
+ * 给模型 —— `Error: ${message}` —— 结构化的 code 字段到不了模型）。保持
+ * code/status/reason/cause 不变，所以按 code 断言的既有测试与多会话门禁不受影响。
+ *
+ * 已经带 `[CODE]` 前缀的消息原样返回（幂等），避免包裹层重复叠加。
+ */
+export function presentBrowserError(error: unknown): unknown {
+  if (!(error instanceof BrowserError) || error.message.startsWith(`[${error.code}]`)) return error
+  const recovery = BROWSER_ERROR_RECOVERY[error.code]
+  const message = `[${error.code}] ${error.message}${recovery !== undefined ? ` Recovery: ${recovery}` : ''}`
+  return new BrowserError(message, error.code, {
+    ...error.cause !== undefined ? { cause: error.cause } : {},
+    ...error.status !== undefined ? { status: error.status } : {},
+    ...error.reason !== undefined ? { reason: error.reason } : {},
+  })
+}
+
+/**
  * 新开一个受控标签页。省略 `url` 时开空白页（`about:blank`）。
  *
  * `url` 会过地址策略：只允许 HTTP(S)、禁止内嵌凭据、长度有上限。
@@ -201,6 +268,12 @@ export interface BrowserRef {
   readonly role: string
   /** 可访问性名称（已做空白折叠与长度裁剪）。 */
   readonly name: string
+  /**
+   * 只读文本锚点（项 3 补正，2026-10-08）：`true` = 仅授予读权限
+   * （region_ref / locate / 截图 / revalidate / wait）；click / fill / press 拿它
+   * 报 `BROWSER_READ_ONLY_ANCHOR`。普通可操作元素不带这个字段。
+   */
+  readonly anchor?: boolean
 }
 
 /**
@@ -253,6 +326,12 @@ export interface BrowserPageChanged {
   readonly at?: number
 }
 
+/** 正文读取的单条文本：底稿行号 + 未裁切文本。 */
+export interface BrowserTextRead {
+  readonly line: number
+  readonly text: string
+}
+
 /**
  * 紧凑页面大纲。
  *
@@ -285,6 +364,17 @@ export interface BrowserSnapshot {
    * **不进模型上下文**（模型看到的是 `outline`）；provider 不做折叠时可以不填。
    */
   readonly fullOutline?: string
+  /**
+   * 正文读取（项 3，2026-10-07）：底稿行的**未裁切**可访问性名称，稀疏 `{line, text}`
+   * （`line` 与 `fullOutline` 的行号对齐，只含有增量信息的行）。不进模型上下文，
+   * 由 `webpage_find(full_text=true)` 按需读取 —— 120 字符裁切的长段落靠它拿回尾部。
+   */
+  readonly fullTexts?: readonly BrowserTextRead[]
+  /**
+   * 同级 statictext **块**文本（代码块被高亮拆成一串 statictext，块文本才是完整代码，
+   * 换行与缩进保留）。行号口径同 `fullTexts`；由 `webpage_find(full_text=true)` 按需读取。
+   */
+  readonly textBlocks?: readonly BrowserTextRead[]
   /**
    * 被折叠而未打印的重复行数。与 `droppedElements` 是两套口径：那个是「预算不够、没输出」，
    * 这个是「重复、没打印」—— 元素都还在 `refs` 里。两者必须分开报，否则「要不要抬 max_lines」
@@ -410,6 +500,16 @@ export type BrowserMutationRequest =
     /** 等该 ref 的元素从文档里消失（spinner 消失之类）。 */
     readonly ref?: string
     /**
+     * ref 等待的具体条件（项 2 补正，2026-10-08）：
+     * - `'removed'`（默认）：元素脱离文档（旧语义，兼容不动）；
+     * - `'hidden'`：元素**还在文档里**但已不可见（无布局盒 / display:none /
+     *   visibility:hidden 等）。流式页的发送按钮提交后往往只是被隐藏而不是被移除，
+     *   只等 removed 的条件永远不会成立 —— hidden 条件成功而 removed 不成功正是
+     *   「本轮已提交、旧回答还留着」的证据。
+     * 必须与 `ref` 同给；与 time/text/until 互斥。
+     */
+    readonly refState?: 'removed' | 'hidden'
+    /**
      * 等页面安静（readyState complete + DOM 静默 + 网络静默或已超宽限期）。
      * 与 time_ms / text / ref 四选一；`timeoutMs` 只覆盖本模式的 deadline。
      */
@@ -468,6 +568,14 @@ export interface BrowserMutationResult {
   readonly pageChanged?: BrowserPageChanged
   /** wait 独有：条件是否在超时前成立（超时为 false，不是错误）。 */
   readonly satisfied?: boolean
+  /**
+   * wait(ref) 超时独有（项 2，2026-10-07）：元素超时那一刻的状态 ——
+   * `hidden` = 还在文档里但没有布局盒（display:none / 未渲染），`visible` = 还在且显示着，
+   * `removed` = 已脱离文档（hidden 等待下「等隐藏却先被移除」就是这个；removed 等待下
+   * 出现即为自相矛盾，同样要如实报）。
+   * 超时原因靠它区分，模型不再把「元素被隐藏」当成「页面没提交」。
+   */
+  readonly refState?: 'hidden' | 'visible' | 'removed'
   /**
    * `until: 'stable'` 独有：各信号是否安静。超时也如实报，不把慢页面谎成稳定。
    * 不暴露页面探针的全局名。
@@ -725,6 +833,8 @@ export interface BrowserExecuteResult {
   /** 执行后的 ref 纪元；导航类命令会推进它。 */
   readonly epoch: number
   readonly url: string
+  /** 执行后实际页面标题；旧 provider 可省略，不从表达式或结果正文推断。 */
+  readonly title?: string
   /** 该命令是否属于导航类（`Page.navigate` / `Page.reload`），或探测到地址变化。 */
   readonly navigated: boolean
   /**
@@ -802,8 +912,16 @@ export interface BrowserLocateResult {
   readonly y: number
   readonly width: number
   readonly height: number
-  /** `scroll=true` 时元素先被滚到视口中央再量，为 true。 */
+  /**
+   * `scroll=true` 时是否真的居中成功：按**最终一次测量**判定「元素中心对齐视口中心」
+   * （每轴容差 16px，盖住滚动条半宽与亚像素抖动；元素超过视口的轴按「完全盖住该轴」判，
+   * 那是滚动被文档边缘夹住时居中的极限）。「看得见」不算居中 —— 只是「元素中心落在视口内」
+   * 的旧判据会把 smooth 动画刚进视口的中间帧谎报成已居中（2026-10-07 独立验收）。
+   * 视口尺寸测不到或为零时无法证明居中，恒为 `false`，绝不默认成功。
+   */
   readonly centered: boolean
+  /** 本次调用是否请求了滚动（与 `centered` 区分「请求了」和「生效了」）。 */
+  readonly scrollRequested: boolean
   /**
    * 量到的那一刻，元素是否与视口有交集（`scroll=false` 时直接回答「它在不在屏幕上」）。
    * 视口尺寸读不到时为 `undefined`。

@@ -152,6 +152,7 @@ function makeProvider(id: string, available: boolean): StubProvider {
         width: 100,
         height: 40,
         centered: request.scroll ?? false,
+        scrollRequested: request.scroll ?? false,
         inViewport: true,
       })
     },

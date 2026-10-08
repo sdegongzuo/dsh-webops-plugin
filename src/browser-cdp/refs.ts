@@ -36,6 +36,12 @@ export interface RefTarget {
   readonly name: string
   readonly backendNodeId: number
   /**
+   * 只读锚点（项 3 补正，2026-10-08）：`true` = 这条 ref 只授予**读**权限
+   * （区域快照 region_ref / locate / 截图 / revalidate），click / fill / press 拿它会被
+   * `BROWSER_READ_ONLY_ANCHOR` 就地拒绝 —— 文本/标题锚点定位内容，但不能凭空增加点击权限。
+   */
+  readonly anchor?: boolean
+  /**
    * 恢复锚点：`hash(role + name + 稳定祖先路径)`。只参与匹配，不生成 ref 号。
    * 不出现在模型可见的 `list()` 里。
    */
@@ -355,7 +361,12 @@ export class RefRegistry {
   /** 当前纪元的全部 ref（模型可见形态）。 */
   list(): readonly BrowserRef[] {
     if (this.targets === undefined) return []
-    return [...this.targets.values()].map(({ ref, role, name }) => ({ ref, role, name }))
+    return [...this.targets.values()].map(({ ref, role, name, anchor }) => ({
+      ref,
+      role,
+      name,
+      ...(anchor === true ? { anchor: true } : {}),
+    }))
   }
 
   /** 可持久化的 `ref → semanticKey` 映射，不含 backendNodeId。 */
@@ -518,6 +529,7 @@ function bindTarget(ref: string, row: RefPublishRow, semanticKey: string): RefTa
     name: row.name,
     backendNodeId: row.backendNodeId,
     semanticKey,
+    ...(row.anchor === true ? { anchor: true } : {}),
   }
 }
 

@@ -43,7 +43,7 @@ interface Rect {
 }
 
 interface ElInit {
-  readonly tag?: 'DIV' | 'FORM' | 'DIALOG'
+  readonly tag?: 'DIV' | 'FORM' | 'DIALOG' | 'BUTTON' | 'A' | 'INPUT' | 'MAIN'
   readonly id?: string
   readonly className?: string
   readonly attrs?: Record<string, string>
@@ -110,7 +110,7 @@ class FakeEl {
     return null
   }
 
-  private static matches(node: FakeEl, selector: string): boolean {
+  static matches(node: FakeEl, selector: string): boolean {
     const attr = /^\[([a-zA-Z-]+)="([^"]+)"\]$/.exec(selector)
     if (attr !== null) return node.getAttribute(attr[1] ?? '') === attr[2]
     return node.tagName.toLowerCase() === selector.toLowerCase()
@@ -121,14 +121,44 @@ interface FakePage {
   readonly body: FakeEl
   /** `elementFromPoint` 的返回值；`null` = 落点上什么都没有。 */
   readonly topAtCenter: FakeEl | null
+  /**
+   * 项 6：外部控件命中测试的覆写（按坐标）。缺省回落到「按矩形从文档序倒着扫」的
+   * 近似命中——后来的元素盖在先来的上面。
+   */
+  readonly hitAt?: (x: number, y: number) => FakeEl | null
+}
+
+/** 收集文档序的全部元素（querySelectorAll 与矩形命中都要）。 */
+function flatten(body: FakeEl): FakeEl[] {
+  const out: FakeEl[] = []
+  const walk = (el: FakeEl): void => { out.push(el); for (const child of el.children) walk(child) }
+  walk(body)
+  return out
 }
 
 /** 把页面脚本放进受控的 `window` / `document` / `getComputedStyle` 里求值。 */
 function runOverlayScript(page: FakePage): { role: string; name: string; hint: string } | null {
   const body = page.body
+  const all = flatten(body)
+  const center = { x: Math.round(VIEW.width / 2), y: Math.round(VIEW.height / 2) }
+  const rectHit = (x: number, y: number): FakeEl | null => {
+    for (let i = all.length - 1; i >= 0; i -= 1) {
+      const el = all[i] as FakeEl
+      const r = el.getBoundingClientRect()
+      if (x >= r.left && x <= r.right && y >= r.top && y <= r.bottom) return el
+    }
+    return null
+  }
   const document = {
     body,
-    elementFromPoint: () => page.topAtCenter,
+    // 项 6：脚本现在会按坐标问命中、还会采样外部控件。
+    querySelectorAll: (selector: string): FakeEl[] =>
+      all.filter(el => selector.split(',').some(part => FakeEl.matches(el, part.trim()))),
+    elementFromPoint: (x: number, y: number): FakeEl | null => {
+      if (page.hitAt !== undefined) return page.hitAt(x, y)
+      if (x === center.x && y === center.y) return page.topAtCenter
+      return rectHit(x, y)
+    },
   }
   const window = { innerWidth: VIEW.width, innerHeight: VIEW.height }
   const script = new Function(
@@ -196,9 +226,21 @@ function zhihuLikeOverlay(overrides: ElInit = {}): FakeEl {
   return wrapper.add(backdrop, inner)
 }
 
-/** 页面壳：body 下挂一个浮层浮层 + 一段正文。 */
+/** 页面壳：body 下挂一段带控件的正文 + 浮层（浮层在后 = 盖在上面）。
+ *
+ * 项 6 起，探测脚本会采样「分层元素之外」的可操作控件来判断真遮挡 —— 没有外部控件
+ * 的页面会被判成「正常 fixed main」。所以缺省给一层被盖住的正文按钮，代表「页面本来
+ * 有、被浮层盖住了的控件」；要验「正常 fixed main 不误报」的用例自己搭不带外部控件的页。
+ */
 function pageWith(overlay: FakeEl, hitTarget: FakeEl | null = null): FakePage {
-  const body = new FakeEl({ tag: 'DIV' }).add(overlay)
+  const contentButton = new FakeEl({
+    tag: 'BUTTON',
+    className: 'ContentButton',
+    text: '正文按钮',
+    rect: { left: 100, top: 100, right: 220, bottom: 140 },
+  })
+  const content = new FakeEl({ tag: 'DIV', className: 'PageContent' }).add(contentButton)
+  const body = new FakeEl({ tag: 'DIV' }).add(content, overlay)
   return { body, topAtCenter: hitTarget }
 }
 
@@ -287,5 +329,113 @@ describe('浮层取名（P0-a）', () => {
 
     // 无定位祖先 → while 会爬到 body 然后 `return null`。
     expect(runOverlayScript({ body, topAtCenter: article })).toBeNull()
+  })
+
+  // ---- 项 6（2026-10-07）：普通 fixed main 不再误报，真遮罩照报 ----
+
+  it('普通 fixed main（可操作内容全在其中）不报 OVERLAY（Google 误报形状）', () => {
+    // Google 的形状：main 是 fixed 且盖满视口，控件全在它里面 —— 旧判据单看
+    // 「fixed + ≥60%」把它误报成浮层。现在外部控件采样为空 → 不是遮挡。
+    const button = new FakeEl({
+      tag: 'BUTTON', className: 'Send', text: '发送',
+      rect: { left: 700, top: 700, right: 820, bottom: 740 },
+    })
+    const main = new FakeEl({
+      tag: 'MAIN', className: 'PageMain', position: 'fixed',
+      rect: { left: 0, top: 0, right: VIEW.width, bottom: VIEW.height },
+    }).add(button)
+    const body = new FakeEl({ tag: 'DIV' }).add(main)
+
+    expect(runOverlayScript({ body, topAtCenter: main })).toBeNull()
+  })
+
+  it('无 role / 无标签的真实遮罩照报：外部控件全部被盖', () => {
+    const button = new FakeEl({
+      tag: 'BUTTON', className: 'Submit', text: '提交',
+      rect: { left: 100, top: 100, right: 220, bottom: 140 },
+    })
+    const main = new FakeEl({ tag: 'MAIN', className: 'PageMain', rect: FULL_RECT }).add(button)
+    const backdrop = new FakeEl({
+      tag: 'DIV', className: 'Modal-backdrop', position: 'fixed',
+      rect: { left: 0, top: 0, right: VIEW.width, bottom: VIEW.height },
+    })
+    const body = new FakeEl({ tag: 'DIV' }).add(main, backdrop)
+
+    // 外部按钮的中心命中落在遮罩上（被盖）→ 报；遮罩无 dialog / aria-label / 文本也照报。
+    const probe = runOverlayScript({ body, topAtCenter: backdrop })
+    expect(probe).not.toBeNull()
+    expect(probe?.hint).toBe('.Modal-backdrop')
+  })
+
+  it('外部控件仍有可达者时不报（页面没有被盖死）', () => {
+    const reachable = new FakeEl({
+      tag: 'BUTTON', className: 'Reachable', text: '可达',
+      rect: { left: 100, top: 600, right: 220, bottom: 640 },
+    })
+    const covered = new FakeEl({
+      tag: 'BUTTON', className: 'Covered', text: '被盖',
+      rect: { left: 100, top: 100, right: 220, bottom: 140 },
+    })
+    const main = new FakeEl({ tag: 'MAIN', className: 'PageMain', rect: FULL_RECT }).add(reachable, covered)
+    const backdrop = new FakeEl({
+      tag: 'DIV', className: 'Partial-backdrop', position: 'fixed',
+      // 只盖上半 70%：covered 在盖内，reachable 在盖外。
+      rect: { left: 0, top: 0, right: VIEW.width, bottom: Math.round(VIEW.height * 0.7) },
+    })
+    const body = new FakeEl({ tag: 'DIV' }).add(main, backdrop)
+
+    const probe = runOverlayScript({ body, topAtCenter: backdrop })
+    expect(probe).toBeNull()
+  })
+
+  // ---- 第 6 项（2026-10-08 独立验收）：/plain 的主内容 main 盖住头部链接也不许报 ----
+
+  it('主内容区 main 盖住页头链接（/plain 夹具形状）不报 OVERLAY', () => {
+    // fixture.mjs /plain 的真实形状：h1/目录/章节链接在前，`main.fixed{inset:0;
+    // background:white}` 在文档序最后、盖满整页 —— 两个链接的中心命中全落在 main 上，
+    // 「外部控件全被盖」判据成立，旧判据把主内容区误报成 OVERLAY。
+    // main/[role=main] 是页面主内容地标，语义上不是浮层；真遮罩从不长成 main。
+    const heading = new FakeEl({
+      tag: 'DIV', className: 'Heading', text: '独立复验 /plain',
+      rect: { left: 0, top: 0, right: VIEW.width, bottom: 60 },
+    })
+    const toc = new FakeEl({ tag: 'A', className: 'Toc', text: '目录', rect: { left: 0, top: 64, right: 60, bottom: 88 } })
+    const chapter = new FakeEl({ tag: 'A', className: 'Chapter', text: '章节', rect: { left: 64, top: 64, right: 130, bottom: 88 } })
+    const button = new FakeEl({
+      tag: 'BUTTON', text: '正常 fixed 按钮',
+      rect: { left: 100, top: 100, right: 300, bottom: 140 },
+    })
+    const main = new FakeEl({
+      tag: 'MAIN', className: 'fixed', position: 'fixed',
+      rect: { left: 0, top: 0, right: VIEW.width, bottom: VIEW.height },
+    }).add(button)
+    const body = new FakeEl({ tag: 'DIV' }).add(heading, toc, chapter, main)
+
+    expect(runOverlayScript({ body, topAtCenter: main })).toBeNull()
+  })
+
+  it('[role=main] 的主内容区同样豁免，普通 div 遮罩不受影响（反向）', () => {
+    const roleMain = new FakeEl({
+      tag: 'DIV', className: 'AppMain', position: 'fixed',
+      attrs: { role: 'main' }, rect: FULL_RECT,
+    })
+    const body = new FakeEl({ tag: 'DIV' }).add(roleMain)
+    expect(runOverlayScript({ body, topAtCenter: roleMain })).toBeNull()
+
+    // 反向：无标签 div 遮罩 + 外部控件全被盖，照报（第 6 项的 /overlay 形状）。
+    const covered = new FakeEl({
+      tag: 'BUTTON', text: '被盖住的按钮',
+      rect: { left: 100, top: 100, right: 220, bottom: 140 },
+    })
+    const mask = new FakeEl({
+      tag: 'DIV', id: 'mask', position: 'fixed',
+      rect: { left: 0, top: 0, right: VIEW.width, bottom: VIEW.height },
+    })
+    const maskButton = new FakeEl({ tag: 'BUTTON', text: '关闭遮罩', rect: { left: 400, top: 300, right: 520, bottom: 340 } })
+    mask.add(maskButton)
+    const body2 = new FakeEl({ tag: 'DIV' }).add(covered, mask)
+    const probe = runOverlayScript({ body: body2, topAtCenter: mask })
+    expect(probe).not.toBeNull()
+    expect(probe?.hint).toBe('#mask')
   })
 })

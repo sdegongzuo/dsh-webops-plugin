@@ -211,6 +211,21 @@ export interface OutlineLine {
   readonly text: string
   /** 该行绑定了一个可操作元素时，是它在 `rows` 里的下标。 */
   readonly targetRow?: number
+  /**
+   * 该行的**未裁切**可访问性名称（原始空白与换行保留，超长截断到 {@link MAX_TEXT_READ_CHARS}）。
+   *
+   * 项 3（2026-10-07）：大纲行默认裁到 120 字符，MDN 长段落与代码行尾部模型永远看不到，
+   * 而抬 max_lines 只会重印整页、救不回同一行里被裁掉的部分。这里把裁掉的部分留在底稿行上，
+   * 供 webpage_find(full_text=true) 只读取回 —— 不改大纲打印、不加模型上下文。
+   */
+  readonly full?: string
+  /**
+   * 该行所在**同级 statictext 组**的完整文本（各成员未裁切名称按序以 '\n' 连接，截断规则同上）。
+   *
+   * 代码块在 AX 里被高亮拆成一串 statictext 行，单行 full 拿不到整块；同一个容器的同级
+   * statictext 合起来才是完整代码（换行与缩进保留）。 ≥2 个同级 statictext 才产出。
+   */
+  readonly block?: string
 }
 
 /** 大纲构建结果。 */
@@ -277,6 +292,18 @@ export interface SnapshotOutline {
 function clip(raw: string, maxLength: number): string {
   const text = raw.replace(/\s+/gu, ' ').trim()
   return text.length <= maxLength ? text : `${text.slice(0, maxLength - 1)}…`
+}
+
+/**
+ * 正文读取（项 3）单条文本的硬上限。原始名称不进模型上下文、只经 find(full_text) 按需读取，
+ * 但一个 10MB 的 text 节点照样能把缓存撑爆 —— 截断要带账目（少了多少字符），不静默丢尾。
+ */
+const MAX_TEXT_READ_CHARS = 4000
+
+/** 正文读取的截断标记：显式声明被截掉多少，模型不会把截断当成完整结尾。 */
+function capTextRead(raw: string): string {
+  if (raw.length <= MAX_TEXT_READ_CHARS) return raw
+  return `${raw.slice(0, MAX_TEXT_READ_CHARS - 1)}… [truncated, ${String(raw.length - (MAX_TEXT_READ_CHARS - 1))} more chars]`
 }
 
 /** 读取 `{ type, value }` 包装里的可展示文本。 */
@@ -400,30 +427,38 @@ export function buildOutline(
   const threshold = limits.foldRepeatThreshold ?? DEFAULT_FOLD_REPEAT_THRESHOLD
 
   // ---- 第一遍：全量走树，产出候选行（不结算预算）----
-  const candidates: { depth: number; text: string; role: string; name: string; targetRow?: number; foldKey?: string }[] = []
+  const candidates: { depth: number; text: string; role: string; name: string; raw: string; parentAxId?: string | undefined; targetRow?: number; foldKey?: string }[] = []
   const rows: RefPublishRow[] = []
   const visited = new Set<string>()
   let truncated = false
   let droppedElements = 0
 
-  const visit = (node: AxNode, depth: number, ancestors: readonly string[]): void => {
+  const visit = (node: AxNode, depth: number, ancestors: readonly string[], parentAxId?: string): void => {
     if (visited.has(node.nodeId)) return
     visited.add(node.nodeId)
 
     const role = roleOf(node)
-    const name = clip(stringValue(node.name) ?? '', limits.maxTextLength)
+    const raw = stringValue(node.name) ?? ''
+    const name = clip(raw, limits.maxTextLength)
     const transparent = node.ignored === true || TRANSPARENT_ROLES.has(role)
     const actionable = !transparent && ACTIONABLE_ROLES.has(role)
+    // 项 3 补正（2026-10-08）：heading 也发 ref，但标成**只读锚点**（anchor=true）——
+    // 同名标题的正文块定位需要它：find 拿到两条同名标题各自的锚点，
+    // webpage_snapshot(region_ref=锚点) 读的就是那一节的正文。锚点只授予读权限
+    // （region/locate/截图），click/fill/press 在 provider 侧就拒绝 —— 文本定位
+    // 不凭空增加点击权限。其余非可操作行仍不发：逐 statictext 发 ref 会撑爆 ref 表。
+    const anchorRow = !actionable && role === 'heading' && typeof node.backendDOMNodeId === 'number'
 
     let childDepth = depth
     const text = transparent ? undefined : renderLine(node, role, name, limits.maxTextLength, actionable)
     if (text !== undefined) {
-      const targetRow = actionable && typeof node.backendDOMNodeId === 'number'
+      const targetRow = (actionable || anchorRow) && typeof node.backendDOMNodeId === 'number'
         ? rows.push({
           role,
           name,
           backendNodeId: node.backendDOMNodeId,
           ancestorPath: ancestors.join('>'),
+          ...(anchorRow ? { anchor: true as const } : {}),
         }) - 1
         : undefined
       // 只有「可操作 + 有名字 + 不是 statictext」的行才可能被折叠：
@@ -438,6 +473,8 @@ export function buildOutline(
         text,
         role,
         name,
+        raw,
+        parentAxId,
         ...targetRow !== undefined ? { targetRow } : {},
         ...foldKey !== undefined ? { foldKey } : {},
       })
@@ -457,7 +494,7 @@ export function buildOutline(
     for (const childId of node.childIds ?? []) {
       const child = byId.get(childId)
       if (child === undefined) continue
-      visit(child, childDepth, nextAncestors)
+      visit(child, childDepth, nextAncestors, node.nodeId)
     }
   }
 
@@ -620,11 +657,41 @@ export function buildOutline(
   let foldedRepeats = 0
   let dedupedLines = 0
 
+  // 正文读取（项 3，2026-10-07；MDN-B 2026-10-08 修正连接方式）：代码块在 AX 里被高亮拆成
+  // 一串同级 statictext。Chromium 的 staticText 对应 DOM 文本节点——**空白/换行本身就是
+  // 独立的 run**（MDN 实测：token 间夹着 " "、"\n  " 这样的空白节点），所以按序**原样连接**
+  // （join('')）就是渲染出的原文。任何外加分隔符都是往原文里塞页面没有的字符：
+  // 旧实现 join('\n') 把 `function checkData() {…}` 打成每 token 一行，模板字符串里也多出
+  // 换行，代码格式与字符串语义都被改掉（证据 MDN-code-format-mismatch.json）。
+  // 分组按 **AX 树的父节点** 而不是候选行链：generic 容器是透明层，不产候选行。
+  const staticByParent = new Map<string, string[]>()
+  for (const candidate of candidates) {
+    if (candidate.role !== 'statictext' || candidate.parentAxId === undefined) continue
+    const list = staticByParent.get(candidate.parentAxId)
+    if (list === undefined) staticByParent.set(candidate.parentAxId, [candidate.raw])
+    else list.push(candidate.raw)
+  }
+  const blockTextOf = (index: number): string | undefined => {
+    const self = candidates[index]
+    if (self === undefined || self.role !== 'statictext' || self.parentAxId === undefined) return undefined
+    const siblings = staticByParent.get(self.parentAxId)
+    if (siblings === undefined || siblings.length < 2) return undefined
+    // 首尾缩进与换行也属于代码原文，不裁掉它们。
+    const block = siblings.join('')
+    return block.length > self.raw.length ? capTextRead(block) : undefined
+  }
+
   for (const [index, candidate] of candidates.entries()) {
+    const full = candidate.raw.length > 0 && candidate.raw !== candidate.name
+      ? capTextRead(candidate.raw)
+      : undefined
+    const block = blockTextOf(index)
     const line: OutlineLine = {
       depth: candidate.depth,
       text: candidate.text,
       ...candidate.targetRow !== undefined ? { targetRow: candidate.targetRow } : {},
+      ...full !== undefined ? { full } : {},
+      ...block !== undefined ? { block } : {},
     }
     const foldedAway = hiddenRows.has(index)
     if (foldedAway || redundantRows.has(index)) {
@@ -729,7 +796,9 @@ export function renderOutline(
     .map((line) => {
       const indent = '  '.repeat(line.depth)
       const target = line.targetRow === undefined ? undefined : refs[line.targetRow]
-      return target === undefined ? `${indent}- ${line.text}` : `${indent}- ${line.text} [ref=${target.ref}]`
+      // 只读锚点显式写成 `[anchor=…]`：与可操作 ref 一眼可辨 —— 它定位内容，不能点击。
+      if (target === undefined) return `${indent}- ${line.text}`
+      return `${indent}- ${line.text} [${target.anchor === true ? 'anchor' : 'ref'}=${target.ref}]`
     })
     .join('\n')
 }

@@ -49,9 +49,10 @@ describe('buildOutline', () => {
     expect(outline.rows).toEqual([{ role: 'button', name: 'Go', backendNodeId: 1, ancestorPath: '' }])
   })
 
-  it('assigns refs to actionable roles only', () => {
+  it('分配交互 ref 与明确标记的只读标题锚点', () => {
     const outline = buildOutline(PAGE)
     expect(outline.rows).toEqual([
+      { role: 'heading', name: 'Welcome back', backendNodeId: 3, ancestorPath: '', anchor: true },
       { role: 'textbox', name: 'Email', backendNodeId: 4, ancestorPath: '' },
       { role: 'button', name: 'Sign in', backendNodeId: 5, ancestorPath: '' },
     ])
@@ -621,5 +622,103 @@ describe('geometry region helpers', () => {
     expect(filtered.find(item => item.nodeId === '2')?.childIds).toEqual(['3'])
     const outline = buildOutline(filtered)
     expect(outline.rows.map(row => row.name)).toEqual(['In'])
+  })
+})
+
+describe('buildOutline：正文读取（项 3 · 2026-10-07）', () => {
+  const LONG_PARAGRAPH = 'This is a very long paragraph whose tail carries a unique marker: '
+    + 'x'.repeat(140) + ' TAIL_MARKER_9F2.'
+  /** 造一棵「长段落 + 代码块（同级 statictext 被高亮拆行）」的树。 */
+  const READ_PAGE: AxNode[] = [
+    node({ nodeId: '1', role: { value: 'RootWebArea' }, childIds: ['2'], backendDOMNodeId: 1 }),
+    node({ nodeId: '2', role: { value: 'generic' }, childIds: ['3', '4'], backendDOMNodeId: 2 }),
+    node({ nodeId: '3', role: { value: 'heading' }, name: { value: 'Example' }, backendDOMNodeId: 3 }),
+    node({ nodeId: '4', role: { value: 'statictext' }, name: { value: LONG_PARAGRAPH }, backendDOMNodeId: 4 }),
+  ]
+
+  it('keeps the unclipped paragraph tail on the outline line without printing it', () => {
+    const outline = buildOutline(READ_PAGE)
+    // 打印行仍然裁到 120：大纲不加价。
+    expect(outline.lines.some(line => line.text.includes('TAIL_MARKER_9F2'))).toBe(false)
+    // 底稿行带着未裁切全文（换行/缩进原样），尾部标记能被 full_text 读取拿到。
+    const full = outline.unfoldedLines.find(line => line.full?.includes('TAIL_MARKER_9F2'))
+    expect(full?.full).toBe(LONG_PARAGRAPH)
+  })
+
+  it('concatenates sibling statictext runs verbatim: runs already carry the whitespace', () => {
+    // 真实 Chromium AX 形状：高亮把代码拆成一段段 staticText，**空白/换行本身也是独立的
+    // staticText run**（对应 DOM 里的空白文本节点）。按序原样连接就是渲染出的原文；
+    // 任何外加分隔符（旧的 '\n'）都是往原文里塞页面没有的字符。
+    const tree: AxNode[] = [
+      node({ nodeId: '1', role: { value: 'RootWebArea' }, childIds: ['2'], backendDOMNodeId: 1 }),
+      node({ nodeId: '2', role: { value: 'generic' }, childIds: ['3'], backendDOMNodeId: 2 }),
+      node({ nodeId: '3', role: { value: 'generic' }, childIds: ['4', '5', '6'], backendDOMNodeId: 3 }),
+      node({ nodeId: '4', role: { value: 'statictext' }, name: { value: 'function countSelected() {' }, backendDOMNodeId: 4 }),
+      node({ nodeId: '5', role: { value: 'statictext' }, name: { value: '\n  return 1;\n' }, backendDOMNodeId: 5 }),
+      node({ nodeId: '6', role: { value: 'statictext' }, name: { value: '}' }, backendDOMNodeId: 6 }),
+    ]
+    const outline = buildOutline(tree)
+    const block = outline.unfoldedLines.find(line => line.block !== undefined)?.block
+    expect(block).toBe('function countSelected() {\n  return 1;\n}')
+  })
+
+  it('MDN-B（2026-10-08 独立验收）：token 级高亮 run 拼回的是原始连续代码，不是逐 token 换行', () => {
+    // 证据 MDN-code-format-mismatch.json：Control_flow_and_error_handling 的 checkData
+    // 在 AX 里被拆成 token 级 staticText（"function"、" "、"checkData"、…，空白 run 单独成节点），
+    // 旧实现按 '\n' join，把 `function checkData() {…}` 打成了每 token 一行，模板字符串里
+    // 也多出换行 —— 代码格式与字符串语义都被改掉。真实 shadowRoot.textContent 是连续原文。
+    const tokens = [
+      'function', ' ', 'checkData', '(', ')', ' ', '{', '\n  ',
+      'if', ' ', '(', 'document', '.', 'form1', '.', 'threeChar', '.', 'value', '.', 'length',
+      ' ', '===', ' ', '3', ')', ' ', '{', '\n    ',
+      'return', ' ', 'true', ';', '\n  ',
+      '}', '\n  ',
+      'alert', '(', '\n    ',
+      '`', '\nEnter exactly three characters. ', '${', 'document', '.', 'form1', '.', 'threeChar', '.', 'value', '}',
+      ' is not valid.', '`', ',', '\n  ',
+      ')', ';', '\n  ',
+      'return', ' ', 'false', ';', '\n',
+      '}',
+    ]
+    const original = tokens.join('')
+    // 与证据里 mdn-code-example.shadowRoot.textContent 的代码段逐字一致：
+    // 模板字符串内部的真实换行（` 后的 \n）属于原文，必须保留。
+    expect(original).toBe(
+      'function checkData() {\n'
+      + '  if (document.form1.threeChar.value.length === 3) {\n'
+      + '    return true;\n'
+      + '  }\n'
+      + '  alert(\n'
+      + '    `\nEnter exactly three characters. ${document.form1.threeChar.value} is not valid.`,\n'
+      + '  );\n'
+      + '  return false;\n'
+      + '}',
+    )
+    const tree: AxNode[] = [
+      node({ nodeId: '1', role: { value: 'RootWebArea' }, childIds: ['2'], backendDOMNodeId: 1 }),
+      node({ nodeId: '2', role: { value: 'generic' }, childIds: ['3'], backendDOMNodeId: 2 }),
+      node({ nodeId: '3', role: { value: 'generic' }, childIds: tokens.map((_, i) => String(10 + i)), backendDOMNodeId: 3 }),
+      ...tokens.map((token, i) => node({
+        nodeId: String(10 + i),
+        role: { value: 'statictext' },
+        name: { value: token },
+        backendDOMNodeId: 10 + i,
+      })),
+    ]
+    const outline = buildOutline(tree)
+    const block = outline.unfoldedLines.find(line => line.block !== undefined)?.block
+    expect(block).toBe(original)
+  })
+
+  it('caps oversized text with an explicit truncation account, not a silent cut', () => {
+    const tree: AxNode[] = [
+      node({ nodeId: '1', role: { value: 'RootWebArea' }, childIds: ['2'], backendDOMNodeId: 1 }),
+      node({ nodeId: '2', role: { value: 'generic' }, childIds: ['3'], backendDOMNodeId: 2 }),
+      node({ nodeId: '3', role: { value: 'statictext' }, name: { value: 'y'.repeat(5000) }, backendDOMNodeId: 3 }),
+    ]
+    const outline = buildOutline(tree)
+    const full = outline.unfoldedLines.find(line => line.full !== undefined)?.full ?? ''
+    expect(full.length).toBeLessThanOrEqual(4100)
+    expect(full).toContain('more chars')
   })
 })

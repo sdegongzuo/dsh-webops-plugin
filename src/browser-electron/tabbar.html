@@ -46,6 +46,19 @@
     flex: 0 0 40px; height: 40px; padding: 0 6px;
     border-bottom: 1px solid var(--line);
   }
+  /* —— 标签行（L1，2026-10-07）——
+     标签放在独立的横向滚动容器里：`#new` 与右侧控制权区（#hint/#holder/#control）
+     都在滚动区外，`flex: 0 0 auto` 永不被压缩 —— 标签再多（min-width:90px × 17 个
+     早就溢出 1560px 窗口）也只能挤滚动区自己，接管按钮结构上不可能再被推出窗口。
+     滚动条做成 4px 细条，不占 40px 行高的视觉空间。 */
+  #tabs {
+    display: flex; align-items: center; gap: 4px;
+    flex: 1 1 0; min-width: 0;
+    overflow-x: auto; overflow-y: hidden;
+  }
+  #tabs::-webkit-scrollbar { height: 4px; }
+  #tabs::-webkit-scrollbar-track { background: transparent; }
+  #tabs::-webkit-scrollbar-thumb { background: rgba(127,127,127,0.3); border-radius: 2px; }
   #navbar {
     display: flex; align-items: center; gap: 4px;
     flex: 0 0 36px; height: 36px; padding: 0 6px;
@@ -69,6 +82,7 @@
   #url:focus { border-color: var(--accent); }
   .tab {
     display: flex; align-items: center; gap: 6px;
+    flex: 0 0 auto;
     max-width: 220px; min-width: 90px; height: 28px; padding: 0 6px 0 10px;
     border-radius: 6px; cursor: pointer;
     background: transparent; color: var(--fg-dim);
@@ -119,7 +133,7 @@
 <body>
   <div id="bar">
     <button id="new" title="新建标签页">+</button>
-    <span id="hint"></span>
+    <div id="tabs"><span id="hint"></span></div>
     <span id="holder"></span>
     <button id="control" type="button" disabled></button>
   </div>
@@ -131,6 +145,7 @@
   </div>
 <script>
   const bar = document.getElementById('bar')
+  const tabsBox = document.getElementById('tabs')
   const hint = document.getElementById('hint')
   const urlInput = document.getElementById('url')
   const navBack = document.getElementById('back')
@@ -139,9 +154,17 @@
   document.getElementById('new').addEventListener('click', () => {
     window.dshTabBar?.create()
   })
+  // 标签条只滚自己：鼠标滚轮在标签行上默认走纵向，而这里唯一要滚的是横向 ——
+  // 把 deltaY 折算进 scrollLeft，不按键就能滚到被挤出可视区的标签。
+  tabsBox.addEventListener('wheel', (event) => {
+    if (event.deltaY === 0) return
+    event.preventDefault()
+    tabsBox.scrollLeft += event.deltaY
+  }, { passive: false })
 
   function render(tabs) {
-    bar.querySelectorAll('.tab').forEach(node => node.remove())
+    tabsBox.querySelectorAll('.tab').forEach(node => node.remove())
+    let activeNode = null
     for (const tab of tabs) {
       const node = document.createElement('div')
       node.className = 'tab'
@@ -164,8 +187,13 @@
       node.appendChild(close)
 
       node.addEventListener('click', () => { window.dshTabBar?.select(tab.id) })
-      bar.insertBefore(node, hint)
+      tabsBox.insertBefore(node, hint)
+      if (tab.active) activeNode = node
     }
+    // 活动标签滚进可视区：标签多到要滚动时，切到后台标签不能让人自己找。
+    // （容器外的 #holder/#control 不受影响——ShiftTab 聚焦按钮也不会再拖动整栏横移，
+    // 那正是独立验收截图里地址栏被截断的机制。）
+    activeNode?.scrollIntoView({ block: 'nearest', inline: 'nearest' })
     hint.textContent = tabs.length === 0 ? '（没有打开的标签页）' : ''
   }
 
@@ -173,10 +201,21 @@
 
   // 地址栏状态：输入框没有聚焦时才跟随 url 更新（用户正在手动输入时别抢内容），
   // 前进/后退按钮的 disabled 跟随 canGoBack / canForward（没有历史就置灰）。
+  //
+  // 聚焦期间的推送**不能丢**：记下最新状态，失焦时重放一次。否则最后一次推送若正好
+  // 落在聚焦窗口里，地址栏会永久停在旧 URL（页面已经换址也没有任何事件再推），这正是
+  // 2026-10-07 MDN 实测「操作条停留在前一章节 URL」的可复现机制之一。
+  let lastNavState = { url: '', canGoBack: false, canForward: false }
   window.dshTabBar?.onNavState((state) => {
+    lastNavState = state
     if (document.activeElement !== urlInput) urlInput.value = state.url
     navBack.disabled = !state.canGoBack
     navForward.disabled = !state.canForward
+  })
+  urlInput.addEventListener('blur', () => {
+    if (document.activeElement !== urlInput && urlInput.value !== lastNavState.url) {
+      urlInput.value = lastNavState.url
+    }
   })
 
   // —— 控制权（§6.5）——

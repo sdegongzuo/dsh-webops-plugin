@@ -5,6 +5,7 @@
 以独占方式打开文件，直接 PermissionDenied；Python 的 open() 走共享读，能正常压。
 用法：
     python scripts/zip-stage.py --stage .desktop-stage-026 --out dist/.building-xxx.zip
+保留式打包加 --no-overwrite：独占创建新 ZIP，不删除或覆盖已有输出。
 参数缺省时压 `.desktop-stage`。压完自动 testzip + 打印 sha256。
 """
 
@@ -26,12 +27,16 @@ def main() -> int:
     ap.add_argument('--stage', default='.desktop-stage')
     ap.add_argument('--out', required=True)
     ap.add_argument('--level', type=int, default=1, help='deflate 级别，1=Fastest（与脚本一致）')
+    ap.add_argument('--no-overwrite', action='store_true', help='仅创建新 ZIP；已有输出及竞争创建均拒绝，不执行删除')
     args = ap.parse_args()
 
     stage = args.stage if os.path.isabs(args.stage) else os.path.join(ROOT, args.stage)
     out = args.out if os.path.isabs(args.out) else os.path.join(ROOT, args.out)
     if not os.path.isdir(stage):
         print(f'zip-stage: 暂存目录不存在：{stage}', file=sys.stderr)
+        return 1
+    if args.no_overwrite and os.path.exists(out):
+        print(f'zip-stage: 目标已存在，保留模式拒绝覆盖：{out}', file=sys.stderr)
         return 1
 
     t0 = time.time()
@@ -48,9 +53,14 @@ def main() -> int:
             dirs.append(arc)
     print(f'zip-stage: {stage} -> {out}（文件 {len(files)}，目录 {len(dirs)}）')
 
-    if os.path.exists(out):
+    if not args.no_overwrite and os.path.exists(out):
         os.remove(out)
-    with zipfile.ZipFile(out, 'w', zipfile.ZIP_DEFLATED, compresslevel=args.level) as z:
+    try:
+        archive = zipfile.ZipFile(out, 'x' if args.no_overwrite else 'w', zipfile.ZIP_DEFLATED, compresslevel=args.level)
+    except FileExistsError:
+        print(f'zip-stage: 压缩前目标出现，保留模式拒绝覆盖：{out}', file=sys.stderr)
+        return 1
+    with archive as z:
         for arc in dirs:
             zi = zipfile.ZipInfo(arc + '/', date_time=(2026, 9, 17, 18, 13, 0))
             zi.external_attr = 0x10  # 目录位

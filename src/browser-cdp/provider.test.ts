@@ -86,6 +86,11 @@ class FakeChrome {
   pageMetaFailReads = 0
   /** P1：wait-hidden 里元素是否还连在文档上。 */
   elementConnected = true
+  /**
+   * wait(ref_state='hidden')：元素此刻是否「在文档里但不可见」（display:none 等）。
+   * 与 `elementConnected` 正交：连着但藏起来了 ≠ 被移除。
+   */
+  elementHidden = false
   /** 写前门：元素所在**子文档**的地址（null = 元素在顶层文档）。用于验 iframe 不误伤。 */
   frameHref: string | null = null
   /** 写前门：true = 子 frame 跨源，顶层地址读不到（脚本抛 SecurityError → 门没证据）。 */
@@ -109,8 +114,14 @@ class FakeChrome {
   responseBody = 'pong'
   /** P3：`getBoundingClientRect` 的返回值（locate / click 共用）。 */
   elementRect = { x: 10, y: 20, width: 100, height: 40 }
-  /** P3：视口尺寸（locate 的 `in_viewport` 与「不带 ref 的 scroll」都要它）。 */
-  viewport = { width: 1280, height: 720 }
+  /**
+   * P3：rect 序列——按调用次序逐个消费，耗尽后回落到 `elementRect`。
+   * 模拟 smooth 滚动（CSS `scroll-behavior: smooth`）：`scrollIntoView` 后立即量到的是
+   * 滚动前的旧布局，要等动画推进后重测才能看到目标真的进入视口。
+   */
+  elementRectSequence: { x: number; y: number; width: number; height: number }[] = []
+  /** P3：视口尺寸（locate 的 `in_viewport` 与「不带 ref 的 scroll」都要它）；`undefined` 模拟读不到。 */
+  viewport: { width: number; height: number } | undefined = { width: 1280, height: 720 }
   /** P3：设置后 `DOM.resolveNode` 抛这条消息（模拟节点已被销毁）。 */
   resolveNodeError: string | undefined
   /** P2：设置后，含 `throw` 的表达式返回 `exceptionDetails`（异常文本）。 */
@@ -144,6 +155,13 @@ class FakeChrome {
   canActivate = false
   /** B1-e：被切到前台的 targetId 流水。 */
   readonly activateCalls: string[] = []
+  /**
+   * L2（2026-10-08）：页面级 `document.visibilityState`；`undefined` = 不挂这条
+   * evaluate 分支（保持既有用例「读不到可见性」的形状）。
+   */
+  visibilityState: string | undefined = undefined
+  /** L2：activateTarget 成功后 visibilityState 变成什么；`undefined` = 激活不改可见性。 */
+  visibilityAfterActivate: string | undefined = undefined
   /** B2-d：视口中心浮层探测的返回值；`null` = 没有浮层。 */
   overlay: { role: string; name: string; hint: string } | null = null
   /**
@@ -188,6 +206,11 @@ class FakeChrome {
         return {}
       case 'Runtime.evaluate': {
         const expression = String(params['expression'])
+        // L2：页面级可见性。只在夹具显式挂上时才应答 —— 缺省走兜底对象，
+        // provider 的 readVisibilityState 对非字符串返回 undefined（不做无证据拒绝）。
+        if (expression === 'document.visibilityState' && this.visibilityState !== undefined) {
+          return { result: { value: this.visibilityState } }
+        }
         // B2-d：视口中心浮层探测。判据串 `elementFromPoint` 只有这条脚本里有；
         // 缺省 `null` = 没有浮层。
         if (expression.includes('elementFromPoint')) {
@@ -240,8 +263,31 @@ class FakeChrome {
       }
       case 'Runtime.callFunctionOn': {
         const fn = String(params['functionDeclaration'])
+        // wait(ref_state='hidden') 的等待条件：成功 = 元素还连着文档且已不可见。
+        // 脚本里含 `checkVisibility`（与其它 wait 探测共用串没有），先于 isConnected 分支判。
+        if (fn.includes('checkVisibility') && fn.includes('isConnected') && fn.includes('return false')) {
+          return { result: { value: this.elementConnected && this.elementHidden } }
+        }
+        // wait 超时后的三态探测（项 2）：`laidOut` 是该脚本独有的局部变量名 ——
+        // 返回 'removed' / 'visible' / 'hidden' 字符串，不是 boolean。
+        if (fn.includes('getBoundingClientRect') && fn.includes('laidOut')) {
+          if (!this.elementConnected) return { result: { value: 'removed' } }
+          const rect = this.elementRectSequence[0] ?? this.elementRect
+          const laidOut = rect.width > 0 && rect.height > 0 && !this.elementHidden
+          return { result: { value: laidOut ? 'visible' : 'hidden' } }
+        }
         if (fn.includes('getBoundingClientRect')) {
-          return { result: { value: { ...this.elementRect, viewportWidth: this.viewport.width, viewportHeight: this.viewport.height } } }
+          const next = this.elementRectSequence.shift()
+          const rect = next ?? this.elementRect
+          return {
+            result: {
+              value: {
+                ...rect,
+                viewportWidth: this.viewport?.width,
+                viewportHeight: this.viewport?.height,
+              },
+            },
+          }
         }
         if (fn.includes('!this.isConnected')) {
           // wait-hidden 的判据：true = 元素已从文档移除。
@@ -307,12 +353,13 @@ class FakeChrome {
         }
       case 'Page.getLayoutMetrics':
         if (this.layoutMetricsOverride !== undefined) return this.layoutMetricsOverride
+        // viewport 可能是 undefined（模拟视口尺寸读不到）：布局度量按缺省视口给。
         return {
           visualViewport: {
             pageX: 0,
             pageY: 0,
-            clientWidth: this.viewport.width,
-            clientHeight: this.viewport.height,
+            clientWidth: this.viewport?.width ?? 1280,
+            clientHeight: this.viewport?.height ?? 720,
             offsetX: 0,
             offsetY: 0,
             scale: 1,
@@ -320,8 +367,8 @@ class FakeChrome {
           layoutViewport: {
             pageX: 0,
             pageY: 0,
-            clientWidth: this.viewport.width,
-            clientHeight: this.viewport.height,
+            clientWidth: this.viewport?.width ?? 1280,
+            clientHeight: this.viewport?.height ?? 720,
           },
         }
       case 'DOMSnapshot.captureSnapshot':
@@ -435,6 +482,7 @@ class FakeChrome {
         ? {
           activateTarget: (targetId: string): Promise<void> => {
             chrome.activateCalls.push(targetId)
+            if (chrome.visibilityAfterActivate !== undefined) chrome.visibilityState = chrome.visibilityAfterActivate
             return Promise.resolve()
           },
         }
@@ -624,13 +672,32 @@ describe('CdpBrowserProvider', () => {
     if (snapshot.kind !== 'snapshot') throw new Error('expected a snapshot')
     expect(snapshot.epoch).toBe(1)
     expect(snapshot.refs).toEqual([
-      { ref: 'e1', role: 'textbox', name: 'Email' },
-      { ref: 'e2', role: 'button', name: 'Submit' },
+      { ref: 'e1', role: 'heading', name: 'Hello', anchor: true },
+      { ref: 'e2', role: 'textbox', name: 'Email' },
+      { ref: 'e3', role: 'button', name: 'Submit' },
     ])
-    expect(snapshot.outline).toContain('textbox "Email" [ref=e1]')
-    expect(snapshot.outline).toContain('button "Submit" [ref=e2]')
+    expect(snapshot.outline).toContain('textbox "Email" [ref=e2]')
+    expect(snapshot.outline).toContain('button "Submit" [ref=e3]')
     expect(snapshot.url).toBe('https://example.com/')
     expect(snapshot.truncated).toBe(false)
+  })
+
+  it('只读标题锚点拒绝 click/fill/press，三个调用均零输入副作用', async () => {
+    const session = await provider.open({})
+    const snapshot = await provider.observe({ kind: 'snapshot', sessionId: session.id })
+    if (snapshot.kind !== 'snapshot') throw new Error('expected a snapshot')
+    const anchor = snapshot.refs.find(target => target.anchor === true)
+    expect(anchor?.name).toBe('Hello')
+    if (anchor === undefined) throw new Error('missing read-only anchor')
+    const before = chrome.calls.length
+    for (const request of [
+      { kind: 'click' as const, sessionId: session.id, ref: anchor.ref },
+      { kind: 'fill' as const, sessionId: session.id, ref: anchor.ref, value: '拒绝写入' },
+      { kind: 'press' as const, sessionId: session.id, ref: anchor.ref, key: 'Enter' },
+    ]) {
+      await expect(provider.mutate(request)).rejects.toThrow(expect.objectContaining({ code: 'BROWSER_READ_ONLY_ANCHOR' }))
+    }
+    expect(chrome.calls.slice(before)).toEqual([])
   })
 
   it('puts an OVERLAY line on top of the outline when something covers the viewport center (B2-d · J1)', async () => {
@@ -664,7 +731,7 @@ describe('CdpBrowserProvider', () => {
     await provider.open({})
     const full = await provider.observe({ kind: 'snapshot', sessionId: 'tab-1' })
     if (full.kind !== 'snapshot') throw new Error('expected a snapshot')
-    const ref = full.refs[0]?.ref as string
+    const ref = full.refs.find(target => target.anchor !== true)?.ref as string
     chrome.overlay = { role: 'div', name: '登录后查看', hint: '#login-modal' }
 
     const region = await provider.observe({ kind: 'snapshot', sessionId: 'tab-1', region: { ref } })
@@ -676,7 +743,7 @@ describe('CdpBrowserProvider', () => {
     await provider.open({})
     const full = await provider.observe({ kind: 'snapshot', sessionId: 'tab-1' })
     if (full.kind !== 'snapshot') throw new Error('expected a snapshot')
-    const first = full.refs[0]?.ref as string
+    const first = full.refs.find(target => target.anchor !== true)?.ref as string
     const epoch = full.epoch
 
     const regional = await provider.observe({
@@ -695,7 +762,7 @@ describe('CdpBrowserProvider', () => {
     await provider.open({})
     const first = await provider.observe({ kind: 'snapshot', sessionId: 'tab-1' })
     if (first.kind !== 'snapshot') throw new Error('expected a snapshot')
-    const stale = first.refs[0]?.ref as string
+    const stale = first.refs.find(target => target.anchor !== true)?.ref as string
     const second = await provider.observe({ kind: 'snapshot', sessionId: 'tab-1' })
     if (second.kind !== 'snapshot') throw new Error('expected a snapshot')
     await expect(provider.observe({ kind: 'screenshot', sessionId: 'tab-1', ref: stale }))
@@ -713,7 +780,7 @@ describe('CdpBrowserProvider', () => {
     await provider.open({})
     const first = await provider.observe({ kind: 'snapshot', sessionId: 'tab-1' })
     if (first.kind !== 'snapshot') throw new Error('expected a snapshot')
-    const stale = first.refs[0]?.ref as string
+    const stale = first.refs.find(target => target.anchor !== true)?.ref as string
     chrome.loaderId = 'loader-2'
     await provider.observe({ kind: 'snapshot', sessionId: 'tab-1' })
 
@@ -729,7 +796,7 @@ describe('CdpBrowserProvider', () => {
     await provider.open({})
     const first = await provider.observe({ kind: 'snapshot', sessionId: 'tab-1' })
     if (first.kind !== 'snapshot') throw new Error('expected a snapshot')
-    const stale = first.refs[0]?.ref as string
+    const stale = first.refs.find(target => target.anchor !== true)?.ref as string
     await provider.observe({ kind: 'snapshot', sessionId: 'tab-1' })
     chrome.missingBackendNodeIds.add(8)
 
@@ -769,8 +836,8 @@ describe('CdpBrowserProvider', () => {
     expect(regional.epoch).toBe(full.epoch)
     expect(regional.outline).toContain('Email')
     expect(regional.outline).not.toContain('Submit')
-    expect(regional.outsideRegion).toBe(1)
-    const shot = await provider.observe({ kind: 'screenshot', sessionId: 'tab-1', ref: full.refs[0]?.ref as string })
+    expect(regional.outsideRegion).toBe(2)
+    const shot = await provider.observe({ kind: 'screenshot', sessionId: 'tab-1', ref: full.refs.find(target => target.anchor !== true)?.ref as string })
     expect(shot.kind).toBe('screenshot')
   })
 
@@ -789,7 +856,7 @@ describe('CdpBrowserProvider', () => {
     if (regional.kind !== 'snapshot') throw new Error('expected a snapshot')
     expect(regional.refs.some(entry => entry.name === 'Submit')).toBe(true)
     expect(regional.outline).not.toContain('Email')
-    expect(regional.outsideRegion).toBe(1)
+    expect(regional.outsideRegion).toBe(2)
   })
 
   it('高 DPI 下滚动后的视口和 CSS 区域盒与布局快照使用同一坐标系', async () => {
@@ -819,7 +886,7 @@ describe('CdpBrowserProvider', () => {
     if (second.kind !== 'snapshot') throw new Error('expected a snapshot')
     expect(second.epoch).toBe(2)
     // 序号跨 snapshot 连续，因此旧 ref 不可能撞上新元素。
-    expect(second.refs.map(ref => ref.ref)).toEqual(['e3', 'e4'])
+    expect(second.refs.map(ref => ref.ref)).toEqual(['e4', 'e5', 'e6'])
     await expect(provider.observe({ kind: 'screenshot', sessionId: session.id, ref: 'e1' }))
       .rejects.toThrow(expect.objectContaining({ code: 'BROWSER_STALE_REF' }))
   })
@@ -828,7 +895,7 @@ describe('CdpBrowserProvider', () => {
     const session = await provider.open({})
     const snapshot = await provider.observe({ kind: 'snapshot', sessionId: session.id })
     if (snapshot.kind !== 'snapshot') throw new Error('expected a snapshot')
-    const ref = snapshot.refs[0]?.ref as string
+    const ref = snapshot.refs.find(target => target.anchor !== true)?.ref as string
 
     chrome.page = { url: 'https://example.com/next', title: 'Next' }
     const navigated = await provider.navigate({ sessionId: session.id, url: 'https://example.com/next' })
@@ -905,7 +972,7 @@ describe('CdpBrowserProvider', () => {
     if (snapshot.kind !== 'snapshot') throw new Error('expected a snapshot')
     chrome.boxModel = [10, 20, 10, 20, 10, 20, 10, 20]
 
-    await expect(provider.observe({ kind: 'screenshot', sessionId: session.id, ref: snapshot.refs[0]?.ref as string }))
+    await expect(provider.observe({ kind: 'screenshot', sessionId: session.id, ref: snapshot.refs.find(target => target.anchor !== true)?.ref as string }))
       .rejects.toThrow(expect.objectContaining({ code: 'BROWSER_PROTOCOL_ERROR' }))
   })
 
@@ -916,7 +983,7 @@ describe('CdpBrowserProvider', () => {
     const snapshot = await provider.observe({ kind: 'snapshot', sessionId: session.id })
     if (snapshot.kind !== 'snapshot') throw new Error('expected a snapshot')
 
-    await expect(provider.observe({ kind: 'screenshot', sessionId: session.id, ref: snapshot.refs[0]?.ref as string }))
+    await expect(provider.observe({ kind: 'screenshot', sessionId: session.id, ref: snapshot.refs.find(target => target.anchor !== true)?.ref as string }))
       .rejects.toThrow(expect.objectContaining({ code: 'BROWSER_STALE_REF' }))
   })
 
@@ -1074,7 +1141,10 @@ describe('CdpBrowserProvider.mutate (P1)', () => {
     const session = await provider.open({})
     const snapshot = await provider.observe({ kind: 'snapshot', sessionId: session.id })
     if (snapshot.kind !== 'snapshot') throw new Error('expected a snapshot')
-    return snapshot.refs[0]?.ref as string
+    // heading 现在也发只读锚点（项 3 补正）：可操作测试要的是第一个**非锚点** ref。
+    const first = snapshot.refs.find(item => item.anchor !== true)
+    if (first === undefined) throw new Error('快照里一个可操作 ref 都没有')
+    return first.ref
   }
 
   /** 开会话并 snapshot，返回第一个 ref **以及它的 role/name**（未导航回执要报这两个）。 */
@@ -1082,8 +1152,9 @@ describe('CdpBrowserProvider.mutate (P1)', () => {
     const session = await provider.open({})
     const snapshot = await provider.observe({ kind: 'snapshot', sessionId: session.id })
     if (snapshot.kind !== 'snapshot') throw new Error('expected a snapshot')
-    const first = snapshot.refs[0]
-    if (first === undefined) throw new Error('快照里一个 ref 都没有')
+    // heading 现在也发只读锚点（项 3 补正）：这里要的是第一个**非锚点** ref。
+    const first = snapshot.refs.find(item => item.anchor !== true)
+    if (first === undefined) throw new Error('快照里一个可操作 ref 都没有')
     return { ref: first.ref, role: first.role, name: first.name }
   }
 
@@ -1120,7 +1191,7 @@ describe('CdpBrowserProvider.mutate (P1)', () => {
     expect(result.target).toEqual({ role, name, href: 'https://example.com/go' })
   })
 
-  it('reports the element covering the click point instead of a silent "click done" (B1-d · J1)', async () => {
+  it('rejects an occluded click BEFORE dispatching — zero page side effects (2026-10-07 独立验收)', async () => {
     const ref = await firstRef()
     // 落点上最顶层的是浮层，不是目标 —— 真实场景：登录浮层盖住正文里的外链。
     chrome.hitTest = {
@@ -1129,32 +1200,42 @@ describe('CdpBrowserProvider.mutate (P1)', () => {
       node: { role: 'dialog', name: '登录后查看', hint: '#login-modal' },
     }
 
-    const result = await provider.mutate({ kind: 'click', sessionId: 'tab-1', ref })
-    expect(result).toMatchObject({ navigated: false })
-    expect(result.occluded_by).toEqual({ role: 'dialog', name: '登录后查看', hint: '#login-modal' })
-    // **事件照样派发**：自动 Escape、自动改点遮罩上的按钮都是误触（方案 §5），不做。
-    expect(chrome.calls.filter(call => call.method === 'Input.dispatchMouseEvent').map(call => call.params['type']))
-      .toEqual(['mousePressed', 'mouseReleased'])
+    // 旧实现「事件照发、回执如实」：连续三次点击全部 DISPATCHED 给遮罩 —— 被盖按钮的
+    // onclick 不该触发却可能被遮罩上的控件误收，页面已被动了。验收要求派发前拒绝。
+    await expect(provider.mutate({ kind: 'click', sessionId: 'tab-1', ref }))
+      .rejects.toThrow(expect.objectContaining({ code: 'BROWSER_TARGET_OCCLUDED' }))
+    // 拒绝必须发生在派发之前：一次鼠标事件都不许出去。
+    expect(chrome.calls.filter(call => call.method === 'Input.dispatchMouseEvent')).toHaveLength(0)
+    // 错误文本要点名遮罩与恢复建议，模型才知道下一步是「关浮层」而不是「重试」。
+    try {
+      await provider.mutate({ kind: 'click', sessionId: 'tab-1', ref })
+      throw new Error('expected the occluded click to be rejected')
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      expect(message).toContain('dialog')
+      expect(message).toContain('#login-modal')
+      expect(message).toContain('NOT dispatched')
+    }
   })
 
-  it('omits occluded_by when the point really is the target (反向验证 · 不误报)', async () => {
+  it('clicks through when the point really is the target (反向验证 · 不误拒)', async () => {
     const ref = await firstRef()
     chrome.hitTest = { hit: 'target', href: null, node: null }
 
     const result = await provider.mutate({ kind: 'click', sessionId: 'tab-1', ref })
-    // 误报遮挡比漏报更糟：模型会去关一个根本不存在的浮层。
-    expect(result.occluded_by).toBeUndefined()
+    // 误拒比漏报更糟：模型会去关一个根本不存在的浮层。命中目标时必须照常派发。
+    expect(result).toMatchObject({ action: 'click', navigated: false })
+    expect(chrome.calls.filter(call => call.method === 'Input.dispatchMouseEvent')).toHaveLength(2)
   })
 
-  it('still clicks when the hit test itself cannot answer (命中校验是回执增强，不是动作)', async () => {
+  it('still clicks when the hit test itself cannot answer (命中校验失败不许把 click 打成失败)', async () => {
     const ref = await firstRef()
-    // 跨源 iframe / CSP 拦下 evaluate 时查不出来。这时宁可少报一条遮挡，
+    // 跨源 iframe / CSP 拦下 evaluate 时查不出来。这时宁可放过（无证据不拒绝），
     // 也不许把 click 打成失败 —— 加了新探针反而让点击不可用是最糟的回归。
     chrome.hitTest = undefined
 
     const result = await provider.mutate({ kind: 'click', sessionId: 'tab-1', ref })
     expect(result).toMatchObject({ action: 'click', navigated: false })
-    expect(result.occluded_by).toBeUndefined()
     expect(chrome.calls.filter(call => call.method === 'Input.dispatchMouseEvent')).toHaveLength(2)
   })
 
@@ -1162,7 +1243,7 @@ describe('CdpBrowserProvider.mutate (P1)', () => {
     const session = await provider.open({})
     const snapshot = await provider.observe({ kind: 'snapshot', sessionId: session.id })
     if (snapshot.kind !== 'snapshot') throw new Error('expected a snapshot')
-    const ref = snapshot.refs[0]?.ref as string
+    const ref = snapshot.refs.find(target => target.anchor !== true)?.ref as string
 
     chrome.page = { url: 'https://example.com/next', title: 'Next' }
     await provider.navigate({ sessionId: session.id, url: 'https://example.com/next' })
@@ -1196,7 +1277,7 @@ describe('CdpBrowserProvider.mutate (P1)', () => {
     await expect(provider.mutate({ kind: 'click', sessionId: 'tab-1', ref })).rejects.toThrow(
       expect.objectContaining({
         code: 'BROWSER_STALE_REF',
-        message: 'ref "e1" points at a stale document: the page moved from https://example.com/ '
+        message: `ref "${ref}" points at a stale document: the page moved from https://example.com/ `
           + 'to https://example.com/next since the snapshot; the action was NOT dispatched; '
           + 'run webpage_snapshot again',
       }),
@@ -1219,7 +1300,7 @@ describe('CdpBrowserProvider.mutate (P1)', () => {
     await expect(provider.mutate({ kind: 'click', sessionId: 'tab-1', ref })).rejects.toThrow(
       expect.objectContaining({
         code: 'BROWSER_STALE_REF',
-        message: 'the element for ref "e1" was removed from the document (the page may have '
+        message: `the element for ref "${ref}" was removed from the document (the page may have `
           + 're-rendered); the action was NOT dispatched; run webpage_snapshot again',
       }),
     )
@@ -1312,7 +1393,7 @@ describe('CdpBrowserProvider.mutate (P1)', () => {
     await expect(provider.mutate({ kind: 'fill', sessionId: 'tab-1', ref, value: 'x' })).rejects.toThrow(
       expect.objectContaining({
         code: 'BROWSER_STALE_REF',
-        message: 'the element for ref "e1" is gone from the document; run webpage_snapshot again',
+        message: `the element for ref "${ref}" is gone from the document; run webpage_snapshot again`,
       }),
     )
     // 「动作没发出」：一条输入事件都没派发。
@@ -1493,7 +1574,7 @@ describe('CdpBrowserProvider.mutate (P1)', () => {
       const session = await counted.open({})
       const snapshot = await counted.observe({ kind: 'snapshot', sessionId: session.id })
       if (snapshot.kind !== 'snapshot') throw new Error('expected a snapshot')
-      const ref = snapshot.refs[0]?.ref as string
+      const ref = snapshot.refs.find(target => target.anchor !== true)?.ref as string
 
       // ① 人工在后台换了路由 → 粗门拒，桶是 `stale_document`。
       chrome.page = { url: 'https://example.com/next', title: 'Next' }
@@ -1531,7 +1612,7 @@ describe('CdpBrowserProvider.mutate (P1)', () => {
       const snapshot = await quiet.observe({ kind: 'snapshot', sessionId: session.id })
       if (snapshot.kind !== 'snapshot') throw new Error('expected a snapshot')
       chrome.page = { url: 'https://example.com/next', title: 'Next' }
-      await expect(quiet.mutate({ kind: 'click', sessionId: session.id, ref: snapshot.refs[0]?.ref as string }))
+      await expect(quiet.mutate({ kind: 'click', sessionId: session.id, ref: snapshot.refs.find(target => target.anchor !== true)?.ref as string }))
         .rejects.toThrow(expect.objectContaining({ code: 'BROWSER_STALE_REF' }))
       await quiet.dispose()
 
@@ -1553,7 +1634,7 @@ describe('CdpBrowserProvider.mutate (P1)', () => {
     const session = await provider.open({})
     const snapshot = await provider.observe({ kind: 'snapshot', sessionId: session.id })
     if (snapshot.kind !== 'snapshot') throw new Error('expected a snapshot')
-    const ref = snapshot.refs[0]?.ref as string
+    const ref = snapshot.refs.find(target => target.anchor !== true)?.ref as string
     chrome.navigateOnClick = true
 
     const result = await provider.mutate({ kind: 'click', sessionId: session.id, ref })
@@ -1599,7 +1680,7 @@ describe('CdpBrowserProvider.mutate (P1)', () => {
     const session = await withActive.open({})
     const snapshot = await withActive.observe({ kind: 'snapshot', sessionId: session.id })
     if (snapshot.kind !== 'snapshot') throw new Error('expected a snapshot')
-    const ref = snapshot.refs[0]?.ref as string
+    const ref = snapshot.refs.find(target => target.anchor !== true)?.ref as string
     let adopted: Promise<unknown> | undefined
     activeChrome.popupOnClick = popupTarget()
     activeChrome.onPopup = target => { adopted = withActive.adopt(target) }
@@ -1614,7 +1695,7 @@ describe('CdpBrowserProvider.mutate (P1)', () => {
     const session = await provider.open({})
     const snapshot = await provider.observe({ kind: 'snapshot', sessionId: session.id })
     if (snapshot.kind !== 'snapshot') throw new Error('expected a snapshot')
-    const ref = snapshot.refs[0]?.ref as string
+    const ref = snapshot.refs.find(target => target.anchor !== true)?.ref as string
     // 脚本里 `location.href = ...` 与 `window.open` 并发：导航首检即命中，
     // 800ms 轮询窗口提前结束 —— 通报还没到。这正是补观测窗口存在的理由。
     chrome.navigateOnClick = true
@@ -1781,7 +1862,7 @@ describe('CdpBrowserProvider.mutate (P1)', () => {
     await provider.open({})
     const snapshot = await provider.observe({ kind: 'snapshot', sessionId: 'tab-1' })
     if (snapshot.kind !== 'snapshot') throw new Error('expected a snapshot')
-    const ref = snapshot.refs[0]?.ref as string
+    const ref = snapshot.refs.find(target => target.anchor !== true)?.ref as string
 
     const timed = await provider.mutate({ kind: 'wait', sessionId: 'tab-1', timeMs: 10 })
     expect(timed).toMatchObject({ action: 'wait', satisfied: true })
@@ -1934,7 +2015,7 @@ describe('归属通报与 ref 纪元作废（多会话防冲突 · A4）', () =>
   it('invalidateSession 作废该会话的 ref 纪元，旧 ref 立刻报 BROWSER_STALE_REF', async () => {
     const snapshot = await provider.observe({ kind: 'snapshot', sessionId: 'tab-1' })
     if (snapshot.kind !== 'snapshot') throw new Error('expected a snapshot')
-    const ref = snapshot.refs[0]?.ref as string
+    const ref = snapshot.refs.find(target => target.anchor !== true)?.ref as string
 
     provider.invalidateSession('tab-1')
 
@@ -1945,13 +2026,13 @@ describe('归属通报与 ref 纪元作废（多会话防冲突 · A4）', () =>
   it('invalidateSession 只动被点名的会话；未知 id 是 no-op', async () => {
     const stale = await provider.observe({ kind: 'snapshot', sessionId: 'tab-1' })
     if (stale.kind !== 'snapshot') throw new Error('expected a snapshot')
-    const staleRef = stale.refs[0]?.ref as string
+    const staleRef = stale.refs.find(target => target.anchor !== true)?.ref as string
 
     // 第二个会话：它的 ref 必须不受影响（作废是「点名作废」，不是清空全表）。
     const other = await provider.open({})
     const kept = await provider.observe({ kind: 'snapshot', sessionId: other.id })
     if (kept.kind !== 'snapshot') throw new Error('expected a snapshot')
-    const keptRef = kept.refs[0]?.ref as string
+    const keptRef = kept.refs.find(target => target.anchor !== true)?.ref as string
 
     expect(() => { provider.invalidateSession('tab-1') }).not.toThrow()
     expect(() => { provider.invalidateSession('never-opened') }).not.toThrow()
@@ -2142,7 +2223,7 @@ describe('P2: console / network / execute', () => {
     const snapshot = await provider.observe({ kind: 'snapshot', sessionId: 'tab-1' })
     if (snapshot.kind !== 'snapshot') throw new Error('expected a snapshot')
     const epochBefore = snapshot.epoch
-    const staleRef = snapshot.refs[0]?.ref as string
+    const staleRef = snapshot.refs.find(target => target.anchor !== true)?.ref as string
 
     const result = await provider.execute({
       sessionId: 'tab-1',
@@ -2341,7 +2422,7 @@ describe('B2-b: webpage_navigate 走历史栈（back / forward / reload）', () 
     const session = await provider.open({})
     const snapshot = await provider.observe({ kind: 'snapshot', sessionId: session.id })
     if (snapshot.kind !== 'snapshot') throw new Error('expected a snapshot')
-    const ref = snapshot.refs[0]?.ref as string
+    const ref = snapshot.refs.find(target => target.anchor !== true)?.ref as string
     chrome.page = { url: 'https://example.com/next', title: 'Next' }
     await provider.navigate({ sessionId: 'tab-1', url: 'https://example.com/next' })
     chrome.history = {
@@ -2371,7 +2452,7 @@ describe('P3: locate', () => {
     const session = await provider.open({})
     const snapshot = await provider.observe({ kind: 'snapshot', sessionId: session.id })
     if (snapshot.kind !== 'snapshot') throw new Error('expected a snapshot')
-    return { ref: snapshot.refs[0]?.ref as string, before: chrome.calls.length }
+    return { ref: snapshot.refs.find(target => target.anchor !== true)?.ref as string, before: chrome.calls.length }
   }
 
   it('resolves the ref, checks isConnected, then measures a fresh rect — in that order', async () => {
@@ -2388,6 +2469,7 @@ describe('P3: locate', () => {
       width: 100,
       height: 40,
       centered: false,
+      scrollRequested: false,
       inViewport: true,
     })
 
@@ -2407,14 +2489,137 @@ describe('P3: locate', () => {
 
   it('scrolls the element to the centre only when scroll=true, and then reports centered=true', async () => {
     const { ref } = await firstRef()
+    // 元素最终停在居中位（1280×720 视口，100×40 元素 → x=590 / y=340）。
+    chrome.elementRect = { x: 590, y: 340, width: 100, height: 40 }
 
     const result = await provider.locate({ sessionId: 'tab-1', ref, scroll: true })
     expect(result.centered).toBe(true)
+    expect(result.scrollRequested).toBe(true)
 
     const rectCall = chrome.calls.filter(call =>
       call.method === 'Runtime.callFunctionOn'
       && String(call.params['functionDeclaration']).includes('getBoundingClientRect')).at(-1)
     expect(String(rectCall?.params['functionDeclaration'])).toContain('scrollIntoView')
+  })
+
+  it('reports scrollRequested=false without echo semantics when scroll is not requested', async () => {
+    const { ref } = await firstRef()
+
+    const result = await provider.locate({ sessionId: 'tab-1', ref })
+    expect(result.scrollRequested).toBe(false)
+    expect(result.centered).toBe(false)
+  })
+
+  it('re-measures a multi-frame smooth scroll (several outside frames) until centred, then reports the final box', async () => {
+    const { ref } = await firstRef()
+    // 多帧都在视口外的 smooth 滚动：连续两帧量到滚动前旧布局（y=5171），动画结束后
+    // 才落到居中位（100×40 在 1280×720 → x=590 / y=340）。旧实现 y=300 就收（交集即停），
+    // 且按「中心落在视口内」谎报居中。
+    chrome.elementRectSequence = [
+      { x: 10, y: 5171, width: 100, height: 40 },
+      { x: 10, y: 5171, width: 100, height: 40 },
+      { x: 590, y: 340, width: 100, height: 40 },
+    ]
+
+    const result = await provider.locate({ sessionId: 'tab-1', ref, scroll: true })
+    expect(result.x).toBe(590)
+    expect(result.y).toBe(340)
+    expect(result.centered).toBe(true)
+    expect(result.inViewport).toBe(true)
+
+    const measureCalls = chrome.calls.filter(call =>
+      call.method === 'Runtime.callFunctionOn'
+      && String(call.params['functionDeclaration']).includes('getBoundingClientRect'))
+    expect(measureCalls.length).toBeGreaterThanOrEqual(3)
+  })
+
+  it('gives up re-measuring within a bounded budget and reports the centring as NOT achieved', async () => {
+    const { ref } = await firstRef()
+    // 元素永远到不了视口（滚动容器拒绝/目标不可达）：有界重测后必须如实说没居中，
+    // 不许把 scroll=true 回显成成功，也不许无限重试。
+    chrome.elementRectSequence = [
+      { x: 10, y: 5171, width: 100, height: 40 },
+      { x: 10, y: 5171, width: 100, height: 40 },
+      { x: 10, y: 5171, width: 100, height: 40 },
+      { x: 10, y: 5171, width: 100, height: 40 },
+      { x: 10, y: 5171, width: 100, height: 40 },
+    ]
+
+    const startedAt = Date.now()
+    const result = await provider.locate({ sessionId: 'tab-1', ref, scroll: true })
+    const elapsed = Date.now() - startedAt
+
+    expect(result.y).toBe(5171)
+    expect(result.centered).toBe(false)
+    expect(result.inViewport).toBe(false)
+    // 有界：重测总预算 ≤600ms，加调度余量也不许超过 2 秒。
+    expect(elapsed).toBeLessThan(2000)
+
+    const measureCalls = chrome.calls.filter(call =>
+      call.method === 'Runtime.callFunctionOn'
+      && String(call.params['functionDeclaration']).includes('getBoundingClientRect'))
+    expect(measureCalls.length).toBeLessThanOrEqual(6)
+  })
+
+  it('re-measures after a smooth scroll until the element is CENTRED, then reports the final box', async () => {
+    const { ref } = await firstRef()
+    // smooth 滚动模拟：scrollIntoView 后第一次量到滚动前旧布局（y=5171 在视口外），
+    // 第二帧已进视口但远未居中（y=650，1280×720 视口的中途帧），动画结束后才真正居中
+    // （100×40 居中位 x=590 / y=340）。旧实现「有交集就停」会在 y=650 就声称居中 ——
+    // 正是 2026-10-07 独立验收抓到的「刚进视口就停止，仍可能未居中却声称居中」。
+    chrome.elementRectSequence = [
+      { x: 10, y: 5171, width: 100, height: 40 },
+      { x: 10, y: 650, width: 100, height: 40 },
+      { x: 590, y: 340, width: 100, height: 40 },
+    ]
+
+    const result = await provider.locate({ sessionId: 'tab-1', ref, scroll: true })
+    expect(result.x).toBe(590)
+    expect(result.y).toBe(340)
+    expect(result.centered).toBe(true)
+    expect(result.inViewport).toBe(true)
+
+    const measureCalls = chrome.calls.filter(call =>
+      call.method === 'Runtime.callFunctionOn'
+      && String(call.params['functionDeclaration']).includes('getBoundingClientRect'))
+    expect(measureCalls.length).toBeGreaterThanOrEqual(3)
+  })
+
+  it('never claims centred from a merely-visible frame: budget may end NOT centred (诚实判据)', async () => {
+    const { ref } = await firstRef()
+    // 动画每帧都「在视口内但未居中」直到预算耗尽：必须如实报 centered=false，
+    // 不许把「看得见」冒充「居中」（旧判据「元素中心落在视口内」正是这么谎报的）。
+    chrome.elementRectSequence = [
+      { x: 10, y: 650, width: 100, height: 40 },
+      { x: 10, y: 655, width: 100, height: 40 },
+      { x: 10, y: 660, width: 100, height: 40 },
+      { x: 10, y: 665, width: 100, height: 40 },
+      { x: 10, y: 670, width: 100, height: 40 },
+    ]
+
+    const startedAt = Date.now()
+    const result = await provider.locate({ sessionId: 'tab-1', ref, scroll: true })
+    const elapsed = Date.now() - startedAt
+
+    expect(result.centered).toBe(false)
+    expect(result.inViewport).toBe(true)
+    // 有界：重测总预算 ≤600ms，加调度余量也不许超过 2 秒。
+    expect(elapsed).toBeLessThan(2000)
+    const measureCalls = chrome.calls.filter(call =>
+      call.method === 'Runtime.callFunctionOn'
+      && String(call.params['functionDeclaration']).includes('getBoundingClientRect'))
+    expect(measureCalls.length).toBeLessThanOrEqual(6)
+  })
+
+  it('reports centered=false when the viewport size cannot be measured (缺视口尺寸不许默认成功)', async () => {
+    const { ref } = await firstRef()
+    // 视口尺寸读不到（undefined）：无法证伪就不许声称居中 —— 旧实现 `?? true` 把
+    // 「没测到」回显成「已居中」，独立验收明令禁止。
+    chrome.viewport = undefined
+
+    const result = await provider.locate({ sessionId: 'tab-1', ref, scroll: true })
+    expect(result.centered).toBe(false)
+    expect(result.inViewport).toBeUndefined()
   })
 
   it('reports in_viewport=false when the element sits outside the current viewport', async () => {
@@ -2426,12 +2631,174 @@ describe('P3: locate', () => {
     expect(result).toMatchObject({ centered: false, inViewport: false, y: 900 })
   })
 
+  it('rejects click / scroll / locate on a zero-size viewport instead of faking success (最小化窗口)', async () => {
+    const { ref } = await firstRef()
+    // 最小化窗口：innerWidth/innerHeight = 0，布局坐标全是负数、命中测试与鼠标派发都无意义。
+    // 旧实现 click 回「成功」但页面计数不增、locate 拿负坐标声称 in viewport
+    // （验收原始证据 D:/dsh-build/accept-verify-20261007/item6-round1-mid.txt）。
+    // 零视口必须明确拒绝 —— 宿主在最小化期间刻意不跑 layout（host.cjs 的退化读数守卫），
+    // 插件侧也没有安全的恢复路径，所以只拒绝 + 指路，不代恢复。
+    chrome.viewport = { width: 0, height: 0 }
+
+    await expect(provider.locate({ sessionId: 'tab-1', ref }))
+      .rejects.toThrow(expect.objectContaining({ code: 'BROWSER_WINDOW_NOT_VISIBLE' }))
+    await expect(provider.mutate({ kind: 'click', sessionId: 'tab-1', ref }))
+      .rejects.toThrow(expect.objectContaining({ code: 'BROWSER_WINDOW_NOT_VISIBLE' }))
+    await expect(provider.mutate({ kind: 'scroll', sessionId: 'tab-1', deltaX: 0, deltaY: -120 }))
+      .rejects.toThrow(expect.objectContaining({ code: 'BROWSER_WINDOW_NOT_VISIBLE' }))
+    // 一条鼠标事件都不许在零视口上派发出去。
+    expect(chrome.calls.filter(call => call.method === 'Input.dispatchMouseEvent')).toHaveLength(0)
+  })
+
+  it('prepares a hidden (background-reloaded) tab before dispatching real click input (L2 · 2026-10-08)', async () => {
+    // 证据 session-409fd63d：后台 reload 后 viewport 非零、elementFromPoint 命中目标，
+    // 但 visibilityState=hidden —— click/press 回执 done 而页面计数不动。派发前必须把
+    // 标签真正带到前台（prepare → dispatch）。transport 在构造时定型，先挂能力再建 provider。
+    chrome.canActivate = true
+    chrome.visibilityState = 'hidden'
+    chrome.visibilityAfterActivate = 'visible'
+    provider = new AdoptableProvider({ navigationTimeoutMs: 200 }, chrome.transport())
+    const { ref } = await firstRef()
+
+    const result = await provider.mutate({ kind: 'click', sessionId: 'tab-1', ref })
+    expect(result).toMatchObject({ action: 'click' })
+    expect(chrome.activateCalls).toContain('tab-1')
+    expect(chrome.calls.filter(call => call.method === 'Input.dispatchMouseEvent')).toHaveLength(2)
+  })
+
+  it('refuses to dispatch click into a tab that stays hidden after activation (L2 · 零副作用)', async () => {
+    // 激活了仍不可见（窗口最小化 / 未显示）：宁可拒绝也不给「done 但没效果」的假回执，
+    // 且一条输入事件都不许出去。
+    chrome.canActivate = true
+    chrome.visibilityState = 'hidden'
+    provider = new AdoptableProvider({ navigationTimeoutMs: 200 }, chrome.transport())
+    const { ref } = await firstRef()
+
+    await expect(provider.mutate({ kind: 'click', sessionId: 'tab-1', ref }))
+      .rejects.toThrow(expect.objectContaining({ code: 'BROWSER_TAB_NOT_VISIBLE' }))
+    expect(chrome.activateCalls).toContain('tab-1')
+    expect(chrome.calls.filter(call => call.method === 'Input.dispatchMouseEvent')).toHaveLength(0)
+  })
+
+  it('激活期间人工接管保持原错误码，不投递输入', async () => {
+    chrome.visibilityState = 'hidden'
+    provider = new AdoptableProvider({ navigationTimeoutMs: 200 }, {
+      ...chrome.transport(),
+      activateTarget: async () => { throw new BrowserError('人工接管', 'BROWSER_HUMAN_HOLDING') },
+    })
+    const { ref } = await firstRef()
+    await expect(provider.mutate({ kind: 'click', sessionId: 'tab-1', ref }))
+      .rejects.toThrow(expect.objectContaining({ code: 'BROWSER_HUMAN_HOLDING' }))
+    expect(chrome.calls.filter(call => call.method.startsWith('Input.'))).toEqual([])
+  })
+
+  it('已知隐藏后激活观察缺失不能误当可见，零输入副作用', async () => {
+    chrome.visibilityState = 'hidden'
+    provider = new AdoptableProvider({ navigationTimeoutMs: 200 }, {
+      ...chrome.transport(),
+      activateTarget: async () => { chrome.visibilityState = undefined },
+    })
+    const { ref } = await firstRef()
+    await expect(provider.mutate({ kind: 'click', sessionId: 'tab-1', ref }))
+      .rejects.toThrow(expect.objectContaining({ code: 'BROWSER_TAB_NOT_VISIBLE' }))
+    expect(chrome.calls.filter(call => call.method.startsWith('Input.'))).toEqual([])
+  })
+
+  it('covers press with the same prepare→dispatch gate, and skips it on visible tabs (L2)', async () => {
+    // 可见标签：不激活、直接派发（既有后台 A/B 通过的行为不打扰）。
+    chrome.canActivate = true
+    chrome.visibilityState = 'visible'
+    provider = new AdoptableProvider({ navigationTimeoutMs: 200 }, chrome.transport())
+    const session1 = await provider.open({})
+    const snapshot1 = await provider.observe({ kind: 'snapshot', sessionId: session1.id })
+    if (snapshot1.kind !== 'snapshot') throw new Error('expected a snapshot')
+    const ref1 = snapshot1.refs.find(target => target.anchor !== true)?.ref as string
+    const pressed = await provider.mutate({ kind: 'press', sessionId: session1.id, ref: ref1, key: 'Enter' })
+    expect(pressed).toMatchObject({ action: 'press' })
+    expect(chrome.activateCalls).toEqual([])
+    expect(chrome.calls.filter(call => call.method === 'Input.dispatchKeyEvent')).toHaveLength(2)
+
+    // 隐藏标签：先激活（键盘事件同样落不进不可见页面 —— MDN 第二轮六次 press/click
+    // 回执成功都不导航，最后靠 execute 绕行）。
+    chrome.visibilityState = 'hidden'
+    chrome.visibilityAfterActivate = 'visible'
+    provider = new AdoptableProvider({ navigationTimeoutMs: 200 }, chrome.transport())
+    const session2 = await provider.open({})
+    const snapshot2 = await provider.observe({ kind: 'snapshot', sessionId: session2.id })
+    if (snapshot2.kind !== 'snapshot') throw new Error('expected a snapshot')
+    const ref2 = snapshot2.refs.find(target => target.anchor !== true)?.ref as string
+    const prepared = await provider.mutate({ kind: 'press', sessionId: session2.id, ref: ref2, key: 'Enter' })
+    expect(prepared).toMatchObject({ action: 'press' })
+    expect(chrome.activateCalls).toContain(session2.id)
+    expect(chrome.calls.filter(call => call.method === 'Input.dispatchKeyEvent')).toHaveLength(4)
+
+    // 激活后仍不可见：派发前拒绝。
+    chrome.visibilityState = 'hidden'
+    chrome.visibilityAfterActivate = undefined
+    provider = new AdoptableProvider({ navigationTimeoutMs: 200 }, chrome.transport())
+    const session3 = await provider.open({})
+    const snapshot3 = await provider.observe({ kind: 'snapshot', sessionId: session3.id })
+    if (snapshot3.kind !== 'snapshot') throw new Error('expected a snapshot')
+    const ref3 = snapshot3.refs.find(target => target.anchor !== true)?.ref as string
+    await expect(provider.mutate({ kind: 'press', sessionId: session3.id, ref: ref3, key: 'Enter' }))
+      .rejects.toThrow(expect.objectContaining({ code: 'BROWSER_TAB_NOT_VISIBLE' }))
+    expect(chrome.calls.filter(call => call.method === 'Input.dispatchKeyEvent')).toHaveLength(4)
+  })
+
   it('reports BROWSER_STALE_REF when resolveNode says the node is gone', async () => {
     const { ref } = await firstRef()
     chrome.resolveNodeError = 'No node with given id found'
 
     await expect(provider.locate({ sessionId: 'tab-1', ref }))
       .rejects.toThrow(expect.objectContaining({ code: 'BROWSER_STALE_REF' }))
+  })
+
+  it('wait(ref) timeout reports the element state: hidden vs visible (项 2 · 2026-10-07)', async () => {
+    // 等待窗口压短（200ms），元素永不移除 → satisfied=false。
+    provider = new AdoptableProvider({ navigationTimeoutMs: 200, waitTimeoutMs: 200 }, chrome.transport())
+    const { ref } = await firstRef()
+
+    // 默认 rect 非零：元素还在且显示着。
+    const visible = await provider.mutate({ kind: 'wait', sessionId: 'tab-1', ref })
+    expect(visible.satisfied).toBe(false)
+    expect(visible.refState).toBe('visible')
+
+    // 元素被 display:none（盒子为 0）：还在文档里但已经不可见 —— 与「没移除」区分开。
+    chrome.elementRect = { x: 0, y: 0, width: 0, height: 0 }
+    const hidden = await provider.mutate({ kind: 'wait', sessionId: 'tab-1', ref })
+    expect(hidden.satisfied).toBe(false)
+    expect(hidden.refState).toBe('hidden')
+  })
+
+  it('wait(ref_state="hidden") succeeds when the element is hidden but still attached (项 2 补正 · 2026-10-08)', async () => {
+    // 流式页发送按钮提交后往往只是被隐藏而不是被移除：removed 条件永远等不到，
+    // hidden 条件必须能在「还在文档里但已不可见」时成功。
+    provider = new AdoptableProvider({ navigationTimeoutMs: 200, waitTimeoutMs: 200 }, chrome.transport())
+    const { ref } = await firstRef()
+
+    chrome.elementHidden = true
+    const satisfied = await provider.mutate({ kind: 'wait', sessionId: 'tab-1', ref, refState: 'hidden' })
+    expect(satisfied.satisfied).toBe(true)
+  })
+
+  it('wait(ref_state="hidden") timeout distinguishes visible vs removed, and rejects a bare ref_state', async () => {
+    provider = new AdoptableProvider({ navigationTimeoutMs: 200, waitTimeoutMs: 200 }, chrome.transport())
+    const { ref } = await firstRef()
+
+    // 元素还在且显示着：hidden 条件不成立，超时如实报 visible。
+    const visible = await provider.mutate({ kind: 'wait', sessionId: 'tab-1', ref, refState: 'hidden' })
+    expect(visible.satisfied).toBe(false)
+    expect(visible.refState).toBe('visible')
+
+    // 等隐藏却先被移除：不是成功，也不能谎成 hidden —— refState 必须说 removed。
+    chrome.elementConnected = false
+    const removed = await provider.mutate({ kind: 'wait', sessionId: 'tab-1', ref, refState: 'hidden' })
+    expect(removed.satisfied).toBe(false)
+    expect(removed.refState).toBe('removed')
+
+    // ref_state 是 ref 条件的修饰，单独给没有意义。
+    await expect(provider.mutate({ kind: 'wait', sessionId: 'tab-1', refState: 'hidden' }))
+      .rejects.toThrow(expect.objectContaining({ code: 'BROWSER_PROTOCOL_ERROR' }))
   })
 
   it('keeps BROWSER_DEBUGGER_DETACHED distinct from a stale ref', async () => {
@@ -2458,6 +2825,16 @@ describe('P3: locate', () => {
 
     await expect(provider.locate({ sessionId: 'tab-1', ref }))
       .rejects.toThrow(expect.objectContaining({ code: 'BROWSER_PROTOCOL_ERROR' }))
+  })
+
+  it('describes a locate zero-box failure as a read-only measurement with no page effect', async () => {
+    const { ref } = await firstRef()
+    chrome.elementRect = { x: 0, y: 0, width: 0, height: 0 }
+
+    // 2026-10-07 计划项 5：只读定位失败 ≠ 已派发动作失败 —— 必须明说「页面上什么都没改」，
+    // 模型才不会把一次 display:none 定位失败当成已生效的写操作去补救。
+    await expect(provider.locate({ sessionId: 'tab-1', ref }))
+      .rejects.toThrow(/read-only measurement and NOTHING was changed/)
   })
 
   it('requires a snapshot first and fails stale refs before any command', async () => {
@@ -2503,7 +2880,7 @@ describe('P3: locate', () => {
     await freshProvider.open({})
     const snapshot = await freshProvider.observe({ kind: 'snapshot', sessionId: 'tab-1' })
     if (snapshot.kind !== 'snapshot') throw new Error('expected a snapshot')
-    await freshProvider.locate({ sessionId: 'tab-1', ref: snapshot.refs[0]?.ref as string })
+    await freshProvider.locate({ sessionId: 'tab-1', ref: snapshot.refs.find(target => target.anchor !== true)?.ref as string })
     expect(fresh.calls.some(call => call.method === 'Overlay.hideHighlight')).toBe(false)
   })
 })
@@ -2538,7 +2915,7 @@ describe('§6.5 控制权（人工接管按钮）', () => {
     const session = await provider.open({})
     const snapshot = await provider.observe({ kind: 'snapshot', sessionId: session.id })
     if (snapshot.kind !== 'snapshot') throw new Error('expected a snapshot')
-    return { sessionId: session.id, ref: snapshot.refs[0]?.ref as string }
+    return { sessionId: session.id, ref: snapshot.refs.find(target => target.anchor !== true)?.ref as string }
   }
 
   it('切到 human 后写族全被拒（BROWSER_HUMAN_HOLDING），且一条 CDP 命令都没派发（J5）', async () => {
@@ -2595,7 +2972,7 @@ describe('§6.5 控制权（人工接管按钮）', () => {
     // 重拍之后才拿得到能用的号。
     const fresh = await provider.observe({ kind: 'snapshot', sessionId })
     if (fresh.kind !== 'snapshot') throw new Error('expected a snapshot')
-    await expect(provider.mutate({ kind: 'click', sessionId, ref: fresh.refs[0]?.ref as string }))
+    await expect(provider.mutate({ kind: 'click', sessionId, ref: fresh.refs.find(target => target.anchor !== true)?.ref as string }))
       .resolves.toMatchObject({ action: 'click' })
   })
 
@@ -2697,7 +3074,7 @@ describe('§6.2 决策时通知（P2）+ D-5 + D-19', () => {
     const session = await provider.open({})
     emitOpenNavigation(chrome.page.url)
     const snapshot = await fullSnapshot(session.id)
-    return { sessionId: session.id, ref: snapshot.refs[0]?.ref as string }
+    return { sessionId: session.id, ref: snapshot.refs.find(target => target.anchor !== true)?.ref as string }
   }
 
   it('全页快照回执带上「页面在模型之外变过」，并把锚点前移（下一次就干净了）', async () => {
@@ -2778,7 +3155,7 @@ describe('§6.2 决策时通知（P2）+ D-5 + D-19', () => {
     const session = await provider.open({})
     emitOpenNavigation(chrome.page.url)
     const snapshot = await fullSnapshot(session.id)
-    const ref = snapshot.refs[0]?.ref as string
+    const ref = snapshot.refs.find(target => target.anchor !== true)?.ref as string
 
     // 同 host + 同 path，只有遥测参数变了 —— §5.1.2 ① 实测的那种「每次交互都抖一下」。
     chrome.page = { url: 'https://www.google.com/search?q=cat&sxsrf=BBB', title: 'cat - Google' }
@@ -2797,7 +3174,7 @@ describe('§6.2 决策时通知（P2）+ D-5 + D-19', () => {
     const session = await provider.open({})
     emitOpenNavigation(chrome.page.url)
     const snapshot = await fullSnapshot(session.id)
-    const ref = snapshot.refs[0]?.ref as string
+    const ref = snapshot.refs.find(target => target.anchor !== true)?.ref as string
 
     // 这一次不是「页面在外面被人改了」，而是**这次点击自己**触发的软导航：
     // 页面脚本换了一批遥测令牌（`replaceState`），文档身份不变。
@@ -2823,7 +3200,7 @@ describe('§6.2 决策时通知（P2）+ D-5 + D-19', () => {
     const session = await provider.open({})
     emitOpenNavigation(chrome.page.url)
     const snapshot = await fullSnapshot(session.id)
-    const ref = snapshot.refs[0]?.ref as string
+    const ref = snapshot.refs.find(target => target.anchor !== true)?.ref as string
 
     // **故意不发事件**：模拟 `Page.enable` 之前就加载完 / 事件丢失那一档 —— 事件线从头到尾
     // 没见过新地址，所以轮询线是这个变化唯一的观测者，它必须报出来。
