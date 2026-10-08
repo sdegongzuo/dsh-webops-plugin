@@ -27,7 +27,10 @@ import { resolveConfig } from './index.ts'
 // electron 包未安装也不能在纯 Node 里跑，所以用 Module._load 钩子顶掉 require('electron')，
 // 只测它可独立运行的部分（地址规范化、导航指令的空态忽略）。
 const fakeElectron = {
-  app: { on: () => {}, whenReady: () => ({ then: () => {} }) },
+  app: {
+    on: () => {}, whenReady: () => ({ then: () => {} }),
+    commandLine: { getSwitchValue: () => '', appendSwitch: () => {} },
+  },
   BaseWindow: class {},
   WebContentsView: class {},
   ipcMain: { on: () => {} },

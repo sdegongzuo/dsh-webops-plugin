@@ -98,6 +98,15 @@ const { createActionOverlay } = require('./action-overlay.cjs')
 const net = require('node:net')
 const path = require('node:path')
 
+// Windows 原生遮挡会把仍可操作的前台标签变成 hidden，真实输入准备门因此误拒。
+// 只关闭遮挡计算：后台标签准备、最小化拒写与人工控制门保持原有行为。
+// 保留启动方已有的 disable-features，且必须在 app ready 前配置。
+if (process.platform === 'win32') {
+  const disabled = app.commandLine.getSwitchValue('disable-features').split(',').filter(Boolean)
+  if (!disabled.includes('CalculateNativeWinOcclusion')) disabled.push('CalculateNativeWinOcclusion')
+  app.commandLine.appendSwitch('disable-features', disabled.join(','))
+}
+
 // 实测按需启用独立网页窗口的 CDP；默认关闭，仅监听本机，不改变工具通道。
 const diagnosticPort = process.env.DSH_BROWSER_WINDOW_CDP_PORT
 if (diagnosticPort !== undefined) {

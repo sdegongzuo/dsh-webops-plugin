@@ -12,20 +12,19 @@
  *   · 输出 zip **必须尚不存在**，存在即报错退出，绝不覆盖；
  *   · 全程零 rmSync —— 符合 AGENTS.md 的文件删除禁令，发版工作流走这条。
  *
- * **兼容模式**（一个新参数都不传）：沿用旧行为 —— 起手删除 `.portable-stage`、
+ * **历史兼容分支**（一个新参数都不传）：源码保留旧行为 —— 起手删除 `.portable-stage`、
  *   删除同名旧 ZIP、收尾删除暂存。⚠️ 含删除分支，本仓文件规则**禁止实际运行**；
- *   仅为不破坏旧调用方而保留，新流程一律用保留安全模式。
+ *   缺少必填 --lib-dir 的调用现会提前拒绝，新流程一律用保留安全模式。
  *
  * 用法（保留安全模式，推荐）：
  *   node scripts/package-portable.mjs 0.2.13 \
- *     --lib-dir <本轮构建目录，默认 ./lib> \
+ *     --lib-dir <本轮构建目录，必填> \
  *     --stage-root <D 盘暂存父目录，默认仓库内 .portable-stage> \
  *     --out <未存在的 ZIP 路径，默认 dist/dsh-webops-plugin-<ver>-win-x64-portable.zip> \
  *     --keep-stage   # 保留暂存证据；安全模式下暂存本来就永远保留，此参数仅为与
  *                    # package-plugin-update 的参数面保持一致
  *
- * 兼容模式（含删除，本仓规则禁止运行）：
- *   node scripts/package-portable.mjs [版本号]
+ * 裸调用因缺少 --lib-dir 被拒绝，不能默用旧 lib。
  */
 
 import { execFileSync, spawnSync } from 'node:child_process'
@@ -57,12 +56,11 @@ if (argv.includes('--help') || argv.includes('-h')) {
     '用法：',
     '  保留安全模式（推荐，零删除零覆盖）：',
     '    node scripts/package-portable.mjs [版本] --lib-dir <目录> --stage-root <目录> --out <未存在的zip> [--keep-stage]',
-    '      --lib-dir     打进包里的构建产物目录（须含 index.js 等，默认 ./lib）',
+    '      --lib-dir     必须显式指定本轮构建目录（须含 index.js 等，不回退到仓库 lib）',
     '      --stage-root  唯一暂存目录的父目录（会在其下新建 dsh-portable-XXXX）',
     '      --out         输出 zip 路径；必须尚不存在，存在即报错，绝不覆盖',
     '      --keep-stage  保留暂存目录（安全模式下本就永远保留，参数仅为参数面对齐）',
-    '  兼容模式（含删除分支，本仓文件规则禁止运行）：',
-    '    node scripts/package-portable.mjs [版本]',
+    '  裸调用会因缺少必填 --lib-dir 被拒绝；不会默用仓库旧 lib。',
   ].join('\n'))
   process.exit(0)
 }
@@ -101,7 +99,9 @@ if (!/^\d+\.\d+\.\d+(?:-[\w.]+)?$/.test(version)) {
   fail(`版本号不合法: ${version}`)
 }
 
-const libDir = resolve(readArg('lib-dir') ?? join(ROOT, 'lib'))
+const libArg = readArg('lib-dir')
+if (!libArg) fail('--lib-dir 必须显式指定本轮构建目录；拒绝回退到仓库旧 lib')
+const libDir = resolve(libArg)
 const stageRoot = resolve(readArg('stage-root') ?? join(ROOT, '.portable-stage'))
 const zipName = `dsh-webops-plugin-v${version}-win-x64-portable.zip`
 const zipPath = resolve(readArg('out') ?? join(DIST, zipName))

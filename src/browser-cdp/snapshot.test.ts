@@ -662,6 +662,29 @@ describe('buildOutline：正文读取（项 3 · 2026-10-07）', () => {
     expect(block).toBe('function countSelected() {\n  return 1;\n}')
   })
 
+  it('保留 code 内 generic 包装的实体 token，且不串联相邻代码块和普通段落', () => {
+    // 真实 MDN AX：code -> StaticText R, generic -> StaticText &amp;, StaticText B。
+    const tree: AxNode[] = [
+      node({ nodeId: '1', role: { value: 'RootWebArea' }, childIds: ['2', '9', '12'] }),
+      node({ nodeId: '2', role: { value: 'code' }, childIds: ['3', '4', '6'] }),
+      node({ nodeId: '3', role: { value: 'StaticText' }, name: { value: '<option>R' } }),
+      node({ nodeId: '4', role: { value: 'generic' }, childIds: ['5'] }),
+      node({ nodeId: '5', role: { value: 'StaticText' }, name: { value: '&amp;' } }),
+      node({ nodeId: '6', role: { value: 'StaticText' }, name: { value: 'B</option>\n' } }),
+      node({ nodeId: '9', role: { value: 'code' }, childIds: ['10', '11'] }),
+      node({ nodeId: '10', role: { value: 'StaticText' }, name: { value: 'return ' } }),
+      node({ nodeId: '11', role: { value: 'StaticText' }, name: { value: '42;\n' } }),
+      node({ nodeId: '12', role: { value: 'paragraph' }, childIds: ['13', '14'] }),
+      node({ nodeId: '13', role: { value: 'StaticText' }, name: { value: '普通正文' } }),
+      node({ nodeId: '14', role: { value: 'generic' }, childIds: ['15'] }),
+      node({ nodeId: '15', role: { value: 'StaticText' }, name: { value: '独立包装' } }),
+    ]
+    const outline = buildOutline(tree)
+    const blocks = new Set(outline.unfoldedLines.flatMap(line => line.block === undefined ? [] : [line.block]))
+    expect(blocks).toEqual(new Set(['<option>R&amp;B</option>\n', 'return 42;\n']))
+    expect(outline.unfoldedLines.find(line => line.text.includes('普通正文'))?.block).toBeUndefined()
+  })
+
   it('MDN-B（2026-10-08 独立验收）：token 级高亮 run 拼回的是原始连续代码，不是逐 token 换行', () => {
     // 证据 MDN-code-format-mismatch.json：Control_flow_and_error_handling 的 checkData
     // 在 AX 里被拆成 token 级 staticText（"function"、" "、"checkData"、…，空白 run 单独成节点），

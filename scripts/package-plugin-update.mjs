@@ -5,8 +5,8 @@
  * 插件侧真实变化只有 407KB。给已经装过旧包的用户重下 472MB 是纯粹的浪费。
  *
  * 用法：
- *   node scripts/package-plugin-update.mjs [--version 0.2.8] [--out dist/xxx.zip]
- *   node scripts/package-plugin-update.mjs --probe-token XXX   # 自检专用：注入一行可识别的打印
+ *   node scripts/package-plugin-update.mjs --lib-dir <本次构建目录> [--version 0.2.8] [--out dist/xxx.zip]
+ *   node scripts/package-plugin-update.mjs --lib-dir <本次构建目录> --probe-token XXX   # 自检专用：注入一行可识别的打印
  *   node scripts/package-plugin-update.mjs --lib-dir <本次构建目录> --stage-root <暂存父目录> --keep-stage
  *       # 使用指定构建并保留暂存文件；目标 zip 必须尚不存在，不传 --force。
  *
@@ -44,7 +44,12 @@ const readArg = (name) => {
 }
 const probeToken = readArg('probe-token')
 const keepStage = args.includes('--keep-stage')
-const libDir = resolve(readArg('lib-dir') ?? join(ROOT, 'lib'))
+const libArg = readArg('lib-dir')
+if (!libArg || libArg.startsWith('--')) {
+  console.error('package-plugin-update: --lib-dir 必须显式指定本轮构建目录；缺少路径值，拒绝回退到仓库旧 lib')
+  process.exit(1)
+}
+const libDir = resolve(libArg)
 const stageRoot = resolve(readArg('stage-root') ?? tmpdir())
 
 const pkg = JSON.parse(readFileSync(join(ROOT, 'package.json'), 'utf8'))

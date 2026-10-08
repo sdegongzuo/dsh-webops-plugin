@@ -330,7 +330,8 @@ function refresh() {
   if (existsSync(zipPath)) removeTreeFast(zipPath)
   const packed = spawnSync(
     process.execPath,
-    [join(ROOT, 'scripts', 'package-plugin-update.mjs'), '--version', version, '--out', zipPath],
+    [join(ROOT, 'scripts', 'package-plugin-update.mjs'), '--version', version,
+      '--lib-dir', join(ROOT, 'lib'), '--out', zipPath],
     { cwd: ROOT, encoding: 'utf8' },
   )
   console.log((packed.stdout ?? '').trim())

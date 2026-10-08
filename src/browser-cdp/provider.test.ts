@@ -1,7 +1,7 @@
 import { mkdtemp, readdir, readFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { beforeEach, describe, expect, it } from 'vitest'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { BrowserError } from '../browser/types.ts'
 import type { BrowserSnapshot } from '../browser/types.ts'
 import { METRICS_ENV, StaleRefMetrics } from './metrics.ts'
@@ -2660,10 +2660,48 @@ describe('P3: locate', () => {
     provider = new AdoptableProvider({ navigationTimeoutMs: 200 }, chrome.transport())
     const { ref } = await firstRef()
 
+    const originalHandle = chrome.handle.bind(chrome)
+    const geometryVisibility: (string | undefined)[] = []
+    vi.spyOn(chrome, 'handle').mockImplementation((socket, method, params) => {
+      if (method === 'Runtime.callFunctionOn' && String(params['functionDeclaration']).includes('scrollIntoView')) {
+        geometryVisibility.push(chrome.visibilityState)
+      }
+      return originalHandle(socket, method, params)
+    })
     const result = await provider.mutate({ kind: 'click', sessionId: 'tab-1', ref })
     expect(result).toMatchObject({ action: 'click' })
     expect(chrome.activateCalls).toContain('tab-1')
+    expect(geometryVisibility).toEqual(['visible'])
     expect(chrome.calls.filter(call => call.method === 'Input.dispatchMouseEvent')).toHaveLength(2)
+  })
+
+  it('测量命中后被切到后台时拒绝点击，不再次激活并复用旧落点', async () => {
+    chrome.canActivate = true
+    chrome.visibilityState = 'visible'
+    chrome.visibilityAfterActivate = 'visible'
+    provider = new AdoptableProvider({ navigationTimeoutMs: 200 }, chrome.transport())
+    const { ref } = await firstRef()
+    const originalHandle = chrome.handle.bind(chrome)
+    vi.spyOn(chrome, 'handle').mockImplementation((socket, method, params) => {
+      const result = originalHandle(socket, method, params)
+      if (method === 'Runtime.callFunctionOn' && String(params['functionDeclaration']).includes('elementFromPoint')) {
+        chrome.visibilityState = 'hidden'
+      }
+      return result
+    })
+    await expect(provider.mutate({ kind: 'click', sessionId: 'tab-1', ref }))
+      .rejects.toThrow(expect.objectContaining({ code: 'BROWSER_TAB_NOT_VISIBLE' }))
+    expect(chrome.activateCalls).toHaveLength(0)
+    expect(chrome.calls.filter(call => call.method === 'Input.dispatchMouseEvent')).toHaveLength(0)
+  })
+
+  it('滚动预算结束后落点仍在视口外时拒绝真实点击，不能报告假成功', async () => {
+    chrome.elementRect = { x: 434, y: 1048, width: 100, height: 40 }
+    chrome.viewport = { width: 1087, height: 683 }
+    const { ref } = await firstRef()
+    await expect(provider.mutate({ kind: 'click', sessionId: 'tab-1', ref }))
+      .rejects.toThrow(expect.objectContaining({ code: 'BROWSER_PROTOCOL_ERROR' }))
+    expect(chrome.calls.filter(call => call.method === 'Input.dispatchMouseEvent')).toHaveLength(0)
   })
 
   it('refuses to dispatch click into a tab that stays hidden after activation (L2 · 零副作用)', async () => {

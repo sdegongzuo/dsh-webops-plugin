@@ -1497,13 +1497,10 @@ export class CdpBrowserProvider implements BrowserProvider {
       // 正文读取（项 3）：底稿行的未裁切全文与同级 statictext 块文本（稀疏 {行号, 文本}，
       // 行号与 fullOutline 逐行对齐）—— find(full_text=true) 按行号取用。原文可能含换行，
       // 不能 join 成字符串；不进模型上下文，只有 find 按需读取。
-      ...outline.unfoldedLines.some(line => line.full !== undefined)
-        ? {
-          fullTexts: outline.unfoldedLines
-            .map((line, index) => ({ line: index, text: line.full ?? '' }))
-            .filter(entry => entry.text !== ''),
-        }
-        : {},
+      // 空数组也声明正文已采集但无附加全文条目，不能误报缺少快照。
+      fullTexts: outline.unfoldedLines
+        .map((line, index) => ({ line: index, text: line.full ?? '' }))
+        .filter(entry => entry.text !== ''),
       ...outline.unfoldedLines.some(line => line.block !== undefined)
         ? {
           textBlocks: outline.unfoldedLines
@@ -2257,8 +2254,19 @@ export class CdpBrowserProvider implements BrowserProvider {
     const objectId = await this.resolveObjectId(session, ref, signal)
     let hit: HitTestOutcome | undefined
     try {
+      // 后台页面的 smooth 滚动可能暂停；先准备可见标签，再滚动和量落点。
+      // 否则激活后布局已经改变，却仍把之前的视口外坐标用于真实输入。
+      await this.ensureInputDispatchable(session, signal)
       const box = await this.elementViewportBox(session, objectId, signal)
       const point = { x: box.x + box.width / 2, y: box.y + box.height / 2 }
+      if ((box.viewportWidth !== undefined && (point.x < 0 || point.x >= box.viewportWidth))
+        || (box.viewportHeight !== undefined && (point.y < 0 || point.y >= box.viewportHeight))) {
+        throw new BrowserError(
+          'the target centre is still outside the viewport after scrolling; no mouse event was dispatched. '
+            + 'Use webpage_locate to verify its position or take a fresh snapshot before retrying.',
+          'BROWSER_PROTOCOL_ERROR',
+        )
+      }
       hit = await this.hitTest(session, objectId, point, signal)
       // 命中测试证实落点被别的元素盖住 → **派发前拒绝**（2026-10-07 独立验收：零页面
       // 副作用）。旧实现「事件照发、回执如实」会把鼠标事件实际打到遮罩上 —— 真实对话
@@ -2272,7 +2280,9 @@ export class CdpBrowserProvider implements BrowserProvider {
       // 回执 done、页面计数不动（submits=0）。innerWidth>0 与命中测试都判不出这个坑，
       // 所以派发前把本标签切到前台并确认页面真的可见；
       // 激活后仍不可见就在派发前拒绝，零副作用。
-      await this.ensureInputDispatchable(session, signal)
+      this.assertWritable(session)
+      // 量点后若被另一会话切到后台，拒绝而不再次激活，避免恢复滚动后复用旧坐标。
+      await this.ensureInputDispatchable(session, signal, false)
       const options = { signal, timeoutMs: this.config.commandTimeoutMs }
       await session.connection.send('Input.dispatchMouseEvent', {
         type: 'mousePressed', ...point, button: 'left', clickCount: 1,
@@ -2540,9 +2550,17 @@ export class CdpBrowserProvider implements BrowserProvider {
    * 边界：不能抢人工持有的标签（hold 门在更早的写入前检查里已拒）；不跨模型调用锁前台
    * （这里只为本一次派发准备，之后的可见性由下一次动作自己重新确认）。
    */
-  private async ensureInputDispatchable(session: SessionState, signal?: AbortSignal): Promise<void> {
+  private async ensureInputDispatchable(session: SessionState, signal?: AbortSignal, allowActivation = true): Promise<void> {
     const state = await this.readVisibilityState(session, signal)
     if (state === undefined || state === 'visible') return
+    if (!allowActivation) {
+      throw new BrowserError(
+        `session_id=${session.targetId} became visibilityState=${state} after the click position was measured. `
+          + 'No mouse event was dispatched; activate the tab and retry once so scrolling and hit testing '
+          + 'start from the current visible layout.',
+        'BROWSER_TAB_NOT_VISIBLE',
+      )
+    }
     const activate = this.transport.activateTarget
     if (activate === undefined) {
       throw new BrowserError(

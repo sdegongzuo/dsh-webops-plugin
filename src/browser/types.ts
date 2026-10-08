@@ -198,7 +198,7 @@ const BROWSER_ERROR_RECOVERY: Readonly<Partial<Record<BrowserErrorCode, string>>
   BROWSER_EXECUTE_NOT_ALLOWED: 'use one of the allowed CDP commands listed in the tool description.',
   BROWSER_HUMAN_HOLDING: 'a human is holding this tab — do not retry; wait for them to release it, then take a fresh webpage_snapshot (old refs stay invalid).',
   BROWSER_CALLER_REQUIRED: 'the runtime did not pass a caller identity; report this as an environment problem.',
-  BROWSER_TAB_NOT_HELD: 'claim the tab first with webpage_tabs(action=claim), then take a fresh webpage_snapshot.',
+  BROWSER_TAB_NOT_HELD: 'if the tab is idle, claim it with webpage_tabs(action=claim); if another conversation holds it, wait for release or an explicit handover instead of trying to take it over. After acquiring it, take a fresh webpage_snapshot.',
   BROWSER_TAB_OCCUPIED: 'another conversation holds this tab — do not fight for it; use another tab or wait for release.',
   BROWSER_TAB_BUSY: 'a call is still running on this tab; wait for it to finish, then retry.',
   BROWSER_HANDOFF_INVALID: 'this handoff code is used or expired — ask the previous holder for a fresh code.',

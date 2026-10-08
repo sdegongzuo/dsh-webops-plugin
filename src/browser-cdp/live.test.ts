@@ -31,7 +31,9 @@ import { LocalAttachmentStore } from '@deepseek-ai/dsh-attachment-local'
 import { CdpBrowserProvider } from './provider.ts'
 import { validateEndpoint } from './url-policy.ts'
 
-const { buildRoot } = await import('../../scripts/local-env.mjs')
+const { buildRoot } = await import(new URL('../../scripts/local-env.mjs', import.meta.url).href) as {
+  buildRoot(): string
+}
 
 /** 调试端点，可用 `DSH_CDP_ENDPOINT` 覆盖。默认 9222 —— 本机那个端口属于桌面端，见文件头。 */
 const ENDPOINT = validateEndpoint(process.env['DSH_CDP_ENDPOINT'] ?? 'http://127.0.0.1:9222')
@@ -87,11 +89,11 @@ const FIXTURE_HTML = `<!doctype html>
 </html>
 `
 
-const SECTION_CODE = '  function secondExample(value) {\n    return `${value} END_TEMPLATE`;\n  }\n'
+const SECTION_CODE = '  function secondExample(value) {\n    return `${value} R&amp;B END_TEMPLATE`;\n  }\n'
 const SECTION_TAIL = `${'第二段长正文。'.repeat(40)}SECOND_SECTION_TAIL`
 const SECTIONS_HTML = `<!doctype html><title>同名章节真实正文</title><main>
 <section><h2>同名标题</h2><p>FIRST_ONLY</p><pre><code>firstExample()</code></pre></section>
-<section><h2>同名标题</h2><p>${SECTION_TAIL}</p><pre><code>${SECTION_CODE.replace('function', '<span>function</span>')}</code></pre></section>
+<section><h2>同名标题</h2><p>${SECTION_TAIL}</p><pre><code>${SECTION_CODE.replace('function', '<span>function</span>').replace('&amp;', '<span>&amp;amp;</span>')}</code></pre></section>
 </main>`
 
 /**
@@ -250,7 +252,7 @@ describe.runIf(PROBE.run)(`live Chrome at ${ENDPOINT}`, () => {
     // 序号跨 snapshot 单调递增，所以新 ref 不可能与旧 ref 同号。
     expect(refreshed.refs.map(ref => ref.ref)).not.toContain(button?.ref)
 
-    const targetId = session.targetId
+    const targetId = session.id
     const sessionsBeforeClose = provider.sessionCount
     await provider.close(session.id)
     expect(provider.sessionCount).toBe(sessionsBeforeClose - 1)

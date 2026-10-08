@@ -433,7 +433,7 @@ export function buildOutline(
   let truncated = false
   let droppedElements = 0
 
-  const visit = (node: AxNode, depth: number, ancestors: readonly string[], parentAxId?: string): void => {
+  const visit = (node: AxNode, depth: number, ancestors: readonly string[], parentAxId?: string, codeAxId?: string): void => {
     if (visited.has(node.nodeId)) return
     visited.add(node.nodeId)
 
@@ -474,7 +474,10 @@ export function buildOutline(
         role,
         name,
         raw,
-        parentAxId,
+        // 代码高亮可在某个 token 外再包 generic（真实 MDN 的 &amp; 如此）。
+        // 同一 code 容器按 DFS 次序合并所有 statictext；普通正文仍按原 AX 父分组，
+        // 避免透明布局层把独立段落或相邻代码块拼到一起。
+        parentAxId: role === 'statictext' ? codeAxId ?? parentAxId : parentAxId,
         ...targetRow !== undefined ? { targetRow } : {},
         ...foldKey !== undefined ? { foldKey } : {},
       })
@@ -494,7 +497,7 @@ export function buildOutline(
     for (const childId of node.childIds ?? []) {
       const child = byId.get(childId)
       if (child === undefined) continue
-      visit(child, childDepth, nextAncestors, node.nodeId)
+      visit(child, childDepth, nextAncestors, node.nodeId, role === 'code' ? node.nodeId : codeAxId)
     }
   }
 
@@ -663,7 +666,7 @@ export function buildOutline(
   // （join('')）就是渲染出的原文。任何外加分隔符都是往原文里塞页面没有的字符：
   // 旧实现 join('\n') 把 `function checkData() {…}` 打成每 token 一行，模板字符串里也多出
   // 换行，代码格式与字符串语义都被改掉（证据 MDN-code-format-mismatch.json）。
-  // 分组按 **AX 树的父节点** 而不是候选行链：generic 容器是透明层，不产候选行。
+  // 代码按最近 code 祖先分组，跨越高亮 token 的透明包装；普通正文按实际 AX 父节点。
   const staticByParent = new Map<string, string[]>()
   for (const candidate of candidates) {
     if (candidate.role !== 'statictext' || candidate.parentAxId === undefined) continue

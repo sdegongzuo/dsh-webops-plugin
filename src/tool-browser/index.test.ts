@@ -350,7 +350,7 @@ describe('registration', () => {
     expect(text).toContain('webpage_wait(text=...)')
     expect(text).toContain('webpage_find and a regional snapshot (region_ref)')
     expect(text).toContain('truncated=true')
-    expect(text).toContain('outline you hold no longer matches')
+    expect(text).toContain('outline no longer matches the page')
     expect(text).toContain('Revalidate does not release human control')
   })
 
@@ -380,7 +380,8 @@ describe('registration', () => {
     expect(wait).toContain('one such wait confirms submission too')
     expect(wait).not.toContain('Use until=stable after sending a chat message')
     const snapshot = String(tool(harness, 'webpage_snapshot').description)
-    expect(snapshot).toContain('For reply text after webpage_wait use region_viewport')
+    expect(snapshot).toContain('region_viewport reads only the visible fragment')
+    expect(snapshot).toContain('find(query=unique text,full_text=true)')
     expect(snapshot).not.toContain('use it before deciding anything')
     const section = harness.sections[0]
     const text = (section?.text as (context: { scope?: undefined }) => string)({ scope: undefined })
@@ -818,6 +819,12 @@ describe('webpage_tabs and the P1 mutation tools', () => {
       signals: { readyState: 'complete', dom: 'quiet', network: 'quiet' },
     })
     expect(quiet).not.toContain('webpage_wait(text=')
+
+    // 真 Chrome 已确认 visibility:hidden 保留正宽度；隐藏状态不能推断为无布局盒。
+    const hidden = render({ ...base, action: 'wait', satisfied: false, ref_state: 'hidden' })
+    expect(hidden).toContain('not visible; it may retain a layout box')
+    expect(hidden).toContain('only when the node actually leaves the document')
+    expect(hidden).not.toContain('NO layout box')
 
     // 新字段必须能被工具的输出契约接受（additionalProperties: false，漏声明就是运行时炸）。
     expect(validateJsonSchemaValue(
@@ -1305,6 +1312,17 @@ describe('webpage_find / webpage_locate (P3)', () => {
     await expect(tool(harness, 'webpage_find')
       .execute({ session_id: 's1', query: 'Submit', full_text: true }, exec()))
       .rejects.toThrow(expect.objectContaining({ code: 'BROWSER_SNAPSHOT_REQUIRED' }))
+  })
+
+  it('正文数据为空的有效快照允许完整读取控件与零命中，不要求反复重拍', async () => {
+    harness.snapshotResponse = { ...SNAPSHOT, fullTexts: [] }
+    await tool(harness, 'webpage_snapshot').execute({ session_id: 's1' }, exec())
+    const matched = await tool(harness, 'webpage_find')
+      .execute({ session_id: 's1', query: 'Submit', full_text: true }, exec()) as { matches: unknown[] }
+    expect(matched.matches).toHaveLength(1)
+    const absent = await tool(harness, 'webpage_find')
+      .execute({ session_id: 's1', query: '不存在的正文', full_text: true }, exec()) as { matches: unknown[] }
+    expect(absent.matches).toEqual([])
   })
 
   it('#7 (2026-10-07) 回执附带单调时钟实测的 duration_ms，标注只代表本次工具调用', async () => {
@@ -1928,6 +1946,19 @@ describe('§6.2 ② 回执字段与文案（P2 最后一公里）', () => {
     const withWindow = render('webpage_snapshot',
       await tool(harness, 'webpage_snapshot').execute({ session_id: 's1' }, exec()))
     expect(withWindow).toContain('human takeover window was opened 1 time(s)')
+  })
+
+  it('接管提示区分 DevTools 与真实控制权，不暗示交还会复活旧 ref', async () => {
+    harness.snapshotResponse = {
+      ...SNAPSHOT,
+      pageChanged: { navigated: 0, withinDocument: 0, takeoverWindow: 1 },
+    }
+    const text = render('webpage_snapshot',
+      await tool(harness, 'webpage_snapshot').execute({ session_id: 's1' }, exec()))
+    expect(text).toContain('Opening DevTools alone does not invalidate refs')
+    expect(text).toContain('remain obsolete after handback')
+    expect(text).toContain('never retry a pre-take-over ref')
+    expect(text).not.toContain('probably still valid')
   })
 
   it('D-5 的 reboundRefs 单独一段文案，并说清「报的是指针动过、不是元素变了」', async () => {

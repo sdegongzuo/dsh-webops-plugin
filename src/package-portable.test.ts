@@ -7,6 +7,7 @@ import { fileURLToPath } from 'node:url'
 import { describe, expect, it } from 'vitest'
 
 const script = fileURLToPath(new URL('../scripts/package-portable.mjs', import.meta.url))
+const updateScript = fileURLToPath(new URL('../scripts/package-plugin-update.mjs', import.meta.url))
 const zipper = fileURLToPath(new URL('../scripts/zip-stage.py', import.meta.url))
 const localPaths = await import(new URL('../scripts/local-env.mjs', import.meta.url).href) as {
   buildRoot(): string
@@ -37,6 +38,16 @@ function pack(lib: string, stage: string, out: string) {
 }
 
 describe('纯插件包保留模式的真实 ZIP', () => {
+  it.each([script, updateScript])('遗漏 --lib-dir 时写入前拒绝：%s', (target) => {
+    const data = fixture()
+    const before = readdirSync(data.root)
+    const result = spawnSync(process.execPath, [target, '--stage-root', data.stage,
+      '--keep-stage', '--out', join(data.root, '未执行.zip')], { encoding: 'utf8' })
+    expect(result.status).toBe(1)
+    expect(result.stderr).toContain('--lib-dir 必须显式指定')
+    expect(readdirSync(data.root)).toEqual(before)
+  })
+
   it.each(['host.cjs', 'action-overlay.cjs', 'action-overlay.html', 'tabbar.html', 'tabbar-preload.cjs'])
   ('缺少 %s 时在打包前拒绝', (asset) => {
     const data = fixture(asset)
