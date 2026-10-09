@@ -96,6 +96,7 @@ interface PendingCommand {
 interface CdpErrorPayload {
   readonly code?: number
   readonly message?: string
+  readonly data?: { readonly kind?: unknown; readonly timeoutMs?: unknown; readonly method?: unknown }
 }
 
 /**
@@ -165,7 +166,8 @@ export class CdpConnection {
         entry?.detachAbort()
         reject(new BrowserError(
           `CDP command "${method}" did not complete within ${timeoutMs} ms`,
-          'BROWSER_PROTOCOL_ERROR',
+          'BROWSER_CDP_COMMAND_TIMEOUT',
+          { timeoutMs, method },
         ))
       }, timeoutMs)
       const signal = options?.signal
@@ -314,6 +316,18 @@ function connectionLost(message: string): BrowserError {
  */
 function mapCdpError(error: CdpErrorPayload): BrowserError {
   const detail = error.message ?? 'unknown error'
+  if (error.data?.['kind'] === 'command-timeout') {
+    const timeoutMs = typeof error.data.timeoutMs === 'number' ? error.data.timeoutMs : undefined
+    const method = typeof error.data.method === 'string' ? error.data.method : undefined
+    return new BrowserError(
+      `Electron host CDP command${method === undefined ? '' : ` "${method}"`} timed out${timeoutMs === undefined ? '' : ` after ${timeoutMs} ms`}`,
+      'BROWSER_CDP_COMMAND_TIMEOUT',
+      {
+        ...(timeoutMs === undefined ? {} : { timeoutMs }),
+        ...(method === undefined ? {} : { method }),
+      },
+    )
+  }
   if (detail.includes('No target available')) {
     return new BrowserError(
       `the CDP debugger is detached from this target (${detail}); it re-attaches by itself once DevTools `

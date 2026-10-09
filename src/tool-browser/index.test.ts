@@ -298,7 +298,7 @@ function mount(): Harness {
             truncated: false,
           })
       },
-      execute: (args: { method: string }) => {
+      execute: (args: { method: string; params?: { expression?: string } }) => {
         browserCalls.push({ method: 'execute', args })
         return Promise.resolve({
           kind: 'execute',
@@ -308,7 +308,7 @@ function mount(): Harness {
           url: SESSION.url,
           navigated: harness.executeNavigated,
           ...harness.pageChanged !== undefined ? { pageChanged: harness.pageChanged } : {},
-          value: 2,
+          value: { __dsh_webpage_execute_result_v1__: 1, has_value: true, value: 2 },
           truncated: false,
         })
       },
@@ -360,7 +360,7 @@ describe('registration', () => {
       webpage_snapshot: ['does NOT invalidate other refs', 'webpage_find', 'truncated=true'],
       webpage_tabs: ['one-time code', 'ends your access', 'kills every ref'],
       webpage_revalidate: ['document_changed', 'node_gone', 'identity_mismatch', 'not_archived', 'SAME number'],
-      webpage_execute: ['BROWSER_EXECUTE_NOT_ALLOWED', 'BROWSER_EXECUTE_RESULT_UNSERIALIZABLE', 'side effects NOT rolled back'],
+      webpage_execute: ['async 函数体', 'return 返回普通数据', 'timeout_ms', '副作用'],
       webpage_wait: ['exactly ONE condition', 'satisfied=false', 'timeout_ms'],
     }
     for (const [name, phrases] of Object.entries(anchors)) {
@@ -936,84 +936,61 @@ describe('webpage_console / webpage_network / webpage_execute', () => {
       .rejects.toThrow(/list, body/u)
   })
 
-  it('forwards the whitelisted CDP command with its params and returns the value', async () => {
+  it('wraps one async function body in Runtime.evaluate and returns its value', async () => {
     const definition = tool(harness, 'webpage_execute')
     const value = await definition.execute(
-      { session_id: 's1', method: 'Runtime.evaluate', params: { expression: '1 + 1' } },
+      { session_id: 's1', code: 'return 1 + 1;' },
       exec(),
     )
 
     expect(harness.browserCalls).toEqual([{
       method: 'execute',
-      args: { sessionId: 's1', method: 'Runtime.evaluate', params: { expression: '1 + 1' } },
+      args: { sessionId: 's1', method: 'Runtime.evaluate', params: { expression: expect.stringContaining('return 1 + 1;') }, timeoutMs: 5_000 },
     }])
-    expect(value).toMatchObject({ session_id: 's1', method: 'Runtime.evaluate', value: 2, truncated: false })
+    expect(value).toMatchObject({ session_id: 's1', method: 'Runtime.evaluate', has_value: true, value: 2, truncated: false })
     expect(validateJsonSchemaValue(definition.output.schema, value)).toEqual([])
   })
 
-  it('rejects a malformed execute call as a PARAM error, not a page-state error (2026-10-08)', async () => {
-    // 独立验收：缺 params.expression 的调用过去打到 CDP 变 "Invalid parameters"，恢复建议
-    // 却说「页面状态拒绝、重拍快照」——模型反复无效刷新。参数错误必须在工具边界拦下，
-    // 并把正确结构写在消息里。
+  it('rejects unknown and malformed execute fields before dispatch', async () => {
     const definition = tool(harness, 'webpage_execute')
-
-    // params 整个缺失（expression 被误放在工具调用顶层就是这个形状）。
-    await expect(definition.execute({ session_id: 's1', method: 'Runtime.evaluate' }, exec()))
-      .rejects.toThrow(expect.objectContaining({
-        code: 'BROWSER_INVALID_PARAMS',
-        message: expect.stringContaining('params={"expression"') as unknown as string,
-      }))
-    await expect(definition.execute({ session_id: 's1', method: 'Runtime.evaluate' }, exec()))
-      .rejects.toThrow(/INSIDE params/u)
-
-    // params.expression 缺失 / 非字符串。
-    await expect(definition.execute({ session_id: 's1', method: 'Runtime.evaluate', params: {} }, exec()))
+    await expect(definition.execute({ session_id: 's1', code: 'return 1;', method: 'Runtime.evaluate' } as never, exec()))
+      .rejects.toThrow(expect.objectContaining({ code: 'BROWSER_INVALID_PARAMS', message: expect.stringContaining('unsupported field') }))
+    await expect(definition.execute({ session_id: 's1', code: 'return 1;', params: { expression: '1' } } as never, exec()))
       .rejects.toThrow(expect.objectContaining({ code: 'BROWSER_INVALID_PARAMS' }))
-    await expect(definition.execute({
-      session_id: 's1', method: 'Runtime.evaluate', params: { expression: 42 },
-    }, exec())).rejects.toThrow(expect.objectContaining({ code: 'BROWSER_INVALID_PARAMS' }))
-
-    // params 不是对象。
-    await expect(definition.execute({
-      session_id: 's1', method: 'Runtime.evaluate', params: '1+1' as never,
-    }, exec())).rejects.toThrow(expect.objectContaining({ code: 'BROWSER_INVALID_PARAMS' }))
-
-    // Page.navigate 缺 url。
-    await expect(definition.execute({ session_id: 's1', method: 'Page.navigate' }, exec()))
-      .rejects.toThrow(expect.objectContaining({
-        code: 'BROWSER_INVALID_PARAMS',
-        message: expect.stringContaining('params={"url"') as unknown as string,
-      }))
-
-    // 一条都没到 provider：参数校验是纯边界检查。
+    await expect(definition.execute({ session_id: 's1', code: '   ' }, exec()))
+      .rejects.toThrow(expect.objectContaining({ code: 'BROWSER_INVALID_PARAMS' }))
+    await expect(definition.execute({ session_id: '', code: 'return 1;' }, exec()))
+      .rejects.toThrow(expect.objectContaining({ code: 'BROWSER_INVALID_PARAMS' }))
+    await expect(definition.execute({ session_id: 's1', code: 'return 1;', timeout_ms: 0 }, exec()))
+      .rejects.toThrow(expect.objectContaining({ code: 'BROWSER_INVALID_PARAMS' }))
     expect(harness.browserCalls).toEqual([])
   })
 
-  it('forwards timeout_ms only when the model passed one (B5-d · J8)', async () => {
+  it('uses the default 5000 ms budget and forwards a valid explicit timeout', async () => {
     const definition = tool(harness, 'webpage_execute')
 
     await definition.execute(
-      { session_id: 's1', method: 'Runtime.evaluate', params: { expression: 'idle()' }, timeout_ms: 1_500 },
+      { session_id: 's1', code: 'return await idle();', timeout_ms: 1_500 },
       exec(),
     )
     expect(harness.browserCalls[0]?.args).toEqual({
       sessionId: 's1',
       method: 'Runtime.evaluate',
-      params: { expression: 'idle()' },
+      params: { expression: expect.stringContaining('return await idle();') },
       timeoutMs: 1_500,
     })
 
-    // 不传时**不能凭空多出这个字段**：provider 用 `request.timeoutMs === undefined` 分「调用方给了」
-    // 与「没给」两条路，所以这里用 `toStrictEqual`（它分得出 `{timeoutMs: undefined}` 与没有这个键）。
+    // 默认期限是工具契约的一部分，必须传到 provider。
     const fresh = mount()
     await tool(fresh, 'webpage_execute').execute(
-      { session_id: 's1', method: 'Runtime.evaluate', params: { expression: 'idle()' } },
+      { session_id: 's1', code: 'return await idle();' },
       exec(),
     )
     expect(fresh.browserCalls[0]?.args).toStrictEqual({
       sessionId: 's1',
       method: 'Runtime.evaluate',
-      params: { expression: 'idle()' },
+      params: { expression: expect.stringContaining('return await idle();') },
+      timeoutMs: 5_000,
     })
   })
 })
@@ -1245,7 +1222,7 @@ describe('webpage_find / webpage_locate (P3)', () => {
     await expect(definition.execute({ session_id: 's1', ref: 'e1' }, exec()))
       .rejects.toThrow(/^\[BROWSER_PROTOCOL_ERROR\] the element has no usable layout box/)
     await expect(definition.execute({ session_id: 's1', ref: 'e1' }, exec()))
-      .rejects.toThrow(/Recovery: .*verify the element with webpage_locate or a fresh webpage_snapshot before retrying/)
+      .rejects.toThrow(/Recovery: the browser connection or protocol could not complete this command; inspect the current page and connection state/)
 
     // 旧 ref：仍报 BROWSER_STALE_REF（不是布局错误），且恢复建议跟着到模型。
     harness.failLocate = new BrowserError('ref belongs to an obsolete epoch', 'BROWSER_STALE_REF')
@@ -1564,7 +1541,7 @@ describe('2026-09-17 导航后 find 缓存必须失效', () => {
     await cacheSnapshot()
     harness.executeNavigated = true
     await tool(harness, 'webpage_execute').execute(
-      { session_id: 's1', method: 'Runtime.evaluate', params: { expression: 'location.href="/x"' } },
+      { session_id: 's1', code: 'location.href="/x"; return true;' },
       exec(),
     )
 
@@ -1913,7 +1890,7 @@ describe('§6.2 ② 回执字段与文案（P2 最后一公里）', () => {
   it('execute / revalidate 的回执同样带上（逃生舱能跑任意页面代码；revalidate 的成功判据看不出重排）', async () => {
     harness.pageChanged = CHANGED
     const executed = await tool(harness, 'webpage_execute')
-      .execute({ session_id: 's1', method: 'Runtime.evaluate', params: { expression: '1' } }, exec())
+      .execute({ session_id: 's1', code: 'return 1;' }, exec())
     expect(render('webpage_execute', executed)).toContain('PAGE CHANGED SINCE YOUR LAST SNAPSHOT')
 
     const revalidated = await tool(harness, 'webpage_revalidate')
@@ -1995,7 +1972,7 @@ describe('§6.2 ② 回执字段与文案（P2 最后一公里）', () => {
     expect(validateJsonSchemaValue(tool(harness, 'webpage_click').output.schema, mutationValue)).toEqual([])
 
     const executeValue = await tool(harness, 'webpage_execute')
-      .execute({ session_id: 's1', method: 'Runtime.evaluate', params: { expression: '1' } }, exec())
+      .execute({ session_id: 's1', code: 'return 1;' }, exec())
     expect(validateJsonSchemaValue(tool(harness, 'webpage_execute').output.schema, executeValue)).toEqual([])
 
     const revalidateValue = await tool(harness, 'webpage_revalidate')
@@ -2103,10 +2080,7 @@ describe('T-C 前缀成本守卫', () => {
 
     // 二档：**只出现在散文描述里**、没有任何结构性断言的锚点。措辞瘦身时它们最容易被顺手删掉，
     // 而删掉之后总量仍 < 预算、上一档也照样绿 —— 没有任何门禁会红。所以单独锚在 description 上。
-    // 2026-09-20 评审补入：起因是发现失败的 `BROWSER_EXECUTE_RESULT_UNSERIALIZABLE` 不在原清单里。
     for (const needle of [
-      'BROWSER_EXECUTE_NOT_ALLOWED',           // execute 的允许清单拒绝码
-      'BROWSER_EXECUTE_RESULT_UNSERIALIZABLE', // execute 返回值过不了 CDP 边界的码
       'BROWSER_NAVIGATION_FAILED',             // 导航失败码
       'replay_truncated',                      // network 回放被截断
       'document_changed',                      // revalidate 的「文档已换」结论

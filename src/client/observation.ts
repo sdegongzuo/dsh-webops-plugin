@@ -180,7 +180,7 @@ function parseAtPayload(payload: string): { url: string; title: string | undefin
  *
  * - open / navigate / snapshot：首行就是地址，`title:` 行与 session 行在前三行；
  * - click / fill / press / scroll / wait：`… done on session_id=t9 (now at URL — 标题, ref epoch N).`；
- * - execute：`<method> on session_id=t9 (at URL, ref epoch N)`；
+ * - execute：`Runtime.evaluate on session_id=t9 (at URL, ref epoch N)`；工具调用只接受 async 函数体字段；
  * - tabs：只认 `[foreground]` 行 —— 那是「当前页」的权威观察（无 epoch）。
  *
  * 失败与运行中的调用不算观察（动作没落地或没回话，页面状态未知）。

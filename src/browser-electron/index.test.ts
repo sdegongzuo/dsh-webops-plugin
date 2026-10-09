@@ -14,7 +14,7 @@ import { fileURLToPath } from 'node:url'
 import type { ChildProcess } from 'node:child_process'
 import { connect, createServer, type Socket as NetSocket } from 'node:net'
 import { CdpConnection } from '../browser-cdp/protocol.ts'
-import { ElectronWindowBridge } from './bridge.ts'
+import { BridgeError, ElectronWindowBridge } from './bridge.ts'
 import type { BridgeControl, BridgeDevTools, BridgeTab, BridgeTabBar, ControlHolder, ControlListener, EventListener, TabHostChannel, TakeoverListener, TabOpenedListener } from './bridge.ts'
 import { parseAnnouncedAddress, resolveHostLaunch } from './bridge.ts'
 import { formatHostOutput } from './bridge.ts'
@@ -819,6 +819,21 @@ describe('WindowCdpSocket', () => {
 
     host.breakChannel()
     expect(connection.isClosed).toBe(true)
+  })
+
+  it('host/bridge/socket 超时以结构化 CDP 错误穿过 Electron 通道', async () => {
+    const host = new FakeHost()
+    host.respond = () => new BridgeError('host command timeout', 'CDP_COMMAND_TIMEOUT', {
+      timeoutMs: 30_000,
+      method: 'Runtime.evaluate',
+    })
+    const connection = new CdpConnection(new WindowCdpSocket(host, 't1'), 5_000)
+
+    await expect(connection.send('Runtime.evaluate', { expression: '1' })).rejects.toMatchObject({
+      code: 'BROWSER_CDP_COMMAND_TIMEOUT',
+      timeoutMs: 30_000,
+      method: 'Runtime.evaluate',
+    })
   })
 })
 

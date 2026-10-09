@@ -29,7 +29,7 @@
 | webpage_wait | 等文本、元素消失、页面稳定或指定时间；生成回复优先等待当前回复的完成标记 |
 | webpage_screenshot / console / network | 截图与调试采集 |
 | webpage_tabs | 查看持有/空闲标签、激活、关闭、领取、释放与移交 |
-| webpage_execute | 执行允许列表内的一条 CDP 命令；Runtime.evaluate 会执行页面代码 |
+| webpage_execute | 用 session_id、code 和可选 timeout_ms 执行一次 async 函数体；用 return 返回普通数据，用 await 等待结果 |
 
 每个受控标签同时最多由一个对话占用；弹窗继承家族归属。释放保留页面，移交使用一次性码。人工接管期间 agent 不能操作，交还后重新取得有效 ref。重启不会恢复旧对话权限。页面内容按不可信数据处理。
 

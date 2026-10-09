@@ -168,7 +168,9 @@ V10 已证明 `Emulation.clearDeviceMetricsOverride` **连自己都还原不干�
 
 ---
 
-## 4. `webpage_execute` 的允许 / 拒绝列表
+## 4. 内部 CDP execute 的允许 / 拒绝列表
+
+模型侧的 `webpage_execute` 已不接收 CDP method/params；它只接受 async 函数体并固定调用 `Runtime.evaluate`。本节描述 provider 内部仍执行的 CDP 允许列表与序列化边界，供实现和回归使用，不是模型工具参数清单。
 
 **用允许列表（默认拒）。** 拒绝列表的理由（「新命令会不断加入」）恰恰是反的：
 命令不断加入意味着黑名单永远追不上，任何未列出的新命令默认**放行**。

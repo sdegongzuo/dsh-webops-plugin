@@ -733,7 +733,11 @@ async function handle(command) {
         let timer
         const timeout = new Promise((resolve, reject) => {
           timer = setTimeout(() => {
-            reject(new Error(`cdp command timed out after ${CDP_COMMAND_TIMEOUT_MS}ms: ${command.method}`))
+            const timeoutError = new Error(`cdp command timed out after ${CDP_COMMAND_TIMEOUT_MS}ms: ${command.method}`)
+            timeoutError.code = 'CDP_COMMAND_TIMEOUT'
+            timeoutError.timeoutMs = CDP_COMMAND_TIMEOUT_MS
+            timeoutError.method = command.method
+            reject(timeoutError)
           }, CDP_COMMAND_TIMEOUT_MS)
         })
         let result
@@ -747,7 +751,12 @@ async function handle(command) {
           void projectAction(entry, command.params ?? {})
         }
       } catch (error) {
-        send({ type: 'cdp', id: command.id, error: { message: String(error?.message ?? error) } })
+        const message = String(error?.message ?? error)
+        const hostTimeout = error?.code === 'CDP_COMMAND_TIMEOUT'
+        send({ type: 'cdp', id: command.id, error: {
+          message,
+          ...(hostTimeout ? { code: error.code, timeoutMs: error.timeoutMs, method: error.method } : {}),
+        } })
       }
       return
     }

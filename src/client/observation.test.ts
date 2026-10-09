@@ -188,7 +188,7 @@ describe('observeBrowser', () => {
     const observation = observeBrowser([
       call({
         toolName: 'webpage_execute',
-        argsRaw: '{"session_id":"t9","method":"Runtime.evaluate"}',
+        argsRaw: '{"session_id":"t9","code":"return document.title;"}',
         resultText: 'Runtime.evaluate on session_id=t9 (at http://127.0.0.1:9791/chapter, ref epoch 6)\n\n{"href":"http://127.0.0.1:9791/chapter"}',
       }),
     ])
@@ -256,7 +256,7 @@ describe('observeBrowser', () => {
     const observation = observeBrowser([
       call({
         toolName: 'webpage_execute',
-        argsRaw: '{"session_id":"t9","method":"Runtime.evaluate"}',
+        argsRaw: '{"session_id":"t9","code":"return document.title;"}',
         resultText: 'Runtime.evaluate on session_id=t9 (at http://127.0.0.1:9794/chapter?x=a,b(c), ref epoch 6)\n\n{"href":"http://127.0.0.1:9794/chapter?x=a,b(c)"}',
       }),
     ])
@@ -312,7 +312,7 @@ describe('observeBrowser', () => {
     const observation = observeBrowser([
       call({
         toolName: 'webpage_execute',
-        argsRaw: '{"session_id":"t9","method":"Runtime.evaluate","params":{"expression":"fetch(\\"http://127.0.0.1:9794/event\\")"}}',
+        argsRaw: '{"session_id":"t9","code":"return fetch(\\"http://127.0.0.1:9794/event\\");"}',
         resultText: [
           'Runtime.evaluate on session_id=t9 (at http://127.0.0.1:9794/chapter, ref epoch 6)',
           '',

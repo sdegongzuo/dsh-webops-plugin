@@ -89,6 +89,20 @@ describe('CdpConnection', () => {
     }))
   })
 
+  it('preserves structured command timeout fields from an Electron host', async () => {
+    const connection = new CdpConnection(socket)
+    const pending = connection.send('Runtime.evaluate', { expression: '1' })
+    socket.respond({ id: 1, error: {
+      message: 'host wait expired',
+      data: { kind: 'command-timeout', timeoutMs: 30_000, method: 'Runtime.evaluate' },
+    } })
+    await expect(pending).rejects.toMatchObject({
+      code: 'BROWSER_CDP_COMMAND_TIMEOUT',
+      timeoutMs: 30_000,
+      method: 'Runtime.evaluate',
+    })
+  })
+
   it('maps "No target available" onto the recoverable BROWSER_DEBUGGER_DETACHED', async () => {
     const connection = new CdpConnection(socket)
     const pending = connection.send('Runtime.evaluate', { expression: '1' })
@@ -143,7 +157,7 @@ describe('CdpConnection', () => {
   it('times a command out rather than waiting forever', async () => {
     const connection = new CdpConnection(socket)
     await expect(connection.send('Page.enable', undefined, { timeoutMs: 5 }))
-      .rejects.toThrow(expect.objectContaining({ code: 'BROWSER_PROTOCOL_ERROR' }))
+      .rejects.toThrow(expect.objectContaining({ code: 'BROWSER_CDP_COMMAND_TIMEOUT', timeoutMs: 5, method: 'Page.enable' }))
   })
 
   it('unhooks its abort listener when the command times out (2026-09-17)', async () => {
@@ -165,7 +179,7 @@ describe('CdpConnection', () => {
     }) as typeof remove
 
     await expect(connection.send('Page.enable', undefined, { signal, timeoutMs: 5 }))
-      .rejects.toThrow(expect.objectContaining({ code: 'BROWSER_PROTOCOL_ERROR' }))
+      .rejects.toThrow(expect.objectContaining({ code: 'BROWSER_CDP_COMMAND_TIMEOUT', timeoutMs: 5, method: 'Page.enable' }))
 
     // 工具的 exec.signal 是长生命周期的：一次工具调用里发好几条命令，
     // 每条超时都漏一个监听就会一直攒下去。

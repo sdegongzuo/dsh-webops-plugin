@@ -1,5 +1,6 @@
 /**
- * `webpage_execute` 的能力边界与返回值处理（方案 3.3）。
+ * provider 内部 CDP execute 能力边界与 CDP Runtime.evaluate 返回值处理（方案 3.3）。
+ * 模型工具只发送 async 函数体，method/params 不暴露给模型。
  *
  * ## 白名单制，默认拒
  *

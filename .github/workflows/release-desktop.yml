@@ -20,7 +20,9 @@ name: release-desktop
 #        extraResources，并让 `main.ts` 打包态的 dsh 指回 `resources\dsh`
 #        （0.1.5 及更早就是这条路径）。代价只是少享一点上游的 asar 收益。
 #   2. `scripts/patch-electron-builder.mjs`
-#      electron-builder 解包完立即 rename，Windows 上因句柄未释放报 EPERM。加个重试。
+#      electron-builder 解包完立即 rename，Windows 上因句柄未释放报 EPERM。
+#      26.17.0 起上游原生实现 moveDirAtomic（重试+copy 兜底）——脚本改为检测原生修复，
+#      检测到就放行；旧版 ref 仍会打我们自己的重试补丁。
 #
 # 注：**不需要 Visual C++ 构建工具**。node-pty 用的是预编译的 conpty.dll，
 # koffi / sharp 同理，实测一遍都没编译过原生模块。
@@ -64,10 +66,10 @@ concurrency:
 
 env:
   # 默认 pin 到与本机 checkout 一致的提交，避免上游 main 漂移把构建搞挂。
-  # 5badb15009 = tag `dsh-v0.2.1-alpha.1`。之所以必须跟着上游走：
+  # d743267388 = tag `dsh-v0.2.1-alpha.2`。之所以必须跟着上游走：
   # `docs/harness-desktop-build.patch` 的上下文行取自这个提交，pin 旧 ref 会直接 apply 失败。
   # 换 ref 会让本体缓存 key 失效，CI 得全量重建一次（~18min），属预期。
-  HARNESS_REF: ${{ inputs.harness_ref || '5badb15009ae1756c3afe0ae0cef1faafc290ccc' }}
+  HARNESS_REF: ${{ inputs.harness_ref || 'd743267388641bc76f17c45ce8b4c231aed1d32c' }}
   TAG: ${{ github.event_name == 'workflow_dispatch' && format('desktop-v{0}', inputs.version) || github.ref_name }}
   # ⚠️ 这一条**不生效**：dsh 0.1.6-alpha.2 起 `loadDesktopPackageEnvironment()` 会把环境变量里的
   # release 设置全部过滤掉（`AMBIENT_RELEASE_SETTING`），`DSH_DESKTOP_APP_ID` 只能由
@@ -228,8 +230,10 @@ jobs:
       - name: 构建插件
         run: pnpm build
 
-      - name: 修 electron-builder 解包 rename 的 EPERM
-        # 必须在 pnpm install 之后（改的是 node_modules 里的 app-builder-lib）。
+      - name: 核 electron-builder 解包 rename 的 EPERM 防护
+        # 必须在 pnpm install 之后（检查/修改的是 node_modules 里的 app-builder-lib）。
+        # 26.17.0 起上游原生实现了 moveDirAtomic（EPERM/EBUSY/ENOENT/EXDEV 重试 5 次 + copy 兜底），
+        # 脚本检测到它就放行；旧版 ref 仍会打我们自己的重试补丁；两者都没有才失败。
         shell: pwsh
         run: |
           node "$env:GITHUB_WORKSPACE/scripts/patch-electron-builder.mjs" "$env:HARNESS_ROOT"

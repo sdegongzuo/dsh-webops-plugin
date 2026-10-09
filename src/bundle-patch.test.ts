@@ -362,7 +362,8 @@ describe('alpha.2 宿主入口（desktop-host 不再导出 runDesktopHost）', (
     expect(helper, 'resources 根不是从 runtimeDir 推的')
       .toContain("const resources = join(runtimeDir, '..')")
     expect(helper, 'pnpm 探测路径与 resources 布局不符')
-      .toContain("join(resources, 'runtime', 'pnpm', 'bin', 'pnpm.mjs')")
+      // alpha.2 起上游把 pnpm 实体挪到 primary-runtime/dependencies 下（main.ts 与其 spec 同步改了）。
+      .toContain("join(resources, 'runtime', 'primary-runtime', 'dependencies', 'pnpm', 'bin', 'pnpm.mjs')")
     expect(helper, 'nodeBin 探测路径与 resources 布局不符')
       .toContain("join(resources, 'runtime', 'bin')")
     expect(helper, 'packageManager 不是「存在才成对给」（宿主只看 argv[5] 是否为 undefined）')

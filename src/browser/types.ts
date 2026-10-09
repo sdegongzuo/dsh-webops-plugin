@@ -43,6 +43,8 @@ export type BrowserErrorCode =
   | 'BROWSER_NAVIGATION_FAILED'
   /** CDP 返回了错误，或返回了不符合协议的消息。 */
   | 'BROWSER_PROTOCOL_ERROR'
+  /** CDP 本地定时器或 Electron host 超时；保留结构化预算，供 execute 转成页面等待超时。 */
+  | 'BROWSER_CDP_COMMAND_TIMEOUT'
   | 'BROWSER_INVALID_PARAMS'
   /** WebSocket 在命令完成前断开。 */
   | 'BROWSER_CONNECTION_LOST'
@@ -63,6 +65,10 @@ export type BrowserErrorCode =
    * 循环引用 / `Symbol` 会抛错，`[V22]`）。提示模型改用原始值或 JSON 字符串。
    */
   | 'BROWSER_EXECUTE_RESULT_UNSERIALIZABLE'
+  /** 页面 async 函数体的语法错误、运行时异常或拒绝的 Promise。 */
+  | 'BROWSER_EXECUTE_SCRIPT_ERROR'
+  /** 页面 execute 等待预算耗尽；页面代码可能仍在运行。 */
+  | 'BROWSER_EXECUTE_TIMEOUT'
   /**
    * P2：`webpage_execute` 只放行白名单里的 CDP 命令（方案 3.3）。不在允许列表里的
    * `domain.method` 一律拒绝 —— **新命令默认拒**，避免黑名单永远追不上协议演进。
@@ -154,17 +160,21 @@ export class BrowserError extends Error {
   readonly status: number | undefined
   /** 见 {@link BrowserStaleRefReason}；非 `BROWSER_STALE_REF` 时为 `undefined`。 */
   readonly reason: BrowserStaleRefReason | undefined
+  readonly timeoutMs: number | undefined
+  readonly method: string | undefined
 
   constructor(
     message: string,
     code: BrowserErrorCode,
-    options?: { cause?: unknown; status?: number; reason?: BrowserStaleRefReason },
+    options?: { cause?: unknown; status?: number; reason?: BrowserStaleRefReason; timeoutMs?: number; method?: string },
   ) {
     super(message, options)
     this.name = 'BrowserError'
     this.code = code
     this.status = options?.status
     this.reason = options?.reason
+    this.timeoutMs = options?.timeoutMs
+    this.method = options?.method
   }
 }
 
@@ -189,13 +199,16 @@ const BROWSER_ERROR_RECOVERY: Readonly<Partial<Record<BrowserErrorCode, string>>
   BROWSER_URL_BLOCKED: 'use an http(s) URL without embedded credentials.',
   BROWSER_ENDPOINT_UNREACHABLE: 'check that the browser is running and its debugging port is reachable.',
   BROWSER_NAVIGATION_FAILED: 'check the URL; if the page is slow, retry once or report the site as unreachable.',
-  BROWSER_PROTOCOL_ERROR: 'the page state rejected this action — verify the element with webpage_locate or a fresh webpage_snapshot before retrying; do not blindly retry or press Enter.',
+  BROWSER_PROTOCOL_ERROR: 'the browser connection or protocol could not complete this command; inspect the current page and connection state, then retry only when the action is safe.',
+  BROWSER_CDP_COMMAND_TIMEOUT: 'the CDP command did not return within its wait budget; the result is unknown, so inspect state before repeating any potentially mutating action.',
   BROWSER_INVALID_PARAMS: 'fix the tool arguments exactly as described in the message — this is a malformed tool call, not a page problem; no snapshot, retry or page inspection can fix it.',
   BROWSER_CONNECTION_LOST: 'the connection dropped; re-open the page with webpage_open.',
   BROWSER_DEBUGGER_DETACHED: 'the debugger briefly detached (e.g. DevTools opened); this recovers automatically — retry once after a moment.',
   BROWSER_STATE_CONTENDED: 'the state is held by someone else; do not retry the same write — coordinate or use force only if you mean to override.',
-  BROWSER_EXECUTE_RESULT_UNSERIALIZABLE: 'return a primitive value or a JSON string instead of a live DOM object.',
-  BROWSER_EXECUTE_NOT_ALLOWED: 'use one of the allowed CDP commands listed in the tool description.',
+  BROWSER_EXECUTE_RESULT_UNSERIALIZABLE: 'return ordinary JSON data with enumerable data fields; avoid live DOM nodes, functions, cycles, accessors, and deeply nested objects.',
+  BROWSER_EXECUTE_SCRIPT_ERROR: 'fix the reported JavaScript syntax or runtime error; the function body is not automatically retried.',
+  BROWSER_EXECUTE_TIMEOUT: 'inspect the page state before retrying; the result is unconfirmed and page code may still finish.',
+  BROWSER_EXECUTE_NOT_ALLOWED: 'this internal CDP command is not exposed by webpage_execute; use its documented session_id, code, and optional timeout_ms interface.',
   BROWSER_HUMAN_HOLDING: 'a human is holding this tab — do not retry; wait for them to release it, then take a fresh webpage_snapshot (old refs stay invalid).',
   BROWSER_CALLER_REQUIRED: 'the runtime did not pass a caller identity; report this as an environment problem.',
   BROWSER_TAB_NOT_HELD: 'if the tab is idle, claim it with webpage_tabs(action=claim); if another conversation holds it, wait for release or an explicit handover instead of trying to take it over. After acquiring it, take a fresh webpage_snapshot.',
@@ -805,10 +818,10 @@ export interface BrowserNetworkResult {
   readonly truncatedByBudget?: boolean
 }
 
-/** P2：`webpage_execute` —— 唯一能直接发任意 CDP 命令的逃生舱。 */
+/** 内部 CDP execute 请求；模型入口的 async 函数体由工具层转换到此请求。 */
 export interface BrowserExecuteRequest {
   readonly sessionId: string
-  /** `domain.method` 全文，例如 `Runtime.evaluate`。 */
+  /** 内部 CDP `domain.method`，例如 `Runtime.evaluate`；不是网页工具参数。 */
   readonly method: string
   readonly params?: Record<string, unknown>
   /**
@@ -825,7 +838,7 @@ export interface BrowserExecuteRequest {
   readonly timeoutMs?: number
 }
 
-/** `webpage_execute` 的结果。 */
+/** 内部 CDP execute 结果；工具层再解开页面 JSON 信封。 */
 export interface BrowserExecuteResult {
   readonly kind: 'execute'
   readonly sessionId: string

@@ -62,10 +62,22 @@ export class WindowCdpSocket implements CdpSocket {
         this.emit('message', { data: JSON.stringify({ id, result: result ?? {} }) })
       },
       (error: unknown) => {
+        const timedOut = error instanceof Error && (error as { code?: unknown }).code === 'CDP_COMMAND_TIMEOUT'
+        const timeoutMs = (error as { timeoutMs?: unknown } | null)?.timeoutMs
+        const timedOutMethod = (error as { method?: unknown } | null)?.method
         this.emit('message', {
           data: JSON.stringify({
             id,
-            error: { message: error instanceof Error ? error.message : String(error) },
+            error: {
+              message: error instanceof Error ? error.message : String(error),
+              ...(timedOut ? {
+                data: {
+                  kind: 'command-timeout',
+                  ...(typeof timeoutMs === 'number' ? { timeoutMs } : {}),
+                  ...(typeof timedOutMethod === 'string' ? { method: timedOutMethod } : {}),
+                },
+              } : {}),
+            },
           }),
         })
       },

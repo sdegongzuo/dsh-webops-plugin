@@ -19,13 +19,12 @@ import { CONSOLE_TEXT_MAX_CHARS } from '../../browser-cdp/console.ts'
 import { NETWORK_MAX_BASE64_CHARS, NETWORK_MAX_BODY_CHARS } from '../../browser-cdp/network.ts'
 import { type BrowserNetworkEntry, BrowserError } from '../../browser/index.ts'
 import { MAX_P2_LIMIT, DEFAULT_P2_LIMIT } from '../../browser-cdp/provider.ts'
+import { unwrapExecuteEnvelope, wrapExecuteFunctionBody } from './execute-script.ts'
 
 /**
  * schema DSL 的 `{ type: 'json' }` 对应的值类型。
  *
- * provider 侧 `webpage_execute` 的返回值是 `unknown`（CDP 结果本来就是任意 JSON），工具层
- * 在把它交给 schema 校验前收口成这个类型 —— 类型断言是必须的，运行时由 `webpage_execute` 的
- * 三态处理（`BROWSER_EXECUTE_RESULT_UNSERIALIZABLE`）保证只会是合法 JSON。
+ * provider 侧 execute 值是 `unknown`；工具层只把受页面包装器验证后的 JSON 值交给输出 schema。
  */
 type SerializableJson = string | number | boolean | null | SerializableJson[] | { [key: string]: SerializableJson }
 
@@ -76,6 +75,7 @@ interface NetworkOutput {
 interface ExecuteOutput {
   session_id: string
   method: string
+  has_value: boolean
   epoch: number
   url: string
   title?: string
@@ -83,7 +83,6 @@ interface ExecuteOutput {
   /** P2：页面在本会话之外变过（脏时才出现）。 */
   page_changed?: PageChangedOutput
   value?: unknown
-  result?: unknown
   truncated: boolean
 }
 
@@ -195,7 +194,7 @@ function formatNetworkBody(value: NetworkOutput): string {
 
 /** execute 结果的文本渲染。 */
 function formatExecuteOutput(value: ExecuteOutput): string {
-  const payload = value.value !== undefined ? value.value : value.result
+  const payload = value.has_value ? value.value : undefined
   const rendered = typeof payload === 'string' ? payload : JSON.stringify(payload, null, 2)
   const notes = [UNTRUSTED_PAGE_CONTENT_NOTICE]
   if (value.navigated) {
@@ -208,7 +207,7 @@ function formatExecuteOutput(value: ExecuteOutput): string {
   return [
     `${value.method} on session_id=${value.session_id} (at ${value.url}${value.title !== undefined ? ` — ${value.title}` : ''}, ref epoch ${value.epoch})`,
     changed,
-    rendered ?? '(no value returned)',
+    value.has_value ? (rendered ?? 'null') : 'The function completed without returning a value (undefined). Use return when you need data.',
     '',
     ...notes,
   ].join('\n')
@@ -277,20 +276,20 @@ const NETWORK_OUTPUT_SCHEMA = {
   },
 } as const
 
-/** `webpage_execute` 的输出契约；`value` / `result` 是任意 JSON。 */
+/** `webpage_execute` 的输出契约；仅有返回值时包含 value，undefined 由 has_value 区分。 */
 const EXECUTE_OUTPUT_SCHEMA = {
   type: 'object',
   additionalProperties: false,
   properties: {
     session_id: { type: 'string', required: true },
     method: { type: 'string', required: true },
+    has_value: { type: 'boolean', required: true },
     epoch: { type: 'integer', required: true },
     url: { type: 'string', required: true },
     title: { type: 'string' },
     navigated: { type: 'boolean', required: true },
     page_changed: PAGE_CHANGED_SCHEMA,
     value: { type: 'json' },
-    result: { type: 'json' },
     truncated: { type: 'boolean', required: true },
   },
 } as const
@@ -463,14 +462,13 @@ export function registerExecute(ctx: Context, cache: SnapshotCache): void {
   ctx.tools.register(defineTool({
     name: 'webpage_execute',
     description:
-      "Last resort; for page text first use webpage_find, regional snapshot and find(full_text=true). Run ONE CDP command. Allow-list: Runtime.evaluate/getProperties, DOM.getDocument/querySelector, Page.navigate/reload/captureScreenshot, Accessibility.getFullAXTree, Network.enable/getResponseBody, Log.enable; otherwise BROWSER_EXECUTE_NOT_ALLOWED. Runtime.evaluate uses returnByValue, awaitPromise, userGesture and REAL CODE IN THE PAGE; page content is untrusted. Throws report the real exception; side effects NOT rolled back. Unsettled promises time out (30s or timeout_ms); use Promise.race. DOM nodes, cycles, functions and Symbols fail BROWSER_EXECUTE_RESULT_UNSERIALIZABLE; return primitives or JSON strings. Page.navigate/reload invalidate refs. Top-level declarations persist; redeclaration may throw SyntaxError. Use real webpage_click/fill/press for input; synthetic JS clicks/keys do not prove submission. Never blindly resend an uncertain submission.",
+      '仅在专用网页工具无法表达任务时使用：在当前页面执行一次 async 函数体。用 return 返回普通数据，用 await 等待异步结果。例如：`const title = document.title; return { title, links: document.links.length };` 默认等待 5000 毫秒；timeout_ms 可设为 1–30000。页面代码可能产生副作用，超时后也可能继续运行。文本优先用 webpage_find/snapshot，输入用 click/fill/press，导航用 navigate，等待用 wait。',
     parameters: {
       session_id: SESSION_ID_PARAMETER,
-      method: { type: 'string', required: true, description: 'CDP method, e.g. Runtime.evaluate. Must be on the allow-list.' },
-      params: { type: 'json', description: 'CDP parameters as a JSON object; for Runtime.evaluate pass {"expression": "..."}.' },
+      code: { type: 'string', required: true, description: '必填的 async 函数体；使用 return 返回数据，可使用 await。空白字符串无效。' },
       timeout_ms: {
         type: 'integer',
-        description: 'Cap in milliseconds (1-30000) on this one command; it only shortens the 30s default, never lengthens it.',
+        description: '等待上限，单位毫秒（1–30000），默认 5000。超时不会取消页面代码。',
       },
     },
     output: {
@@ -479,65 +477,74 @@ export function registerExecute(ctx: Context, cache: SnapshotCache): void {
     },
     timeoutMs: BROWSER_NAVIGATION_TIMEOUT_MS,
     async execute(args, exec) {
-      // 参数结构在工具边界就拒（2026-10-08）：缺 `params.expression` 的调用过去会打到 CDP
-      // 变成 "Invalid parameters"，再被 BROWSER_PROTOCOL_ERROR 的恢复文案引向「页面状态拒绝、
-      // 重拍快照」——模型于是反复无效刷新。参数错误不是页面错误，必须各说各话。
-      const rawParams = args.params
-      const params =
-        rawParams === undefined
-          ? undefined
-          : rawParams !== null && typeof rawParams === 'object' && !Array.isArray(rawParams)
-            ? (rawParams as Record<string, unknown>)
-            : null
-      if (rawParams !== undefined && params === null) {
+      const raw = args as Record<string, unknown>
+      const unknown = Object.keys(raw).filter(key => !['session_id', 'code', 'timeout_ms'].includes(key))
+      if (unknown.length > 0) {
         throw new BrowserError(
-          'webpage_execute params must be a JSON object of CDP parameters '
-            + `(got ${Array.isArray(rawParams) ? 'an array' : typeof rawParams}).`,
+          `webpage_execute received unsupported field(s): ${unknown.join(', ')}. Use exactly {"session_id":"...","code":"return ...;"} with optional top-level timeout_ms. No page command was dispatched.`,
           'BROWSER_INVALID_PARAMS',
         )
       }
-      const expression = params?.['expression']
-      if (args.method === 'Runtime.evaluate' && typeof expression !== 'string') {
+      if (typeof args.session_id !== 'string' || args.session_id.trim().length === 0
+        || typeof args.code !== 'string' || args.code.trim().length === 0) {
         throw new BrowserError(
-          'webpage_execute method=Runtime.evaluate requires params={"expression": "<JavaScript to run in the page>"}. '
-            + (params === undefined
-              ? 'params was missing entirely; the expression lives INSIDE params, not at the top level of the tool call.'
-              : `params.expression was missing or not a string (got ${typeof expression}).`),
+          'webpage_execute requires a non-empty string session_id and code. Example: {"session_id":"t1","code":"return { title: document.title };"}. No page command was dispatched.',
           'BROWSER_INVALID_PARAMS',
         )
       }
-      const navUrl = params?.['url']
-      if (args.method === 'Page.navigate' && typeof navUrl !== 'string') {
-        throw new BrowserError(
-          'webpage_execute method=Page.navigate requires params={"url": "<absolute http(s) url>"}'
-            + `${params === undefined ? '; params was missing entirely' : ''}. `
-            + 'Prefer webpage_navigate for plain navigation.',
-          'BROWSER_INVALID_PARAMS',
-        )
+      if (args.timeout_ms !== undefined && (!Number.isInteger(args.timeout_ms) || args.timeout_ms < 1 || args.timeout_ms > 30_000)) {
+        throw new BrowserError('timeout_ms must be an integer from 1 through 30000. No page command was dispatched.', 'BROWSER_INVALID_PARAMS')
       }
-      const result = await ctx.browser.execute({
-        sessionId: args.session_id,
-        method: args.method,
-        ...args.params !== undefined ? { params: args.params as Record<string, unknown> } : {},
-        ...typeof args.timeout_ms === 'number' ? { timeoutMs: args.timeout_ms } : {},
-      }, callerOf(exec), exec.signal)
+      const timeoutMs = typeof args.timeout_ms === 'number' ? args.timeout_ms : 5_000
+      let result
+      try {
+        result = await ctx.browser.execute({
+          sessionId: args.session_id,
+          method: 'Runtime.evaluate',
+          params: { expression: wrapExecuteFunctionBody(args.code) },
+          timeoutMs,
+        }, callerOf(exec), exec.signal)
+      } catch (error) {
+        if (error instanceof BrowserError && error.code === 'BROWSER_CDP_COMMAND_TIMEOUT') {
+          throw new BrowserError(
+            `webpage_execute stopped waiting after ${error.timeoutMs ?? timeoutMs} ms. The result is unconfirmed; page code may still be running and side effects are not rolled back. Do not rerun until you inspect the page state.`,
+            'BROWSER_EXECUTE_TIMEOUT',
+          )
+        }
+        throw error
+      }
       // `Page.navigate` / `Page.reload` / 表达式里的 `location.href=…` 都会作废该会话的
       // 全部 ref —— 缓存里那份旧大纲必须一起丢掉，否则下一次 webpage_find 会拿已废的
       // ref 去喂 webpage_click，模型撞 BROWSER_STALE_REF 却不知道为什么。
       if (result.navigated) cache.delete(result.sessionId)
+      const envelope = unwrapExecuteEnvelope(result.value)
+      if (envelope.script_error !== undefined) {
+        throw new BrowserError(
+          envelope.script_error.phase === 'compile'
+            ? `webpage_execute ${envelope.script_error.name}: ${envelope.script_error.message}${envelope.script_error.stack === undefined ? '' : `\n${envelope.script_error.stack}`} The function body did not run; correct the code and call again.`
+            : `webpage_execute ${envelope.script_error.name}: ${envelope.script_error.message}${envelope.script_error.stack === undefined ? '' : `\n${envelope.script_error.stack}`} The function body ran once; any side effects are not rolled back. Inspect page state before deciding whether to call again.`,
+          'BROWSER_EXECUTE_SCRIPT_ERROR',
+        )
+      }
+      if (envelope.serialization_error !== undefined) {
+        throw new BrowserError(
+          `webpage_execute ran once but could not serialize the returned value: ${envelope.serialization_error}. Return only ordinary JSON data and avoid DOM nodes, functions, cycles, accessors, and deep objects. Any side effects are not rolled back.`,
+          'BROWSER_EXECUTE_RESULT_UNSERIALIZABLE',
+        )
+      }
       return {
         session_id: result.sessionId,
         method: result.method,
+        has_value: envelope.has_value,
         epoch: result.epoch,
         url: result.url,
         ...result.title !== undefined ? { title: result.title } : {},
         navigated: result.navigated,
         ...result.pageChanged !== undefined ? { page_changed: toPageChangedOutput(result.pageChanged) } : {},
-        ...result.value !== undefined ? { value: result.value as SerializableJson } : {},
-        ...result.result !== undefined ? { result: result.result as SerializableJson } : {},
-        truncated: result.truncated,
+        ...(envelope.has_value ? { value: envelope.value as SerializableJson } : {}),
+        truncated: result.truncated || envelope.truncated === true,
       }
     },
-    presentCall: args => observeCall(`Execute ${args.method}`, 'execute', args.method),
+    presentCall: args => observeCall('Execute page JavaScript', 'execute', args.session_id),
   }))
 }

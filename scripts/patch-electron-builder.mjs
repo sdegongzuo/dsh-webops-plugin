@@ -1,11 +1,21 @@
 /**
- * 给 electron-builder 的 `extractArchive` 打补丁：解包后 rename 失败时重试。
+ * 核验 electron-builder 解包 rename 的 EPERM 防护；旧版 app-builder-lib 则补上重试。
  *
- * 为什么需要：`app-builder-lib/out/util/electronGet.js` 里 `extractZipStreaming()` 写完
- * 立刻 `fs.rename(tmpDir, dir)`，在 Windows 上常因句柄尚未释放报
- * `EPERM: operation not permitted, rename '...win-unpacked.tmp' -> '...win-unpacked'`。
- * 等一两秒再 rename 就一定成功（手动 `mv` 从来没失败过），所以补个重试循环。
+ * ## 26.17.0 起上游已原生修复（2026-10-09 升级 alpha.2 时核对）
  *
+ * `app-builder-lib/out/util/electronGet.js` 的 `extractArchive` 把
+ * `await fs.rename(tmpDir, dir)` 换成了 `await moveDirAtomic(tmpDir, dir)`：
+ * 对 `TRANSIENT_RENAME_CODES = {ENOENT, EPERM, EBUSY, EXDEV}` 重试 5 次
+ * （250–1000ms 退避），重试穷尽再回落 copy+delete。我们当年的 EPERM 场景被覆盖，
+ * 旧补丁的匹配片段在新版里已不存在 —— 所以脚本改成三态：
+ *
+ *   1. 检测到 `moveDirAtomic` → 上游原生修复在位，放行（exit 0），不打补丁；
+ *   2. 检测到旧片段 `fs.rename(tmpDir, dir)` → 旧版 ref，打我们的重试补丁；
+ *   3. 两者都没有 → 版本又变了且没带修复，明确失败（不许静默跳过）。
+ *
+ * 为什么需要防 EPERM：`extractZipStreaming()` 写完立刻 rename，Windows 上常因句柄
+ * 尚未释放报 `EPERM: operation not permitted, rename '...win-unpacked.tmp' -> ...`。
+ * 等一两秒再 rename 就一定成功（手动 `mv` 从来没失败过）。
  * 与杀软无关：Defender 实时保护关着也一样复现。
  *
  * 用法：
@@ -52,6 +62,9 @@ const ORIGINAL = [
   '        await fs.rename(tmpDir, dir);',
 ].join('\n')
 
+/** 上游 26.17.0 原生修复的标志（见文件头）。有它就不需要我们的补丁。 */
+const NATIVE = 'function moveDirAtomic(src, dest)'
+
 const PATCHED = [
   '        await fs.rm(dir, { recursive: true, force: true });',
   '        // Patched by dsh-webops-plugin/scripts/patch-electron-builder.mjs',
@@ -88,8 +101,20 @@ function assertParses(file, source) {
 }
 
 let patched = 0
+let nativeFixed = 0
 for (const file of targets) {
   const source = readFileSync(file, 'utf8')
+  if (source.includes(NATIVE)) {
+    // 上游原生修复在位：确认重试码集合确实包含 EPERM（就在 Set 字面量附近），再放行。
+    const marker = source.indexOf('TRANSIENT_RENAME_CODES')
+    if (marker === -1 || !source.slice(marker, marker + 200).includes('EPERM')) {
+      console.error(`检测到 moveDirAtomic，但重试码集合里没看到 EPERM，需人工核对: ${file}`)
+      process.exit(1)
+    }
+    console.log(`上游已原生重试（moveDirAtomic），无需补丁: ${file}`)
+    nativeFixed += 1
+    continue
+  }
   if (source.includes('Patched by dsh-webops-plugin')) {
     // 标记只能证明「曾经写过」，不能证明「写对了」—— 所以照样校验。
     assertParses(file, source)
@@ -97,7 +122,8 @@ for (const file of targets) {
     continue
   }
   if (!source.includes(ORIGINAL)) {
-    console.error(`片段不匹配（app-builder-lib 版本变了？）: ${file}`)
+    console.error(`片段不匹配，也没检测到上游原生修复（app-builder-lib 版本变了？）: ${file}`)
+    console.error('  需要人工核对新版 electronGet.js 的 rename 行为，再决定补丁形状。')
     process.exit(1)
   }
   const next = source.replace(ORIGINAL, PATCHED)
@@ -109,4 +135,4 @@ for (const file of targets) {
   console.log(`已打补丁: ${file}`)
 }
 
-console.log(`完成，共 ${patched} 处`)
+console.log(`完成：${patched} 处补丁，${nativeFixed} 处原生修复`)

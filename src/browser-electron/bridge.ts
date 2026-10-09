@@ -69,15 +69,19 @@ export interface BridgeOptions {
 /** 宿主给的失败。 */
 export class BridgeError extends Error {
   readonly code: string
+  readonly timeoutMs: number | undefined
+  readonly method: string | undefined
 
   /**
    * @param message - 诊断信息。
    * @param code - 机器可读的失败码。
    */
-  constructor(message: string, code: string) {
+  constructor(message: string, code: string, options: { timeoutMs?: number; method?: string } = {}) {
     super(message)
     this.name = 'BridgeError'
     this.code = code
+    this.timeoutMs = options.timeoutMs
+    this.method = options.method
   }
 }
 
@@ -630,7 +634,15 @@ export class ElectronWindowBridge implements TabHostChannel {
     return new Promise<Record<string, unknown>>((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(id)
-        reject(new BridgeError(`window host did not answer "${String(fields['op'])}" in time`, 'BRIDGE_TIMEOUT'))
+        const cdp = fields['op'] === 'cdp'
+        reject(new BridgeError(
+          `window host did not answer "${String(fields['op'])}" in time`,
+          cdp ? 'CDP_COMMAND_TIMEOUT' : 'BRIDGE_TIMEOUT',
+          {
+            ...(cdp ? { timeoutMs: this.commandTimeoutMs } : {}),
+            ...(cdp && typeof fields['method'] === 'string' ? { method: fields['method'] } : {}),
+          },
+        ))
       }, this.commandTimeoutMs)
       this.pending.set(id, { resolve: value => resolve(value as Record<string, unknown>), reject, timer })
       this.socket.write(`${JSON.stringify({ ...fields, id })}\n`)
@@ -748,8 +760,17 @@ export class ElectronWindowBridge implements TabHostChannel {
 
     const error = message['error']
     if (error !== undefined) {
-      const detail = (error as { message?: unknown }).message
-      entry.reject(new BridgeError(typeof detail === 'string' ? detail : 'window host reported an error', 'BRIDGE_COMMAND_FAILED'))
+      const payload = error as { message?: unknown; code?: unknown; timeoutMs?: unknown; method?: unknown }
+      const detail = payload.message
+      const timedOut = payload.code === 'CDP_COMMAND_TIMEOUT'
+      entry.reject(new BridgeError(
+        typeof detail === 'string' ? detail : 'window host reported an error',
+        timedOut ? 'CDP_COMMAND_TIMEOUT' : 'BRIDGE_COMMAND_FAILED',
+        {
+          ...(timedOut && typeof payload.timeoutMs === 'number' ? { timeoutMs: payload.timeoutMs } : {}),
+          ...(timedOut && typeof payload.method === 'string' ? { method: payload.method } : {}),
+        },
+      ))
       return
     }
     entry.resolve(message)

@@ -1,8 +1,8 @@
 diff --git a/apps/desktop/scripts/electron-builder-config.mjs b/apps/desktop/scripts/electron-builder-config.mjs
-index 1fb787803c..29439e3532 100644
+index f08b783865..6ef6ef7f4b 100644
 --- a/apps/desktop/scripts/electron-builder-config.mjs
 +++ b/apps/desktop/scripts/electron-builder-config.mjs
-@@ -136,13 +136,17 @@ export function createElectronBuilderConfig(
+@@ -135,13 +135,17 @@ export function createElectronBuilderConfig(
        'lib/preload-welcome.cjs',
        'renderer/**/*',
        'package.json',
@@ -24,10 +24,10 @@ index 1fb787803c..29439e3532 100644
        // Windows tray bitmaps; macOS keeps the Dock and ships no menu bar icon.
        ...(packagesWindows ? [{ from: fileURLToPath(new URL('../resources/tray-windows.ico', import.meta.url)), to: 'tray.ico' }] : []),
 diff --git a/apps/desktop/scripts/prepare-dsh.ts b/apps/desktop/scripts/prepare-dsh.ts
-index 442e01757e..1ac26d4601 100644
+index 7d290b945a..549e0c2c0c 100644
 --- a/apps/desktop/scripts/prepare-dsh.ts
 +++ b/apps/desktop/scripts/prepare-dsh.ts
-@@ -127,7 +127,11 @@ async function main(): Promise<void> {
+@@ -130,7 +130,11 @@ async function main(): Promise<void> {
        readFileSync(join(BUILD_ROOT, 'pnpm-lock.yaml'), 'utf8'),
        readDesktopCorePackageSet(BUILD_ROOT, release.version),
      )
@@ -41,7 +41,7 @@ index 442e01757e..1ac26d4601 100644
      const targetName = resolveDesktopBuildTarget()
      const target = { platform: process.platform, arch: desktopTargetPlatform(targetName).arch }
 diff --git a/apps/desktop/scripts/smoke-packaged-runtime.ts b/apps/desktop/scripts/smoke-packaged-runtime.ts
-index 106830b5ad..3926678927 100644
+index b91030008b..6427f25bcc 100644
 --- a/apps/desktop/scripts/smoke-packaged-runtime.ts
 +++ b/apps/desktop/scripts/smoke-packaged-runtime.ts
 @@ -1,4 +1,5 @@
@@ -50,7 +50,7 @@ index 106830b5ad..3926678927 100644
  import { join } from 'node:path'
  import { parseArgs } from 'node:util'
  import { resolveDesktopBuildTarget, resolveDesktopTargetBuildPaths } from './desktop-build-paths.mjs'
-@@ -20,4 +21,21 @@ const executable = windows ? join(application, 'DeepSeek Harness.exe') : join(ap
+@@ -19,4 +20,21 @@ const executable = windows ? join(application, 'DeepSeek Harness.exe') : join(ap
  const descriptor = await verifyDesktopRuntime(paths.dsh, readDesktopRuntime(paths.dsh).release.version,
    resolveDesktopPackageTarget(target))
  if (windows && !values.unsigned) await verifyWindowsCode(application)
@@ -93,7 +93,7 @@ index d406c27235..36bb70f4fb 100644
    if (!inside(appDir, sourceRoot)) {
      // Builder's source matcher slices the appDir prefix even for external FileSets.
 diff --git a/apps/desktop/src/main.ts b/apps/desktop/src/main.ts
-index b4b8153b7f..c9e07ae48a 100644
+index 1202670a3e..d278b0d2d5 100644
 --- a/apps/desktop/src/main.ts
 +++ b/apps/desktop/src/main.ts
 @@ -2,7 +2,9 @@ import type { ProductEventMap, ProductEvent } from '@deepseek-ai/dsh-client-prod
@@ -124,7 +124,7 @@ index b4b8153b7f..c9e07ae48a 100644
  import { DesktopFatalRecovery } from './fatal-recovery.ts'
  import { pruneCrashReports, RendererConsoleTail, writeCrashReport, type CrashReportSource } from './crash-report.ts'
  import { openWelcomeWindow } from './welcome-window.ts'
-@@ -60,6 +62,78 @@ import { DesktopQuitConfirmation } from './quit-confirmation.ts'
+@@ -61,6 +63,78 @@ import { DesktopQuitConfirmation } from './quit-confirmation.ts'
  import { DesktopTray } from './tray.ts'
  import { DesktopBackgroundNotice } from './background-notice.ts'
  
@@ -203,10 +203,10 @@ index b4b8153b7f..c9e07ae48a 100644
  let focusPrimaryWindow = (): void => {}
  let stopForRecovery = async (): Promise<void> => {}
  let shuttingDown = false
-@@ -155,8 +229,17 @@ function runtimeResources(): RuntimeResources {
+@@ -156,8 +230,17 @@ function runtimeResources(): RuntimeResources {
    const pnpm = (development ? process.env.DSH_DESKTOP_PNPM_ENTRY : undefined)
      ?? (development ? join(app.getAppPath(), 'node_modules', 'pnpm', 'bin', 'pnpm.mjs')
-       : join(process.resourcesPath, 'runtime', 'pnpm', 'bin', 'pnpm.mjs'))
+       : join(process.resourcesPath, 'runtime', 'primary-runtime', 'dependencies', 'pnpm', 'bin', 'pnpm.mjs'))
 +  // 便携版把 dsh 运行时留在 `resources\dsh` 真目录，不跟着上游塞进 app.asar：
 +  // 进了 app 目录就会被 electron-builder 当生产依赖剪裁（实测 239 个包的
 +  // package.json 字节被改小），`desktop-runtime.json` 的 files 清单随之对不上，
@@ -222,7 +222,20 @@ index b4b8153b7f..c9e07ae48a 100644
    return { node, nodeBin, pnpm, dsh }
  }
  
-@@ -448,11 +531,28 @@ async function main(): Promise<void> {
+@@ -314,7 +397,11 @@ function createWindow(preload: string, show = false, primary = false): BrowserWi
+ }
+ 
+ async function main(): Promise<void> {
+-  const desktopSettings = readDesktopSettings(app.getPath('userData'))
++  // alpha.2 起上游用 `updates.allowTestAuthPopupWindow`（默认 false）门控飞书登录弹窗 —— 默认值
++  // 会把我们「手动检查更新时询问登录」一起掐死。便携版语义是「启动不弹（launch 排队已删）、
++  // 手动检查才弹」，所以仅在 settings.json 尚不存在时以 true 兜底落盘；文件存在则完全按文件
++  // 内容（用户显式 false 依旧生效），文件写坏仍按上游硬默认抑制弹窗（fail-safe）。
++  const desktopSettings = readDesktopSettings(app.getPath('userData'), { updates: { allowTestAuthPopupWindow: true } })
+   void pruneCrashReports(app.getPath('logs'))
+   const journalDirectory = process.env.DSH_DESKTOP_UPDATE_JOURNAL_DIR
+   const updateJournal = journalDirectory === undefined ? undefined : new DesktopUpdateJournal(journalDirectory, app.getVersion())
+@@ -450,11 +537,28 @@ async function main(): Promise<void> {
      return {
        start: async () => {
          const ready = await host.start()
@@ -254,20 +267,22 @@ index b4b8153b7f..c9e07ae48a 100644
          analyticsEnabled = await welcomeBackend.analyticsEnabled().catch(() => false)
          if (!reportedLaunch) { reportedLaunch = true; void track('desktop_app_launch', {}) }
          stopAccount?.()
-@@ -707,7 +807,11 @@ async function main(): Promise<void> {
+@@ -709,7 +813,13 @@ async function main(): Promise<void> {
      return browserGuests.release(event.sender, lease)
    })
  
--  session.defaultSession.webRequest.onBeforeSendHeaders({ urls: ['ws://127.0.0.1/*'] }, (details, callback) => {
+-  session.defaultSession.webRequest.onBeforeSendHeaders({ urls: ['ws://127.0.0.1/*', 'wss://127.0.0.1/*'] }, (details, callback) => {
 +  // 渲染进程的事件流是自己发起的 WebSocket（不是走 Node 的转发），所以握手 cookie 得由壳注入。
 +  // 过滤名单必须覆盖**所有可能被选中的回环名**：兜底可能把 Host 定在 `localhost`（代理只放通
 +  // 它），此时旧名单 `ws://127.0.0.1/*` 一条都匹配不上 —— 名字通了却没带上 cookie，握手被拒，
 +  // 界面照样停在「重新连接中…」。真正「只喂给被选中的那台」由下面的 `requested.host !== target.host` 保证。
-+  session.defaultSession.webRequest.onBeforeSendHeaders({ urls: ['ws://127.0.0.1/*', 'ws://localhost/*', 'ws://[::1]/*'] }, (details, callback) => {
++  // alpha.2 上游又给名单加了 `wss://127.0.0.1/*`（宿主可能以 https 起服务）；我们的名单取并集，
++  // ws/wss × 三个回环名都覆盖 —— 协议判别由下面的三元判断兜住。
++  session.defaultSession.webRequest.onBeforeSendHeaders({ urls: ['ws://127.0.0.1/*', 'ws://localhost/*', 'ws://[::1]/*', 'wss://127.0.0.1/*', 'wss://localhost/*', 'wss://[::1]/*'] }, (details, callback) => {
      if (hostUrl === undefined || hostCookie === undefined || details.webContentsId !== mainWindow?.webContents.id) {
        callback({})
        return
-@@ -1318,9 +1422,8 @@ async function main(): Promise<void> {
+@@ -1322,9 +1432,8 @@ async function main(): Promise<void> {
        refresh: async () => { await Promise.all([checkPolicyManually(), updateSchedule.check(true)]) },
        download: downloadUpdate, install: version => updates.install(version),
      })
@@ -279,7 +294,7 @@ index b4b8153b7f..c9e07ae48a 100644
    }
    automaticCheck()
    await reconcileBackend().catch(() => undefined)
-@@ -1333,17 +1436,29 @@ async function main(): Promise<void> {
+@@ -1337,17 +1446,29 @@ async function main(): Promise<void> {
    publishUpdate(updateState)
  }
  
@@ -353,6 +368,37 @@ index cf03e38c36..878122bcd6 100644
 +  const portableHome = resolve(dirname(executablePath), '..', 'home')
 +  return existsSync(portableHome) ? portableHome : undefined
 +}
+diff --git a/apps/desktop/src/settings.ts b/apps/desktop/src/settings.ts
+index a4bb67b3bd..8cd243b194 100644
+--- a/apps/desktop/src/settings.ts
++++ b/apps/desktop/src/settings.ts
+@@ -19,18 +19,24 @@ function record(value: unknown): value is Record<string, unknown> {
+ /**
+  * Read shell settings, creating the default document exclusively when missing.
+  * @param userData - Electron's userData directory, independent of DSH_HOME.
++ * @param fallbacks - Values used **only** when the document does not exist yet and must be
++ *   created (portable builds: `allowTestAuthPopupWindow: true` so the manual update check can
++ *   still offer login; the shell suppresses the startup prompt itself). An existing document —
++ *   including a partial one — always wins over `fallbacks`, and unreadable/invalid documents
++ *   still fall back to the hard defaults below, never to `fallbacks`.
+  * @returns Validated settings, or defaults when reading, creating or validating fails; changes require a restart.
+  */
+-export function readDesktopSettings(userData: string): DesktopSettings {
++export function readDesktopSettings(userData: string, fallbacks?: DesktopSettings): DesktopSettings {
+   const directory = join(userData, 'desktop')
+   const path = join(directory, 'settings.json')
+   const defaults: DesktopSettings = { updates: { allowTestAuthPopupWindow: false } }
++  const bootstrap = fallbacks ?? defaults
+   try {
+     let raw: string
+     try { raw = readFileSync(path, 'utf8') } catch (error) {
+       if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+       mkdirSync(directory, { recursive: true, mode: 0o700 })
+-      try { writeFileSync(path, `${JSON.stringify(defaults, null, 2)}\n`, { flag: 'wx', mode: 0o600 }) } catch (error) {
++      try { writeFileSync(path, `${JSON.stringify(bootstrap, null, 2)}\n`, { flag: 'wx', mode: 0o600 }) } catch (error) {
+         // An existing document belongs to the user, including one created during initialization.
+         if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error
+       }
 diff --git a/apps/desktop/src/web-document.ts b/apps/desktop/src/web-document.ts
 index a74ea7c7ef..0a410e8163 100644
 --- a/apps/desktop/src/web-document.ts
@@ -633,7 +679,7 @@ index 54ab46d85e..28512376f9 100644
      const settings = await invoke({ namespace: 'settings', method: 'describe', args: {} })
      if (!record(settings) || !Array.isArray(settings.namespaces)) throw new Error('desktop welcome: missing settings namespaces')
 diff --git a/apps/desktop/tests/main-startup.spec.ts b/apps/desktop/tests/main-startup.spec.ts
-index b6b6fd476f..48243b2479 100644
+index d9a8f3103b..d5ccc62e6a 100644
 --- a/apps/desktop/tests/main-startup.spec.ts
 +++ b/apps/desktop/tests/main-startup.spec.ts
 @@ -16,7 +16,16 @@ import { writeCrashReport } from '../src/crash-report.ts'
@@ -663,11 +709,14 @@ index b6b6fd476f..48243b2479 100644
  vi.mock('../src/project-manager.ts', () => ({
    DesktopProjectManager: class {
      readonly applyRelease = harness.applyRelease
-@@ -531,47 +540,20 @@ describe('desktop main startup', () => {
-     expect(console.error).toHaveBeenLastCalledWith(expect.objectContaining({ message: 'overlay unavailable' }))
+@@ -655,48 +664,22 @@ describe('desktop main startup', () => {
+     expect(host.stop).not.toHaveBeenCalled()
    })
  
 -  it('shows one explained startup login before Host readiness and joins concurrent checks without reopening it', async () => {
+-    configureTestAuthPopup(true)
++  // 上游 alpha.2 保留了「启动即弹登录」的测试，但按 allowTestAuthPopupWindow=true 才成立；
++  // 便携版的主进程补丁直接删掉了 launch 排队（启动永不弹），所以这条测试沿用我们的替换版。
 +  it('首次启动隐藏飞书登录，主动检查更新才询问', async () => {
      harness.embeddedPolicy = { origin: 'https://policy.example.com', authentication: 'feishu-test', allowedAuthOrigins: ['https://login.example.com'],
        allowedPageOrigins: ['https://downloads.example.com'], intervalMs: 1000, jitter: 0 }
@@ -721,7 +770,7 @@ index b6b6fd476f..48243b2479 100644
    })
  
    it.each(['returned', 'cancelled', 'failed'] as const)('requires explicit test login and handles %s without downloading', async (outcome) => {
-@@ -582,7 +564,7 @@ describe('desktop main startup', () => {
+@@ -708,7 +691,7 @@ describe('desktop main startup', () => {
      await readyForUpdate()
      await vi.advanceTimersByTimeAsync(0)
      expect(testAuth.login).not.toHaveBeenCalled()
@@ -730,8 +779,8 @@ index b6b6fd476f..48243b2479 100644
      harness.dialog.showMessageBox.mockClear()
      testAuth.login.mockImplementationOnce(async () => {
        request.mockImplementation(async () => Response.json({ code: 0, data: { biz_code: 0, biz_data: null } }))
-@@ -913,6 +895,11 @@ describe('desktop main startup', () => {
-     await harness.hostStarted.promise
+@@ -1042,6 +1025,11 @@ describe('desktop main startup', () => {
+     harness.hosts[0]!.url = `${protocol}//127.0.0.1:3080/?token=test`
      harness.hosts[0]!.ready.resolve()
      await Promise.resolve(invoke(DESKTOP_IPC.boot))
 +    // 兜底可能把 Host 定在 `localhost`（代理只放通它），过滤名单必须跟得上 ——
@@ -742,7 +791,7 @@ index b6b6fd476f..48243b2479 100644
      const handler = harness.socketHeaders.mock.calls[0]![1] as (
        details: { url: string; webContentsId: number; requestHeaders: Record<string, string> },
        callback: (result: unknown) => void,
-@@ -2095,7 +2082,8 @@ describe('desktop main startup', () => {
+@@ -2231,7 +2219,8 @@ describe('desktop main startup', () => {
      expect(harness.applyRelease).toHaveBeenCalledTimes(1)
      expect(harness.hosts[0]).toMatchObject({
        node: process.execPath,
@@ -956,7 +1005,7 @@ index dea2905583..cb70d68123 100644
    })
  })
 diff --git a/apps/desktop/tests/welcome-startup.spec.ts b/apps/desktop/tests/welcome-startup.spec.ts
-index 9848c7fb26..c62bf0719a 100644
+index 7915248243..8b568d227f 100644
 --- a/apps/desktop/tests/welcome-startup.spec.ts
 +++ b/apps/desktop/tests/welcome-startup.spec.ts
 @@ -1,4 +1,10 @@
@@ -977,9 +1026,9 @@ index 9848c7fb26..c62bf0719a 100644
  
 -vi.mock('../src/paths.ts', () => ({ resolveDesktopPaths: () => ({ profile: '/profile' }) }))
 +vi.mock('../src/paths.ts', () => ({ resolveDesktopPaths: () => ({ profile: '/profile' }), resolvePortableDshHome: () => undefined }))
+ vi.mock('../src/settings.ts', () => ({ readDesktopSettings: () => ({ updates: { allowTestAuthPopupWindow: false } }) }))
  vi.mock('../src/login-shell-environment.ts', async importOriginal => ({
    ...await importOriginal<typeof import('../src/login-shell-environment.ts')>(),
-   readDesktopLoginShellEnvironment: async (base: NodeJS.ProcessEnv) => ({ environment: base, failures: [] }),
 diff --git a/packages/sandbox/sandbox-local/src/index.ts b/packages/sandbox/sandbox-local/src/index.ts
 index 45028746ff..c929f42495 100644
 --- a/packages/sandbox/sandbox-local/src/index.ts

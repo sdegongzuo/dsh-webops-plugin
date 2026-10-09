@@ -138,7 +138,9 @@ export function startPackagedDesktopHost(options) {
   // 打包布局：runtimeDir 就是 `resources/dsh`，所以 `runtimeDir/..` 即 `resources`。
   // 与 `primaryRuntime` 的默认值同源（`resources/runtime/primary-runtime`）。
   const resources = join(runtimeDir, '..')
-  const pnpm = join(resources, 'runtime', 'pnpm', 'bin', 'pnpm.mjs')
+  // alpha.2 起上游把 pnpm 实体挪到 primary-runtime 的 dependencies 下（main.ts 与其 spec 同步改了）；
+  // 旧位置 runtime/pnpm/bin 在新布局里不存在，探测会落空 → packageManager 成对不传 → 宿主走兜底。
+  const pnpm = join(resources, 'runtime', 'primary-runtime', 'dependencies', 'pnpm', 'bin', 'pnpm.mjs')
   const nodeBin = join(resources, 'runtime', 'bin')
   // 成对传，缺一不传：宿主只看 `argv[5] === undefined` 决定要不要建 packageManager 对象，
   // 给半个反而会造出「paths 是空串的 pnpm」。
