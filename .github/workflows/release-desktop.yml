@@ -36,7 +36,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: 版本号（不含 v 前缀，例如 0.1.0）
+        description: DSH 本体版本（不含 v 前缀，例如 0.2.1-alpha.1）
         required: true
         type: string
       harness_ref:
@@ -99,19 +99,6 @@ jobs:
         uses: actions/checkout@v5
         with:
           ref: ${{ env.TAG }}
-
-      - name: 校验 tag 版本与 package.json 一致
-        # 放最前面（在拉 harness / 装依赖那堆几分钟的步骤之前），5 秒就能给出结论。
-        # 为什么必须有：`--version` 是**显式传**下去的，它会同时决定 zip 名、
-        # profile 里登记的插件版本、以及随包插件 package.json 的 version。
-        # 于是「tag 是 desktop-v0.2.9 而 package.json 还停在 0.2.6」不会报任何错，
-        # 只会产出一个自称 0.2.9、里面却是 0.2.6 的包 —— 用户报的版本号从此不可信。
-        shell: pwsh
-        run: |
-          $version = $env:TAG -replace '^desktop-v', ''
-          $pkg = (Get-Content package.json -Raw | ConvertFrom-Json).version
-          Write-Host "tag: $version / package.json: $pkg"
-          if ($pkg -ne $version) { throw "版本不一致：tag=$version package.json=$pkg —— 先把 package.json 的版本提上去（并推一个提交）再打 tag" }
 
       - name: 装 pnpm + Node
         uses: pnpm/action-setup@v5
@@ -448,7 +435,12 @@ jobs:
         shell: pwsh
         run: |
           $version = $env:TAG -replace '^desktop-v', ''
-          Write-Host "version: $version"
+          $dshVersion = node scripts/desktop-release-version.mjs --app "$env:WIN_UNPACKED" --expected $version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $pluginVersion = (Get-Content package.json -Raw | ConvertFrom-Json).version
+          Write-Host "DSH: $dshVersion / plugin: $pluginVersion"
+          Add-Content -Path $env:GITHUB_ENV -Value "DSH_VERSION=$dshVersion"
+          Add-Content -Path $env:GITHUB_ENV -Value "PLUGIN_VERSION=$pluginVersion"
           node scripts/package-desktop-portable.mjs --app "$env:WIN_UNPACKED" --version $version
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           # 按**确定的文件名**取，不用 `Get-ChildItem dist/*.zip | Select-Object -First 1`：
@@ -538,7 +530,10 @@ jobs:
         shell: pwsh
         run: |
           $notes = @'
-          ## dsh 桌面端便携版 __TAG__
+          ## DSH __DSH_VERSION__ 桌面端便携版
+
+          本体版本：`__DSH_VERSION__`；内置 dsh-webops-plugin 版本：`__PLUGIN_VERSION__`。
+          桌面包版本与 DSH 本体一致，插件后续通过独立插件包更新。
 
           内置 [dsh-webops-plugin](https://github.com/sdegongzuo/dsh-webops-plugin) 的
           DeepSeek Harness 桌面端。**解压即用**：不需要 Node、pnpm、Git，也不需要联网装插件。
@@ -579,8 +574,7 @@ jobs:
           **保留 `home\` 即可**：把新包解压到别处，再把旧包的 `home\` 整个拷进新包根目录 ——
           会话 / 设置 / 凭据 / 已装插件全在 `home\` 里，一个都不会丢。
 
-          ⚠️ **这一版换了 dsh 本体**（0.1.7-rc.2 → 0.2.0-rc.2），所以**不能只贴插件增量包**升上来：
-          增量包只带插件，本体得下整包。
+          DSH 本体升级时下载桌面整包；本体不变且接口兼容时，下载独立插件包覆盖实际插件目录后重启。
 
           ⚠️ 出厂模型配置从 dsh 0.1.7 起写在 `home\profiles\desktop\cordis.patch.yml` ——
           dsh 0.1.7 把 `home\settings.yaml` 退役了，设置的家就是这份 profile patch。
@@ -599,7 +593,8 @@ jobs:
 
           **未签名构建**：CLI 这条链路的产物不做代码签名，SmartScreen 会有提示。
           '@
-          $notes = $notes -replace '__TAG__', $env:TAG `
+          $notes = $notes -replace '__DSH_VERSION__', $env:DSH_VERSION `
+                           -replace '__PLUGIN_VERSION__', $env:PLUGIN_VERSION `
                            -replace '__ZIP__', $env:ZIP_NAME `
                            -replace '__MB__', $env:ZIP_MB `
                            -replace '__SHA__', $env:ZIP_SHA256

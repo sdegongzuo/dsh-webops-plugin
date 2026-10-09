@@ -5,8 +5,8 @@
  * dsh 桌面端。用户端不需要 pnpm / Node / 签名证书，也不需要联网装插件。
  *
  * 用法：
- *   node scripts/package-desktop-portable.mjs --app <win-unpacked 目录> [--version 0.1.0]
- *   node scripts/package-desktop-portable.mjs [--version 0.1.0]        # 复用缓存里最新的 base
+ *   node scripts/package-desktop-portable.mjs --app <win-unpacked 目录> [--version <预期DSH版本>]
+ *   node scripts/package-desktop-portable.mjs [--version <预期DSH版本>]        # 复用缓存里最新的 base
  *   node scripts/package-desktop-portable.mjs --app <dir> --cache-base # 构建后顺便把 base 入库
  *   node scripts/package-desktop-portable.mjs --app <dir> --cache-base --cache-move  # 入库时优先同盘改名
  *   node scripts/package-desktop-portable.mjs --app <dir> --cache-base --cache-only  # 只入库、不打 zip
@@ -58,6 +58,7 @@ import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { buildRoot } from './local-env.mjs'
 import { readRuntimeDescriptor } from './desktop-runtime.mjs'
+import { desktopReleaseVersion } from './desktop-release-version.mjs'
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const DIST = join(ROOT, 'dist')
@@ -420,7 +421,7 @@ function installBaseCache(sourceDir, options = {}) {
 }
 
 const pkg = JSON.parse(readFileSync(join(ROOT, 'package.json'), 'utf8'))
-const version = readArg('version') ?? pkg.version
+const pluginVersion = pkg.version
 const pluginName = pkg.name
 
 const explicitApp = appDir !== undefined
@@ -489,6 +490,16 @@ if (listCached) {
   console.log(`CACHE_APP_DIR=${appDir}`)
   process.exit(0)
 }
+
+// --version 仅校验预期 DSH 版本，不能给本体或插件改版本号。
+let version
+try {
+  version = desktopReleaseVersion(appDir, readArg('version'))
+} catch (error) {
+  console.error(`package-desktop-portable: ${error.message}`)
+  process.exit(1)
+}
+console.log(`桌面便携包版本：DSH ${version}；内置插件版本：${pluginVersion}`)
 
 if (cacheBase) {
   const cached = installBaseCache(appDir, { move: cacheMove })
@@ -588,7 +599,7 @@ writeFileSync(
       // 依赖必须是**精确版本**（project-manager.ts:160-162 会校验）——vendor manifest
       // 里的 version 就是精确版本，直接派生，不在这里手写第二份。
       dependencies: {
-        [pluginName]: version,
+        [pluginName]: pluginVersion,
         ...Object.fromEntries(vendoredPlugins.map((plugin) => [plugin.name, plugin.version])),
       },
       // bundles 必须以前两个内置 bundle 开头（project-manager.ts:169），本插件与
@@ -662,7 +673,7 @@ const pluginDir = join(profileDir, 'node_modules', pluginName)
 mkdirSync(pluginDir, { recursive: true })
 cpSync(join(ROOT, 'lib'), join(pluginDir, 'lib'), { recursive: true })
 cpSync(join(ROOT, 'cordis.patch.yml'), join(pluginDir, 'cordis.patch.yml'))
-const releasePkg = { ...pkg, version }
+const releasePkg = { ...pkg, version: pluginVersion }
 delete releasePkg.devDependencies
 delete releasePkg.scripts
 writeFileSync(join(pluginDir, 'package.json'), `${JSON.stringify(releasePkg, null, 2)}\n`)

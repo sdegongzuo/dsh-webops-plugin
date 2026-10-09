@@ -511,7 +511,7 @@ describe('发布链的身份契约：签出哪个 ref、版本对不对得上、
       .toContain('ref: ${{ env.TAG }}')
   })
 
-  it.each(files)('%s：校验 tag 版本 == package.json version，且排在任何 harness 克隆之前', (file) => {
+  it.each(['.github/workflows/release.yml'])('%s：校验插件 tag 版本 == package.json version，且排在任何 harness 克隆之前', (file) => {
     const workflow = yamlBody(readRepoFile(file))
     expect(workflow, '缺「tag 版本 == package.json version」断言 —— 版本不一致会静默发出「名实不符」的包')
       .toContain('if ($pkg -ne $version) { throw')
@@ -521,6 +521,16 @@ describe('发布链的身份契约：签出哪个 ref、版本对不对得上、
     expect(workflow.indexOf(HARNESS_CLONE), '找不到 harness 克隆那一步，锚点失效了').toBeGreaterThan(-1)
     expect(assertAt, '版本断言排在了 harness 克隆之后 —— 那读到的可能是 harness 的 package.json')
       .toBeLessThan(workflow.indexOf(HARNESS_CLONE))
+  })
+
+  it('桌面 tag 校验实际 DSH 本体，插件版本独立保留', () => {
+    const workflow = yamlBody(readRepoFile('.github/workflows/release-desktop.yml'))
+    expect(workflow).toContain('node scripts/desktop-release-version.mjs --app "$env:WIN_UNPACKED" --expected $version')
+    expect(workflow).not.toContain('if ($pkg -ne $version) { throw')
+    const pack = readRepoFile('scripts/package-desktop-portable.mjs')
+    expect(pack).toContain('desktopReleaseVersion(appDir, readArg(\'version\'))')
+    expect(pack).toContain('[pluginName]: pluginVersion')
+    expect(pack).toContain('version: pluginVersion')
   })
 
   it.each(files)('%s：发布链里不许出现 `pnpm typecheck` / `pnpm test`（加过、跑不起来）', (file) => {
@@ -597,10 +607,19 @@ describe('发版工作流的保留式打包（不删除、不覆盖）', () => {
     expect(workflow, '发布链还在跑 `pnpm build`（展开即 clean 构建）').not.toContain('run: pnpm build')
   })
 
-  it('两个打包脚本都显式走保留安全模式：lib-dir / stage-root / keep-stage / out', () => {
+  it('独立插件包显式走保留安全模式：lib-dir / stage-root / keep-stage / out', () => {
     for (const flag of ['--lib-dir', '--stage-root', '--keep-stage', '--out']) {
       expect(workflow, `发布链没给打包脚本传 ${flag} —— 保留模式不完整`).toContain(flag)
     }
+  })
+
+  it('插件 Release 只发布独立插件附件，与桌面整包解耦', () => {
+    expect(workflow).toContain('dsh-webops-plugin-v$version.zip')
+    expect(workflow).toContain('node scripts/package-portable.mjs')
+    expect(workflow).not.toContain('node scripts/package-plugin-update.mjs')
+    expect(workflow).not.toContain('UPDATE_ZIP_NAME')
+    expect(workflow).toContain('--notes-file dist/notes.md $pluginZip')
+    expect(workflow).toContain('不能直接解压到便携版根目录')
   })
 
   it('发布步没有 --clobber：Release 已存在时明确失败，不覆盖附件', () => {

@@ -1,5 +1,5 @@
 /**
- * 打 Windows x64 便携版 zip（纯插件包）。
+ * 打独立插件 zip，支持首次登记与覆盖已有插件目录。
  *
  * 便携版 = **免构建**的产物包：`lib/` 已经编译好，解压后直接 `dsh plugin add <目录>`
  * 即可加载，用户端不需要 pnpm / tsdown / TypeScript，也不需要本地的 deepseek-harness
@@ -20,7 +20,7 @@
  *   node scripts/package-portable.mjs 0.2.13 \
  *     --lib-dir <本轮构建目录，必填> \
  *     --stage-root <D 盘暂存父目录，默认仓库内 .portable-stage> \
- *     --out <未存在的 ZIP 路径，默认 dist/dsh-webops-plugin-<ver>-win-x64-portable.zip> \
+ *     --out <未存在的 ZIP 路径，默认 dist/dsh-webops-plugin-v<ver>.zip> \
  *     --keep-stage   # 保留暂存证据；安全模式下暂存本来就永远保留，此参数仅为与
  *                    # package-plugin-update 的参数面保持一致
  *
@@ -103,7 +103,7 @@ const libArg = readArg('lib-dir')
 if (!libArg) fail('--lib-dir 必须显式指定本轮构建目录；拒绝回退到仓库旧 lib')
 const libDir = resolve(libArg)
 const stageRoot = resolve(readArg('stage-root') ?? join(ROOT, '.portable-stage'))
-const zipName = `dsh-webops-plugin-v${version}-win-x64-portable.zip`
+const zipName = `dsh-webops-plugin-v${version}.zip`
 const zipPath = resolve(readArg('out') ?? join(DIST, zipName))
 
 /** 相对仓库根 → 包内相对路径。目录整体拷贝，文件单拷贝。lib 一项用 libDir 来源。 */

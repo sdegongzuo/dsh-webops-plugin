@@ -12,11 +12,11 @@
 
 | 使用方式 | 产物 | 操作 |
 |---|---|---|
-| 首次使用桌面端 | dsh-webops-desktop-v&lt;版本&gt;-win-x64-portable.zip | 解压后运行启动.cmd |
-| 已有桌面便携版 | dsh-webops-plugin-update-v&lt;版本&gt;.zip | 覆盖到便携版根目录，保留 home，然后重启 |
-| 已有自己的 dsh | dsh-webops-plugin-v&lt;版本&gt;-win-x64-portable.zip | 按 [插件安装说明](docs/portable-install.md) 装入 profile |
+| 首次使用桌面端 | dsh-webops-desktop-v&lt;DSH版本&gt;-win-x64-portable.zip | 解压后运行启动.cmd |
+| 更新已有插件 | dsh-webops-plugin-v&lt;版本&gt;.zip | 完全退出后覆盖到实际插件目录，再重启 |
+| 已有自己的 dsh | dsh-webops-plugin-v&lt;版本&gt;.zip | 按 [插件安装说明](docs/portable-install.md) 装入 profile |
 
-各版本实际提供的附件以发布页为准，整包与增量包可以分别发布。下载后核对 SHA256；版本号取插件目录中的 package.json。
+各版本实际提供的附件以发布页为准，DSH 桌面整包与独立插件分别发布；DSH 本体不变且接口兼容时只需替换插件。下载后核对 SHA256；版本号取插件目录中的 package.json。
 
 ## 工具与权限
 

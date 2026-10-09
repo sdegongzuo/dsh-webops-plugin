@@ -1,9 +1,19 @@
-# dsh-webops-plugin 便携版 · 安装说明
+# dsh-webops-plugin 独立插件包 · 安装说明
 
 便携版 = **已经编译好的插件目录**。解压即可用，不需要 Node 工具链，也不需要
 DeepSeek Harness 的源码 checkout。
 
-## 一、解压
+## 一、更新已有插件（DSH 本体不变时）
+
+下载 `dsh-webops-plugin-v<版本>.zip`，完全退出 DSH 后，将包内文件合并覆盖到**已安装的插件目录**，再重新启动 DSH。这个 ZIP 根目录就是插件内容，不要直接解压到便携版根目录。
+
+便携版默认插件目录为 `<便携目录>\home\profiles\desktop\node_modules\dsh-webops-plugin`；自定义 DSH_HOME 或 profile 时，以实际加载的插件目录为准。通过 `dsh plugin add` 安装的用户覆盖当初登记的源目录。
+
+覆盖后核对插件目录 `package.json` 的 version，再启动检查网页工具是否能实际调用。保留旧 chunk，无需清理；用户会话、设置及 profile 的 `package.json` 不在覆盖范围内。
+
+本包包含完整插件运行时，不依赖上一版插件文件。DSH 与插件分别发版；DSH 本体不变且接口兼容时，只需更新插件。需要新宿主接口的版本应在 Release 说明列出兼容要求，旧 DSH 不自动获得新接口。
+
+## 二、首次安装：解压
 
 解压到任意位置，路径里**不要有中文或空格**（Windows 上 dsh 的 profile 依赖解析对
 非 ASCII 路径不友好）。例如：
@@ -24,7 +34,7 @@ dsh-webops-plugin/
   LICENSE
 ```
 
-## 二、装进 profile
+## 三、装进 profile
 
 ```bat
 dsh plugin --profile <你的 profile 名> add D:\tools\dsh-webops-plugin
@@ -34,7 +44,7 @@ dsh plugin --profile <你的 profile 名> add D:\tools\dsh-webops-plugin
 
 > **注意**：`add` 之后不要再移动或删除这个目录 —— dsh 是把它 link 进 profile 的。
 
-## 三、验证
+## 四、验证
 
 ```bat
 dsh --profile <你的 profile 名> --dump-config
@@ -60,7 +70,7 @@ dsh --profile <你的 profile 名> --dump-config
 [dsh-webops-plugin] webpage-tools: registered webpage_open, webpage_navigate, webpage_snapshot, webpage_screenshot, ...（共 16 个，前缀统一 `webpage_`）
 ```
 
-## 四、选 provider
+## 五、选 provider
 
 | provider | 环境变量 | 开的是什么 |
 |---|---|---|
@@ -78,7 +88,7 @@ dsh --profile <你的 profile 名> --dump-config
 端口**别用 9222**：dsh 桌面端开发态的 Electron renderer 调试端口占着它，插件会连上
 那个 Electron 而不是 Chrome，`/json/new` 必然失败。
 
-## 五、卸载
+## 六、卸载
 
 ```bat
 dsh plugin --profile <你的 profile 名> remove dsh-webops-plugin
