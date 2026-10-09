@@ -28,6 +28,8 @@ export const zh = {
   receipt: '原始回执',
   imageReceipt: '回执包含图片，可在对话工具卡片中查看',
   emptyReceipt: '无文本回执',
+  failedCalls: '次调用失败',
+  completedCalls: '次调用完成',
 } as const
 
 /** 英文文案；键集与 {@link zh} 一致。 */
@@ -50,6 +52,8 @@ export const en: Record<BrowserKey, string> = {
   receipt: 'Original result',
   imageReceipt: 'Image result available in the conversation tool card',
   emptyReceipt: 'No text result',
+  failedCalls: 'calls failed',
+  completedCalls: 'calls completed',
 }
 
 /** 本命名空间的文案键。 */
