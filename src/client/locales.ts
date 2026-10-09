@@ -20,6 +20,14 @@ export const zh = {
   screenshot: '截图',
   failure: '失败',
   untitled: '未命名页面',
+  records: '操作记录',
+  failuresOnly: '只看失败',
+  noRecords: '暂无符合条件的操作记录',
+  succeeded: '调用成功',
+  arguments: '调用参数',
+  receipt: '原始回执',
+  imageReceipt: '回执包含图片，可在对话工具卡片中查看',
+  emptyReceipt: '无文本回执',
 } as const
 
 /** 英文文案；键集与 {@link zh} 一致。 */
@@ -34,6 +42,14 @@ export const en: Record<BrowserKey, string> = {
   screenshot: 'screenshots',
   failure: 'failures',
   untitled: 'untitled page',
+  records: 'Operations',
+  failuresOnly: 'Failures only',
+  noRecords: 'No matching operations',
+  succeeded: 'Call succeeded',
+  arguments: 'Arguments',
+  receipt: 'Original result',
+  imageReceipt: 'Image result available in the conversation tool card',
+  emptyReceipt: 'No text result',
 }
 
 /** 本命名空间的文案键。 */

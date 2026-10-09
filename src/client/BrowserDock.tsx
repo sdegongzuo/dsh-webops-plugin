@@ -13,7 +13,7 @@
  * 时面板退化成不显示而不是崩掉，这里把 hook 的调用点固定在一个函数上（`readChat`），
  * 缺失时换成不读任何状态的常量实现——hook 调用次数因此恒定。
  */
-import { useMemo } from 'react'
+import { useId, useMemo, useState } from 'react'
 import type { PropsLocale, PropsRuntime } from '@deepseek-ai/dsh-client-ui-slots'
 // 类型上把 ui-chat / ui-conversation 的 SlotMap 与 SessionStandardProps 合并拉进来。
 import type {} from '@deepseek-ai/dsh-client-ui-chat/client'
@@ -54,17 +54,23 @@ export function BrowserDock(props: BrowserDockProps) {
   const state = observation.running ? 'running' : observation.failures > 0 ? 'error' : 'idle'
   const stateText = state === 'running' ? t('active') : state === 'error' ? t('failed') : t('idle')
   const idle = observation.calls === 0
+  const [failuresOnly, setFailuresOnly] = useState(false)
+  const [expanded, setExpanded] = useState(false)
+  const recordsId = useId()
+  const visibleCalls = [...calls].reverse().filter(call => !failuresOnly || (call.settled && call.isError))
 
   return (
     <div
       data-dsh-browser-dock=""
       data-dsh-browser-state={state}
       style={{
-        display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap',
+        display: 'flex', flexDirection: 'column-reverse',
         padding: '6px 10px', margin: '0 0 6px', fontSize: 12,
         border: '1px solid rgba(127,127,127,0.35)', borderRadius: 8,
       }}
     >
+      <button type="button" aria-expanded={expanded} aria-controls={recordsId} onClick={() => setExpanded(value => !value)}
+        style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap', cursor: 'pointer', border: 0, padding: 0, background: 'transparent', color: 'inherit', font: 'inherit', textAlign: 'left', width: '100%' }}>
       <span style={{ fontWeight: 600 }}>{t('title')}</span>
       <span style={{ opacity: 0.75 }}>{stateText}</span>
       {/* 无活动时给一句说明，否则这行就只剩「网页操作 · 已就绪」，看不出在等什么。 */}
@@ -97,6 +103,34 @@ export function BrowserDock(props: BrowserDockProps) {
           )}
         </>
       )}
+      <span style={{ marginLeft: 'auto', opacity: 0.65 }}>{t('records')} {calls.length} {expanded ? '▾' : '▴'}</span>
+      </button>
+      <div id={recordsId} hidden={!expanded} data-dsh-browser-records style={{ maxHeight: 'min(360px, 45vh)', overflowY: 'auto', marginBottom: 8 }}>
+        <label style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '6px 0' }}>
+          <input type="checkbox" checked={failuresOnly} onChange={event => setFailuresOnly(event.target.checked)} />
+          {t('failuresOnly')}
+        </label>
+        {visibleCalls.length === 0 ? <p style={{ opacity: 0.65 }}>{t('noRecords')}</p> : null}
+        {visibleCalls.map((call, index) => (
+          <details key={`${call.callId}:${index}`} data-dsh-browser-call-state={!call.settled ? 'running' : call.isError ? 'error' : 'success'}
+            style={{ borderTop: '1px solid rgba(127,127,127,0.25)', padding: '6px 0' }}>
+            <summary style={{ cursor: 'pointer', overflowWrap: 'anywhere' }}>
+              <span style={{ color: call.settled && call.isError ? '#d04444' : undefined }}>
+                {!call.settled ? t('active') : call.isError ? t('failure') : t('succeeded')}
+              </span>{' · '}<code>{call.toolName}</code>
+              {call.isError && call.resultText ? <span>{' · '}{call.resultText.split('\n')[0]}</span> : null}
+            </summary>
+            <div style={{ padding: '6px 10px' }}>
+              <strong>{t('arguments')}</strong>
+              <pre style={{ whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', margin: '4px 0 8px' }}>{call.argsRaw || '—'}</pre>
+              <strong>{t('receipt')}</strong>
+              <pre style={{ whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', margin: '4px 0' }}>
+                {call.resultText || (!call.settled ? t('active') : call.image ? t('imageReceipt') : t('emptyReceipt'))}
+              </pre>
+            </div>
+          </details>
+        ))}
+      </div>
     </div>
   )
 }
