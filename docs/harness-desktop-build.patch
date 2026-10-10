@@ -93,29 +93,28 @@ index d406c27235..36bb70f4fb 100644
    if (!inside(appDir, sourceRoot)) {
      // Builder's source matcher slices the appDir prefix even for external FileSets.
 diff --git a/apps/desktop/src/main.ts b/apps/desktop/src/main.ts
-index 1202670a3e..d278b0d2d5 100644
+index 1202670a3e..6a3f01efe4 100644
 --- a/apps/desktop/src/main.ts
 +++ b/apps/desktop/src/main.ts
 @@ -2,7 +2,9 @@ import type { ProductEventMap, ProductEvent } from '@deepseek-ai/dsh-client-prod
  import { WINDOWS_TITLEBAR_HEIGHT } from './windows-layout.ts'
  /** Electron shell: desktop project ownership, custom protocol, windows, and lifecycle. */
- 
+
 +import { existsSync } from 'node:fs'
  import { readFile, writeFile } from 'node:fs/promises'
 +import { createRequire } from 'node:module'
  import { join } from 'node:path'
  import { fileURLToPath } from 'node:url'
  import {
-@@ -22,7 +24,7 @@ import {
-   type IpcMainInvokeEvent,
+@@ -23,6 +25,7 @@ import {
    type MenuItemConstructorOptions,
  } from 'electron'
--import { resolveDesktopPaths } from './paths.ts'
-+import { resolveDesktopPaths, resolvePortableDshHome } from './paths.ts'
+ import { resolveDesktopPaths } from './paths.ts'
++import { configurePortableData } from './portable-data.ts'
  import { DesktopProjectManager } from './project-manager.ts'
  import { DesktopHostFatalError, DesktopHostProcess, DesktopHostUncleanExitError } from './host-process.ts'
  import { DesktopPlatformView, PLATFORM_IPC, platformBounds } from './platform-view.ts'
-@@ -35,7 +37,7 @@ import { desktopUpdateReadyConfirmation, formatDesktopMessage, resolveDesktopLoc
+@@ -35,7 +38,7 @@ import { desktopUpdateReadyConfirmation, formatDesktopMessage, resolveDesktopLoc
  import { claimDesktopSingleInstance } from './single-instance.ts'
  import { DesktopUpdateCoordinator } from './update-coordinator.ts'
  import { DesktopCommandManager } from './command-management.ts'
@@ -124,10 +123,10 @@ index 1202670a3e..d278b0d2d5 100644
  import { DesktopFatalRecovery } from './fatal-recovery.ts'
  import { pruneCrashReports, RendererConsoleTail, writeCrashReport, type CrashReportSource } from './crash-report.ts'
  import { openWelcomeWindow } from './welcome-window.ts'
-@@ -61,6 +63,78 @@ import { DesktopQuitConfirmation } from './quit-confirmation.ts'
+@@ -61,6 +64,70 @@ import { DesktopQuitConfirmation } from './quit-confirmation.ts'
  import { DesktopTray } from './tray.ts'
  import { DesktopBackgroundNotice } from './background-notice.ts'
- 
+
 +// 让 host 子进程（以及跑在里面的插件）知道 shell 主 exe 在哪 —— 便携版没有独立的
 +// electron.exe，browser-electron 的窗口宿主只能用这个 exe 起第二个实例。
 +//
@@ -189,21 +188,22 @@ index 1202670a3e..d278b0d2d5 100644
 +  ? bundledPtcNode
 +  : process.execPath
 +
-+// 便携模式：主 exe 的上一级如果存在 `home\`，就把这份安装当成便携版，把它认作 $DSH_HOME。
-+// 便携版的布局是 `<root>\app\<exe>` + `<root>\home`，于是**双击 exe 本体**也能自带配置
-+// 与插件，不必再走 `启动.cmd`。只在 `$DSH_HOME` 为空时兜底 —— 显式设置（`启动.cmd`、
-+// `scripts/dev-desktop.mjs`、CI）永远优先，空值/纯空白与 `resolveDshHome()` 的口径一致。
-+// 必须在任何 `resolveDesktopPaths()` 之前执行：`main()` 里构造 DesktopProjectManager 时
-+// 就会用到，恢复流程的 `disablePlugins` 回调里也用（那条是懒执行，不构成新的时序约束）。
-+if ((process.env.DSH_HOME ?? '').trim() === '') {
-+  const portableHome = resolvePortableDshHome(process.execPath)
-+  if (portableHome !== undefined) process.env.DSH_HOME = portableHome
-+}
++// 包目录决定便携实例的全部数据归属，早于日志、会话与单实例锁初始化。
++const portableHome = configurePortableData(app, process.execPath, process.env)
 +
  let focusPrimaryWindow = (): void => {}
  let stopForRecovery = async (): Promise<void> => {}
  let shuttingDown = false
-@@ -156,8 +230,17 @@ function runtimeResources(): RuntimeResources {
+@@ -81,7 +148,7 @@ const rendererConsole = new RendererConsoleTail()
+
+ // Platform-conventional logs directory (macOS ~/Library/Logs/<name>, otherwise under userData);
+ // set before ready so the first fatal report already resolves under it.
+-app.setAppLogsPath()
++if (portableHome === undefined) app.setAppLogsPath()
+
+ function currentDesktopLocale(): ReturnType<typeof resolveDesktopLocale> {
+   return resolveDesktopLocale(windowsLanguage ?? app.getLocale())
+@@ -156,8 +223,17 @@ function runtimeResources(): RuntimeResources {
    const pnpm = (development ? process.env.DSH_DESKTOP_PNPM_ENTRY : undefined)
      ?? (development ? join(app.getAppPath(), 'node_modules', 'pnpm', 'bin', 'pnpm.mjs')
        : join(process.resourcesPath, 'runtime', 'primary-runtime', 'dependencies', 'pnpm', 'bin', 'pnpm.mjs'))
@@ -221,10 +221,10 @@ index 1202670a3e..d278b0d2d5 100644
 +    ?? (development ? join(app.getAppPath(), '.desktop-build', 'development', 'project') : join(process.resourcesPath, 'dsh'))
    return { node, nodeBin, pnpm, dsh }
  }
- 
-@@ -314,7 +397,11 @@ function createWindow(preload: string, show = false, primary = false): BrowserWi
+
+@@ -314,7 +390,11 @@ function createWindow(preload: string, show = false, primary = false): BrowserWi
  }
- 
+
  async function main(): Promise<void> {
 -  const desktopSettings = readDesktopSettings(app.getPath('userData'))
 +  // alpha.2 起上游用 `updates.allowTestAuthPopupWindow`（默认 false）门控飞书登录弹窗 —— 默认值
@@ -235,7 +235,19 @@ index 1202670a3e..d278b0d2d5 100644
    void pruneCrashReports(app.getPath('logs'))
    const journalDirectory = process.env.DSH_DESKTOP_UPDATE_JOURNAL_DIR
    const updateJournal = journalDirectory === undefined ? undefined : new DesktopUpdateJournal(journalDirectory, app.getVersion())
-@@ -450,11 +537,28 @@ async function main(): Promise<void> {
+@@ -330,9 +410,9 @@ async function main(): Promise<void> {
+   const loginShellRead = new AbortController()
+   // The probe runs in its own process group, which outlives Desktop unless the read is aborted.
+   app.on('will-quit', () => { loginShellRead.abort() })
+-  const loginShell = readDesktopLoginShellEnvironment(process.env, resolveDesktopLoginShellConfig(process.env), {
++  const loginShell = (portableHome === undefined ? readDesktopLoginShellEnvironment(process.env, resolveDesktopLoginShellConfig(process.env), {
+     signal: loginShellRead.signal,
+-  }).then((result) => {
++  }) : Promise.resolve({ environment: process.env, failures: [] })).then((result) => {
+     for (const failure of result.failures) console.warn(`desktop login shell: ${failure.shell} failed (${failure.reason})`)
+     return result.environment
+   })
+@@ -450,11 +530,28 @@ async function main(): Promise<void> {
      return {
        start: async () => {
          const ready = await host.start()
@@ -267,10 +279,10 @@ index 1202670a3e..d278b0d2d5 100644
          analyticsEnabled = await welcomeBackend.analyticsEnabled().catch(() => false)
          if (!reportedLaunch) { reportedLaunch = true; void track('desktop_app_launch', {}) }
          stopAccount?.()
-@@ -709,7 +813,13 @@ async function main(): Promise<void> {
+@@ -709,7 +806,13 @@ async function main(): Promise<void> {
      return browserGuests.release(event.sender, lease)
    })
- 
+
 -  session.defaultSession.webRequest.onBeforeSendHeaders({ urls: ['ws://127.0.0.1/*', 'wss://127.0.0.1/*'] }, (details, callback) => {
 +  // 渲染进程的事件流是自己发起的 WebSocket（不是走 Node 的转发），所以握手 cookie 得由壳注入。
 +  // 过滤名单必须覆盖**所有可能被选中的回环名**：兜底可能把 Host 定在 `localhost`（代理只放通
@@ -282,7 +294,16 @@ index 1202670a3e..d278b0d2d5 100644
      if (hostUrl === undefined || hostCookie === undefined || details.webContentsId !== mainWindow?.webContents.id) {
        callback({})
        return
-@@ -1322,9 +1432,8 @@ async function main(): Promise<void> {
+@@ -1229,7 +1332,7 @@ async function main(): Promise<void> {
+     window.focus()
+   }
+
+-  if (app.isPackaged || process.env.DSH_DESKTOP_DEV_APP === '1') app.setAsDefaultProtocolClient('dsh')
++  if (portableHome === undefined && (app.isPackaged || process.env.DSH_DESKTOP_DEV_APP === '1')) app.setAsDefaultProtocolClient('dsh')
+   app.on('open-url', (event, url) => {
+     event.preventDefault()
+     if (url === 'dsh://open' || url === 'dsh://open/') focusPrimaryWindow()
+@@ -1322,9 +1425,8 @@ async function main(): Promise<void> {
        refresh: async () => { await Promise.all([checkPolicyManually(), updateSchedule.check(true)]) },
        download: downloadUpdate, install: version => updates.install(version),
      })
@@ -294,10 +315,10 @@ index 1202670a3e..d278b0d2d5 100644
    }
    automaticCheck()
    await reconcileBackend().catch(() => undefined)
-@@ -1337,17 +1446,29 @@ async function main(): Promise<void> {
+@@ -1337,17 +1439,29 @@ async function main(): Promise<void> {
    publishUpdate(updateState)
  }
- 
+
 -const ownsDesktopInstance = claimDesktopSingleInstance(app, () => { focusPrimaryWindow() })
 +// 窗口宿主模式：便携版里 browser-electron 用主 exe 起第二个实例来开浏览器窗口，
 +// 靠 `DSH_BROWSER_ELECTRON_HOST` 把宿主脚本的绝对路径传进来
@@ -306,7 +327,7 @@ index 1202670a3e..d278b0d2d5 100644
 +// 必须在 `claimDesktopSingleInstance` **之前**接管：先抢了单实例锁的话第二个实例会直接退出。
 +// 宿主只管开窗口，不碰 profile、也不开主窗口。
 +const browserHostScript = process.env.DSH_BROWSER_ELECTRON_HOST
- 
+
 -if (ownsDesktopInstance) void app.whenReady().then(main).catch(async (error: unknown) => {
 -  const message = error instanceof Error ? error.message : String(error)
 -  console.error(error)
@@ -343,12 +364,12 @@ index cf03e38c36..878122bcd6 100644
 +++ b/apps/desktop/src/paths.ts
 @@ -1,6 +1,7 @@
  /** Filesystem ownership for the Electron-managed desktop installation. */
- 
+
 -import { join } from 'node:path'
 +import { existsSync } from 'node:fs'
 +import { dirname, join, resolve } from 'node:path'
  import { resolveDshHome } from '@deepseek-ai/dsh-home-paths'
- 
+
  /** Stable desktop installation paths under the shared Harness home. */
 @@ -20,3 +21,17 @@ export function resolveDesktopPaths(dshHome: string = resolveDshHome()): Desktop
      lock: join(dshHome, 'profiles', 'desktop', 'lock'),
@@ -406,7 +427,7 @@ index a74ea7c7ef..0a410e8163 100644
 @@ -35,16 +35,183 @@ export async function serveWebDocument(request: Request, root: string): Promise<
    })
  }
- 
+
 +/**
 + * The Host's authentication exchange answered with something other than its 303 + cookie.
 + *
@@ -595,17 +616,17 @@ index 54ab46d85e..28512376f9 100644
 --- a/apps/desktop/src/welcome-backend.ts
 +++ b/apps/desktop/src/welcome-backend.ts
 @@ -3,6 +3,7 @@ import type { ProductEvent } from '@deepseek-ai/dsh-client-product-analytics/typ
- 
+
  import { randomUUID } from 'node:crypto'
  import { desktopAccountBackend, type DesktopAccountBackend } from './account-backend.ts'
 +import { loopbackCandidates } from './web-document.ts'
- 
+
  /** Metadata needed before the native entry or workspace becomes visible. */
  export interface WelcomeState {
 @@ -34,21 +35,58 @@ function record(value: unknown): value is Record<string, unknown> {
    return typeof value === 'object' && value !== null && !Array.isArray(value)
  }
- 
+
 +/**
 + * Authenticate against whichever loopback host name this transport stack can actually reach.
 + *
@@ -685,7 +706,7 @@ index d9a8f3103b..d5ccc62e6a 100644
 @@ -16,7 +16,16 @@ import { writeCrashReport } from '../src/crash-report.ts'
  type InvokeEvent = { sender?: unknown; senderFrame: { url: string } }
  type InvokeHandler = (event: InvokeEvent, ...args: unknown[]) => unknown
- 
+
 -vi.mock('../src/web-document.ts', () => ({ authenticateWebHost: async () => 'test-cookie', serveWebDocument: vi.fn(), forwardWebRequest: vi.fn() }))
 +vi.mock('../src/web-document.ts', async importOriginal => ({
 +  ...await importOriginal<typeof import('../src/web-document.ts')>(),
@@ -712,7 +733,7 @@ index d9a8f3103b..d5ccc62e6a 100644
 @@ -655,48 +664,22 @@ describe('desktop main startup', () => {
      expect(host.stop).not.toHaveBeenCalled()
    })
- 
+
 -  it('shows one explained startup login before Host readiness and joins concurrent checks without reopening it', async () => {
 -    configureTestAuthPopup(true)
 +  // 上游 alpha.2 保留了「启动即弹登录」的测试，但按 allowTestAuthPopupWindow=true 才成立；
@@ -768,7 +789,7 @@ index d9a8f3103b..d5ccc62e6a 100644
 +    }))
 +    expect(testAuth.login).not.toHaveBeenCalled()
    })
- 
+
    it.each(['returned', 'cancelled', 'failed'] as const)('requires explicit test login and handles %s without downloading', async (outcome) => {
 @@ -708,7 +691,7 @@ describe('desktop main startup', () => {
      await readyForUpdate()
@@ -811,13 +832,13 @@ index 0fd9b591b1..da9b3ab383 100644
  import { join } from 'node:path'
 -import { authenticateWebHost, forwardWebRequest, serveWebDocument } from '../src/web-document.ts'
 +import { authenticateLoopbackHost, authenticateWebHost, exchangeProbe, forwardWebRequest, jarProbe, serveWebDocument } from '../src/web-document.ts'
- 
+
  const roots: string[] = []
  afterEach(async () => {
 @@ -35,6 +35,121 @@ it('requires the Host authentication exchange and retains only its cookie value'
    await expect(authenticateWebHost('http://127.0.0.1:1234/')).rejects.toThrow('authentication failed')
  })
- 
+
 +it('falls back to another loopback name when the announced one cannot be reached', async () => {
 +  const urls: string[] = []
 +  const fetch = vi.fn().mockImplementation(async (input: unknown) => {
@@ -943,7 +964,7 @@ index dea2905583..cb70d68123 100644
 @@ -93,7 +93,6 @@ describe('desktop welcome Web operations', () => {
      await expect(backend.read()).rejects.toThrow('Web RPC failed')
    })
- 
+
 -
    it('submits native analytics through authenticated RPC with a bounded request', async () => {
      const host = transport()
@@ -951,7 +972,7 @@ index dea2905583..cb70d68123 100644
 @@ -106,8 +105,53 @@ describe('desktop welcome Web operations', () => {
      expect(JSON.parse(init!.body as string)).toMatchObject({ payload: { args: { event } } })
    })
- 
+
 -  it('refuses an unauthenticated Web launch', async () => {
 +  it('keeps trying the next name when an intermediary answers on the Host behalf', async () => {
 +    // 代理代替 Host 回 403（`ok === false`）时**不能**当终局 —— 它只说明这个名字没通过。
@@ -1018,12 +1039,12 @@ index 7915248243..8b568d227f 100644
 +  forwardWebRequest: vi.fn(),
 +}))
  /** Welcome startup uses the Host before transitioning to the workspace. */
- 
+
  import { afterEach, expect, it, vi } from 'vitest'
 @@ -101,7 +107,7 @@ vi.mock('electron', () => ({
  // The Windows tray relabels through Menu as well; keep the menu call counts below platform-neutral.
  vi.mock('../src/tray.ts', () => ({ DesktopTray: class { relabel() {} dispose() {} } }))
- 
+
 -vi.mock('../src/paths.ts', () => ({ resolveDesktopPaths: () => ({ profile: '/profile' }) }))
 +vi.mock('../src/paths.ts', () => ({ resolveDesktopPaths: () => ({ profile: '/profile' }), resolvePortableDshHome: () => undefined }))
  vi.mock('../src/settings.ts', () => ({ readDesktopSettings: () => ({ updates: { allowTestAuthPopupWindow: false } }) }))
@@ -1036,7 +1057,7 @@ index 45028746ff..c929f42495 100644
 @@ -148,6 +148,41 @@ interface AclTempCapability {
    grant: AclWriteGrant
  }
- 
+
 +/**
 + * The node executable the windows-acl runner argv is prefixed with.
 + *
@@ -1093,3 +1114,355 @@ index 45028746ff..c929f42495 100644
      const sourceEntry = fileURLToPath(import.meta.resolve('@deepseek-ai/dsh-sandbox-windows-acl/src/runner.ts'))
      const sourceConfig = fileURLToPath(new URL('../../../../tsconfig.base.json', import.meta.url))
      const registration = `import { register } from ${JSON.stringify(import.meta.resolve('tsx/esm/api'))}; register({ tsconfig: ${JSON.stringify(sourceConfig)} });`
+diff --git a/apps/desktop/README.md b/apps/desktop/README.md
+index 60f14b908f..fbcc12270c 100644
+--- a/apps/desktop/README.md
++++ b/apps/desktop/README.md
+@@ -2,6 +2,8 @@
+
+ English | [中文](README.zh.md)
+
++Portable bundles use `<root>/app/<exe>` beside `<root>/home`. The bundle directory owns each instance and overrides inherited global directory settings: sessions, configuration, credentials, plugins and dependency runtimes live under `home`, and shared agent configuration under `home/.agents`. Electron user and session data, logs, crash reports, temporary files, update caches and journals, and npm/pnpm/Python user directories live under `data`. Different bundle directories run concurrently; launching the same directory focuses its owner, with directory aliases resolved to the real path. Both the executable and launcher follow this rule. Portable mode neither registers the system `dsh://` protocol nor reads the system login shell to override bundle paths. Explicit workspace paths and external application installation directories remain accessible. Existing system Electron data is not imported automatically; see the [portable directory upgrade guide](../../docs/upgrade-guide/v0.2.1-alpha.2/portable-data/guide.md).
++
+ Desktop analytics follows the [product collection policy](../../packages/client/product-analytics/README.md), including its live application setting. Web usage is excluded. Update installation waits for its local analytics intake before locking API admission and stopping the Host. Intake has a one-second deadline; failure does not prevent installation, and collector delivery is not awaited.
+
+ The desktop application is an Electron shell around the complete dsh Web application. An Electron RunAsNode child starts the shared profile runner, and Electron immediately loads the packaged Web entry at `dsh-app://app/`. Its shared loading page waits for Host boot injections, then starts the client without navigating to another document. Electron forwards application HTTP requests to the authenticated Web Host, dropping connection-level response headers (`transfer-encoding`, `connection`, `keep-alive`) that describe the Node fetch rather than the resource, and marking plugin bundle responses `no-store` because their per-launch revisions would only accumulate in Chromium's disk cache; WebSocket streams connect to that Host with credentials attached only for the owned application window. Node IPC carries boot injections, readiness, and shutdown. Desktop listens on an OS-assigned port by default, so it cannot collide with Web’s `3080` or a reserved port; a `webserver.config.port` patch can override it.
+diff --git a/apps/desktop/README.zh.md b/apps/desktop/README.zh.md
+index eb1cbe5b78..daddef95c4 100644
+--- a/apps/desktop/README.zh.md
++++ b/apps/desktop/README.zh.md
+@@ -2,6 +2,8 @@
+
+ [English](README.md) | 中文
+
++便携包采用 `<根目录>/app/<exe>` 与 `<根目录>/home` 布局。启动时由包目录决定实例归属，覆盖继承的全局目录环境：会话、配置、凭据、插件与依赖运行时位于 `home`，共享智能体配置位于 `home/.agents`；Electron 用户数据及会话缓存、日志、崩溃报告、临时目录、更新缓存与日志、npm/pnpm/Python 用户目录位于 `data`。不同包目录可并行运行，同目录重复启动聚焦原实例；目录别名按真实路径识别。exe 与启动脚本使用同一规则，便携模式不注册系统 `dsh://` 协议，也不读取系统登录 shell 来覆盖包内路径。用户明确指定的工作区与外部程序安装目录仍按实际路径访问。旧版的系统 Electron 数据不会自动导入，迁移说明见[便携目录升级指南](../../docs/upgrade-guide/v0.2.1-alpha.2/portable-data/guide.zh.md)。
++
+ 桌面埋点遵循[产品采集策略](../../packages/client/product-analytics/README.zh.md)及其动态应用配置，不包含 Web 使用情况。安装更新会等待该操作的本地埋点接收请求结束，再锁定 API 准入并停止 Host。接收请求的时限为一秒，失败不会阻止安装，也不等待收集端完成发送。
+
+ 桌面应用是完整 dsh Web 应用外的一层 Electron 壳。Electron RunAsNode 子进程启动共享 profile runner，Electron 立即从 `dsh-app://app/` 加载打包内的 Web 入口。共享加载页等待 Host 启动注入，然后在同一文档中启动客户端。Electron 将应用 HTTP 请求转发给已认证的 Web Host，转发时丢弃描述 Node fetch 连接而非资源本身的响应头（`transfer-encoding`、`connection`、`keep-alive`），并把插件 bundle 响应标记为 `no-store`，因为其每次启动都变化的 revision 只会在 Chromium 磁盘缓存中累积；WebSocket 流连接到该 Host，仅为归属的应用窗口附加凭据。Node IPC 承载启动注入、就绪与关闭。Desktop 默认监听系统分配的端口，因此不会与 Web 的 `3080` 或系统保留端口冲突；可通过 `webserver.config.port` patch 覆盖。
+diff --git a/apps/desktop/src/portable-data.ts b/apps/desktop/src/portable-data.ts
+new file mode 100644
+--- /dev/null
++++ b/apps/desktop/src/portable-data.ts
+@@ -0,0 +1,69 @@
++/** 便携版在获取单实例锁前确定所有可写数据目录。 */
++import { resolvePortableDshHome } from './paths.ts'
++import { mkdirSync, realpathSync } from 'node:fs'
++import { dirname, join, parse } from 'node:path'
++
++/** Electron 启动阶段的目录设置接口。 */
++export interface PortableApplicationPaths {
++  setPath(name: 'appData' | 'userData' | 'sessionData' | 'temp' | 'crashDumps', path: string): void
++  setAppLogsPath(path: string): void
++  commandLine: { appendSwitch(name: string, value: string): void }
++}
++
++/**
++ * 初始化便携版数据归属；普通安装不改变系统路径。
++ * @param application - 尚未 ready 的 Electron 应用。
++ * @param executable - 主程序的绝对路径。
++ * @param environment - 主进程与子进程共享的环境。
++ * @returns 检测到的包内 Harness home；普通安装返回 undefined。
++ */
++export function configurePortableData(
++  application: PortableApplicationPaths, executable: string, environment: NodeJS.ProcessEnv,
++): string | undefined {
++  const detected = resolvePortableDshHome(executable)
++  if (detected === undefined) return undefined
++  // realpath 让目录别名与原路径使用同一个 Electron 单实例锁。
++  const home = realpathSync(detected)
++  const data = join(dirname(home), 'data')
++  const userHome = join(data, 'user-home')
++  const appData = join(data, 'app-data')
++  const localAppData = join(data, 'local-app-data')
++  const temporary = join(data, 'temp')
++  const cache = join(data, 'cache')
++  const browserHost = (environment.DSH_BROWSER_ELECTRON_HOST ?? '') !== ''
++  const electronPaths = {
++    appData, temp: temporary, crashDumps: join(data, 'crash-dumps'),
++    ...browserHost ? {} : { userData: join(data, 'electron'), sessionData: join(data, 'electron') },
++  }
++  const logs = join(data, 'logs', browserHost ? 'browser' : 'desktop')
++  const overrides: Record<string, string> = {
++    DSH_HOME: home, DSH_AGENTS_HOME: join(home, '.agents'),
++    DSH_PORTABLE_DOCUMENTS_DIR: join(data, 'documents'),
++    HOME: userHome, USERPROFILE: userHome,
++    APPDATA: appData, LOCALAPPDATA: localAppData,
++    TEMP: temporary, TMP: temporary, TMPDIR: temporary,
++    XDG_CONFIG_HOME: join(data, 'config'), XDG_CACHE_HOME: cache,
++    XDG_DATA_HOME: join(data, 'share'), XDG_STATE_HOME: join(data, 'state'),
++    npm_config_cache: join(cache, 'npm'), npm_config_userconfig: join(userHome, '.npmrc'),
++    npm_config_store_dir: join(cache, 'pnpm-store'), PNPM_HOME: join(data, 'pnpm'),
++    npm_config_prefix: join(data, 'npm-global'), npm_config_global_dir: join(data, 'pnpm-global'),
++    PIP_CACHE_DIR: join(cache, 'pip'), PYTHONUSERBASE: join(data, 'python-user'),
++    DSH_DESKTOP_UPDATE_JOURNAL_DIR: join(data, 'update-journals'),
++  }
++  for (const directory of [userHome, appData, localAppData, temporary, cache, logs,
++    ...Object.values(electronPaths), ...Object.entries(overrides)
++      .filter(([key]) => key !== 'npm_config_userconfig').map(([, value]) => value)]) {
++    mkdirSync(directory, { recursive: true })
++  }
++  Object.assign(environment, overrides)
++  if (process.platform === 'win32') {
++    environment.HOMEDRIVE = parse(userHome).root.replace(/[\\/]$/u, '')
++    environment.HOMEPATH = userHome.slice(environment.HOMEDRIVE.length)
++  }
++  for (const [name, path] of Object.entries(electronPaths)) {
++    application.setPath(name as Parameters<PortableApplicationPaths['setPath']>[0], path)
++  }
++  application.setAppLogsPath(logs)
++  application.commandLine.appendSwitch('log-file', join(logs, 'chromium.log'))
++  return home
++}
+diff --git a/apps/desktop/tests/portable-data.spec.ts b/apps/desktop/tests/portable-data.spec.ts
+new file mode 100644
+--- /dev/null
++++ b/apps/desktop/tests/portable-data.spec.ts
+@@ -0,0 +1,92 @@
++import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
++import { tmpdir } from 'node:os'
++import { join, relative, isAbsolute } from 'node:path'
++import { homedir } from 'node:os'
++import { spawnSync } from 'node:child_process'
++import { describe, expect, it, vi } from 'vitest'
++import { configurePortableData, type PortableApplicationPaths } from '../src/portable-data.ts'
++import { claimDesktopSingleInstance } from '../src/single-instance.ts'
++
++function fixture() {
++  const root = mkdtempSync(join(tmpdir(), 'dsh-portable-data-'))
++  mkdirSync(join(root, 'home'))
++  mkdirSync(join(root, 'app'))
++  return { root, executable: join(root, 'app', 'DeepSeek Harness.exe') }
++}
++
++function application() {
++  const paths = new Map<string, string>()
++  return { paths, setPath: (name, path) => { paths.set(name, path) },
++    setAppLogsPath: (path) => { paths.set('logs', path) }, commandLine: { appendSwitch: vi.fn() },
++  } satisfies PortableApplicationPaths & { paths: Map<string, string> }
++}
++
++describe('便携包目录隔离', () => {
++  it('两目录可同时持有单实例锁，同目录重复启动交给原实例，数据各自持久化', () => {
++    const locks = new Set<string>()
++    const first = fixture()
++    const second = fixture()
++    const start = (executable: string) => {
++      const app = application()
++      const environment = { DSH_HOME: '其他安装的 home', DSH_AGENTS_HOME: '系统共享 agents' }
++      configurePortableData(app, executable, environment)
++      const key = app.paths.get('userData') ?? '系统共享 Electron 数据'
++      const owns = claimDesktopSingleInstance({ requestSingleInstanceLock: () => {
++        if (locks.has(key)) return false
++        locks.add(key)
++        return true
++      }, quit: vi.fn(), on: vi.fn() }, vi.fn())
++      return { app, environment, owns }
++    }
++    const a = start(first.executable)
++    writeFileSync(join(first.root, 'home', '会话哨兵.txt'), 'A 的记录')
++    const b = start(second.executable)
++    expect([a.owns, b.owns]).toEqual([true, true])
++    expect(start(first.executable).owns).toBe(false)
++    expect(a.environment.DSH_HOME).toBe(join(first.root, 'home'))
++    expect(b.environment.DSH_HOME).toBe(join(second.root, 'home'))
++    expect(a.environment.DSH_AGENTS_HOME).toBe(join(first.root, 'home', '.agents'))
++    expect(readFileSync(join(first.root, 'home', '会话哨兵.txt'), 'utf8')).toBe('A 的记录')
++    for (const name of ['appData', 'userData', 'sessionData', 'temp', 'crashDumps', 'logs']) {
++      expect(a.app.paths.get(name)?.startsWith(first.root)).toBe(true)
++      expect(a.app.paths.get(name)).not.toBe(b.app.paths.get(name))
++    }
++  })
++
++  it('普通安装保留显式环境与系统路径', () => {
++    const app = application()
++    const environment = { DSH_HOME: 'custom' }
++    expect(configurePortableData(app, join(tmpdir(), 'ordinary', 'app.exe'), environment)).toBeUndefined()
++    expect(environment).toEqual({ DSH_HOME: 'custom' })
++    expect(app.paths.size).toBe(0)
++  })
++
++  it('所有全局环境目录都在包内，Node 子进程的 home 和临时目录继承隔离', () => {
++    const { root, executable } = fixture()
++    const environment: NodeJS.ProcessEnv = { ...process.env, DSH_HOME: homedir() }
++    configurePortableData(application(), executable, environment)
++    for (const key of ['DSH_HOME', 'DSH_AGENTS_HOME', 'DSH_PORTABLE_DOCUMENTS_DIR', 'HOME', 'USERPROFILE', 'APPDATA', 'LOCALAPPDATA',
++      'TEMP', 'TMP', 'TMPDIR', 'XDG_CONFIG_HOME', 'XDG_CACHE_HOME', 'XDG_DATA_HOME', 'XDG_STATE_HOME',
++      'npm_config_cache', 'npm_config_userconfig', 'npm_config_store_dir', 'PNPM_HOME', 'PIP_CACHE_DIR',
++      'PYTHONUSERBASE', 'DSH_DESKTOP_UPDATE_JOURNAL_DIR', 'npm_config_prefix', 'npm_config_global_dir']) {
++      const path = relative(root, environment[key]!)
++      expect(path.startsWith('..') || isAbsolute(path), key).toBe(false)
++    }
++    const child = spawnSync(process.execPath, ['-e',
++      'console.log(JSON.stringify({home:require("node:os").homedir(),temp:require("node:os").tmpdir()}))'],
++    { env: environment, encoding: 'utf8' })
++    expect(child.status).toBe(0)
++    expect(JSON.parse(child.stdout)).toEqual({ home: join(root, 'data', 'user-home'), temp: join(root, 'data', 'temp') })
++  })
++
++  it('网页宿主保留自己的 Chromium 用户数据，但其他路径仍归属包目录', () => {
++    const { root, executable } = fixture()
++    const app = application()
++    app.setPath('userData', join(root, 'data', 'temp', 'browser-host'))
++    app.setPath('sessionData', join(root, 'data', 'temp', 'browser-host'))
++    configurePortableData(app, executable, { DSH_BROWSER_ELECTRON_HOST: 'host.cjs' })
++    expect(app.paths.get('userData')).toBe(join(root, 'data', 'temp', 'browser-host'))
++    expect(app.paths.get('sessionData')).toBe(join(root, 'data', 'temp', 'browser-host'))
++    expect(app.paths.get('logs')).toBe(join(root, 'data', 'logs', 'browser'))
++  })
++})
+diff --git a/docs/upgrade-guide/v0.2.1-alpha.2/portable-data/guide.md b/docs/upgrade-guide/v0.2.1-alpha.2/portable-data/guide.md
+new file mode 100644
+--- /dev/null
++++ b/docs/upgrade-guide/v0.2.1-alpha.2/portable-data/guide.md
+@@ -0,0 +1,20 @@
++---
++kind: upgrade-guide
++description: Portable Electron and global data directories become owned by each bundle directory.
++---
++# Portable data isolation
++
++English | [中文](guide.zh.md)
++
++## Change
++
++Previously only the Harness home lived inside a portable bundle; Electron data, its single-instance lock and some global directories used system paths. Each bundle now owns `home` and `data`, and different directories run concurrently. Inherited `DSH_HOME` and other global directory variables no longer point a portable instance at another installation. Ordinary installations retain their directory rules. Portable mode no longer registers the system `dsh://` protocol automatically.
++
++## Migration
++
++The first automatically created workspace uses `data/documents/deepseek-harness/default-workspace`. Existing workspaces and explicitly selected or configured project directories keep their original locations.
++
++1. Quit the instance normally and back up its portable `home`. Preserve that directory when updating application files: it contains sessions, configuration, credentials and plugins.
++2. First launch creates `data` inside the bundle. Existing system Electron data is neither changed nor copied automatically, so previous shortcut preferences, desktop preferences and browser sign-in state do not appear automatically. To retain preferences, quit the instance and copy its identified `keybindings.json` and `desktop/settings.json` into the corresponding locations under `data/electron`. Do not merge an entire system directory whose instance ownership is unclear.
++3. Copy required shared agent configuration into `home/.agents`. User tool configuration lives under `data/user-home`; copy needed npm configuration to `.npmrc` there.
++4. Launch bundles from two different directories, create separate sessions and change configuration in each. Restart and verify that sessions, configuration and `data/electron` remain separate. Launching the same directory again should focus the running window.
+diff --git a/docs/upgrade-guide/v0.2.1-alpha.2/portable-data/guide.zh.md b/docs/upgrade-guide/v0.2.1-alpha.2/portable-data/guide.zh.md
+new file mode 100644
+--- /dev/null
++++ b/docs/upgrade-guide/v0.2.1-alpha.2/portable-data/guide.zh.md
+@@ -0,0 +1,20 @@
++---
++kind: upgrade-guide
++description: 便携版的 Electron 和全局数据目录改为由包目录独占。
++---
++# 便携版数据目录隔离
++
++[English](guide.md) | 中文
++
++## 变更
++
++旧便携版仅把 Harness home 放到包内，Electron 数据、单实例锁和部分全局目录仍使用系统路径。现在每份便携包拥有独立的 `home` 与 `data`，不同目录可同时启动；继承的 `DSH_HOME` 与其他全局目录变量不再把便携实例指向另一个安装。普通安装保留原有目录规则。便携版不再自动注册系统 `dsh://` 协议。
++
++## 迁移
++
++首次自动创建的默认工作区位于 `data/documents/deepseek-harness/default-workspace`。已有工作区、主动选择或明确配置的项目目录保持原位置。
++
++1. 正常退出待更新实例，备份原便携包的 `home`。更新应用文件时保留该目录；它包含会话、配置、凭据和插件。
++2. 首次启动会创建包内 `data`。旧系统 Electron 目录不会被修改或自动复制；旧快捷键、桌面偏好及网页登录态不会自动出现。需要旧偏好时，在实例退出后将明确属于该实例的 `keybindings.json` 与 `desktop/settings.json` 复制到包内 `data/electron` 的对应位置；来源归属不明确时不要混合导入整个系统目录。
++3. 如需原共享智能体配置，将所需文件复制到 `home/.agents`。包内用户工具配置位于 `data/user-home`，需要使用的 npm 配置可复制为该目录下的 `.npmrc`。
++4. 启动两个不同目录的便携包，分别建立会话和修改配置。重启后核对各自会话、配置与 `data/electron` 均保持独立。同目录再次启动应聚焦已运行的窗口。
+diff --git a/packages/api/workspace-controller/src/default-directory.ts b/packages/api/workspace-controller/src/default-directory.ts
+index b15fea8b94..b17e86b6cc 100644
+--- a/packages/api/workspace-controller/src/default-directory.ts
++++ b/packages/api/workspace-controller/src/default-directory.ts
+@@ -7,6 +7,7 @@ import { DEFAULT_WORKSPACE_DIRECTORY } from './default-workspace.ts'
+
+ /** Platform observations replaceable in directory-resolution tests. */
+ interface DocumentsDirectoryInternals {
++  readonly environment?: NodeJS.ProcessEnv
+   readonly platform?: NodeJS.Platform
+   readonly home?: string
+   readonly run?: NativeCommandRunner
+@@ -42,7 +43,8 @@ export async function defaultWorkspaceDirectory(
+   const platform = internals.platform ?? process.platform
+   const paths = platform === 'win32' ? win32 : posix
+   signal.throwIfAborted()
+-  let directory = documentsDirectory
++  // 便携桌面将首次自动创建目录收进包内；明确配置仍有优先权。
++  let directory = documentsDirectory ?? (internals.environment ?? process.env).DSH_PORTABLE_DOCUMENTS_DIR
+   if (directory === undefined) {
+     const run = internals.run ?? runNativeCommand
+     let stdout: string
+diff --git a/packages/api/workspace-controller/tests/default-directory.host.spec.ts b/packages/api/workspace-controller/tests/default-directory.host.spec.ts
+index c382f410ac..e462edd384 100644
+--- a/packages/api/workspace-controller/tests/default-directory.host.spec.ts
++++ b/packages/api/workspace-controller/tests/default-directory.host.spec.ts
+@@ -3,6 +3,16 @@ import type { NativeCommandRunner } from '@deepseek-ai/dsh-native-command'
+ import { defaultWorkspaceDirectory, validateDocumentsDirectory } from '../src/default-directory.ts'
+
+ describe('system Documents directory', () => {
++  it('便携版首次目录使用包内位置，明确配置优先且不查询系统目录', async () => {
++    const run = vi.fn<NativeCommandRunner>()
++    const internals = { platform: 'win32' as const, run,
++      environment: { DSH_PORTABLE_DOCUMENTS_DIR: 'D:\\portable\\data\\documents' } }
++    await expect(defaultWorkspaceDirectory(undefined, new AbortController().signal, internals))
++      .resolves.toBe('D:\\portable\\data\\documents\\deepseek-harness\\default-workspace')
++    await expect(defaultWorkspaceDirectory('D:\\chosen', new AbortController().signal, internals))
++      .resolves.toBe('D:\\chosen\\deepseek-harness\\default-workspace')
++    expect(run).not.toHaveBeenCalled()
++  })
+   it.each([
+     ['darwin', '/Users/a/文档/\n', '/Users/a/文档/deepseek-harness/default-workspace', 'osascript'],
+     ['win32', 'D:\\Redirected Documents\r\n', 'D:\\Redirected Documents\\deepseek-harness\\default-workspace', 'powershell.exe'],
+diff --git a/packages/api/workspace-controller/README.md b/packages/api/workspace-controller/README.md
+index b24053384f..0813b7dc5e 100644
+--- a/packages/api/workspace-controller/README.md
++++ b/packages/api/workspace-controller/README.md
+@@ -38,6 +38,8 @@ The [Workspace registry](../../workspace/workspace/README.md#first-use-workspace
+ | Configuration | Default | Purpose |
+ | --- | --- | --- |
+ | `documentsDirectory` | System Documents directory | Fully qualified Host directory override |
++
++Portable desktop supplies its package-local default through `DSH_PORTABLE_DOCUMENTS_DIR`; explicit `documentsDirectory` takes precedence. Existing workspace registrations are not migrated when this default changes.
+ | `documentsLookupTimeoutMs` | `10000` | Positive maximum duration of OS directory lookup, in milliseconds |
+
+ Documents lookup holds the registry mutation queue, so other Workspace mutations, including registration of a picked directory, can wait up to `documentsLookupTimeoutMs`. Cancellation can stop the lookup; after resolution succeeds, it does not roll back creation or registration.
+diff --git a/packages/api/workspace-controller/README.zh.md b/packages/api/workspace-controller/README.zh.md
+index dc240950cc..56caf00762 100644
+--- a/packages/api/workspace-controller/README.zh.md
++++ b/packages/api/workspace-controller/README.zh.md
+@@ -38,6 +38,8 @@ Client 入口提供 `ClientWorkspaceModel` 和 `createWorkspaceStateStream()`。
+ | 配置 | 默认值 | 用途 |
+ | --- | --- | --- |
+ | `documentsDirectory` | 系统 Documents 目录 | 完全限定的 Host 目录覆盖值 |
++
++便携桌面通过 `DSH_PORTABLE_DOCUMENTS_DIR` 提供包内默认目录；显式 `documentsDirectory` 优先。已有工作区注册不会因默认值变化而迁移。
+ | `documentsLookupTimeoutMs` | `10000` | 操作系统目录查询的正数最大时长，单位为毫秒 |
+
+ Documents 查询占用注册表变更队列，因此其他 Workspace 变更（包括登记已选目录）最多可能等待 `documentsLookupTimeoutMs`。取消可以停止查询；解析成功后，取消不会回滚创建或登记。
+diff --git a/packages/api/workspace-controller/README.i18n.yaml b/packages/api/workspace-controller/README.i18n.yaml
+index d804399b83..9b998ed83b 100644
+--- a/packages/api/workspace-controller/README.i18n.yaml
++++ b/packages/api/workspace-controller/README.i18n.yaml
+@@ -18,8 +18,8 @@
+   en: aa0d93826ab685fe
+   zh: 144e48d49020f5a4
+ /workspace-controller/use-this-package/first-use-workspace:
+-  en: 61032e060e7213f0
+-  zh: 437eb982a8738539
++  en: 0c6f6053b6d95703
++  zh: faf44626103fd3de
+ /workspace-controller/model-experience:
+   en: 4f399d6a27daf683
+   zh: 13811489fe636127
+diff --git a/docs/upgrade-guide/v0.2.1-alpha.2/portable-data/guide.i18n.yaml b/docs/upgrade-guide/v0.2.1-alpha.2/portable-data/guide.i18n.yaml
+new file mode 100644
+--- /dev/null
++++ b/docs/upgrade-guide/v0.2.1-alpha.2/portable-data/guide.i18n.yaml
+@@ -0,0 +1,16 @@
++# Bilingual-pair consistency record for guide.md (docs/i18n/README.md): per heading
++# section, a hash of its English and Chinese blocks outside code blocks and generated regions.
++# After editing either side, bring the other along and re-record with:
++#   pnpm run verify-translation-pairing --write docs/upgrade-guide/v0.2.1-alpha.2/portable-data/guide.md
++/:
++  en: cb81233c3825a326
++  zh: ad218bda5d426e85
++/portable-data-isolation:
++  en: 45d3336d55963a1d
++  zh: 2cfb61f3f31c9c1b
++/portable-data-isolation/change:
++  en: fe4d80df751e95b8
++  zh: c9b34995048a0969
++/portable-data-isolation/migration:
++  en: 8a3156e04c102a85
++  zh: 738c9f7bdb2bd73a

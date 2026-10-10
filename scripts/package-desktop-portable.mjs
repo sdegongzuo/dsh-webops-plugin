@@ -698,7 +698,7 @@ console.log(`  + home/profiles/desktop/node_modules/{${vendoredPlugins.map((plug
 //    （apps/desktop/src/paths.ts:26 默认参数 resolveDshHome() 读 $DSH_HOME）
 //
 //    从 v0.2.2 起**这个脚本不再是唯一入口**：harness 补丁在 main.ts 顶层加了便携兜底 ——
-//    `$DSH_HOME` 为空时，若 `process.execPath` 的上一级存在 `home/`，就把它认作 $DSH_HOME。
+//    若 `process.execPath` 的上一级存在 `home/`，数据与 Electron 单实例锁都归属该包目录。
 //    于是直接双击 `app\<exe>` 与走本脚本等价（判定逻辑见 harness 的 `resolvePortableDshHome`，
 //    由 `verify:portable` 在真解压目录上正反两向验证）。
 //    保留本脚本：它把「配置随包走」写死成显式动作，不依赖 exe 的摆放位置。
@@ -710,7 +710,7 @@ writeFileSync(
     'set "ROOT=%~dp0"',
     'set "DSH_HOME=%ROOT%home"',
     'if not exist "%DSH_HOME%" mkdir "%DSH_HOME%"',
-    `start "" "%ROOT%app\\${exe}"`,
+    `start "" "%ROOT%app\\${exe}" %*`,
     '',
   ].join('\r\n'),
 )

@@ -474,8 +474,10 @@ if (check(existsSync(asarPath), 'app/resources/app.asar 在包里')) {
   const asarText = readFileSync(asarPath).toString('latin1')   // 标记全是 ASCII，按字节对齐
   for (const [pattern, what] of [
     [/process\.env\.DSH_APP_EXECUTABLE = process\.execPath/u, '主 exe 路径注入（app 模式的窗口宿主靠它）'],
-    [/resolvePortableDshHome\(process\.execPath\)/u, '便携 home 兜底（双击 exe 免启动脚本）'],
-    [/\(process\.env\.DSH_HOME \?\? ['"]{2}\)\.trim\(\) === ['"]{2}/u, '便携兜底只在 $DSH_HOME 为空时生效'],
+    [/configurePortableData\(app, process\.execPath, process\.env\)/u, '按包目录初始化数据与单实例归属（exe 和启动脚本共用）'],
+    [/DSH_AGENTS_HOME:/u, '共享智能体目录归属便携包'],
+    [/sessionData:/u, 'Chromium 会话数据归属便携包'],
+    [/DSH_DESKTOP_UPDATE_JOURNAL_DIR:/u, '更新日志归属便携包'],
     [/process\.env\.DSH_BROWSER_ELECTRON_HOST/u, '窗口宿主的早期分支'],
     // 2026-09-17 补：桌面端里 `cdp` 与 `electron` 会同时「可用」（前者 available() 乐观为真），
     // 没人指定 provider 就抛 BROWSER_PROVIDER_AMBIGUOUS —— `webpage_open` 直接失败，而

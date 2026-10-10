@@ -12,6 +12,21 @@ const zipper = fileURLToPath(new URL('../scripts/zip-stage.py', import.meta.url)
 const desktopVersionScript = fileURLToPath(new URL('../scripts/desktop-release-version.mjs', import.meta.url))
 const releasePortableScript = fileURLToPath(new URL('../scripts/package-release-portable.mjs', import.meta.url))
 const verifyReleaseScript = fileURLToPath(new URL('../scripts/verify-release-portable.mjs', import.meta.url))
+
+describe('便携实例的构建接线', () => {
+  it('两个出货入口都限定环境作用域并转发 exe 参数，构建补丁包含全局目录隔离', () => {
+    for (const file of ['package-desktop-portable.mjs', 'package-release-portable.mjs']) {
+      const source = readFileSync(new URL(`../scripts/${file}`, import.meta.url), 'utf8')
+      expect(source).toContain("'setlocal'")
+      expect(source).toContain(' %*')
+    }
+    const patch = readFileSync(new URL('../docs/harness-desktop-build.patch', import.meta.url), 'utf8')
+    expect(patch).toContain('configurePortableData(app, process.execPath, process.env)')
+    for (const key of ['DSH_AGENTS_HOME', 'sessionData', 'LOCALAPPDATA', 'TMPDIR', 'npm_config_prefix']) {
+      expect(patch).toContain(`${key}:`)
+    }
+  })
+})
 const localPaths = await import(new URL('../scripts/local-env.mjs', import.meta.url).href) as {
   buildRoot(): string
 }
