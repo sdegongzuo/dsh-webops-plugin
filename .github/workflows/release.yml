@@ -1,6 +1,6 @@
 name: release
 
-# 发版流程：推 `v*` tag 即触发，产出独立插件 zip 并挂到 GitHub Release。
+# 发版流程：推 `v*` tag 即触发，必须同时产出完整便携包与独立插件包。
 #
 # 为什么必须在这里 clone deepseek-harness：本仓 devDependencies 里 13 个 dsh 包用的是
 # pnpm 的 `link:../deepseek-harness/...`，指向**本机的 harness checkout**（README「接进
@@ -42,6 +42,9 @@ env:
   # 用同一个 ref，也让本 workflow 的构建对着我们实际随包出货的那个 harness 版本。
   HARNESS_REF: ${{ inputs.harness_ref || 'd743267388641bc76f17c45ce8b4c231aed1d32c' }}
   TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+  BASE_DESKTOP_TAG: v0.2.15
+  BASE_DESKTOP_ASSET: dsh-webops-desktop-v0.2.15-win-x64-portable.zip
+  BASE_DESKTOP_SHA256: 771170d847cc36629ae989c56d0357ee215feece47f470df99122c6f21e77465
 
 jobs:
   portable-win-x64:
@@ -143,13 +146,45 @@ jobs:
           Add-Content -Path $env:GITHUB_ENV -Value "PLUGIN_ZIP_KB=$([math]::Round((Get-Item $pluginZip).Length / 1KB, 1))"
           Add-Content -Path $env:GITHUB_ENV -Value "PLUGIN_VERSION=$version"
 
+      - name: 组装并验证本次完整便携包（失败即阻止发布）
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PYTHONUTF8: '1'
+        run: |
+          $baseRoot = Join-Path $env:RUNNER_TEMP 'webops-base-desktop'
+          New-Item -ItemType Directory -Path $baseRoot | Out-Null
+          gh release download $env:BASE_DESKTOP_TAG --pattern $env:BASE_DESKTOP_ASSET --dir $baseRoot
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $baseZip = Join-Path $baseRoot $env:BASE_DESKTOP_ASSET
+          if ((Get-FileHash $baseZip -Algorithm SHA256).Hash.ToLower() -ne $env:BASE_DESKTOP_SHA256) { throw 'DSH 基包哈希不一致，拒绝发布' }
+          python scripts/unzip-portable.py --zip $baseZip --dir $baseRoot --only-prefix app/
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $version = $env:PLUGIN_VERSION
+          $portableZip = Join-Path dist "dsh-webops-desktop-v$version-win-x64-portable.zip"
+          $stageRoot = Join-Path $env:RUNNER_TEMP 'webops-full-stage'
+          node scripts/package-release-portable.mjs --app (Join-Path $baseRoot 'app') --plugin-zip (Join-Path dist $env:PLUGIN_ZIP_NAME) --version $version --stage-root $stageRoot --out $portableZip
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $checkRoot = Join-Path $env:RUNNER_TEMP 'webops-full-check'
+          python scripts/unzip-portable.py --zip $portableZip --dir $checkRoot
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          node scripts/verify-release-portable.mjs --dir $checkRoot
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $manifest = Get-Content (Join-Path $checkRoot 'release-manifest.json') -Raw | ConvertFrom-Json
+          Add-Content -Path $env:GITHUB_ENV -Value "DSH_VERSION=$($manifest.dshVersion)"
+          Add-Content -Path $env:GITHUB_ENV -Value "PORTABLE_ZIP_NAME=$(Split-Path -Leaf $portableZip)"
+          Add-Content -Path $env:GITHUB_ENV -Value "PORTABLE_ZIP_SHA256=$((Get-FileHash $portableZip -Algorithm SHA256).Hash.ToLower())"
+          Add-Content -Path $env:GITHUB_ENV -Value "PORTABLE_ZIP_KB=$([math]::Round((Get-Item $portableZip).Length / 1KB, 1))"
+
       - name: 写 release 说明
         shell: pwsh
         run: |
           $notes = @'
-          ## dsh-webops-plugin __TAG__ · 独立插件发布
+          ## dsh-webops-plugin __TAG__ · 完整便携包与独立插件包
 
           下载 `__PLUGIN_ZIP__`，包内包含完整编译插件及 INSTALL.md，无需重新下载 DSH 桌面整包。
+
+          首次安装下载 `__PORTABLE_ZIP__`，解压后双击启动.cmd；内置本次插件、Context 与 Better Sidebar 三个插件。DSH 本体版本为 __DSH_VERSION__，插件版本为 __VERSION__。首次使用请在设置中填写自己的 API Key；不含凭据或会话数据。
 
           ### 更新已有插件
 
@@ -160,18 +195,22 @@ jobs:
           3. 重新启动，核对插件 package.json 的 version 为 `__VERSION__`，并实际调用网页工具。
 
           保留旧 chunk 和用户 profile 登记。首次安装按包内 INSTALL.md 执行 `dsh plugin add`。
-          DSH 与插件分别发布；DSH 本体不变且接口兼容时只替换插件。需要新宿主接口时，仍需升级 DSH。
-          当前发布链构建基线为 DSH 0.2.1-alpha.1；其他宿主版本的兼容性以实测为准。
+          每次发布都提供完整便携包；已有用户也可只更新插件。其他宿主版本的兼容性以实测为准。
 
           | 文件 | 大小 | SHA-256 |
           | --- | --- | --- |
           | __PLUGIN_ZIP__ | __PLUGIN_KB__ KB | __PLUGIN_SHA__ |
+          | __PORTABLE_ZIP__ | __PORTABLE_KB__ KB | __PORTABLE_SHA__ |
           '@
           $notes = $notes -replace '__TAG__', $env:TAG `
                            -replace '__VERSION__', $env:PLUGIN_VERSION `
                            -replace '__PLUGIN_ZIP__', $env:PLUGIN_ZIP_NAME `
                            -replace '__PLUGIN_KB__', $env:PLUGIN_ZIP_KB `
-                           -replace '__PLUGIN_SHA__', $env:PLUGIN_ZIP_SHA256
+                           -replace '__PLUGIN_SHA__', $env:PLUGIN_ZIP_SHA256 `
+                           -replace '__PORTABLE_ZIP__', $env:PORTABLE_ZIP_NAME `
+                           -replace '__PORTABLE_KB__', $env:PORTABLE_ZIP_KB `
+                           -replace '__PORTABLE_SHA__', $env:PORTABLE_ZIP_SHA256 `
+                           -replace '__DSH_VERSION__', $env:DSH_VERSION
           $notes | Out-File -FilePath dist/notes.md -Encoding utf8
 
       - name: 发布 Release
@@ -186,7 +225,9 @@ jobs:
           # 显式列出插件附件，不用 `dist/*.zip` 通配 —— 万一以后 dist/ 里多出别的 zip，
           # 通配会把不相干的文件一起传上去。
           $pluginZip = Join-Path "$env:GITHUB_WORKSPACE\dist" "$env:PLUGIN_ZIP_NAME"
-          foreach ($f in @($pluginZip)) {
+          if (-not $env:PORTABLE_ZIP_NAME) { throw '完整便携包未通过验证，禁止发布' }
+          $portableZip = Join-Path "$env:GITHUB_WORKSPACE\dist" "$env:PORTABLE_ZIP_NAME"
+          foreach ($f in @($pluginZip, $portableZip)) {
             if (-not (Test-Path $f)) { Write-Error "找不到待发布的产物：$f"; exit 1 }
           }
 
@@ -195,7 +236,18 @@ jobs:
             Write-Error "Release $env:TAG 已存在 —— 保留式发布不覆盖既有附件、不重指已发布 tag；请换一个新版本号重新发布。"
             exit 1
           }
-          gh release create "$env:TAG" --title "$env:TAG" --notes-file dist/notes.md $pluginZip
+          gh release create "$env:TAG" --draft --title "$env:TAG" --notes-file dist/notes.md $pluginZip $portableZip
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $release = gh release view "$env:TAG" --json assets | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          foreach ($expected in @(
+            @{ name = $env:PLUGIN_ZIP_NAME; digest = "sha256:$env:PLUGIN_ZIP_SHA256" },
+            @{ name = $env:PORTABLE_ZIP_NAME; digest = "sha256:$env:PORTABLE_ZIP_SHA256" }
+          )) {
+            $asset = @($release.assets | Where-Object { $_.name -eq $expected.name })
+            if ($asset.Count -ne 1 -or $asset[0].state -ne 'uploaded' -or $asset[0].digest -ne $expected.digest) { throw "附件缺失或摘要不一致：$($expected.name)；保留草稿，不公开发布" }
+          }
+          gh release edit "$env:TAG" --draft=false
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: 收尾小结（无论成败都写）
@@ -207,7 +259,7 @@ jobs:
         run: |
           $lines = @('## 产物与结论', '')
           $any = $false
-          foreach ($name in @($env:PLUGIN_ZIP_NAME)) {
+          foreach ($name in @($env:PLUGIN_ZIP_NAME, $env:PORTABLE_ZIP_NAME)) {
             if (-not $name) { continue }
             $f = Join-Path "$env:GITHUB_WORKSPACE\dist" $name
             if (Test-Path $f) {

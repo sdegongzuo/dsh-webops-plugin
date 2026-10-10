@@ -109,6 +109,7 @@ function parseArgs(argv) {
     // 于是文档里那条命令会直接报「未知参数 --」。这里吞掉它，两种写法都能用。
     if (flag === '--') continue
     if (flag === '--keep-home') { options.keepHome = true; continue }
+    if (flag === '--keep-temp') { options.keepTemp = true; options.keepHome = true; continue }
     if (!FLAGS.has(flag)) throw new Error(`verify-portable: 未知参数 ${JSON.stringify(flag)}`)
     const value = argv[i + 1]
     if (value === undefined) throw new Error(`verify-portable: ${flag} 缺值`)
@@ -143,7 +144,7 @@ try {
   // parseArgs 自己的消息已经带过前缀，别打成「verify-portable: verify-portable: …」。
   console.error(`verify-portable: ${reason.replace(/^verify-portable:\s*/u, '')}`)
   console.error('用法：node scripts/verify-portable.mjs --dir <解压后的便携版根目录> '
-    + '[--harness <deepseek-harness 源根目录>] [--profile <名>] [--port <端口>] [--cdp-port <端口>] [--keep-home]')
+    + '[--harness <deepseek-harness 源根目录>] [--profile <名>] [--port <端口>] [--cdp-port <端口>] [--keep-home] [--keep-temp]')
   process.exit(2)
 }
 const profileDir = join(packageRoot, 'home', 'profiles', options.profile)
@@ -157,7 +158,7 @@ const runtimeDir = materialized.runtimeDir
 const runtimeLabel = materialized.layout === 'asar'
   ? 'app/resources/app.asar 内的 dsh 树（已解到临时目录）'
   : 'app/resources/dsh'
-process.on('exit', () => materialized.cleanup())
+process.on('exit', () => { if (!options.keepTemp) materialized.cleanup() })
 
 // `--harness` 显式指定优先；否则走 `.env.local` 的 `DSH_HARNESS`。**不再退回写死的
 // `D:/dev/cli/deepseek-harness`** —— 那正是「换机器/换盘后安静地读错目录」的来源。
@@ -514,7 +515,7 @@ if (launcherExe !== undefined) {
     const verdict = desktopPaths.resolvePortableDshHome(join(notPortable, 'app', 'x.exe'))
     check(verdict === undefined,
       'resolvePortableDshHome 对「没有兄弟 home/ 的 exe」返回 undefined（反向验证，防止误判）')
-    rmSync(notPortable, { recursive: true, force: true })
+    if (!options.keepTemp) rmSync(notPortable, { recursive: true, force: true })
   }
 }
 
@@ -542,7 +543,11 @@ if (options.home === undefined && existsSync(packagedHome)) {
 // 表现为 boot 挂在 writer lock 上而不是报错）。
 process.env.DSH_HOME = scratchHome
 // 上一次跑到一半被杀留下的锁会让下一次 boot 直接超时，先清掉。
-rmSync(join(scratchHome, '.credentials.yaml.lock'), { force: true })
+if (options.keepTemp) {
+  if (existsSync(join(scratchHome, '.credentials.yaml.lock'))) throw new Error('凭据锁已存在，请使用新的验收 home；保留模式不删除锁文件')
+} else {
+  rmSync(join(scratchHome, '.credentials.yaml.lock'), { force: true })
+}
 
 const host = startPackagedDesktopHost({
   runtimeDir,
@@ -690,7 +695,7 @@ if (options.browser === undefined) {
     proxy.close()
     // Chrome 退出时还攥着 crashpad 的 .pma 句柄，删目录必然 EBUSY；临时目录，删不掉就算了。
     try {
-      rmSync(userDataDir, { recursive: true, force: true })
+      if (!options.keepTemp) rmSync(userDataDir, { recursive: true, force: true })
     } catch { /* Chrome 还没退干净，留给系统清 */ }
   }
 }
@@ -700,7 +705,7 @@ if (options.browser === undefined) {
 await host.stop()
 // workProfileDir 是 profile 的工作副本（alpha.2 起不再建 junction，就是一份普通目录拷贝），连同它的父目录一起清掉。
 try {
-  rmSync(scratchBase, { recursive: true, force: true })
+  if (!options.keepTemp) rmSync(scratchBase, { recursive: true, force: true })
 } catch { /* 临时目录，删不掉不影响结论 */ }
 if (!options.keepHome) {
   try {

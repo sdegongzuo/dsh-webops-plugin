@@ -614,12 +614,21 @@ describe('发版工作流的保留式打包（不删除、不覆盖）', () => {
     }
   })
 
-  it('插件 Release 只发布独立插件附件，与桌面整包解耦', () => {
+  it('每次插件 Release 同时发布完整便携包与独立插件附件', () => {
     expect(workflow).toContain('dsh-webops-plugin-v$version.zip')
     expect(workflow).toContain('node scripts/package-portable.mjs')
     expect(workflow).not.toContain('node scripts/package-plugin-update.mjs')
     expect(workflow).not.toContain('UPDATE_ZIP_NAME')
-    expect(workflow).toContain('--notes-file dist/notes.md $pluginZip')
+    expect(workflow).toContain('--notes-file dist/notes.md $pluginZip $portableZip')
+    expect(workflow).toContain('dsh-webops-desktop-v$version-win-x64-portable.zip')
+    expect(workflow).toContain('node scripts/package-release-portable.mjs')
+    expect(workflow).toContain('完整便携包未通过验证，禁止发布')
+    expect(workflow).toContain('--draft --title')
+    expect(workflow).toContain('保留草稿，不公开发布')
+    expect(workflow.indexOf('--json assets')).toBeLessThan(workflow.indexOf('--draft=false'))
+    expect(workflow).toContain('node scripts/verify-release-portable.mjs')
+    expect(workflow.indexOf('node scripts/verify-release-portable.mjs')).toBeLessThan(workflow.indexOf('gh release create'))
+    expect(workflow).toContain('$env:BASE_DESKTOP_SHA256')
     expect(workflow).toContain('不能直接解压到便携版根目录')
   })
 

@@ -10,6 +10,8 @@ const script = fileURLToPath(new URL('../scripts/package-portable.mjs', import.m
 const updateScript = fileURLToPath(new URL('../scripts/package-plugin-update.mjs', import.meta.url))
 const zipper = fileURLToPath(new URL('../scripts/zip-stage.py', import.meta.url))
 const desktopVersionScript = fileURLToPath(new URL('../scripts/desktop-release-version.mjs', import.meta.url))
+const releasePortableScript = fileURLToPath(new URL('../scripts/package-release-portable.mjs', import.meta.url))
+const verifyReleaseScript = fileURLToPath(new URL('../scripts/verify-release-portable.mjs', import.meta.url))
 const localPaths = await import(new URL('../scripts/local-env.mjs', import.meta.url).href) as {
   buildRoot(): string
 }
@@ -37,6 +39,79 @@ function pack(lib: string, stage: string, out: string) {
   return spawnSync(process.execPath, [script, '0.2.13', '--lib-dir', lib,
     '--stage-root', stage, '--keep-stage', '--out', out], { encoding: 'utf8' })
 }
+
+describe('每次发布的完整便携包', () => {
+  it('发布门禁实际拒绝错版本、损坏运行时和出厂用户凭据', () => {
+    const data = fixture()
+    const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'))
+    const runtime = join(data.root, 'app', 'resources', 'dsh')
+    mkdirSync(runtime, { recursive: true })
+    mkdirSync(join(data.root, 'home'), { recursive: true })
+    const manifest = join(data.root, 'release-manifest.json')
+    writeFileSync(manifest, JSON.stringify({ pluginVersion: '错误版本', dshVersion: '0.2.1-alpha.2' }))
+    const bytes = Buffer.from('原始内容')
+    writeFileSync(join(runtime, 'entry.js'), '损坏内容')
+    writeFileSync(join(runtime, 'desktop-runtime.json'), JSON.stringify({
+      platform: 'win32', arch: 'x64', release: { version: '0.2.1-alpha.2' },
+      files: [{ path: 'entry.js', bytes: bytes.length, sha256: createHash('sha256').update(bytes).digest('hex') }],
+    }))
+    const run = () => spawnSync(process.execPath, [verifyReleaseScript, '--dir', data.root], { encoding: 'utf8' })
+    const version = run()
+    expect(version.status).toBe(1)
+    expect(version.stderr).toContain('插件版本与发布源码不一致')
+    writeFileSync(manifest, JSON.stringify({ pluginVersion: pkg.version, dshVersion: '0.2.1-alpha.2' }))
+    const corrupt = run()
+    expect(corrupt.status).toBe(1)
+    expect(corrupt.stderr).toContain('运行时完整性失败')
+    writeFileSync(join(runtime, 'entry.js'), bytes)
+    writeFileSync(join(data.root, 'home', '.credentials.yaml'), '测试凭据不能进入出厂包')
+    const credentials = run()
+    expect(credentials.status).toBe(1)
+    expect(credentials.stderr).toContain('出厂包含用户数据')
+  })
+  it('真实组装三个生产插件和出厂 home，拒绝覆盖与宿主版本不匹配', () => {
+    const data = fixture()
+    const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'))
+    const pluginZip = join(data.root, 'current-plugin.zip')
+    const packed = spawnSync(process.execPath, [script, pkg.version, '--lib-dir', data.lib,
+      '--stage-root', data.stage, '--keep-stage', '--out', pluginZip], { encoding: 'utf8' })
+    expect(packed.status, packed.stderr).toBe(0)
+    const app = join(data.root, 'app')
+    const runtime = join(app, 'resources', 'dsh')
+    mkdirSync(runtime, { recursive: true })
+    const descriptor = join(runtime, 'desktop-runtime.json')
+    writeFileSync(descriptor, JSON.stringify({ release: { version: '0.2.1-alpha.2' } }))
+    writeFileSync(join(app, 'DeepSeek Harness.exe'), '测试本体')
+    writeFileSync(join(app, 'debug.log'), '运行时日志不出货')
+    const out = join(data.root, 'full.zip')
+    const run = (target: string) => spawnSync(process.execPath, [releasePortableScript,
+      '--app', app, '--plugin-zip', pluginZip, '--version', pkg.version,
+      '--stage-root', data.stage, '--out', target], { encoding: 'utf8', env: { ...process.env, PYTHONUTF8: '1' } })
+    const result = run(out)
+    expect(result.status, result.stderr).toBe(0)
+    const inspected = spawnSync('python', ['-c',
+      'import json,sys,zipfile; z=zipfile.ZipFile(sys.argv[1]); print(json.dumps({"bad":z.testzip(),"names":z.namelist(),"manifest":json.loads(z.read("release-manifest.json")),"profile":json.loads(z.read("home/profiles/desktop/package.json"))}))', out], { encoding: 'utf8' })
+    expect(inspected.status, inspected.stderr).toBe(0)
+    const zip = JSON.parse(inspected.stdout)
+    expect(zip.bad).toBeNull()
+    expect(zip.manifest).toEqual({ pluginVersion: pkg.version, dshVersion: '0.2.1-alpha.2' })
+    expect(zip.profile.dsh.profile.bundles).toEqual(['@deepseek-ai/dsh-base', '@deepseek-ai/dsh-web-app',
+      'dsh-webops-plugin', 'dsh-context', 'dsh-better-sidebar'])
+    for (const name of ['dsh-webops-plugin', 'dsh-context', 'dsh-better-sidebar']) {
+      expect(zip.names).toContain(`home/profiles/desktop/node_modules/${name}/package.json`)
+    }
+    expect(zip.names.some((name: string) => /fake-llm|debug\.log|credentials|conversations/.test(name))).toBe(false)
+    const digest = () => createHash('sha256').update(readFileSync(out)).digest('hex')
+    const before = digest()
+    expect(run(out).status).toBe(1)
+    expect(digest()).toBe(before)
+    writeFileSync(descriptor, JSON.stringify({ release: { version: '0.2.1-alpha.1' } }))
+    const wrong = run(join(data.root, 'incompatible.zip'))
+    expect(wrong.status).toBe(1)
+    expect(wrong.stderr).toContain('peerDependencies')
+    expect(readdirSync(data.root)).not.toContain('incompatible.zip')
+  })
+})
 
 describe('纯插件包保留模式的真实 ZIP', () => {
   it('桌面包版本读取实际 DSH 清单，错误预期与缺失版本均拒绝', () => {
