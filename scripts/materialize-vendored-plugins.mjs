@@ -22,6 +22,7 @@ import { join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { gunzipSync } from 'node:zlib'
 import { spawnSync } from 'node:child_process'
+import { applySidebarHostCompatibility, SIDEBAR_COMPATIBILITY_PATCH } from './sidebar-host-compatibility.mjs'
 
 const ROOT = resolve(fileURLToPath(import.meta.url), '..', '..')
 const VENDOR_DIR = join(ROOT, 'vendor', 'plugins')
@@ -144,6 +145,12 @@ for (const plugin of manifest.plugins) {
     throw new Error(`tarball 身份对不上：期望 ${plugin.name}@${plugin.version}，实际 ${meta?.name}@${meta?.version}`)
   }
   console.log(`+ node_modules/${plugin.name}@${plugin.version}`)
+
+  if (plugin.hostCompatibility !== undefined) {
+    if (plugin.hostCompatibility !== SIDEBAR_COMPATIBILITY_PATCH) throw new Error(`未知宿主兼容补丁：${plugin.hostCompatibility}`)
+    const receipt = applySidebarHostCompatibility(pluginDir)
+    console.log(`+ ${plugin.name} 宿主兼容：${receipt.patch ?? '已适配'}`)
+  }
 
   // 该插件声明的运行时依赖，按 npm 嵌套规则落到插件自己的 node_modules 下
   for (const depName of plugin.runtimeDependencies ?? []) {

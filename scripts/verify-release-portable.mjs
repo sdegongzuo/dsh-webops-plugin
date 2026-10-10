@@ -56,7 +56,13 @@ try {
   const html = page.body.toString('utf8')
   assert(html.includes('__DSH_BOOT__'), '首页缺少客户端加载图')
   for (const name of [pkg.name, ...vendor.map(p => p.name)]) assert(html.includes(name), `客户端加载图缺少 ${name}`)
-  console.log(`verify-release-portable: 实际生产宿主首页与三个插件加载图通过；验收副本保留在 ${scratch}`)
+  // 只见客户端不能证明后端挂载；GET 必须进入侧边栏处理器的 JSON 方法校验。
+  const sidebar = await fetchHostPath(ready.url, '/sidebar/api/fs.read')
+  let envelope
+  try { envelope = JSON.parse(sidebar.body.toString('utf8')) } catch { /* 空 405 是本次回归症状。 */ }
+  assert(sidebar.status === 405 && envelope?.ok === false && envelope?.error?.code === 'method-error',
+    `侧边栏后端未正常挂载：HTTP ${sidebar.status}，缺少方法校验信封`)
+  console.log(`verify-release-portable: 实际生产宿主首页、三个插件加载图与侧边栏后端路由通过；验收副本保留在 ${scratch}`)
 } finally {
   await host.stop()
 }

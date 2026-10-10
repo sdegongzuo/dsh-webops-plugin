@@ -95,6 +95,9 @@ describe('每次发布的完整便携包', () => {
     const runtime = join(app, 'resources', 'dsh')
     mkdirSync(runtime, { recursive: true })
     const descriptor = join(runtime, 'desktop-runtime.json')
+    const startup = join(runtime, 'node_modules', '@deepseek-ai', 'dsh-web-app', 'lib')
+    mkdirSync(startup, { recursive: true })
+    writeFileSync(join(startup, 'startup.js'), 'const WEB_STARTUP_SERVICE = "webStartup";\n')
     writeFileSync(descriptor, JSON.stringify({ release: { version: '0.2.1-alpha.2' } }))
     writeFileSync(join(app, 'DeepSeek Harness.exe'), '测试本体')
     writeFileSync(join(app, 'debug.log'), '运行时日志不出货')
@@ -112,6 +115,14 @@ describe('每次发布的完整便携包', () => {
     expect(zip.manifest).toEqual({ pluginVersion: pkg.version, dshVersion: '0.2.1-alpha.2' })
     expect(zip.profile.dsh.profile.bundles).toEqual(['@deepseek-ai/dsh-base', '@deepseek-ai/dsh-web-app',
       'dsh-webops-plugin', 'dsh-context', 'dsh-better-sidebar'])
+    expect(zip.profile.dependencies['dsh-better-sidebar']).toBe('0.25.0')
+    const adapted = spawnSync('python', ['-c',
+      'import sys,zipfile; z=zipfile.ZipFile(sys.argv[1]); print(z.read("home/profiles/desktop/node_modules/dsh-better-sidebar/lib/index.js").decode())', out], { encoding: 'utf8' })
+    expect(adapted.status, adapted.stderr).toBe(0)
+    expect(adapted.stdout).toContain('ctx.get("connection")')
+    expect(adapted.stdout).toContain('ctx.get("webRuntime")?.trustedHosts ?? []')
+    expect(adapted.stdout).not.toContain('ctx.webRuntime.trustedHosts')
+    expect(zip.names).toContain('home/profiles/desktop/node_modules/dsh-better-sidebar/dsh-host-compatibility.json')
     for (const name of ['dsh-webops-plugin', 'dsh-context', 'dsh-better-sidebar']) {
       expect(zip.names).toContain(`home/profiles/desktop/node_modules/${name}/package.json`)
     }
@@ -125,7 +136,7 @@ describe('每次发布的完整便携包', () => {
     expect(wrong.status).toBe(1)
     expect(wrong.stderr).toContain('peerDependencies')
     expect(readdirSync(data.root)).not.toContain('incompatible.zip')
-  })
+  }, 20_000)
 })
 
 describe('纯插件包保留模式的真实 ZIP', () => {
