@@ -1197,7 +1197,7 @@ new file mode 100644
 +    PIP_CACHE_DIR: join(cache, 'pip'), PYTHONUSERBASE: join(data, 'python-user'),
 +    DSH_DESKTOP_UPDATE_JOURNAL_DIR: join(data, 'update-journals'),
 +  }
-+  for (const directory of [userHome, appData, localAppData, temporary, cache, logs,
++  for (const directory of [userHome, join(userHome, 'Desktop'), appData, localAppData, temporary, cache, logs,
 +    ...Object.values(electronPaths), ...Object.entries(overrides)
 +      .filter(([key]) => key !== 'npm_config_userconfig').map(([, value]) => value)]) {
 +    mkdirSync(directory, { recursive: true })
