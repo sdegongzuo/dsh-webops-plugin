@@ -105,6 +105,12 @@ function semanticParameterErrors(toolName: string, args: Record<string, unknown>
     case 'webpage_press':
     case 'webpage_locate':
       nonEmpty('session_id', 'ref')
+      if (toolName === 'webpage_click' || toolName === 'webpage_press') {
+        nonEmpty('wait_text')
+        range('timeout_ms', 1, MAX_WAIT_TIME_MS)
+        if (args.timeout_ms !== undefined && args.wait_text === undefined) errors.push('timeout_ms 必须与 wait_text 一起提供')
+        if (args.wait_text !== undefined && args.observe === false) errors.push('wait_text 需要观察，不能与 observe=false 同用')
+      }
       if (toolName === 'webpage_press') {
         const key = args.key
         const named = ['Enter', 'Tab', 'Escape', 'Backspace', 'Delete', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Home', 'End', 'PageUp', 'PageDown', 'Space', ' ']

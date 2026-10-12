@@ -501,9 +501,30 @@ export type BrowserObservation = BrowserSnapshot | BrowserScreenshot
  * `BROWSER_STALE_REF` / `BROWSER_SNAPSHOT_REQUIRED`，绝不能先动页面再失败。
  */
 export type BrowserMutationRequest =
-  | { readonly kind: 'click'; readonly sessionId: string; readonly ref: string }
+  | {
+    readonly kind: 'click'
+    readonly sessionId: string
+    readonly ref: string
+    /** 动作完成后附带一份全页快照。 */
+    readonly observe?: boolean
+    /** 等待页面正文出现指定文本；超时后仍附带快照。 */
+    readonly waitText?: string
+    /** waitText 的超时预算；省略时使用默认等待时长。 */
+    readonly timeoutMs?: number
+  }
   | { readonly kind: 'fill'; readonly sessionId: string; readonly ref: string; readonly value: string }
-  | { readonly kind: 'press'; readonly sessionId: string; readonly ref: string; readonly key: string }
+  | {
+    readonly kind: 'press'
+    readonly sessionId: string
+    readonly ref: string
+    readonly key: string
+    /** 动作完成后附带一份全页快照。 */
+    readonly observe?: boolean
+    /** 等待页面正文出现指定文本；超时后仍附带快照。 */
+    readonly waitText?: string
+    /** waitText 的超时预算；省略时使用默认等待时长。 */
+    readonly timeoutMs?: number
+  }
   | {
     readonly kind: 'scroll'
     readonly sessionId: string
@@ -593,10 +614,14 @@ export interface BrowserMutationResult {
    * 自己引发的导航不算（见 `dirty.ts` 的赊账机制），那条已经由 `navigated` 报过了。
    */
   readonly pageChanged?: BrowserPageChanged
-  /** wait 独有：条件是否在超时前成立（超时为 false，不是错误）。 */
+  /** wait 或 click/press 的 waitText：条件是否在超时前成立（正常超时为 false）。 */
   readonly satisfied?: boolean
-  /** wait 完成或正常超时后的完整观察；由 BrowserRuntime 在 owner 门禁内补取。 */
+  /** wait 完成或正常超时、或 click/press 显式请求后的完整观察；在 owner 门禁内补取。 */
   readonly snapshot?: BrowserSnapshot
+  /** 后续等待或观察失败时，原动作已成功派发；模型不得重发原动作。 */
+  readonly actionDispatched?: true
+  /** 后续等待或观察失败；仅在 actionDispatched=true 时出现。 */
+  readonly observationError?: { readonly code: BrowserErrorCode; readonly message: string }
   /**
    * wait(ref) 超时独有（项 2，2026-10-07）：元素超时那一刻的状态 ——
    * `hidden` = 还在文档里但没有布局盒（display:none / 未渲染），`visible` = 还在且显示着，

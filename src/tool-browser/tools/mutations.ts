@@ -13,7 +13,7 @@ import {
 } from '../common-output.ts'
 import type { SnapshotCache } from '../snapshot-cache.ts'
 import { defineTool, callerOf, observeCall } from '../tool-runtime.ts'
-import { BROWSER_NAVIGATION_TIMEOUT_MS, BROWSER_OBSERVE_TIMEOUT_MS, BROWSER_WAIT_TIMEOUT_MS } from '../config.ts'
+import { BROWSER_OBSERVE_TIMEOUT_MS, BROWSER_WAIT_TIMEOUT_MS } from '../config.ts'
 import type { BrowserMutationRequest } from '../../browser/index.ts'
 import { SNAPSHOT_OUTPUT_SCHEMA, formatSnapshotOutput, rememberBrowserSnapshot, type SnapshotOutput } from './observation.ts'
 
@@ -55,6 +55,13 @@ const MUTATION_OUTPUT_SCHEMA = {
     },
     // scroll 才有：滚轮已投递、浏览器没回话。
     unconfirmed: { type: 'boolean' },
+    satisfied: { type: 'boolean' },
+    snapshot: SNAPSHOT_OUTPUT_SCHEMA,
+    action_dispatched: { type: 'boolean' },
+    observation_error: {
+      type: 'object', additionalProperties: false,
+      properties: { code: { type: 'string', required: true }, message: { type: 'string', required: true } },
+    },
   },
 } as const
 
@@ -78,6 +85,22 @@ const WAIT_OUTPUT_SCHEMA = {
     snapshot: { ...SNAPSHOT_OUTPUT_SCHEMA, required: true },
   },
 } as const
+
+const POST_ACTION_PARAMETERS = {
+  observe: { type: 'boolean', description: 'Add a full snapshot.' },
+  wait_text: { type: 'string', description: 'Visible body text marker.' },
+  timeout_ms: { type: 'integer', description: '1-30000ms; default 10000.' },
+} as const
+
+function postActionOptions(args: Record<string, unknown>): Pick<Extract<BrowserMutationRequest, { kind: 'click' | 'press' }>, 'observe' | 'waitText' | 'timeoutMs'> {
+  const waitText = args['wait_text']
+  const timeoutMs = args['timeout_ms']
+  return {
+    ...(typeof args['observe'] === 'boolean' ? { observe: args['observe'] } : {}),
+    ...(typeof waitText === 'string' ? { waitText } : {}),
+    ...(typeof timeoutMs === 'number' ? { timeoutMs } : {}),
+  }
+}
 
 /**
  * 五个 mutation 工具共用的注册壳：输出契约、渲染、错误语义完全一致，
@@ -108,7 +131,7 @@ function registerMutationTool(
         const text = formatMutationOutput(mutation, hasSnapshot)
         return [{ type: 'text', text: mutation.snapshot === undefined
           ? text
-          : `${text}\n\nObservation after wait:\n${formatSnapshotOutput(mutation.snapshot, true)}` }]
+          : `${text}\n\n${spec.action === 'wait' ? 'Observation after wait' : 'Observation after action'}:\n${formatSnapshotOutput(mutation.snapshot, true)}` }]
       },
     },
     timeoutMs: spec.timeoutMs,
@@ -131,6 +154,8 @@ function registerMutationTool(
         navigated: result.navigated,
         ...result.pageChanged !== undefined ? { page_changed: toPageChangedOutput(result.pageChanged) } : {},
         ...result.satisfied !== undefined ? { satisfied: result.satisfied } : {},
+        ...result.actionDispatched === true ? { action_dispatched: true } : {},
+        ...result.observationError !== undefined ? { observation_error: result.observationError } : {},
         ...result.refState !== undefined ? { ref_state: result.refState } : {},
         ...result.signals !== undefined ? { signals: result.signals } : {},
         ...snapshot !== undefined ? { snapshot } : {},
@@ -169,13 +194,15 @@ export function registerMutations(
       // 模型 6 分钟里毫不知情 —— 于是 provider 侧按会话差集把新标签页写进回执的
       // `opened_tabs`，这里只需告诉模型「看到这个字段就换到那个 session_id 去干活」。
       + 'Popup links return opened_tabs with new session_id(s) in the same window; switch to the content tab. '
+      + 'Use observe=true for new controls; wait_text waits and returns new refs. '
       + STALE_NOTICE,
     parameters: {
       session_id: SESSION_ID_PARAMETER,
       ref: { type: 'string', required: true, description: 'Element ref, like e12.' },
+      ...POST_ACTION_PARAMETERS,
     },
-    timeoutMs: BROWSER_NAVIGATION_TIMEOUT_MS,
-    build: (args, sessionId) => ({ kind: 'click', sessionId, ref: args['ref'] as string }),
+    timeoutMs: BROWSER_WAIT_TIMEOUT_MS,
+    build: (args, sessionId) => ({ kind: 'click', sessionId, ref: args['ref'] as string, ...postActionOptions(args) }),
     presentTitle: args => `Click ${String(args['ref'])}`,
   })
 
@@ -200,14 +227,16 @@ export function registerMutations(
     action: 'press',
     description:
       'Focus a ref and press a named key or one ASCII character. Use webpage_fill for CJK/composed text. Enter may submit; navigated=true invalidates earlier refs. '
+      + 'Use observe=true for new controls; wait_text waits and returns new refs. '
       + STALE_NOTICE,
     parameters: {
       session_id: SESSION_ID_PARAMETER,
       ref: { type: 'string', required: true, description: 'Element ref to focus.' },
       key: { type: 'string', required: true, description: 'Enter, Tab, Escape, Backspace, Delete, ArrowUp/Down/Left/Right, Home, End, PageUp/Down, Space, or one ASCII character.' },
+      ...POST_ACTION_PARAMETERS,
     },
-    timeoutMs: BROWSER_NAVIGATION_TIMEOUT_MS,
-    build: (args, sessionId) => ({ kind: 'press', sessionId, ref: args['ref'] as string, key: args['key'] as string }),
+    timeoutMs: BROWSER_WAIT_TIMEOUT_MS,
+    build: (args, sessionId) => ({ kind: 'press', sessionId, ref: args['ref'] as string, key: args['key'] as string, ...postActionOptions(args) }),
     presentTitle: args => `Press ${String(args['key'])} on ${String(args['ref'])}`,
   })
 

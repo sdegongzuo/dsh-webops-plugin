@@ -611,6 +611,128 @@ describe('BrowserRuntime tab ownership', () => {
     await browser.dispose()
   })
 
+  it('click wait_text reuses the same lease and queue, then returns one current snapshot', async () => {
+    const { browser, provider, adopt } = await mountWithAdoptingProvider()
+    const session = await browser.open({}, ALICE)
+    provider.sessions.set('popup', { sessionId: 'popup', url: 'https://pop.example/', title: '弹窗' })
+    adopt('popup', session.id)
+
+    const calls: string[] = []
+    const originalObserve = provider.observe
+    const signalForAction = new AbortController().signal
+    let finishWait!: () => void
+    let startedWait!: () => void
+    const waitStarted = new Promise<void>(resolve => { startedWait = resolve })
+    const waitPending = new Promise<void>(resolve => { finishWait = resolve })
+    provider.mutate = async (request, signal) => {
+      calls.push(request.kind)
+      if (request.kind === 'wait') {
+        expect(request.text).toBe('Saved')
+        expect(signal).toBe(signalForAction)
+        startedWait()
+        await waitPending
+        return {
+          kind: 'mutation', sessionId: session.id, action: 'wait', epoch: 4,
+          url: SESSION.url, title: SESSION.title, navigated: false, satisfied: false,
+          pageChanged: { navigated: 0, withinDocument: 0, addressDrift: 1 },
+          openedTabs: [{ sessionId: 'popup', url: 'https://pop.example/', title: '弹窗' }],
+        }
+      }
+      return {
+        kind: 'mutation', sessionId: session.id, action: 'click', epoch: 4,
+        url: SESSION.url, title: SESSION.title, navigated: false,
+        pageChanged: { navigated: 0, withinDocument: 1 },
+        openedTabs: [{ sessionId: 'popup', url: 'https://pop.example/', title: '弹窗' }],
+      }
+    }
+    provider.observe = async request => {
+      calls.push(`observe:${request.kind}`)
+      return { ...await originalObserve(request), epoch: 10 }
+    }
+    const action = browser.mutate({ kind: 'click', sessionId: session.id, ref: 'e1', waitText: 'Saved' }, ALICE, signalForAction)
+    await waitStarted
+    const queued = browser.observe({ kind: 'snapshot', sessionId: session.id }, ALICE)
+    await Promise.resolve()
+    expect(calls).toEqual(['click', 'wait'])
+    finishWait()
+    const result = await action
+    await queued
+
+    expect(calls).toEqual(['click', 'wait', 'observe:snapshot', 'observe:snapshot'])
+    expect(result).toMatchObject({ action: 'click', satisfied: false, epoch: 10, snapshot: { epoch: 10 } })
+    expect(result.openedTabs?.map(tab => tab.sessionId)).toEqual(['popup'])
+    expect(result.pageChanged).toMatchObject({ withinDocument: 1, addressDrift: 1 })
+    await browser.dispose()
+  })
+
+  it('does not append a snapshot or recovery when the post-action text wait fails', async () => {
+    const { browser, provider } = await mountWithProvider()
+    const session = await browser.open({}, ALICE)
+    let calls = 0
+    provider.mutate = async request => {
+      calls += 1
+      if (request.kind === 'wait') throw new BrowserError('human took over', 'BROWSER_HUMAN_HOLDING')
+      return { kind: 'mutation', sessionId: session.id, action: 'press', epoch: 4, url: SESSION.url, title: SESSION.title, navigated: false }
+    }
+    provider.observe = vi.fn(async () => { throw new Error('must not observe after wait failure') })
+
+    const result = await browser.mutate({ kind: 'press', sessionId: session.id, ref: 'e1', key: 'Enter', waitText: 'Saved' }, ALICE)
+    expect(calls).toBe(2)
+    expect(provider.observe).not.toHaveBeenCalled()
+    expect(result).toMatchObject({
+      action: 'press', actionDispatched: true,
+      observationError: { code: 'BROWSER_HUMAN_HOLDING', message: 'human took over' },
+    })
+    expect(result.snapshot).toBeUndefined()
+    await browser.dispose()
+  })
+
+  it('keeps the wait result URL when navigation succeeds but its snapshot fails', async () => {
+    const { browser, provider } = await mountWithProvider()
+    const session = await browser.open({}, ALICE)
+    provider.mutate = async request => request.kind === 'wait'
+      ? {
+          kind: 'mutation', sessionId: session.id, action: 'wait', epoch: 8,
+          url: 'https://example.com/after-submit', title: 'Submitted', navigated: true,
+          satisfied: false,
+        }
+      : {
+          kind: 'mutation', sessionId: session.id, action: 'click', epoch: 4,
+          url: SESSION.url, title: SESSION.title, navigated: false,
+        }
+    provider.observe = vi.fn(async () => { throw new BrowserError('CDP disconnected', 'BROWSER_CONNECTION_LOST') })
+
+    const result = await browser.mutate({ kind: 'click', sessionId: session.id, ref: 'e1', waitText: 'Submitted' }, ALICE)
+    expect(result).toMatchObject({
+      action: 'click', epoch: 8, url: 'https://example.com/after-submit', title: 'Submitted',
+      navigated: true, satisfied: false, actionDispatched: true,
+      observationError: { code: 'BROWSER_CONNECTION_LOST', message: 'CDP disconnected' },
+    })
+    expect(provider.observe).toHaveBeenCalledTimes(1)
+    await browser.dispose()
+  })
+
+  it('显式 observe 返回新观察，且只派发一次点击而不额外等待', async () => {
+    const { browser, provider } = await mountWithProvider()
+    const session = await browser.open({}, ALICE)
+    const result = await browser.mutate({ kind: 'click', sessionId: session.id, ref: 'e1', observe: true }, ALICE)
+    expect(result.snapshot).toMatchObject({ kind: 'snapshot', sessionId: session.id })
+    expect(result.epoch).toBe(result.snapshot?.epoch)
+    expect(provider.calls.filter(call => call === `mutate:${session.id}`)).toHaveLength(1)
+    expect(provider.calls.filter(call => call === `observe:${session.id}`)).toHaveLength(1)
+    await browser.dispose()
+  })
+
+  it('keeps default click behavior free of post-action observations', async () => {
+    const { browser, provider } = await mountWithProvider()
+    const session = await browser.open({}, ALICE)
+    const result = await browser.mutate({ kind: 'click', sessionId: session.id, ref: 'e1' }, ALICE)
+    expect(result.snapshot).toBeUndefined()
+    expect(provider.calls.filter(call => call === `mutate:${session.id}`)).toHaveLength(1)
+    expect(provider.calls.filter(call => call === `observe:${session.id}`)).toHaveLength(0)
+    await browser.dispose()
+  })
+
   it('keeps only this conversation\'s tabs in the opened_tabs receipt', async () => {
     const { browser, provider } = await mountWithProvider()
     const alice = await browser.open({}, ALICE)

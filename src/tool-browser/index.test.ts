@@ -195,7 +195,7 @@ function mount(): Harness {
           ...harness.affectedTabs !== undefined ? { affectedSessionIds: harness.affectedTabs } : {},
         })
       },
-      mutate: (args: { kind: string; sessionId?: string; ref?: string; value?: string; key?: string; deltaX?: number; deltaY?: number; timeMs?: number; text?: string }) => {
+      mutate: (args: { kind: string; sessionId?: string; ref?: string; value?: string; key?: string; deltaX?: number; deltaY?: number; timeMs?: number; text?: string; observe?: boolean; waitText?: string; timeoutMs?: number }) => {
         browserCalls.push({ method: 'mutate', args })
         return Promise.resolve({
           kind: 'mutation',
@@ -205,8 +205,10 @@ function mount(): Harness {
           url: SESSION.url,
           title: SESSION.title,
           navigated: harness.mutateNavigated,
-          ...args.kind === 'wait' ? { satisfied: harness.mutateSatisfied } : {},
-          ...args.kind === 'wait' ? { snapshot: harness.snapshotResponse } : {},
+          ...(args.kind === 'wait' || ((args.kind === 'click' || args.kind === 'press') && args.waitText !== undefined))
+            ? { satisfied: harness.mutateSatisfied } : {},
+          ...(args.kind === 'wait' || ((args.kind === 'click' || args.kind === 'press') && (args.observe === true || args.waitText !== undefined)))
+            ? { snapshot: harness.snapshotResponse } : {},
           ...harness.pageChanged !== undefined ? { pageChanged: harness.pageChanged } : {},
           ...harness.openedTabs !== undefined ? { openedTabs: harness.openedTabs } : {},
         })
@@ -384,7 +386,9 @@ describe('registration', () => {
   it('导航恢复与低成本观察的契约保留在系统提示中', () => {
     const section = mount().sections[0]
     const text = (section?.text as (context: { scope?: undefined }) => string)({ scope: undefined })
-    expect(text).toContain('navigated=true, observe the new document')
+    expect(text).toContain('navigated=true, use its attached snapshot or observe the new document')
+    expect(text).toContain('use wait_text when the next visible text is known')
+    expect(text).toContain('observe=true is for immediate changes with unknown text')
     expect(text).not.toContain('navigated=true, or a ref call')
     expect(text).toContain('webpage_wait(text=...)')
     expect(text).toContain('webpage_find and a regional snapshot (region_ref)')
@@ -744,6 +748,32 @@ describe('webpage_tabs and the P1 mutation tools', () => {
     ])
   })
 
+  it('press observation after navigation returns timeout snapshot refs and refreshes find cache directly', async () => {
+    harness.mutateNavigated = true
+    harness.mutateSatisfied = false
+    harness.snapshotResponse = {
+      ...SNAPSHOT,
+      epoch: 5,
+      url: 'https://example.com/after-submit',
+      outline: '- button "Continue" [ref=e8]',
+      refs: [{ ref: 'e8', role: 'button', name: 'Continue' }],
+      fullOutline: '- button "Continue" [ref=e8]',
+    }
+    const definition = tool(harness, 'webpage_press')
+    const value = await definition.execute({ session_id: 's1', ref: 'e1', key: 'Enter', wait_text: 'Missing', timeout_ms: 200 }, exec())
+    expect(value).toMatchObject({ action: 'press', satisfied: false, navigated: true, epoch: 5, snapshot: { refs: [{ ref: 'e8' }] } })
+    expect(validateJsonSchemaValue(definition.output.schema, value)).toEqual([])
+    const rendered = String((definition.output.render({ session_id: 's1' }, value as never)[0] as { text: string }).text)
+    expect(rendered).toContain('Observation after action:')
+    expect(rendered).toContain('button "Continue" [ref=e8]')
+    expect(rendered).toContain('attached full snapshot')
+    expect(rendered).not.toContain('The next call is webpage_snapshot')
+    expect(rendered).not.toContain('run webpage_snapshot again')
+    expect(harness.browserCalls[0]).toMatchObject({ method: 'mutate', args: { kind: 'press', waitText: 'Missing', timeoutMs: 200 } })
+    const found = await tool(harness, 'webpage_find').execute({ session_id: 's1', query: 'Continue' }, exec())
+    expect(found).toMatchObject({ matches: [{ ref: 'e8' }] })
+  })
+
   it('returns and caches the full snapshot when a condition normally times out', async () => {
     harness.mutateSatisfied = false
     const definition = tool(harness, 'webpage_wait')
@@ -814,6 +844,21 @@ describe('webpage_tabs and the P1 mutation tools', () => {
     })
     // required 之外的字段一旦出现，必须能被工具输出契约接受。
     expect(validateJsonSchemaValue(tool(harness, 'webpage_click').output.schema, value)).toEqual([])
+  })
+
+  it('returns a schema-valid dispatched-action receipt when post-action observation fails', () => {
+    const definition = tool(harness, 'webpage_click')
+    const value = {
+      session_id: 's1', action: 'click', epoch: 4, url: SESSION.url,
+      title: SESSION.title, navigated: false, action_dispatched: true,
+      observation_error: { code: 'BROWSER_CONNECTION_LOST', message: 'CDP disconnected' },
+    }
+    expect(validateJsonSchemaValue(definition.output.schema, value)).toEqual([])
+    const rendered = String((definition.output.render({ session_id: 's1' }, value)[0] as { text: string }).text)
+    expect(rendered).toContain('ACTION DISPATCHED; POST-ACTION OBSERVATION FAILED')
+    expect(rendered).toContain('Do not repeat this action')
+    expect(rendered).toContain('Current page state is not observed; refs may be stale')
+    expect(rendered).not.toContain('The click did NOT navigate')
   })
 
   it('renders the new tab(s) prominently so the model stops assuming a single tab', async () => {

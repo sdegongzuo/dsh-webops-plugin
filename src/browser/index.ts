@@ -31,6 +31,7 @@ import type {
   BrowserCaller,
   BrowserConsoleRequest,
   BrowserConsoleResult,
+  BrowserErrorCode,
   BrowserExecuteRequest,
   BrowserExecuteResult,
   BrowserLocateRequest,
@@ -43,6 +44,7 @@ import type {
   BrowserObservation,
   BrowserObserveRequest,
   BrowserOpenRequest,
+  BrowserPageChanged,
   BrowserProvider,
   BrowserRevalidateRequest,
   BrowserRevalidateResult,
@@ -51,6 +53,29 @@ import type {
   BrowserTabsRequest,
   BrowserTabsResult,
 } from './types.ts'
+
+function mergePageChanges(first: BrowserPageChanged | undefined, second: BrowserPageChanged | undefined): BrowserPageChanged | undefined {
+  if (first === undefined) return second
+  if (second === undefined) return first
+  return {
+    navigated: first.navigated + second.navigated,
+    withinDocument: first.withinDocument + second.withinDocument,
+    ...(first.addressDrift !== undefined || second.addressDrift !== undefined
+      ? { addressDrift: (first.addressDrift ?? 0) + (second.addressDrift ?? 0) } : {}),
+    ...(first.takeoverWindow !== undefined || second.takeoverWindow !== undefined
+      ? { takeoverWindow: (first.takeoverWindow ?? 0) + (second.takeoverWindow ?? 0) } : {}),
+    ...(second.route !== undefined || first.route !== undefined
+      ? { route: second.route ?? first.route } : {}),
+    ...(second.at !== undefined || first.at !== undefined
+      ? { at: second.at ?? first.at } : {}),
+  }
+}
+
+function observationFailure(error: unknown): { code: BrowserErrorCode; message: string } {
+  return error instanceof BrowserError
+    ? { code: error.code, message: error.message }
+    : { code: 'BROWSER_PROTOCOL_ERROR', message: error instanceof Error ? error.message : String(error) }
+}
 
 export { BrowserError, isBrowserError, presentBrowserError } from './types.ts'
 export { DEFAULT_TAB_HANDOFF_TTL_MS, DEFAULT_TAB_LEASE_IDLE_MS, TabLeaseRegistry } from './lease.ts'
@@ -400,15 +425,71 @@ export class BrowserRuntime extends Service {
     caller: BrowserCaller | undefined,
     signal?: AbortSignal,
   ): Promise<BrowserMutationResult> {
+    if (request.kind === 'click' || request.kind === 'press') {
+      if (request.waitText !== undefined && request.waitText.trim().length === 0) {
+        throw new BrowserError('wait_text must contain non-whitespace text', 'BROWSER_INVALID_PARAMS')
+      }
+      if (request.timeoutMs !== undefined && request.waitText === undefined) {
+        throw new BrowserError('timeout_ms requires wait_text', 'BROWSER_INVALID_PARAMS')
+      }
+      if (request.waitText !== undefined && request.observe === false) {
+        throw new BrowserError('observe=false cannot be combined with wait_text', 'BROWSER_INVALID_PARAMS')
+      }
+      if (request.timeoutMs !== undefined
+        && (!Number.isInteger(request.timeoutMs) || request.timeoutMs < 1 || request.timeoutMs > 30_000)) {
+        throw new BrowserError('timeout_ms must be an integer from 1 to 30000', 'BROWSER_INVALID_PARAMS')
+      }
+    }
     return this.withLease(request.sessionId, caller, async (provider, ownerId) => {
       const result = await provider.mutate(request, signal)
-      const filtered = this.filterOpenedTabs(provider, ownerId, result)
-      if (request.kind !== 'wait') return filtered
-      const snapshot = await provider.observe({ kind: 'snapshot', sessionId: request.sessionId }, signal)
-      if (snapshot.kind !== 'snapshot') {
-        throw new BrowserError(`webpage_wait received a "${snapshot.kind}" observation`, 'BROWSER_PROTOCOL_ERROR')
+      let filtered = this.filterOpenedTabs(provider, ownerId, result)
+      if ((request.kind === 'click' || request.kind === 'press') && request.waitText !== undefined) {
+        let waited: BrowserMutationResult
+        try {
+          waited = await provider.mutate({
+            kind: 'wait', sessionId: request.sessionId, text: request.waitText,
+            ...(request.timeoutMs !== undefined ? { timeoutMs: request.timeoutMs } : {}),
+          }, signal)
+        } catch (error) {
+          return {
+            ...filtered,
+            actionDispatched: true,
+            observationError: observationFailure(error),
+          }
+        }
+        const waitResult = this.filterOpenedTabs(provider, ownerId, waited)
+        const openedTabs = new Map<string, BrowserTabInfo>()
+        for (const tab of [...(filtered.openedTabs ?? []), ...(waitResult.openedTabs ?? [])]) {
+          openedTabs.set(tab.sessionId, tab)
+        }
+        const pageChanged = mergePageChanges(filtered.pageChanged, waitResult.pageChanged)
+        filtered = this.filterOpenedTabs(provider, ownerId, {
+          ...filtered,
+          epoch: waitResult.epoch,
+          url: waitResult.url,
+          title: waitResult.title,
+          navigated: filtered.navigated || waitResult.navigated,
+          ...(pageChanged !== undefined ? { pageChanged } : {}),
+          ...(waitResult.satisfied !== undefined ? { satisfied: waitResult.satisfied } : {}),
+          ...(openedTabs.size > 0 ? { openedTabs: [...openedTabs.values()] } : {}),
+        })
       }
-      return { ...filtered, epoch: snapshot.epoch, url: snapshot.url, title: snapshot.title, snapshot }
+      const shouldSnapshot = request.kind === 'wait'
+        || ((request.kind === 'click' || request.kind === 'press')
+          && (request.observe === true || request.waitText !== undefined))
+      if (!shouldSnapshot) return filtered
+      try {
+        const snapshot = await provider.observe({ kind: 'snapshot', sessionId: request.sessionId }, signal)
+        if (snapshot.kind !== 'snapshot') {
+          throw new BrowserError(`mutation received a "${snapshot.kind}" observation`, 'BROWSER_PROTOCOL_ERROR')
+        }
+        return { ...filtered, epoch: snapshot.epoch, url: snapshot.url, title: snapshot.title, snapshot }
+      } catch (error) {
+        if (request.kind === 'click' || request.kind === 'press') {
+          return { ...filtered, actionDispatched: true, observationError: observationFailure(error) }
+        }
+        throw error
+      }
     }, signal, true)
   }
 

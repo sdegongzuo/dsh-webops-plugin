@@ -107,6 +107,8 @@ export interface MutationOutput {
    */
   page_changed?: PageChangedOutput
   satisfied?: boolean
+  action_dispatched?: boolean
+  observation_error?: { code: string; message: string }
   /** wait(ref) 超时独有：元素此刻 hidden（在文档但无布局盒）、visible（还在显示）或 removed（已脱离文档）。 */
   ref_state?: string
   signals?: { readyState: string; dom: string; network: string }
@@ -239,7 +241,7 @@ export function formatMutationOutput(value: MutationOutput, snapshotAttached = f
     ].join('\n')
   // 点完没跳转是最容易被误解的回执：模型拿不到任何「为什么」，于是去翻 console / network
   // 猜（方案 §6 禁止清单）。按顺序把**真实原因与下一步**摆出来，省掉那一圈瞎猜。
-  const noNavigation = value.navigated || value.action !== 'click'
+  const noNavigation = snapshotAttached || value.observation_error !== undefined || value.navigated || value.action !== 'click'
     ? ''
     : formatNoNavigation(value)
   // 「下一步是 snapshot，不是 find」必须写死在这句话里：导航把 find 的缓存大纲一起作废了，
@@ -247,10 +249,14 @@ export function formatMutationOutput(value: MutationOutput, snapshotAttached = f
   // （方案 §6 禁止清单第三条）。
   const navigation = value.navigated
     ? snapshotAttached
-      ? '\nNAVIGATION DETECTED: refs from before this wait are invalid; use the new refs in the attached full snapshot.'
+      ? '\nNAVIGATION DETECTED: refs from before this operation are invalid; use the new refs in the attached full snapshot.'
       : '\nNAVIGATION DETECTED: every ref from earlier snapshots is now invalid — run webpage_snapshot again before any ref-based call. '
         + 'The next call is webpage_snapshot, NOT webpage_find: the cached outline was dropped with the navigation, so find has nothing to search.'
-    : '\nRefs from the latest snapshot are still valid unless the page changed on its own.'
+    : snapshotAttached
+      ? '\nThe attached full snapshot contains new refs for this page; use them directly.'
+      : value.observation_error !== undefined
+        ? '\nCurrent page state is not observed; refs may be stale.'
+      : '\nRefs from the latest snapshot are still valid unless the page changed on its own.'
   // 导航后标题为空要说清是「还没读到」而不是「没导航」：报告 S1 就是拿空标题当「页没就绪」，
   // 于是又等一次。provider 已经补过一小段等待，这里只是把残留情况讲明白。
   const title = value.navigated && value.title.length === 0
@@ -265,6 +271,10 @@ export function formatMutationOutput(value: MutationOutput, snapshotAttached = f
   const waitSignals = value.signals === undefined
     ? ''
     : `\nSignals: readyState=${value.signals.readyState}, dom=${value.signals.dom}, network=${value.signals.network}.`
+  const observationError = value.observation_error === undefined
+    ? ''
+    : `\nACTION DISPATCHED; POST-ACTION OBSERVATION FAILED (${value.observation_error.code}): `
+      + `${value.observation_error.message}. Do not repeat this action; take a fresh webpage_snapshot when access is available.`
   const wait = value.satisfied === undefined
     ? ''
     : value.satisfied
@@ -305,6 +315,7 @@ export function formatMutationOutput(value: MutationOutput, snapshotAttached = f
     unconfirmed,
     title,
     wait,
+    observationError,
     `\n${UNTRUSTED_PAGE_CONTENT_NOTICE}`,
   ].join('')
 }

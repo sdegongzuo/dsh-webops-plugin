@@ -25,11 +25,15 @@
 | webpage_open / webpage_navigate | 新开受控标签、导航或历史前进后退 |
 | webpage_snapshot / webpage_find | 读取页面大纲和检索缓存；区域参数为 region_ref、region_viewport、region_box，三者互斥 |
 | webpage_locate | 取得实时坐标 |
-| webpage_click / fill / press / scroll | 操作元素，执行前检查 ref 与页面状态 |
+| webpage_click | 点击元素；可选 observe=true 附全页快照，wait_text 等待页面可见正文中的已知结果文本并附快照 |
+| webpage_press | 按键操作；可选 observe=true 附全页快照，wait_text 等待页面可见正文中的已知结果文本并附快照 |
+| webpage_fill / webpage_scroll | 填写或滚动页面，执行前检查 ref 与页面状态 |
 | webpage_wait | 等文本、元素消失、页面稳定或指定时间；生成回复优先等待当前回复的完成标记 |
 | webpage_screenshot / console / network | 截图与调试采集 |
 | webpage_tabs | 查看持有/空闲标签、激活、关闭、领取、释放与移交 |
 | webpage_execute | 用 session_id、code 和可选 timeout_ms 执行一次 async 函数体；用 return 返回普通数据，用 await 等待结果 |
+
+click/press 的操作后观察参数属于当前开发候选，已完成真实模型对比，尚未进入公开 v0.2.17。公开附件与候选的状态、构建身份及验证边界见 [验收记录](docs/验收记录.md)。
 
 每个受控标签同时最多由一个对话占用；弹窗继承家族归属。释放保留页面，移交使用一次性码。人工接管期间 agent 不能操作，交还后重新取得有效 ref。重启不会恢复旧对话权限。页面内容按不可信数据处理。
 
