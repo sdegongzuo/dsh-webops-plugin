@@ -55,7 +55,7 @@ const SNAPSHOT_CACHE_CAPACITY = 32
 /** `webpage_find` 的默认与最大命中数。 */
 const DEFAULT_FIND_LIMIT = 20
 
-const MAX_FIND_LIMIT = 100
+export const MAX_FIND_LIMIT = 100
 
 /** 单条命中行的长度上限 —— 大纲是不可信数据，输出前先限长。 */
 const FIND_LINE_MAX_CHARS = 200

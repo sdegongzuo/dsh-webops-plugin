@@ -19,6 +19,9 @@
  * 每次 `pnpm test` 里就能拦住。
  */
 import { readFileSync } from 'node:fs'
+import * as nodePath from 'node:path'
+import { runInNewContext } from 'node:vm'
+import { ModuleKind, transpileModule } from 'typescript'
 import { describe, expect, it } from 'vitest'
 
 /** 会改变用户真实对话行为的插件名（不是「调试工具」，是「出厂即劫持」）。 */
@@ -244,33 +247,92 @@ describe('harness 补丁与插件之间的变量名约定', () => {
   })
 })
 
-describe('便携 home 兜底（双击 exe 也能自带配置）', () => {
+describe('便携数据归属（双击 exe 与启动脚本使用同一包目录）', () => {
   const patch = readRepoFile('docs/harness-desktop-build.patch')
+  const portableDiff = patch.split('diff --git a/apps/desktop/src/portable-data.ts b/apps/desktop/src/portable-data.ts')[1]?.split('\ndiff --git ')[0] ?? ''
+  const portableSource = portableDiff.split('\n').filter(line => line.startsWith('+') && !line.startsWith('+++'))
+    .map(line => line.slice(1)).join('\n')
 
-  it('补丁在 main.ts 顶层把便携 home 认作 $DSH_HOME', () => {
-    // 没有这段：双击 app\<exe> 会落回 ~/.dsh，那里没有本插件 ——
-    // 症状是「打开了，但状态条不见了」，且不报任何错。
-    expect(patch, '补丁没接便携 home 兜底')
-      .toContain('resolvePortableDshHome(process.execPath)')
+  /** 执行出货补丁中的真实模块；只替换文件系统与 Electron 边界，不创建或删除文件。 */
+  function initialize(detected: string | undefined, environment: NodeJS.ProcessEnv, source = portableSource) {
+    const paths: Record<string, string> = {}
+    const directories: string[] = []
+    const exports: Record<string, unknown> = {}
+    const application = {
+      setPath: (name: string, value: string) => { paths[name] = value },
+      setAppLogsPath: (value: string) => { paths['logs'] = value },
+      commandLine: { appendSwitch: (name: string, value: string) => { paths[name] = value } },
+    }
+    const script = transpileModule(source, { compilerOptions: { module: ModuleKind.CommonJS } }).outputText
+    runInNewContext(script, { exports, process: { platform: process.platform }, require: (name: string) => {
+      if (name === './paths.ts') return { resolvePortableDshHome: () => detected }
+      if (name === 'node:path') return nodePath
+      if (name === 'node:fs') return {
+        realpathSync: (value: string) => value,
+        mkdirSync: (value: string) => { directories.push(value) },
+      }
+      throw new Error(`不允许的测试依赖：${name}`)
+    } })
+    const configure = exports['configurePortableData'] as (app: typeof application, executable: string, env: NodeJS.ProcessEnv) => string | undefined
+    const home = configure(application, nodePath.resolve('测试包', 'app', 'desktop.exe'), environment)
+    return { home, paths, directories }
+  }
+
+  it('main.ts 在单实例锁和 ready 前初始化包内数据路径', () => {
+    const main = patch.split('diff --git a/apps/desktop/src/main.ts b/apps/desktop/src/main.ts')[1]?.split('\ndiff --git ')[0] ?? ''
+    const start = main.indexOf('+const portableHome = configurePortableData(app, process.execPath, process.env)')
+    expect(main).toContain("+import { configurePortableData } from './portable-data.ts'")
+    expect(start, '启动入口没初始化便携路径').toBeGreaterThanOrEqual(0)
+    expect(main.indexOf('claimDesktopSingleInstance(', start), '单实例锁必须晚于路径初始化').toBeGreaterThan(start)
+    expect(main.indexOf('app.whenReady()', start), 'ready 必须晚于路径初始化').toBeGreaterThan(start)
   })
 
-  it('兜底只在 $DSH_HOME 为空时生效（显式设置永远优先）', () => {
-    // 反例：无条件赋值会覆盖 `启动.cmd` / dev-desktop / CI 显式指定的 home，
-    // 把「配置随包走」变成「配置永远在 exe 旁边」。
-    expect(patch, '兜底条件丢了，会覆盖用户显式设置的 $DSH_HOME')
-      .toContain("(process.env.DSH_HOME ?? '').trim() === ''")
+  it('便携包覆盖继承的全局目录，Electron 和临时目录都留在包内', () => {
+    const home = nodePath.resolve('测试包甲', 'home'), data = nodePath.join(nodePath.dirname(home), 'data')
+    const environment = { DSH_HOME: '全局home', USERPROFILE: '全局用户', TEMP: '全局临时', DSH_WORKSPACE_DIR: '用户工作区' }
+    const result = initialize(home, environment)
+    expect(result.home).toBe(home)
+    expect(environment).toMatchObject({ DSH_HOME: home, USERPROFILE: nodePath.join(data, 'user-home'),
+      TEMP: nodePath.join(data, 'temp'), DSH_WORKSPACE_DIR: '用户工作区' })
+    expect(result.paths).toMatchObject({ userData: nodePath.join(data, 'electron'), sessionData: nodePath.join(data, 'electron'),
+      temp: nodePath.join(data, 'temp'), crashDumps: nodePath.join(data, 'crash-dumps'), logs: nodePath.join(data, 'logs', 'desktop') })
+    const other = initialize(nodePath.resolve('测试包乙', 'home'), {})
+    expect(other.paths['userData']).not.toBe(result.paths['userData'])
   })
 
-  it('判定逻辑实现于 harness 的 paths.ts，而不是在 main.ts 里手拼', () => {
-    // 抽成导出函数是为了能被真跑：verify:portable 直接 import 它在真解压目录上验。
+  it('普通安装保留现有环境且不设置 Electron 路径', () => {
+    const environment = { DSH_HOME: '用户home', TEMP: '用户临时', USERPROFILE: '用户目录' }
+    const before = { ...environment }, result = initialize(undefined, environment)
+    expect(result.home).toBeUndefined()
+    expect(environment).toEqual(before)
+    expect(result.paths).toEqual({})
+    expect(result.directories).toEqual([])
+  })
+
+  it('浏览器宿主保留自身 userData/sessionData 隔离并使用包内日志和临时目录', () => {
+    const home = nodePath.resolve('测试包甲', 'home'), data = nodePath.join(nodePath.dirname(home), 'data')
+    const result = initialize(home, { DSH_BROWSER_ELECTRON_HOST: 'host.cjs' })
+    expect(result.paths).not.toHaveProperty('userData')
+    expect(result.paths).not.toHaveProperty('sessionData')
+    expect(result.paths).toMatchObject({ temp: nodePath.join(data, 'temp'), logs: nodePath.join(data, 'logs', 'browser') })
+  })
+
+  it('便携判定保留在 paths.ts，共享模块解析真实路径', () => {
     expect(patch, 'paths.ts 里没有 resolvePortableDshHome 导出')
       .toContain('export function resolvePortableDshHome(executablePath: string)')
     expect(patch, '便携判定不再是「exe 上一级的 home」')
       .toContain("resolve(dirname(executablePath), '..', 'home')")
     expect(patch, 'main.ts 绕开了导出函数，自己拼路径')
       .not.toContain("const portableHome = resolve(dirname(process.execPath), '..', 'home')")
-    expect(patch, 'main.ts 没从 paths.ts 引这个函数')
-      .toContain("import { resolveDesktopPaths, resolvePortableDshHome } from './paths.ts'")
+    expect(portableSource).toContain("import { resolvePortableDshHome } from './paths.ts'")
+    expect(portableSource).toContain('const home = realpathSync(detected)')
+  })
+
+  it('反向验证：丢失环境归属和普通安装保护都会被行为断言发现', () => {
+    const home = nodePath.resolve('测试包甲', 'home'), environment = { DSH_HOME: '全局home' }
+    initialize(home, environment, portableSource.replace('Object.assign(environment, overrides)', ''))
+    expect(environment.DSH_HOME).not.toBe(home)
+    expect(() => initialize(undefined, {}, portableSource.replace('if (detected === undefined) return undefined', ''))).toThrow()
   })
 })
 

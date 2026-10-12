@@ -52,6 +52,10 @@ export interface SessionState {
    * 所以交还之后也不能复用接管前的号，必须重拍快照（判据 J5/J6）。
    */
   holder: BrowserHolder
+  /** 控制权每次真实切换递增，用于隔离跨 await 完成的旧观察。 */
+  controlGeneration: number
+  /** 人工交还后，在 agent 成功全页观察前保持为 true。 */
+  needsReobserve: boolean
   /**
    * P3 locate 高亮状态位：本 session 是否画过一层 `Overlay.highlightNode` 高亮。
    * 用于 `highlight: false` 时决定要不要补发 `Overlay.hideHighlight`（只弹自己那层，`[V31]`）。

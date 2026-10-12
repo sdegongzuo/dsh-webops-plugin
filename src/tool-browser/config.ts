@@ -11,6 +11,9 @@ export const BROWSER_NAVIGATION_TIMEOUT_MS = 60_000
 /** 纯观察工具的超时预算（毫秒）。 */
 export const BROWSER_OBSERVE_TIMEOUT_MS = 30_000
 
+/** 等待及导航收尾最多 60 秒，随后还要在 30 秒观察预算内取全页快照，留 5 秒收尾余量。 */
+export const BROWSER_WAIT_TIMEOUT_MS = BROWSER_NAVIGATION_TIMEOUT_MS + BROWSER_OBSERVE_TIMEOUT_MS + 5_000
+
 /**
  * 统一的不可信数据提示。
  *
@@ -54,8 +57,6 @@ export interface Config {
   find?: boolean
   /** 注册 `webpage_locate`。默认 true。 */
   locate?: boolean
-  /** 注册 `webpage_revalidate`。默认 true。 */
-  revalidate?: boolean
 }
 
 export const Config: z<Config> = z.object({
@@ -74,7 +75,6 @@ export const Config: z<Config> = z.object({
   execute: z.boolean().default(true),
   find: z.boolean().default(true),
   locate: z.boolean().default(true),
-  revalidate: z.boolean().default(true),
 })
 
 /**
@@ -101,7 +101,6 @@ export const BROWSER_TOOL_CAPABILITIES: Readonly<Record<string, 'read' | 'mutate
   // scrollIntoView 观察辅助（不派发事件、不改 DOM、不提交表单），与 webpage_scroll 的真实
   // 滚轮事件性质不同；highlight 是本 client 自己的 Overlay 层，也不属于页面状态。
   webpage_locate: 'read',
-  webpage_revalidate: 'read',
   webpage_tabs: 'mutate',
   webpage_click: 'mutate',
   webpage_fill: 'mutate',

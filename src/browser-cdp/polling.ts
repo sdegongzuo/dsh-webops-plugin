@@ -42,7 +42,7 @@ export function delay(ms: number, signal?: AbortSignal): Promise<void> {
  * @returns `probe` 是否成立过。
  */
 export async function pollUntil(
-  probe: () => Promise<boolean>,
+  probe: (remainingMs: number) => Promise<boolean>,
   options: {
     timeoutMs: number
     intervalMs?: number | undefined
@@ -56,7 +56,13 @@ export async function pollUntil(
     // `webpage_wait` 的两处 probe 是直接发 CDP 命令，页面中途导航会让 objectId 失效、
     // 单条命令也可能超时 —— 那不是「等的条件不满足」，但也不该让整个工具失败。
     // 旧骨架在这里是吞异常继续等的，语义必须保住（2026-09-17 收敛时差点丢掉）。
-    const ok = options.swallowErrors === true ? await probe().catch(() => false) : await probe()
+    const remainingBeforeProbe = deadline - Date.now()
+    const ok = options.swallowErrors === true
+      ? await probe(Math.max(1, remainingBeforeProbe)).catch(error => {
+        if (options.signal?.aborted === true) throw error
+        return false
+      })
+      : await probe(Math.max(1, remainingBeforeProbe))
     if (ok) return true
     const remaining = deadline - Date.now()
     if (remaining <= 0) return false

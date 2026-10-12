@@ -322,21 +322,18 @@ export function registerConsole(ctx: Context): void {
   ctx.tools.register(defineTool({
     name: 'webpage_console',
     description:
-      'Read the recent console output of a controlled tab: JavaScript console messages and browser log entries, merged and deduplicated, newest first. Collection starts when the tab is opened; reading re-enables both domains, and the resulting replay is deduplicated by a per-stream high-watermark, so no entry is ever reported twice. At most the newest 1000 entries are kept, so older ones are lost in a long window — replay_truncated reports when the Log domain dropped some. ',
+      'Recent JS console and browser logs, merged/deduplicated, newest first. Keeps 1000 entries; older history may be lost. replay_truncated reports dropped Log replay.',
     parameters: {
       session_id: SESSION_ID_PARAMETER,
       limit: {
         type: 'integer',
-        description: `Maximum entries to return, newest first (1-${String(MAX_P2_LIMIT)}). Default ${String(DEFAULT_P2_LIMIT)}. `
-          + `One entry can be ${String(CONSOLE_TEXT_MAX_CHARS)} chars, so the result is also cut by a total size budget: `
-          + 'when truncated_by_budget is true, narrow with level/text instead of raising this.',
+        description: `Entries 1-${String(MAX_P2_LIMIT)}; default ${String(DEFAULT_P2_LIMIT)}. On truncated_by_budget, filter level/text instead of increasing limit.`,
       },
       level: { type: 'string', description: 'Exact level filter, e.g. info or error.' },
       text: { type: 'string', description: 'Substring filter on the entry text (case-insensitive).' },
       all_documents: {
         type: 'boolean',
-        description: 'Include entries from earlier documents of this tab (before its last navigation). '
-          + 'Default false: only the current document.',
+        description: 'Include pre-navigation history; default false (current document only).',
       },
     },
     output: {
@@ -382,22 +379,19 @@ export function registerNetwork(ctx: Context): void {
   ctx.tools.register(defineTool({
     name: 'webpage_network',
     description:
-      'Inspect the network activity of a controlled tab. action=list returns recent requests (newest first) with request_id, method, url, status, mime_type and disk-cache flag; action=body fetches one response body. Collection is read-only (Network.enable only; no interception or rewriting). IMPORTANT: network events are never replayed — a request that finished while the debugger was detached is lost, and one that started then is reported as partial with unknown method and headers. ',
+      'Read-only network inspection. list returns recent requests newest first (request_id, method, url, status, mime_type, cache); body fetches a response by request_id. No event replay: requests finished while detached are lost; requests started while detached may be partial.',
     parameters: {
       session_id: SESSION_ID_PARAMETER,
-      action: { type: 'string', required: true, description: 'One of: list, body.' },
+      action: { type: 'string', required: true, enum: ['list', 'body'] },
       request_id: { type: 'string', description: 'Fetch the response body of this request_id (action=body only).' },
       limit: {
         type: 'integer',
-        description: `Maximum requests to return for action=list (1-${String(MAX_P2_LIMIT)}). Default ${String(DEFAULT_P2_LIMIT)}. `
-          + 'URLs are long, so the list is also cut by a total size budget: when '
-          + 'truncated_by_budget is true, narrow with url instead of raising this.',
+        description: `list: requests 1-${String(MAX_P2_LIMIT)}; default ${String(DEFAULT_P2_LIMIT)}. On truncated_by_budget, filter url instead of increasing limit.`,
       },
       url: { type: 'string', description: 'Substring filter on the request URL. action=list only.' },
       all_documents: {
         type: 'boolean',
-        description: 'Include requests from earlier documents of this tab (before its last navigation). '
-          + 'Default false: only the current document.',
+        description: 'Include pre-navigation history; default false (current document only).',
       },
     },
     output: {
@@ -411,13 +405,10 @@ export function registerNetwork(ctx: Context): void {
     },
     timeoutMs: BROWSER_OBSERVE_TIMEOUT_MS,
     async execute(args, exec) {
-      if (args.action !== 'list' && args.action !== 'body') {
-        throw new Error('action must be one of: list, body')
-      }
       if (args.action === 'body') {
-        if (args.request_id === undefined) throw new Error('action "body" requires request_id')
         const result = await ctx.browser.network(
-          { kind: 'body', sessionId: args.session_id, requestId: args.request_id },
+          // action=body 的条件必填已在公共参数边界验证。
+          { kind: 'body', sessionId: args.session_id, requestId: args.request_id as string },
           callerOf(exec),
           exec.signal,
         )
@@ -477,24 +468,6 @@ export function registerExecute(ctx: Context, cache: SnapshotCache): void {
     },
     timeoutMs: BROWSER_NAVIGATION_TIMEOUT_MS,
     async execute(args, exec) {
-      const raw = args as Record<string, unknown>
-      const unknown = Object.keys(raw).filter(key => !['session_id', 'code', 'timeout_ms'].includes(key))
-      if (unknown.length > 0) {
-        throw new BrowserError(
-          `webpage_execute received unsupported field(s): ${unknown.join(', ')}. Use exactly {"session_id":"...","code":"return ...;"} with optional top-level timeout_ms. No page command was dispatched.`,
-          'BROWSER_INVALID_PARAMS',
-        )
-      }
-      if (typeof args.session_id !== 'string' || args.session_id.trim().length === 0
-        || typeof args.code !== 'string' || args.code.trim().length === 0) {
-        throw new BrowserError(
-          'webpage_execute requires a non-empty string session_id and code. Example: {"session_id":"t1","code":"return { title: document.title };"}. No page command was dispatched.',
-          'BROWSER_INVALID_PARAMS',
-        )
-      }
-      if (args.timeout_ms !== undefined && (!Number.isInteger(args.timeout_ms) || args.timeout_ms < 1 || args.timeout_ms > 30_000)) {
-        throw new BrowserError('timeout_ms must be an integer from 1 through 30000. No page command was dispatched.', 'BROWSER_INVALID_PARAMS')
-      }
       const timeoutMs = typeof args.timeout_ms === 'number' ? args.timeout_ms : 5_000
       let result
       try {

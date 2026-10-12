@@ -11,6 +11,7 @@ import { PAGE_DOCUMENT_STATE_KEY } from './state.ts'
 import { CdpConnection } from './protocol.ts'
 import type { CdpSocket, CdpTarget, CdpTransport, CdpVersion } from './protocol.ts'
 import type { AxNode } from './snapshot.ts'
+import type { PageObservation } from './page-observation.ts'
 
 /** 造一个尺寸正确的极小 PNG（只填签名 + IHDR，够 `pngDimensions` 读宽高）。 */
 function pngBytes(width: number, height: number): Uint8Array {
@@ -143,6 +144,8 @@ class FakeChrome {
    * `timeoutMs` 真的把等待压短了」，而不是靠读 mock 参数自证。
    */
   hangEvaluate = false
+  /** 设置后 Runtime.evaluate 延迟回包，检验调用方 deadline 是否先结束等待。 */
+  delayEvaluateMs = 0
   /**
    * B1-e：transport 报的「前台标签」；`undefined` = 这个 provider 答不出（外部 Chrome）。
    *
@@ -537,6 +540,14 @@ class FakeSocket implements CdpSocket {
     // 实测就是永不 settle 的 Promise 的表现（V44）。
     if (request.method === 'Runtime.evaluate' && this.chrome.hangEvaluate) {
       this.chrome.handle(this, request.method, params)
+      return
+    }
+    if (request.method === 'Runtime.evaluate' && this.chrome.delayEvaluateMs > 0) {
+      setTimeout(() => {
+        if (this.closed) return
+        const result = this.chrome.handle(this, request.method, params)
+        this.dispatch('message', { data: JSON.stringify({ id: request.id, result }) })
+      }, this.chrome.delayEvaluateMs)
       return
     }
     // 用微任务回消息，保持与真实 WebSocket 一致的「先发后收」时序。
@@ -948,7 +959,7 @@ describe('CdpBrowserProvider', () => {
     await provider.observe({ kind: 'screenshot', sessionId: session.id, fullPage: true })
 
     const capture = chrome.calls.filter(call => call.method === 'Page.captureScreenshot').at(-1)
-    expect(capture?.params).toEqual({ format: 'png', captureBeyondViewport: true, fromSurface: false })
+    expect(capture?.params).toEqual({ format: 'png', captureBeyondViewport: true, fromSurface: true })
   })
 
   it('clips an element screenshot to the ref box and releases the remote handle', async () => {
@@ -963,7 +974,21 @@ describe('CdpBrowserProvider', () => {
     expect(shot.ref).toBe(ref)
     const capture = chrome.calls.filter(call => call.method === 'Page.captureScreenshot').at(-1)
     expect(capture?.params['clip']).toEqual({ x: 10, y: 20, width: 100, height: 40, scale: 1 })
+    expect(capture?.params['fromSurface']).toBe(true)
     expect(chrome.calls.map(call => call.method)).toContain('DOM.releaseObject')
+  })
+
+  it('滚动后元素裁剪使用 CSS 文档坐标，不混入旧设备坐标', async () => {
+    const session = await provider.open({})
+    const snapshot = await provider.observe({ kind: 'snapshot', sessionId: session.id })
+    if (snapshot.kind !== 'snapshot') throw Error('expected snapshot')
+    chrome.layoutMetricsOverride = {
+      cssVisualViewport: { pageX: 5, pageY: 800, clientWidth: 500, clientHeight: 300 },
+      visualViewport: { pageX: 10, pageY: 1600, clientWidth: 1000, clientHeight: 600 },
+    }
+    await provider.observe({ kind: 'screenshot', sessionId: session.id, ref: snapshot.refs[1]!.ref })
+    const capture = chrome.calls.filter(call => call.method === 'Page.captureScreenshot').at(-1)
+    expect(capture?.params['clip']).toEqual({ x: 15, y: 820, width: 100, height: 40, scale: 1 })
   })
 
   it('fails an element screenshot whose element has no layout box', async () => {
@@ -1417,6 +1442,15 @@ describe('CdpBrowserProvider.mutate (P1)', () => {
 
     await expect(provider.observe({ kind: 'screenshot', sessionId: 'tab-1', ref }))
       .rejects.toThrow(expect.objectContaining({ code: 'BROWSER_STALE_REF' }))
+  })
+
+  it('元素截图拒绝已摘除节点，不发截图命令，并给未派发证明', async () => {
+    const ref = await firstRef()
+    chrome.elementConnected = false
+    const mark = chrome.calls.length
+    await expect(provider.observe({ kind: 'screenshot', sessionId: 'tab-1', ref }))
+      .rejects.toMatchObject({ code: 'BROWSER_STALE_REF', reason: 'detached', dispatchState: 'not_dispatched' })
+    expect(chrome.calls.slice(mark).some(call => call.method === 'Page.captureScreenshot')).toBe(false)
   })
 
   it('lets an untouched page through, costing exactly one extra round-trip (零回归)', async () => {
@@ -1893,6 +1927,10 @@ describe('CdpBrowserProvider.mutate (P1)', () => {
       .rejects.toThrow(expect.objectContaining({ code: 'BROWSER_PROTOCOL_ERROR' }))
     await expect(timeoutProvider.mutate({ kind: 'wait', sessionId: 'tab-1', timeMs: 40_000 }))
       .rejects.toThrow(expect.objectContaining({ code: 'BROWSER_PROTOCOL_ERROR' }))
+    await expect(timeoutProvider.mutate({ kind: 'wait', sessionId: 'tab-1', timeMs: 10, timeoutMs: 100 }))
+      .rejects.toThrow(expect.objectContaining({ code: 'BROWSER_PROTOCOL_ERROR' }))
+    await expect(timeoutProvider.mutate({ kind: 'wait', sessionId: 'tab-1', refState: 'hidden', text: 'x' }))
+      .rejects.toThrow(expect.objectContaining({ code: 'BROWSER_PROTOCOL_ERROR' }))
   })
 
   it('waits until the page is stable when DOM and network stay quiet', async () => {
@@ -1926,6 +1964,41 @@ describe('CdpBrowserProvider.mutate (P1)', () => {
     const result = await stableProvider.mutate({ kind: 'wait', sessionId: 'tab-1', until: 'stable', timeoutMs: 80 })
     expect(result.satisfied).toBe(false)
     expect(result.signals).toEqual({ readyState: 'complete', dom: 'busy', network: 'quiet' })
+  })
+
+  it('keeps stable wait probes, including observer setup, inside timeout_ms', async () => {
+    const stableProvider = new CdpBrowserProvider({ commandTimeoutMs: 30_000 }, chrome.transport())
+    await stableProvider.open({})
+    chrome.delayEvaluateMs = 200
+    const started = Date.now()
+    const result = await stableProvider.mutate({ kind: 'wait', sessionId: 'tab-1', until: 'stable', timeoutMs: 40 })
+    expect(result.satisfied).toBe(false)
+    expect(Date.now() - started).toBeLessThan(500)
+  })
+
+  it('does not swallow cancellation in text-condition polling', async () => {
+    const timeoutProvider = new CdpBrowserProvider({ waitTimeoutMs: 500 }, chrome.transport())
+    await timeoutProvider.open({})
+    chrome.waitTextFound = false
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(new Error('cancel wait')), 5)
+    try {
+      await expect(timeoutProvider.mutate(
+        { kind: 'wait', sessionId: 'tab-1', text: 'never' }, controller.signal,
+      )).rejects.toThrow('cancel wait')
+    } finally {
+      clearTimeout(timer)
+    }
+  })
+
+  it('caps a text probe command to the caller remaining deadline', async () => {
+    const timeoutProvider = new CdpBrowserProvider({ commandTimeoutMs: 30_000, waitTimeoutMs: 1_000 }, chrome.transport())
+    await timeoutProvider.open({})
+    chrome.delayEvaluateMs = 200
+    const started = Date.now()
+    const result = await timeoutProvider.mutate({ kind: 'wait', sessionId: 'tab-1', text: 'never', timeoutMs: 40 })
+    expect(result.satisfied).toBe(false)
+    expect(Date.now() - started).toBeLessThan(500)
   })
 
   it('rejects mixing until:stable with time_ms / text / ref', async () => {
@@ -3001,17 +3074,91 @@ describe('§6.5 控制权（人工接管按钮）', () => {
     const { sessionId, ref } = await openWithRef()
 
     provider.setControlHolder(sessionId, 'human')
+    expect(provider.needsReobserve(sessionId)).toBe(false)
+    const during = await provider.observe({ kind: 'snapshot', sessionId })
+    if (during.kind !== 'snapshot') throw new Error('expected a snapshot')
     provider.setControlHolder(sessionId, 'agent')
+    expect(provider.needsReobserve(sessionId)).toBe(true)
+    await provider.observe({ kind: 'snapshot', sessionId, region: { viewport: true } })
+    expect(provider.needsReobserve(sessionId)).toBe(true)
+    provider.setControlHolder(sessionId, 'human')
+    expect(provider.needsReobserve(sessionId)).toBe(true)
+    await provider.observe({ kind: 'snapshot', sessionId })
+    expect(provider.needsReobserve(sessionId)).toBe(true)
+    provider.setControlHolder(sessionId, 'agent')
+    expect(provider.needsReobserve(sessionId)).toBe(true)
+
+    await expect(provider.mutate({ kind: 'click', sessionId, ref: during.refs.find(target => target.anchor !== true)?.ref as string }))
+      .rejects.toThrow(expect.objectContaining({ code: 'BROWSER_SNAPSHOT_REQUIRED' }))
 
     // 交还**不**复活旧号 —— 这是 J6 的核心，别期待「像什么都没发生过」。
     await expect(provider.mutate({ kind: 'click', sessionId, ref }))
-      .rejects.toThrow(expect.objectContaining({ code: 'BROWSER_STALE_REF' }))
+      .rejects.toThrow(expect.objectContaining({ code: 'BROWSER_SNAPSHOT_REQUIRED' }))
 
     // 重拍之后才拿得到能用的号。
     const fresh = await provider.observe({ kind: 'snapshot', sessionId })
     if (fresh.kind !== 'snapshot') throw new Error('expected a snapshot')
+    expect(provider.needsReobserve(sessionId)).toBe(false)
     await expect(provider.mutate({ kind: 'click', sessionId, ref: fresh.refs.find(target => target.anchor !== true)?.ref as string }))
       .resolves.toMatchObject({ action: 'click' })
+
+    provider.setControlHolder(sessionId, 'human')
+    expect(provider.needsReobserve(sessionId)).toBe(false)
+    await provider.observe({ kind: 'snapshot', sessionId })
+    expect(provider.needsReobserve(sessionId)).toBe(false)
+    provider.setControlHolder(sessionId, 'agent')
+    expect(provider.needsReobserve(sessionId)).toBe(true)
+  })
+
+  it('控制权在全页快照返回前再次切换时，旧快照不能清掉新交还标记', async () => {
+    const { sessionId } = await openWithRef()
+    provider.setControlHolder(sessionId, 'human')
+    provider.setControlHolder(sessionId, 'agent')
+    expect(provider.needsReobserve(sessionId)).toBe(true)
+
+    const observation = (provider as unknown as { observation: PageObservation }).observation
+    const originalSnapshot = observation.snapshot.bind(observation)
+    let markStarted!: () => void
+    const started = new Promise<void>(resolve => { markStarted = resolve })
+    let releaseSnapshot!: () => void
+    const delayed = new Promise<void>(resolve => { releaseSnapshot = resolve })
+    const snapshotSpy = vi.spyOn(observation, 'snapshot').mockImplementation(async (...args) => {
+      const result = await originalSnapshot(...args)
+      markStarted()
+      await delayed
+      return result
+    })
+
+    const inFlight = provider.observe({ kind: 'snapshot', sessionId })
+    await started
+    provider.setControlHolder(sessionId, 'human')
+    provider.setControlHolder(sessionId, 'agent')
+    releaseSnapshot()
+    await inFlight
+    expect(provider.needsReobserve(sessionId)).toBe(true)
+
+    snapshotSpy.mockRestore()
+    await provider.observe({ kind: 'snapshot', sessionId })
+    expect(provider.needsReobserve(sessionId)).toBe(false)
+  })
+
+  it('内部恢复旧 ref 也不能绕过交还观察门禁；输入事件保持为零', async () => {
+    const { sessionId, ref } = await openWithRef()
+    provider.setControlHolder(sessionId, 'human')
+    provider.setControlHolder(sessionId, 'agent')
+    const restored = await provider.revalidate({ sessionId, refs: [ref] })
+    expect(restored.restored.map(entry => entry.ref)).toContain(ref)
+    const mark = chrome.calls.length
+    await expect(provider.mutate({ kind: 'click', sessionId, ref }))
+      .rejects.toMatchObject({ code: 'BROWSER_SNAPSHOT_REQUIRED', dispatchState: 'not_dispatched' })
+    await expect(provider.execute({ sessionId, method: 'Runtime.evaluate', params: { expression: '1' } }))
+      .rejects.toMatchObject({ code: 'BROWSER_SNAPSHOT_REQUIRED' })
+    expect(chrome.calls.slice(mark)).toEqual([])
+    expect(provider.needsReobserve(sessionId)).toBe(true)
+    provider.setControlHolder(sessionId, 'human')
+    provider.setControlHolder(sessionId, 'agent')
+    const again = await provider.revalidate({ sessionId, refs: [ref] })
+    expect(again.failed).toEqual([{ ref, reason: 'document_identity_unknown' }])
   })
 
   it('接管只作废本会话 —— 别的会话照常可写（不误伤）', async () => {

@@ -33,12 +33,14 @@ interface StubProvider extends BrowserProvider {
   readonly calls: string[]
   readonly invalidated: string[]
   readonly sessions: Map<string, BrowserTabInfo>
+  readonly pendingReobserve: Set<string>
 }
 
 function makeProvider(id: string, available: boolean): StubProvider {
   const calls: string[] = []
   const invalidated: string[] = []
   const sessions = new Map<string, BrowserTabInfo>()
+  const pendingReobserve = new Set<string>()
   let sequence = 0
   const listTabs = (): readonly BrowserTabInfo[] => [...sessions.values()]
   return {
@@ -46,6 +48,7 @@ function makeProvider(id: string, available: boolean): StubProvider {
     calls,
     invalidated,
     sessions,
+    pendingReobserve,
     available: () => available,
     open: (request: BrowserOpenRequest) => {
       const sessionId = `s${String(++sequence)}`
@@ -101,6 +104,7 @@ function makeProvider(id: string, available: boolean): StubProvider {
     invalidateSession: (sessionId: string) => {
       invalidated.push(sessionId)
     },
+    needsReobserve: (sessionId: string) => pendingReobserve.has(sessionId),
     close: (sessionId: string) => {
       sessions.delete(sessionId)
       return Promise.resolve()
@@ -209,6 +213,18 @@ async function mountWithAdoptingProvider(): Promise<{
 }
 
 describe('BrowserRuntime provider selection', () => {
+  it('交还提示只包含当前 owner 持有且待重观察的 session', async () => {
+    const { browser, provider } = await mountWithProvider()
+    const alice = await browser.open({}, ALICE)
+    const bob = await browser.open({}, BOB)
+    provider.pendingReobserve.add(alice.id)
+    provider.pendingReobserve.add(bob.id)
+
+    expect(browser.reobserveRequired('alice')).toEqual([alice.id])
+    expect(browser.reobserveRequired('bob')).toEqual([bob.id])
+    expect(browser.reobserveRequired('unknown')).toEqual([])
+  })
+
   it('复用快照失败退还占用，下一次调用仍可领取原标签', async () => {
     const { browser, provider } = await mountWithProvider()
     const first = await browser.open({ url: SESSION.url }, ALICE)
@@ -579,6 +595,22 @@ describe('BrowserRuntime tab ownership', () => {
     expect(provider.calls.filter(call => call === 'tabs:list')).toEqual([])
   })
 
+  it('wait performs its final snapshot through the owner-checked observe path', async () => {
+    const { browser, provider } = await mountWithProvider()
+    const session = await browser.open({}, ALICE)
+    const result = await browser.mutate({ kind: 'wait', sessionId: session.id, timeMs: 1 }, ALICE)
+    expect(result.snapshot).toMatchObject({ kind: 'snapshot', sessionId: session.id })
+    expect(result.epoch).toBe(result.snapshot?.epoch)
+    expect(provider.calls).toContain(`mutate:${session.id}`)
+    expect(provider.calls).toContain(`observe:${session.id}`)
+
+    const before = provider.calls.length
+    await expect(browser.mutate({ kind: 'wait', sessionId: session.id, timeMs: 1 }, BOB))
+      .rejects.toThrow(expect.objectContaining({ code: 'BROWSER_TAB_NOT_HELD' }))
+    expect(provider.calls).toHaveLength(before)
+    await browser.dispose()
+  })
+
   it('keeps only this conversation\'s tabs in the opened_tabs receipt', async () => {
     const { browser, provider } = await mountWithProvider()
     const alice = await browser.open({}, ALICE)
@@ -670,5 +702,46 @@ describe('BrowserError', () => {
     expect(error.name).toBe('BrowserError')
     expect(error.code).toBe('BROWSER_PROTOCOL_ERROR')
     expect(error.cause).toBe(cause)
+  })
+})
+
+describe('失败恢复与同标签互斥', () => {
+  it('旧 ref 失败仍抛原错误，附带新快照且不重新派发动作', async () => {
+    const browser = await mountBrowser()
+    const provider = makeProvider('cdp', true)
+    const error = new BrowserError('旧 ref', 'BROWSER_STALE_REF', { dispatchState: 'not_dispatched' })
+    provider.refRecoveryState = () => 1
+    provider.mutate = vi.fn(async () => { throw error })
+    browser.registerProvider(provider)
+    const session = await browser.open({}, ALICE)
+    await expect(browser.mutate({ kind: 'click', sessionId: session.id, ref: 'old' }, ALICE))
+      .rejects.toBe(error)
+    expect(error.recoverySnapshot).toMatchObject({ kind: 'snapshot', sessionId: session.id })
+    expect(provider.mutate).toHaveBeenCalledTimes(1)
+    expect(provider.calls.filter(call => call.startsWith('observe:'))).toHaveLength(1)
+  })
+
+  it('恢复观察期间同标签排队，完成后执行候补读取', async () => {
+    const browser = await mountBrowser()
+    const provider = makeProvider('cdp', true)
+    provider.refRecoveryState = () => 1
+    provider.mutate = async () => { throw new BrowserError('旧 ref', 'BROWSER_STALE_REF', { dispatchState: 'not_dispatched' }) }
+    const observe = provider.observe
+    let finish!: () => void
+    let started!: () => void
+    const observing = new Promise<void>(resolve => { started = resolve })
+    const waiting = new Promise<void>(resolve => { finish = resolve })
+    provider.observe = vi.fn(async (request) => { started(); await waiting; return observe(request) })
+    browser.registerProvider(provider)
+    const session = await browser.open({}, ALICE)
+    const failed = browser.mutate({ kind: 'click', sessionId: session.id, ref: 'old' }, ALICE)
+    const assertion = expect(failed).rejects.toMatchObject({ code: 'BROWSER_STALE_REF' })
+    await observing
+    const queued = browser.observe({ kind: 'snapshot', sessionId: session.id }, ALICE)
+    await Promise.resolve()
+    expect(provider.observe).toHaveBeenCalledTimes(1)
+    finish()
+    await assertion
+    await expect(queued).resolves.toMatchObject({ kind: 'snapshot' })
   })
 })

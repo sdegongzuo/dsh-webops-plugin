@@ -8,7 +8,10 @@ import {
   type ToolDefinition,
   defineTool as defineHarnessTool,
 } from '@deepseek-ai/dsh-tools'
-import { type BrowserCaller, presentBrowserError } from '../browser/index.ts'
+import { BrowserError, type BrowserCaller, presentBrowserError } from '../browser/index.ts'
+import { validateToolArguments } from './parameter-validation.ts'
+import type { SnapshotCache } from './snapshot-cache.ts'
+import { formatSnapshotOutput, rememberBrowserSnapshot } from './snapshot-output.ts'
 
 /** 待执行卡片：一条观察/操作。`kind` 沿用 dsh 的 `ToolCallKind` 词表。 */
 export function observeCall(title: string, kind: 'read' | 'fetch' | 'edit' | 'execute', rawInput: unknown): GenericCallView {
@@ -70,23 +73,48 @@ function patchOutputSchema(schema: unknown): unknown {
  */
 export function defineTool<const S extends ParameterSchemaSpec, const O extends ValueSchemaSpec>(
   options: DefineToolOptions<S, O>,
+  recoveryCache?: SnapshotCache,
 ): ToolDefinition {
   const definition = defineHarnessTool<S, O>(options)
+  const strictParameters = { ...definition.parameters, additionalProperties: false }
   const rawExecute = definition.execute.bind(definition)
   const rawRender = definition.output.render?.bind(definition.output)
+  // token 是宿主分配的调用身份；execute 与投影阶段可能使用不同上下文视图。
+  const recoveryContent = new Map<symbol, string>()
   return {
     ...definition,
+    parameters: strictParameters,
     execute: async (args, exec) => {
       const startedAt = performance.now()
       try {
+        validateToolArguments(options.name, strictParameters, args)
         const value = await rawExecute(args, exec)
         if (value !== null && typeof value === 'object') {
           ;(value as Record<string, unknown>)[DURATION_KEY] = Math.round(performance.now() - startedAt)
         }
         return value
       } catch (error) {
+        if (error instanceof BrowserError && error.recoverySnapshot !== undefined && recoveryCache !== undefined) {
+          const snapshot = rememberBrowserSnapshot(recoveryCache, error.recoverySnapshot)
+          recoveryContent.set(exec.token, `[${error.code}]${error.reason === undefined ? '' : ` reason=${error.reason}`}\n`
+            + 'dispatch_state=not_dispatched. The original action failed and was NOT replayed. '
+            + 'Check the current page below, then use its NEW refs directly; another full snapshot is unnecessary unless details are missing.\n\n'
+            + 'Click/fill/press use [ref=eN] controls only; [anchor=eN] headings are read-only.\n\n'
+            + `Recovery observation:\n${formatSnapshotOutput(snapshot, true)}`)
+        }
         throw presentBrowserError(error)
       }
+    },
+    projectContent: (exec, result) => {
+      const text = recoveryContent.get(exec.token)
+      recoveryContent.delete(exec.token)
+      if (result.isError && !exec.signal.aborted && text !== undefined) return [{ type: 'text', text }]
+      return definition.projectContent?.(exec, result)
+    },
+    finalizeContent: (exec, result) => {
+      // 取消或管线失败可能跳过 projectContent，收尾仍释放本次暂存。
+      recoveryContent.delete(exec.token)
+      return definition.finalizeContent?.(exec, result)
     },
     output: {
       ...definition.output,

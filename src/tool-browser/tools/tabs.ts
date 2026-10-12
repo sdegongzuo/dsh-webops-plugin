@@ -129,10 +129,10 @@ export function registerTabs(ctx: Context, cache: SnapshotCache): void {
       action: {
         type: 'string',
         required: true,
-        description: 'list | claim | release | handoff | activate | close',
+        enum: ['list', 'claim', 'release', 'handoff', 'activate', 'close'],
       },
       session_id: { type: 'string', description: 'Omit for list.' },
-      scope: { type: 'string', description: 'For list: held | available.' },
+      scope: { type: 'string', enum: ['held', 'available'], description: 'list only; default held.' },
       handoff_code: { type: 'string', description: 'For claim on a handed-over tab.' },
     },
     output: {
@@ -146,19 +146,6 @@ export function registerTabs(ctx: Context, cache: SnapshotCache): void {
     timeoutMs: BROWSER_OBSERVE_TIMEOUT_MS,
     async execute(args, exec) {
       const action = String(args.action)
-      if (action !== 'list' && action !== 'claim' && action !== 'release' && action !== 'handoff'
-        && action !== 'activate' && action !== 'close') {
-        throw new Error('action must be one of: list, claim, release, handoff, activate, close')
-      }
-      if (action !== 'list' && args.session_id === undefined) {
-        throw new Error(`action "${action}" requires session_id`)
-      }
-      if (args.scope !== undefined && action !== 'list') {
-        throw new Error('scope only applies to action=list')
-      }
-      if (args.handoff_code !== undefined && action !== 'claim') {
-        throw new Error('handoff_code only applies to action=claim')
-      }
       const request: BrowserTabsRequest = action === 'list'
         ? { kind: 'list', ...args.scope === 'available' ? { scope: 'available' as const } : {} }
         : action === 'claim'

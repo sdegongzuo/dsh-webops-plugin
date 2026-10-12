@@ -12,6 +12,8 @@
 
 ## 0. 一句话
 
+2026-10-12 补充（原始证据 `D:/dsh-build/release-fixes-20261012/`）：`fromSurface=false` 的元素截图实测忽略 clip，43×26 CSS 像素按钮返回整视口；切 true 后前台可裁剪，但 Electron 后台带 clip 仍会超时。当前 Electron 宿主以有界出帧和整页捕获后 nativeImage 裁剪处理，不切活动标签；滚动后的 DOM.getBoxModel border 是视口坐标，clip 需加 CSS page 偏移。最终实际模型对话前台及后台交替截图均通过，原图片已读取。Chrome/154.0.8037.92 的 live 组也已实跑，历史环境说明仍保留，不把这些新结果冒充旧环境。
+
 ### 区域裁剪坐标（2026-10-01 补验）
 
 Windows 200% 缩放、Chrome 154.0.8037.92 与打包态 Electron 的 MDN 复验：`DOMSnapshot.captureSnapshot.layout.bounds` 使用设备坐标，而 `cssLayoutViewport`、`getBoundingClientRect()` 与区域参数使用 CSS 坐标。实测同一标题的 x 分别为 576 与 288；布局视口宽度分别为 2044 与 1022。区域求交前按同次 `layoutViewport.clientWidth / cssLayoutViewport.clientWidth` 转换 CSS 区域，不能直接混用，也不能把比例固定为 2。缺 CSS 指标时保留旧坐标路径。

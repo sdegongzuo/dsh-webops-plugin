@@ -4,8 +4,8 @@
 # 对话都会得到假回复**。它是验证台上的夹具，不是产品能力，所以不能出现在随包出货的
 # `cordis.patch.yml` 里（那个文件被 `package.json#files` 白名单带进便携版）。
 #
-# 生效方式：`scripts/dev-desktop.mjs` 会把 `cordis.patch.yml` 与本文件**拼接**后写进
-# 开发态 profile 的 `cordis.patch.yml`（profile overlay 在 bundle 层之后应用）。
+# 生效方式：`scripts/dev-desktop.mjs --fake-llm` 才把本文件追加到实际开发态
+# home profile 的 `cordis.patch.yml`；生产配置由 bundle 加载，不再在 profile 重复插入。
 # 本文件不在 `package.json#files` 白名单里，出货包拿不到它。
 #
 # 另有一道保险：`src/fake-llm/index.ts` 的 `apply` 只有在 `DSH_FAKE_LLM=1` 时才注册

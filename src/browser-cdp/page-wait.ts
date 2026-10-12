@@ -30,6 +30,16 @@ export class PageWait {
         'BROWSER_PROTOCOL_ERROR',
       )
     }
+    if (wantsTime && request.timeoutMs !== undefined) {
+      throw new BrowserError('webpage_wait time_ms cannot be combined with timeout_ms', 'BROWSER_PROTOCOL_ERROR')
+    }
+    if (request.refState !== undefined && !wantsRef) {
+      throw new BrowserError('webpage_wait ref_state requires ref', 'BROWSER_PROTOCOL_ERROR')
+    }
+    const deadlineMs = wantsTime ? undefined : request.timeoutMs ?? this.config.waitTimeoutMs
+    if (deadlineMs !== undefined && (!Number.isInteger(deadlineMs) || deadlineMs < 1 || deadlineMs > MAX_WAIT_TIME_MS)) {
+      throw new BrowserError(`webpage_wait timeout_ms must be between 1 and ${String(MAX_WAIT_TIME_MS)}`, 'BROWSER_PROTOCOL_ERROR')
+    }
     const beforeUrl = session.url
     let satisfied = true
     let signals: BrowserMutationResult['signals']
@@ -39,7 +49,7 @@ export class PageWait {
       satisfied = outcome.satisfied
       signals = outcome.signals
     } else if (request.timeMs !== undefined) {
-      if (!(request.timeMs > 0) || request.timeMs > MAX_WAIT_TIME_MS) {
+      if (!Number.isInteger(request.timeMs) || !(request.timeMs > 0) || request.timeMs > MAX_WAIT_TIME_MS) {
         throw new BrowserError(
           `webpage_wait time_ms must be between 1 and ${String(MAX_WAIT_TIME_MS)}`,
           'BROWSER_PROTOCOL_ERROR',
@@ -49,32 +59,26 @@ export class PageWait {
     } else if (wantsText) {
       const text = request.text as string
       satisfied = await pollUntil(
-        async () => {
+        async remainingMs => {
           const evaluated = await session.connection.send<EvaluateResult>(
             'Runtime.evaluate',
             { expression: `document.body !== null && document.body.innerText.includes(${JSON.stringify(text)})`, returnByValue: true },
-            { signal, timeoutMs: this.config.commandTimeoutMs },
+            { signal, timeoutMs: Math.min(this.config.commandTimeoutMs, remainingMs) },
           )
           return evaluated.result?.value === true
         },
         // wait 的 probe 会真发命令：失败要当「还没等到」继续等，而不是让整个工具失败。
-        { timeoutMs: this.config.waitTimeoutMs, signal, swallowErrors: true },
+        { timeoutMs: deadlineMs as number, signal, swallowErrors: true },
       )
     } else {
       const ref = request.ref as string
       const wantsHidden = request.refState === 'hidden'
-      if (request.refState !== undefined && !wantsRef) {
-        throw new BrowserError(
-          'webpage_wait ref_state requires ref (it refines what "gone" means for that element)',
-          'BROWSER_PROTOCOL_ERROR',
-        )
-      }
       // hidden 语义也吃 ref 纪元：旧 ref 在这里直接抛，不会傻等一个不存在的元素。
       // 但「元素已脱离文档」正是 removed 分支要等的结果，细门对它放行（allowDetached）。
       const objectId = await this.nodes.resolveObjectId(session, ref, signal, { allowDetached: true })
       try {
         satisfied = await pollUntil(
-          async () => {
+          async remainingMs => {
             const evaluated = await session.connection.send<EvaluateResult>(
               'Runtime.callFunctionOn',
               {
@@ -92,12 +96,12 @@ export class PageWait {
                   : 'function () { return !this.isConnected; }',
                 returnByValue: true,
               },
-              { signal, timeoutMs: this.config.commandTimeoutMs },
+              { signal, timeoutMs: Math.min(this.config.commandTimeoutMs, remainingMs) },
             )
             return evaluated.result?.value === true
           },
           // 同上：hidden 分支的 probe 也是直接发命令，同样不能让工具失败。
-          { timeoutMs: this.config.waitTimeoutMs, signal, swallowErrors: true },
+          { timeoutMs: deadlineMs as number, signal, swallowErrors: true },
         )
         if (!satisfied) {
           // 项 2（2026-10-07）：超时要说明元素**此刻**是什么状态 —— 还在但隐藏
@@ -122,6 +126,9 @@ export class PageWait {
             const state = boxProbe.result?.value
             if (state === 'hidden' || state === 'visible' || state === 'removed') refState = state
           } catch {
+            if (signal?.aborted === true) {
+              throw signal.reason ?? new BrowserError('the operation was aborted', 'BROWSER_CONNECTION_LOST')
+            }
             // 状态读不到就不附加（不把探测失败当成状态结论）。
           }
         }
@@ -147,16 +154,10 @@ export class PageWait {
     timeoutMs: number | undefined,
     signal?: AbortSignal,
   ): Promise<{ satisfied: boolean; signals: NonNullable<BrowserMutationResult['signals']> }> {
-    const deadlineMs = timeoutMs ?? MAX_WAIT_TIME_MS
-    if (!(deadlineMs > 0) || deadlineMs > MAX_WAIT_TIME_MS) {
-      throw new BrowserError(
-        `webpage_wait timeout_ms must be between 1 and ${String(MAX_WAIT_TIME_MS)}`,
-        'BROWSER_PROTOCOL_ERROR',
-      )
-    }
+    const deadlineMs = timeoutMs ?? this.config.waitTimeoutMs
     const windowMs = this.config.stableQuietWindowMs
     const graceMs = this.config.stableNetworkGraceMs
-    await this.evaluateDomQuietInstall(session, signal)
+    const deadline = Date.now() + deadlineMs
     let quietStreak = 0
     let networkBusySince: number | undefined
     let signals: NonNullable<BrowserMutationResult['signals']> = {
@@ -164,10 +165,16 @@ export class PageWait {
       dom: 'busy',
       network: 'busy',
     }
-    const deadline = Date.now() + deadlineMs
+    const installed = await this.withinDeadline(deadline, signal, timeout =>
+      this.evaluateDomQuietInstall(session, signal, timeout).then(() => true))
+    if (installed === undefined) return { satisfied: false, signals }
     for (;;) {
-      const ready = await this.evaluateReadyComplete(session, signal)
-      const mutations = await this.evaluateDomQuietRead(session, signal)
+      const ready = await this.withinDeadline(deadline, signal, timeout =>
+        this.evaluateReadyComplete(session, signal, timeout))
+      if (ready === undefined) return { satisfied: false, signals }
+      const mutations = await this.withinDeadline(deadline, signal, timeout =>
+        this.evaluateDomQuietRead(session, signal, timeout))
+      if (mutations === undefined) return { satisfied: false, signals }
       if (mutations === 0) quietStreak += 1
       else quietStreak = 0
       const inflight = session.networkCollector.inflight
@@ -190,34 +197,52 @@ export class PageWait {
     }
   }
 
-  private async evaluateReadyComplete(session: SessionState, signal?: AbortSignal): Promise<boolean> {
+  private async withinDeadline<T>(
+    deadline: number,
+    signal: AbortSignal | undefined,
+    command: (timeoutMs: number) => Promise<T>,
+  ): Promise<T | undefined> {
+    const remaining = deadline - Date.now()
+    if (remaining <= 0) return undefined
+    const timeoutMs = Math.min(this.config.commandTimeoutMs, remaining)
+    try {
+      return await command(timeoutMs)
+    } catch (error) {
+      if (signal?.aborted !== true && timeoutMs < this.config.commandTimeoutMs
+        && Date.now() >= deadline && error instanceof BrowserError
+        && error.code === 'BROWSER_CDP_COMMAND_TIMEOUT') return undefined
+      throw error
+    }
+  }
+
+  private async evaluateReadyComplete(session: SessionState, signal?: AbortSignal, timeoutMs = this.config.commandTimeoutMs): Promise<boolean> {
     const evaluated = await session.connection.send<EvaluateResult>(
       'Runtime.evaluate',
       { expression: 'document.readyState === "complete"', returnByValue: true },
-      { signal, timeoutMs: this.config.commandTimeoutMs },
+      { signal, timeoutMs },
     )
     return evaluated.result?.value === true
   }
 
-  private async evaluateDomQuietInstall(session: SessionState, signal?: AbortSignal): Promise<void> {
+  private async evaluateDomQuietInstall(session: SessionState, signal?: AbortSignal, timeoutMs = this.config.commandTimeoutMs): Promise<void> {
     await session.connection.send<EvaluateResult>(
       'Runtime.evaluate',
       {
         expression: '(() => { const g = globalThis; if (g.__dsh_mut_installed === true) return true; try { g.__dsh_mut_count = 0; new MutationObserver(() => { g.__dsh_mut_count = (g.__dsh_mut_count ?? 0) + 1 }).observe(document.documentElement || document, { subtree: true, childList: true, attributes: true, characterData: true }); g.__dsh_mut_installed = true; return true } catch { return false } })()',
         returnByValue: true,
       },
-      { signal, timeoutMs: this.config.commandTimeoutMs },
+      { signal, timeoutMs },
     )
   }
 
-  private async evaluateDomQuietRead(session: SessionState, signal?: AbortSignal): Promise<number> {
+  private async evaluateDomQuietRead(session: SessionState, signal?: AbortSignal, timeoutMs = this.config.commandTimeoutMs): Promise<number> {
     const evaluated = await session.connection.send<EvaluateResult>(
       'Runtime.evaluate',
       {
         expression: '(() => { const g = globalThis; const n = Number(g.__dsh_mut_count ?? 0); g.__dsh_mut_count = 0; return n })()',
         returnByValue: true,
       },
-      { signal, timeoutMs: this.config.commandTimeoutMs },
+      { signal, timeoutMs },
     )
     const value = evaluated.result?.value
     return typeof value === 'number' && Number.isFinite(value) ? value : 0

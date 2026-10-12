@@ -24,7 +24,7 @@
 |---|---|
 | webpage_open / webpage_navigate | 新开受控标签、导航或历史前进后退 |
 | webpage_snapshot / webpage_find | 读取页面大纲和检索缓存；区域参数为 region_ref、region_viewport、region_box，三者互斥 |
-| webpage_revalidate / webpage_locate | 恢复旧 ref、取得实时坐标 |
+| webpage_locate | 取得实时坐标 |
 | webpage_click / fill / press / scroll | 操作元素，执行前检查 ref 与页面状态 |
 | webpage_wait | 等文本、元素消失、页面稳定或指定时间；生成回复优先等待当前回复的完成标记 |
 | webpage_screenshot / console / network | 截图与调试采集 |
@@ -49,6 +49,7 @@
 | 优化工具描述、快照与上下文预算 | [上下文方案](docs/上下文膨胀-实施方案.md)、[测量口径](docs/上下文膨胀-测量口径.md) |
 | 运行真实工具场景 | [用户故事](docs/用户故事与实测场景.md)、[打包态对话驱动](docs/打包态对话驱动.md) |
 | 查看版本验证结果与限制 | [验收记录](docs/验收记录.md) |
+| 核对当前遗留问题与证据缺口 | [遗留问题](docs/遗留问题.md) |
 
 ## License
 

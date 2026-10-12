@@ -1,4 +1,4 @@
-/** 页面内容检索、元素定位与 ref 复核：专用输出与工具注册。 */
+/** 页面内容检索与元素定位：专用输出与工具注册。 */
 
 import type { Context } from '@deepseek-ai/cordis'
 import {
@@ -12,11 +12,6 @@ import { UNTRUSTED_PAGE_CONTENT_NOTICE, BROWSER_OBSERVE_TIMEOUT_MS } from '../co
 import { defineTool, callerOf, observeCall } from '../tool-runtime.ts'
 import {
   SESSION_ID_PARAMETER,
-  type PageChangedOutput,
-  formatPageChanged,
-  PAGE_CHANGED_SCHEMA,
-  REF_ITEM_SCHEMA,
-  toPageChangedOutput,
 } from '../common-output.ts'
 import { BrowserError } from '../../browser/index.ts'
 
@@ -164,7 +159,7 @@ export function registerFind(ctx: Context, cache: SnapshotCache): void {
   ctx.tools.register(defineTool({
     name: 'webpage_find',
     description:
-      "Local search of the LAST snapshot: case-insensitive substring or JS regex. Matches include folded rows, ref (empty for plain text), line and nearest-heading context. full_text returns unclipped cached text and code block with original whitespace. Heading matches have anchor=true: region_ref reads that section, including the SECOND of identical headings; anchors grant no writes. Without cache: BROWSER_SNAPSHOT_REQUIRED. No page commands are sent.",
+      'Search the LAST snapshot cache, including folded rows: substring or JS regex. Returns refs/heading context; full_text adds original text/code whitespace. Heading anchor=true selects its own region_ref section, including duplicate headings; anchors grant no writes. No cache: BROWSER_SNAPSHOT_REQUIRED. No page commands.',
     parameters: {
       session_id: SESSION_ID_PARAMETER,
       query: {
@@ -250,22 +245,21 @@ export function registerFind(ctx: Context, cache: SnapshotCache): void {
  * 转发到 provider.locate —— 三道失效守卫（resolveNode / isConnected / 零尺寸）与
  * 「每次现算 rect」都在 provider 侧执法，工具层只做参数与结果的 snake_case 投影。
  */
-export function registerLocate(ctx: Context): void {
+export function registerLocate(ctx: Context, cache: SnapshotCache): void {
   ctx.tools.register(defineTool({
     name: 'webpage_locate',
     description:
-      'Measure a ref FRESH: viewport x/y/width/height and in_viewport. Default scroll=false leaves the viewport unchanged. scroll=true requests centering; centered=true requires the measured element center near the viewport center (16 CSS px tolerance), not merely visible. Failed or unfinished scrolling reports centered=false. Removed nodes fail BROWSER_STALE_REF; zero layout boxes fail as not visible. Recover with a fresh webpage_snapshot. highlight=true draws a temporary outline; a later highlight=false call or navigation clears this client\'s outline without touching other DevTools clients. ',
+      'Measure live viewport x/y/width/height and in_viewport. scroll=false (default) preserves viewport; scroll=true centres the element (16 CSS px tolerance), reporting centered=false if unfinished. BROWSER_STALE_REF needs a fresh snapshot; zero layout boxes fail as invisible. highlight affects only this client\'s outline.',
     parameters: {
       session_id: SESSION_ID_PARAMETER,
       ref: { type: 'string', required: true, description: 'Element ref, like e12.' },
       highlight: {
         type: 'boolean',
-        description: 'Draw a temporary outline for the user; call again with highlight=false to clear it.',
+        description: 'Draw outline; false clears it. Navigation also clears it.',
       },
       scroll: {
         type: 'boolean',
-        description: 'Centre the element before measuring. Default false: coordinates are read without moving the viewport '
-          + '(that is what makes locate a valid check of a previous scroll).',
+        description: 'Centre before measuring; default false (measure without scrolling).',
       },
     },
     output: {
@@ -293,111 +287,5 @@ export function registerLocate(ctx: Context): void {
       }
     },
     presentCall: args => observeCall(`Locate ${args.ref} in ${args.session_id}`, 'read', args.ref),
-  }))
-}
-
-interface RevalidateOutput {
-  session_id: string
-  epoch: number
-  restored: { ref: string; role: string; name: string }[]
-  failed: { ref: string; reason: string }[]
-  /** P2：页面在本会话之外变过（脏时才出现）。见 `formatRevalidateOutput` 里的理由。 */
-  page_changed?: PageChangedOutput
-}
-
-function formatRevalidateOutput(value: RevalidateOutput): string {
-  const restored = value.restored.length === 0
-    ? '(none restored)'
-    : value.restored.map(entry => `${entry.ref} ${entry.role} "${entry.name}"`).join(', ')
-  const failed = value.failed.length === 0
-    ? ''
-    : `\nfailed: ${value.failed.map(entry => `${entry.ref} (${entry.reason})`).join(', ')}`
-  const notes = [
-    'Restored refs keep their original numbers. Revalidate only proves node identity (loaderId + role/name) — '
-    + 'it does NOT prove the element is visible, laid out, or clickable; verify with webpage_locate before acting.',
-    'document_changed means the page navigated — do not reuse those refs; take a fresh webpage_snapshot.',
-    'node_gone / identity_mismatch / not_archived also need a fresh snapshot, not another revalidate of the same ref.',
-    UNTRUSTED_PAGE_CONTENT_NOTICE,
-  ]
-  if (value.page_changed !== undefined) {
-    // 这条回执最需要它：恢复成功的判据只是「归档 loaderId 对得上 + role/name 一致」，
-    // 同一份文档里的重排（列表换序、控件被替换）它一个字都看不出来 —— 一片「restored」会让
-    // 模型以为手里的号全干净。所以放在正文之前，与结论同一屏。
-    notes.unshift(formatPageChanged(value.page_changed))
-  }
-  return `session_id=${value.session_id} (ref epoch ${value.epoch})\nrestored: ${restored}${failed}\n\n${notes.join('\n')}`
-}
-
-/**
- * 注册 `webpage_revalidate`。
- * @param ctx - 上下文；其 `browser` 服务做精确恢复。
- */
-export function registerRevalidate(ctx: Context): void {
-  ctx.tools.register(defineTool({
-    name: 'webpage_revalidate',
-    description:
-      'Restore refs from a previous webpage_snapshot into the current epoch WITHOUT taking a new snapshot. '
-      + 'Each ref is checked against the current document (main-frame loaderId) then the live node '
-      + '(backendNodeId + role/name); a match keeps the SAME number. Failures come back per ref '
-      + '(document_changed / node_gone / identity_mismatch / not_archived) and stay invalid — '
-      + 'take a fresh webpage_snapshot for them. Prefer this over a full snapshot when the page did not navigate. ',
-    parameters: {
-      session_id: SESSION_ID_PARAMETER,
-      refs: {
-        type: 'array',
-        required: true,
-        items: { type: 'string' },
-        description: 'Refs from an earlier snapshot to restore. A single ref is a one-element array.',
-      },
-    },
-    output: {
-      schema: {
-        type: 'object',
-        additionalProperties: false,
-        properties: {
-          session_id: { type: 'string', required: true },
-          epoch: { type: 'integer', required: true },
-          page_changed: PAGE_CHANGED_SCHEMA,
-          restored: {
-            type: 'array',
-            required: true,
-            items: REF_ITEM_SCHEMA,
-          },
-          failed: {
-            type: 'array',
-            required: true,
-            items: {
-              type: 'object',
-              additionalProperties: false,
-              properties: {
-                ref: { type: 'string', required: true },
-                reason: { type: 'string', required: true },
-              },
-            },
-          },
-        },
-      },
-      render: (_args, value) => [{ type: 'text', text: formatRevalidateOutput(value as RevalidateOutput) }],
-    },
-    timeoutMs: BROWSER_OBSERVE_TIMEOUT_MS,
-    async execute(args, exec) {
-      const refs = Array.isArray(args.refs) ? args.refs.filter((item): item is string => typeof item === 'string') : []
-      if (refs.length === 0) {
-        throw new Error('refs must be a non-empty array of ref strings, e.g. ["e12"]')
-      }
-      const result = await ctx.browser.revalidate(
-        { sessionId: args.session_id, refs },
-        callerOf(exec),
-        exec.signal,
-      )
-      return {
-        session_id: result.sessionId,
-        epoch: result.epoch,
-        restored: result.restored.map(({ ref, role, name }) => ({ ref, role, name })),
-        failed: result.failed.map(({ ref, reason }) => ({ ref, reason })),
-        ...result.pageChanged !== undefined ? { page_changed: toPageChangedOutput(result.pageChanged) } : {},
-      }
-    },
-    presentCall: args => observeCall(`Revalidate refs on ${args.session_id}`, 'read', args.session_id),
-  }))
+  }, cache))
 }

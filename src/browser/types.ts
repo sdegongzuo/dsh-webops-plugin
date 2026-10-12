@@ -162,11 +162,16 @@ export class BrowserError extends Error {
   readonly reason: BrowserStaleRefReason | undefined
   readonly timeoutMs: number | undefined
   readonly method: string | undefined
+  /** 仅由输入派发前的守卫设置；不得从错误文案推断。 */
+  readonly dispatchState: 'not_dispatched' | undefined
+  /** 同一次失败调用附带的观察；原操作仍为失败，不自动重放。 */
+  recoverySnapshot?: BrowserSnapshot
+  recoveryAttempted?: boolean
 
   constructor(
     message: string,
     code: BrowserErrorCode,
-    options?: { cause?: unknown; status?: number; reason?: BrowserStaleRefReason; timeoutMs?: number; method?: string },
+    options?: { cause?: unknown; status?: number; reason?: BrowserStaleRefReason; timeoutMs?: number; method?: string; dispatchState?: 'not_dispatched' },
   ) {
     super(message, options)
     this.name = 'BrowserError'
@@ -175,6 +180,7 @@ export class BrowserError extends Error {
     this.reason = options?.reason
     this.timeoutMs = options?.timeoutMs
     this.method = options?.method
+    this.dispatchState = options?.dispatchState
   }
 }
 
@@ -218,7 +224,7 @@ const BROWSER_ERROR_RECOVERY: Readonly<Partial<Record<BrowserErrorCode, string>>
   BROWSER_TARGET_OCCLUDED: 'do not retry the same click — close the overlay or act on the element on top of the target first, then take a fresh webpage_snapshot and click the target again.',
   BROWSER_WINDOW_NOT_VISIBLE: 'restore the browser window (un-minimize or show it), then retry; do not retry while the window stays hidden or minimized.',
   BROWSER_TAB_NOT_VISIBLE: 'real mouse/keyboard input only lands on a visible tab (visibilityState=hidden) — activate the tab with webpage_tabs(action=activate), make sure the browser window itself is shown, then retry; do not dispatch input into a hidden tab.',
-  BROWSER_READ_ONLY_ANCHOR: 'this anchor only locates content for reading — use webpage_snapshot with region_ref, webpage_locate or a screenshot on it; to interact, take a fresh webpage_snapshot and use an actionable element (link/button/textbox) instead.',
+  BROWSER_READ_ONLY_ANCHOR: 'this [anchor=eN] only locates content for reading. Click/fill/press need an actionable [ref=eN] control (button/link/textbox) from your latest observation; choose that control without re-snapshotting if it is already present.',
 }
 
 /**
@@ -231,12 +237,20 @@ const BROWSER_ERROR_RECOVERY: Readonly<Partial<Record<BrowserErrorCode, string>>
 export function presentBrowserError(error: unknown): unknown {
   if (!(error instanceof BrowserError) || error.message.startsWith(`[${error.code}]`)) return error
   const recovery = BROWSER_ERROR_RECOVERY[error.code]
-  const message = `[${error.code}] ${error.message}${recovery !== undefined ? ` Recovery: ${recovery}` : ''}`
-  return new BrowserError(message, error.code, {
+  const dispatch = error.dispatchState === 'not_dispatched' ? ' dispatch_state=not_dispatched; the original action was not replayed.' : ''
+  const observation = error.recoveryAttempted && error.recoverySnapshot === undefined ? ' Recovery observation unavailable.' : ''
+  const message = `[${error.code}] ${error.message}${dispatch}${observation}${recovery !== undefined ? ` Recovery: ${recovery}` : ''}`
+  const presented = new BrowserError(message, error.code, {
     ...error.cause !== undefined ? { cause: error.cause } : {},
     ...error.status !== undefined ? { status: error.status } : {},
     ...error.reason !== undefined ? { reason: error.reason } : {},
+    ...error.timeoutMs !== undefined ? { timeoutMs: error.timeoutMs } : {},
+    ...error.method !== undefined ? { method: error.method } : {},
+    ...error.dispatchState !== undefined ? { dispatchState: error.dispatchState } : {},
   })
+  if (error.recoverySnapshot !== undefined) presented.recoverySnapshot = error.recoverySnapshot
+  if (error.recoveryAttempted !== undefined) presented.recoveryAttempted = error.recoveryAttempted
+  return presented
 }
 
 /**
@@ -524,10 +538,10 @@ export type BrowserMutationRequest =
     readonly refState?: 'removed' | 'hidden'
     /**
      * 等页面安静（readyState complete + DOM 静默 + 网络静默或已超宽限期）。
-     * 与 time_ms / text / ref 四选一；`timeoutMs` 只覆盖本模式的 deadline。
+     * 与 time_ms / text / ref 四选一；`timeoutMs` 是 text/ref/stable 共用的 deadline。
      */
     readonly until?: 'stable'
-    /** `until: 'stable'` 的 deadline（毫秒）；默认与 `MAX_WAIT_TIME_MS` 对齐。 */
+    /** text/ref/stable 的共同 deadline（毫秒）；默认 waitTimeoutMs，timeMs 不可同时指定。 */
     readonly timeoutMs?: number
   }
 
@@ -581,6 +595,8 @@ export interface BrowserMutationResult {
   readonly pageChanged?: BrowserPageChanged
   /** wait 独有：条件是否在超时前成立（超时为 false，不是错误）。 */
   readonly satisfied?: boolean
+  /** wait 完成或正常超时后的完整观察；由 BrowserRuntime 在 owner 门禁内补取。 */
+  readonly snapshot?: BrowserSnapshot
   /**
    * wait(ref) 超时独有（项 2，2026-10-07）：元素超时那一刻的状态 ——
    * `hidden` = 还在文档里但没有布局盒（display:none / 未渲染），`visible` = 还在且显示着，
@@ -889,6 +905,7 @@ export interface BrowserRevalidateRequest {
 export type BrowserRevalidateFailureReason =
   | 'not_archived'
   | 'document_changed'
+  | 'document_identity_unknown'
   | 'node_gone'
   | 'identity_mismatch'
 
@@ -948,6 +965,8 @@ export interface BrowserLocateResult {
  */
 export interface BrowserProvider {
   readonly id: string
+  /** 人工持有时无值；用于确认恢复观察期间控制权代次未改变。 */
+  refRecoveryState?(sessionId: string): number | undefined
   /** 当前是否可用（例如调试端口是否在监听）。 */
   available(): boolean
   open(request: BrowserOpenRequest, signal?: AbortSignal): Promise<BrowserSession>
@@ -992,6 +1011,8 @@ export interface BrowserProvider {
    * 的 ref。可选：没有 ref 纪元的 provider 不必实现。
    */
   invalidateSession?(sessionId: string): void
+  /** 会话在交还 agent 后是否仍需全页观察；全页 snapshot 后清除。 */
+  needsReobserve?(sessionId: string): boolean
   /** 归还一个会话：关闭它的标签页并释放连接。 */
   close(sessionId: string): Promise<void>
   /** 释放 provider 持有的全部资源（连接、标签页、进程）。可省略。 */

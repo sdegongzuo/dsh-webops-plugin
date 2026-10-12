@@ -42,9 +42,9 @@ env:
   # 用同一个 ref，也让本 workflow 的构建对着我们实际随包出货的那个 harness 版本。
   HARNESS_REF: ${{ inputs.harness_ref || 'd743267388641bc76f17c45ce8b4c231aed1d32c' }}
   TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
-  BASE_DESKTOP_TAG: v0.2.15
-  BASE_DESKTOP_ASSET: dsh-webops-desktop-v0.2.15-win-x64-portable.zip
-  BASE_DESKTOP_SHA256: 771170d847cc36629ae989c56d0357ee215feece47f470df99122c6f21e77465
+  BASE_DESKTOP_TAG: v0.2.16
+  BASE_DESKTOP_ASSET: dsh-webops-desktop-v0.2.16-win-x64-portable.zip
+  BASE_DESKTOP_SHA256: 23d2be61276514b5c6d0e488abeb69478e0b2c712040f7d32963a4c5ba1a8f43
 
 jobs:
   portable-win-x64:
@@ -160,10 +160,14 @@ jobs:
           if ((Get-FileHash $baseZip -Algorithm SHA256).Hash.ToLower() -ne $env:BASE_DESKTOP_SHA256) { throw 'DSH 基包哈希不一致，拒绝发布' }
           python scripts/unzip-portable.py --zip $baseZip --dir $baseRoot --only-prefix app/
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $releaseApp = Join-Path $env:RUNNER_TEMP 'webops-release-app'
+          $appStage = Join-Path $env:RUNNER_TEMP 'webops-release-app-stage'
+          node scripts/prepare-release-app.mjs --app (Join-Path $baseRoot 'app') --stage-root $appStage --out $releaseApp
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $version = $env:PLUGIN_VERSION
           $portableZip = Join-Path dist "dsh-webops-desktop-v$version-win-x64-portable.zip"
           $stageRoot = Join-Path $env:RUNNER_TEMP 'webops-full-stage'
-          node scripts/package-release-portable.mjs --app (Join-Path $baseRoot 'app') --plugin-zip (Join-Path dist $env:PLUGIN_ZIP_NAME) --version $version --stage-root $stageRoot --out $portableZip
+          node scripts/package-release-portable.mjs --app $releaseApp --plugin-zip (Join-Path dist $env:PLUGIN_ZIP_NAME) --version $version --stage-root $stageRoot --out $portableZip
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $checkRoot = Join-Path $env:RUNNER_TEMP 'webops-full-check'
           python scripts/unzip-portable.py --zip $portableZip --dir $checkRoot
@@ -181,6 +185,10 @@ jobs:
         run: |
           $notes = @'
           ## dsh-webops-plugin __TAG__ · 完整便携包与独立插件包
+
+          本版取消公开 revalidate。旧引用或交还观察门禁拒绝操作时，确认尚未派发的失败会附带一次有界新观察，模型可直接选择新引用继续；保留错误状态，不自动重跑操作。快照区分可操作按钮与只读标题。
+
+          修复元素截图误截整页、滚动后的裁剪偏移，以及 Electron 后台裁剪超时。完整便携包包含按包目录隔离数据的桌面升级；源码保留式装配与发布验证也已更新。
 
           下载 `__PLUGIN_ZIP__`，包内包含完整编译插件及 INSTALL.md，无需重新下载 DSH 桌面整包。
 

@@ -216,6 +216,8 @@ export class CdpBrowserProvider implements BrowserProvider {
       title: target.title,
       takeover: false,
       holder: 'agent',
+      controlGeneration: 0,
+      needsReobserve: false,
       highlightPainted: false,
     }
     try {
@@ -303,6 +305,8 @@ export class CdpBrowserProvider implements BrowserProvider {
       title: target.title,
       takeover: false,
       holder: 'agent',
+      controlGeneration: 0,
+      needsReobserve: false,
       highlightPainted: false,
     }
     await connection.send('Page.enable', {}, { signal, timeoutMs: this.config.commandTimeoutMs })
@@ -490,9 +494,27 @@ export class CdpBrowserProvider implements BrowserProvider {
   /** @inheritdoc */
   async observe(request: BrowserObserveRequest, signal?: AbortSignal): Promise<BrowserObservation> {
     const session = this.require(request.sessionId)
-    return request.kind === 'snapshot'
-      ? this.observation.snapshot(session, signal, request.maxLines, request.region)
-      : this.observation.screenshot(session, request.ref, request.fullPage ?? false, signal)
+    if (request.kind === 'snapshot') {
+      const controlGeneration = session.controlGeneration
+      const shouldClearReobserve = session.needsReobserve && session.holder === 'agent'
+      const result = await this.observation.snapshot(session, signal, request.maxLines, request.region)
+      if (request.region === undefined && shouldClearReobserve
+        && session.holder === 'agent' && session.controlGeneration === controlGeneration) {
+        session.needsReobserve = false
+      }
+      return result
+    }
+    return this.observation.screenshot(session, request.ref, request.fullPage ?? false, signal)
+  }
+
+  /** 交还后的重观察状态仅按会话查询；租约 owner 过滤由 BrowserRuntime 执行。 */
+  needsReobserve(sessionId: string): boolean {
+    return this.sessions.get(sessionId)?.needsReobserve === true
+  }
+
+  refRecoveryState(sessionId: string): number | undefined {
+    const session = this.sessions.get(sessionId)
+    return session?.holder === 'agent' ? session.controlGeneration : undefined
   }
 
   /**
@@ -554,7 +576,7 @@ export class CdpBrowserProvider implements BrowserProvider {
     const session = this.sessions.get(sessionId)
     // 幂等：重复关闭不是错误。
     if (session === undefined) return
-    this.assertWritable(session)
+    this.assertWritable(session, false, false)
     // 宿主最后一次裁决通过并实际关闭后才摘账，接管拒绝不能被吞掉。
     await this.transport.closeTarget(session.targetId)
     this.sessions.delete(sessionId)
@@ -580,7 +602,7 @@ export class CdpBrowserProvider implements BrowserProvider {
     }
     if (request.kind === 'activate') {
       const session = this.require(request.sessionId)
-      this.assertWritable(session)
+      this.assertWritable(session, false, false)
       const activate = this.transport.activateTarget
       if (activate === undefined) {
         throw new BrowserError(
@@ -608,7 +630,8 @@ export class CdpBrowserProvider implements BrowserProvider {
    */
   async mutate(request: BrowserMutationRequest, signal?: AbortSignal): Promise<BrowserMutationResult> {
     const session = this.require(request.sessionId)
-    this.assertWritable(session)
+    // wait 不派发输入，允许它在交还后完成全页观察；人工持有仍拒绝。
+    this.assertWritable(session, true, request.kind !== 'wait')
     this.metrics.noteRefCall(session.targetId)
     // **操作前**先记下已有会话；收尾时取差集就是「本次操作顺带开出来的标签页」。
     // 快照点必须在动作之前：页面可能在动作里就 adopt 出新会话（虽然实测要 150ms 级）。
@@ -959,8 +982,9 @@ export class CdpBrowserProvider implements BrowserProvider {
    * 两个方向做的事**故意不对称**：
    * - → `'human'`：立刻作废该会话的 ref 纪元（J5 —— agent 手上的号全部失效），并把
    *   接管窗口记进簿记（reason `'human'`，与 DevTools 那条互不干扰）；
-   * - → `'agent'`：只解除封锁，**不恢复任何 ref**（J6 —— agent 恢复可写，但必须重拍快照
-   *   才拿得到号）。「接管期间不碰别的会话」「交还不复活旧号」是这套语义的核心。
+   * - → `'agent'`：解除封锁、再次作废 refs，并标记需重观察；只有交还后的全页 snapshot
+   *   成功后才清除标记。人工期间的只读快照也不能把旧观察带回 agent。
+   *   「接管期间不碰别的会话」「交还不复活旧号」是这套语义的核心。
    *
    * 幂等：同值重复设置直接返回。宿主侧已经判过一次等，这里再判是因为通道可能重放
    * （`invalidate()` 会推进纪元，重复调用会让 ref 表平白再翻一代）。
@@ -972,6 +996,7 @@ export class CdpBrowserProvider implements BrowserProvider {
   protected setHolder(sessionId: string, holder: BrowserHolder): void {
     const session = this.sessions.get(sessionId)
     if (session === undefined || session.holder === holder) return
+    session.controlGeneration += 1
     session.holder = holder
     if (holder === 'human') {
       session.refs.invalidate()
@@ -981,6 +1006,9 @@ export class CdpBrowserProvider implements BrowserProvider {
       session.dirty.noteTakeoverWindow()
       return
     }
+    // 人工控制期间的只读快照也可能生成 refs；交还时再次作废，待交还后的全页快照才清提示标记。
+    session.refs.invalidate()
+    session.needsReobserve = true
     this.stateRegistry.markTakeover(sessionId, false, 'human')
   }
 
@@ -999,8 +1027,14 @@ export class CdpBrowserProvider implements BrowserProvider {
    * @param session - 已经 `require()` 出来的会话。
    * @throws `BROWSER_HUMAN_HOLDING`：该会话当前由人工持有。
    */
-  private assertWritable(session: SessionState): void {
-    if (session.holder !== 'human') return
+  private assertWritable(session: SessionState, beforeInput = false, requireObservation = true): void {
+    if (session.holder !== 'human') {
+      if (requireObservation && session.needsReobserve) {
+        throw new BrowserError('handback requires a fresh full observation before writing',
+          'BROWSER_SNAPSHOT_REQUIRED', beforeInput ? { dispatchState: 'not_dispatched' } : undefined)
+      }
+      return
+    }
     throw new BrowserError(
       `session "${session.targetId}" is under human control right now: a person pressed the `
       + '"take over" button on the dsh tab bar and is operating this page themselves. '

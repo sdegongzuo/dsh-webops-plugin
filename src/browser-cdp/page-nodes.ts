@@ -18,6 +18,7 @@ import {
   type HitTestOutcome,
   type ScreenshotClip,
   type BoxModelResult,
+  type LayoutMetricsResult,
 } from './provider-session.ts'
 import {
   boxCenteredInViewport,
@@ -73,7 +74,7 @@ export class PageNodes {
       throw new BrowserError(
         `the element for ref "${request.ref}" is no longer attached to the document; run webpage_snapshot again`,
         'BROWSER_STALE_REF',
-        { reason: 'node_gone' },
+        { reason: 'node_gone', dispatchState: 'not_dispatched' },
       )
     }
     try {
@@ -89,7 +90,7 @@ export class PageNodes {
           `the element for ref "${request.ref}" was removed from the document (the page may have `
           + 're-rendered); run webpage_snapshot again',
           'BROWSER_STALE_REF',
-          { reason: 'detached' },
+          { reason: 'detached', dispatchState: 'not_dispatched' },
         )
       }
       const scroll = request.scroll ?? false
@@ -162,7 +163,10 @@ export class PageNodes {
     const archived = session.refs.archived(ref)
     if (archived === undefined) return { ok: false, reason: 'not_archived' }
     // 文档身份是第一道门：对不上就停，不看 backendNodeId。
-    if (archived.loaderId === undefined || loaderId === undefined || archived.loaderId !== loaderId) {
+    if (archived.loaderId === undefined || loaderId === undefined) {
+      return { ok: false, reason: 'document_identity_unknown' }
+    }
+    if (archived.loaderId !== loaderId) {
       return { ok: false, reason: 'document_changed' }
     }
     const options = { signal, timeoutMs: this.config.commandTimeoutMs }
@@ -255,13 +259,14 @@ export class PageNodes {
     try {
       return await this.resolveNodeObjectId(session, backendNodeId, signal)
     } catch (error: unknown) {
-      if (error instanceof BrowserError
-        && (error.code === 'BROWSER_DEBUGGER_DETACHED' || error.code === 'BROWSER_CONNECTION_LOST')) throw error
+      // 只有浏览器明确报告节点不存在才翻译为 ref 失效；超时、取消和未知协议故障保持原码。
+      if (!(error instanceof BrowserError) || error.code !== 'BROWSER_PROTOCOL_ERROR'
+        || !/No node with given id|Node with given id does not belong to the document/.test(error.message)) throw error
       this.metrics.noteStale(session.targetId, 'node_gone')
       throw new BrowserError(
         `the element for ref "${ref}" is gone from the document; run webpage_snapshot again`,
         'BROWSER_STALE_REF',
-        { cause: error, reason: 'node_gone' },
+        { cause: error, reason: 'node_gone', dispatchState: 'not_dispatched' },
       )
     }
   }
@@ -291,7 +296,7 @@ export class PageNodes {
       throw new BrowserError(
         'the observed element is no longer attached to the document; run webpage_snapshot again',
         'BROWSER_STALE_REF',
-        { reason: 'node_gone' },
+        { reason: 'node_gone', dispatchState: 'not_dispatched' },
       )
     }
     await this.assertPreActionGate(session, ref, objectId, signal, options?.allowDetached === true)
@@ -359,7 +364,7 @@ export class PageNodes {
           `ref "${ref}" points at a stale document: the page moved from ${publishedUrl} to ${url} `
           + 'since the snapshot; the action was NOT dispatched; run webpage_snapshot again',
           'BROWSER_STALE_REF',
-          { reason: 'stale_document' },
+          { reason: 'stale_document', dispatchState: 'not_dispatched' },
         )
       }
       // D-19：同一份文档，只有 query / hash 变了 —— **不作废纪元、也不拦这次动作**。
@@ -381,7 +386,7 @@ export class PageNodes {
         `the element for ref "${ref}" was removed from the document (the page may have re-rendered); `
         + 'the action was NOT dispatched; run webpage_snapshot again',
         'BROWSER_STALE_REF',
-        { reason: 'detached' },
+        { reason: 'detached', dispatchState: 'not_dispatched' },
       )
     }
   }
@@ -650,21 +655,13 @@ export class PageNodes {
   async elementClip(
     session: SessionState,
     ref: string,
-    backendNodeId: number,
     signal?: AbortSignal,
   ): Promise<ScreenshotClip> {
     const options = { signal, timeoutMs: this.config.commandTimeoutMs }
     // 与 mutate 同一口径：`DOM.resolveNode` 对已消失的节点是**抛错**，
     // 这里以前只兜「返回体缺 objectId」，同样会漏成裸协议错误。
-    const objectId = await this.resolveBackendNodeId(session, ref, backendNodeId, signal)
-    if (objectId === undefined) {
-      this.metrics.noteStale(session.targetId, 'node_gone')
-      throw new BrowserError(
-        'the observed element is no longer attached to the document; run webpage_snapshot again',
-        'BROWSER_STALE_REF',
-        { reason: 'node_gone' },
-      )
-    }
+    // 与输入前门共用节点连接、文档身份检查，避免 detached 节点落成裸布局错误。
+    const objectId = await this.resolveObjectId(session, ref, signal)
     try {
       const box = await session.connection.send<BoxModelResult>('DOM.getBoxModel', { objectId }, options)
       const quad = box.model?.border ?? box.model?.content
@@ -680,7 +677,10 @@ export class PageNodes {
       if (!(width > 0) || !(height > 0)) {
         throw new BrowserError('the element has a zero-sized layout box', 'BROWSER_PROTOCOL_ERROR')
       }
-      return { x, y, width, height, scale: 1 }
+      // DOM box 是视口坐标，截图 clip 是文档坐标；滚动后需要 CSS page 偏移。
+      const metrics = await session.connection.send<LayoutMetricsResult>('Page.getLayoutMetrics', {}, options)
+      const viewport = metrics.cssVisualViewport ?? metrics.cssLayoutViewport
+      return { x: x + (viewport?.pageX ?? 0), y: y + (viewport?.pageY ?? 0), width, height, scale: 1 }
     } finally {
       // 释放远端对象句柄，别让 V8 侧攒下一堆没人用的对象。
       await session.connection.send('DOM.releaseObject', { objectId }, { signal }).catch(() => undefined)

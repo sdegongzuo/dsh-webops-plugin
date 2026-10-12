@@ -158,7 +158,7 @@ function formatNoNavigation(value: MutationOutput): string {
  * ⚠️ 措辞是「本会话之外」而**不是「有人」**：事件这一层分不出「人工导航」和「页面自己的脚本
  * 换路由 / 重定向」，写死成「有人动过」就是插件替模型下了一个它证不了的结论。
  */
-export function formatPageChanged(changed: PageChangedOutput): string {
+export function formatPageChanged(changed: PageChangedOutput, currentSnapshotAttached = false): string {
   const parts: string[] = []
   if (changed.navigated > 0) {
     const where = changed.from === undefined || changed.to === undefined
@@ -181,24 +181,29 @@ export function formatPageChanged(changed: PageChangedOutput): string {
   // 「SINCE YOUR LAST SNAPSHOT」只陈述观察事实（页面在上次观察后变过），不暗示有另一个
   // 操作者 —— 2026-10-07 实测：Google 页面自发的 pushState/replaceState 也会触发这条，
   // 旧文案 "OUTSIDE THIS SESSION" 让模型以为存在第二个对话或人工在抢页面。
-  return `PAGE CHANGED SINCE YOUR LAST SNAPSHOT: this page ${parts.join('; ')}. `
+  return `${currentSnapshotAttached ? 'PAGE CHANGE OBSERVED IN THIS SNAPSHOT' : 'PAGE CHANGED SINCE YOUR LAST SNAPSHOT'}: this page ${parts.join('; ')}. `
     // ⚠️ 指令**按最强信号分级**（2026-09-20 实测修正）：只有真换文档（`navigated`）才配
     // 「重拍全页」。软导航/仅地址漂移时文档没换，refs 大概率仍有效，而重拍一张全页快照
-    // 实测是 ~10.7K 字符，`webpage_revalidate` 只有几百 —— 用便宜探测代替贵重拍。
+    // 实测是 ~10.7K 字符，`a regional observation` 只有几百 —— 用便宜探测代替贵重拍。
     // 旧文案对全部信号一律写 “run webpage_snapshot (full, not regional)”，与同一段里
     // `address_drift` 那半句刚说完的 “NOT invalidated” **自相矛盾**；Google 类页面每次交互
     // 换一批遥测令牌，于是模型被这句推着把同一页连拍 4 次（尺寸逐字节相同）。
     + (changed.navigated > 0
-      ? 'The document changed, so every ref you took before that snapshot is dead — run webpage_snapshot '
-        + '(full, not regional) before your next ref-based call.'
+      ? currentSnapshotAttached
+        ? 'The document changed, so refs from before this snapshot are dead; use refs from the attached full snapshot.'
+        : 'The document changed, so every ref you took before that snapshot is dead — run webpage_snapshot '
+          + '(full, not regional) before your next ref-based call.'
       : (changed.takeover_window ?? 0) > 0
-        ? 'Opening DevTools alone does not invalidate refs, but pressing the human take-over button does: '
-          + 'refs from before that take-over remain obsolete after handback. Use refs from a fresh full '
-          + 'webpage_snapshot after handback; never retry a pre-take-over ref.'
-        : 'The document itself did not change, so the refs you hold are probably still valid — verify the one you '
-        + 'are about to use with webpage_revalidate (one cheap call) instead of re-running the full snapshot. '
-        + 'Take a full snapshot only if that reports BROWSER_STALE_REF, or if the outline you hold no longer '
-        + 'matches what the page reports.')
+        ? currentSnapshotAttached
+          ? 'Refs from before a human take-over remain obsolete after handback; use refs from this attached full snapshot.'
+          : 'Opening DevTools alone does not invalidate refs, but pressing the human take-over button does: '
+            + 'refs from before that take-over remain obsolete after handback. Use refs from a fresh full '
+            + 'webpage_snapshot after handback; never retry a pre-take-over ref.'
+        : currentSnapshotAttached
+          ? 'Use refs from this attached full snapshot for the current page.'
+        : 'The document itself did not change, so refs were not invalidated. Inspect the relevant content if its '
+        + 'meaning may have changed. On BROWSER_STALE_REF use the attached fresh snapshot when present; '
+        + 'otherwise take a full snapshot and use new refs.')
 }
 
 /**
@@ -218,7 +223,7 @@ export function formatReboundRefs(refs: { ref: string; role: string; name: strin
 }
 
 /** mutation 结果的文本渲染：模型最需要知道的是「页面是否被导航、ref 是否还活着」。 */
-export function formatMutationOutput(value: MutationOutput): string {
+export function formatMutationOutput(value: MutationOutput, snapshotAttached = false): string {
   // 点弹窗链接后**必须**明确点名新标签页：真机报告里模型点开 t2 之后 6 分钟毫不知情，
   // 一直对着旧页面做判断，最后在窗口最小化时发 activate → 撞出整窗空白。
   // 放在最前面（紧跟标题行）是因为它是本次调用里唯一「模型不查就永远不知道」的事实。
@@ -241,8 +246,10 @@ export function formatMutationOutput(value: MutationOutput): string {
   // 而模型刚跳完页最想做的恰恰是「找刚才那个东西」—— 于是一次必红的 find 就这么发生了
   // （方案 §6 禁止清单第三条）。
   const navigation = value.navigated
-    ? '\nNAVIGATION DETECTED: every ref from earlier snapshots is now invalid — run webpage_snapshot again before any ref-based call. '
-      + 'The next call is webpage_snapshot, NOT webpage_find: the cached outline was dropped with the navigation, so find has nothing to search.'
+    ? snapshotAttached
+      ? '\nNAVIGATION DETECTED: refs from before this wait are invalid; use the new refs in the attached full snapshot.'
+      : '\nNAVIGATION DETECTED: every ref from earlier snapshots is now invalid — run webpage_snapshot again before any ref-based call. '
+        + 'The next call is webpage_snapshot, NOT webpage_find: the cached outline was dropped with the navigation, so find has nothing to search.'
     : '\nRefs from the latest snapshot are still valid unless the page changed on its own.'
   // 导航后标题为空要说清是「还没读到」而不是「没导航」：报告 S1 就是拿空标题当「页没就绪」，
   // 于是又等一次。provider 已经补过一小段等待，这里只是把残留情况讲明白。
@@ -262,10 +269,13 @@ export function formatMutationOutput(value: MutationOutput): string {
     ? ''
     : value.satisfied
       ? `\nThe awaited condition became true before the timeout.${waitSignals}`
-        + (!value.navigated && (value.page_changed?.navigated ?? 0) === 0
+        + (snapshotAttached
+          ? ' A full snapshot is attached with current refs; continue using them directly.'
+          : !value.navigated && (value.page_changed?.navigated ?? 0) === 0
           ? ' If needed, read updated text with webpage_snapshot(region_viewport=true) for a visible fragment, or region_ref covering the CURRENT reply; verify its tail before claiming a complete answer.'
           : '')
-      : `\nThe awaited condition did NOT become true before the timeout; decide whether to retry, re-snapshot, or give up.${waitSignals}`
+      : `\nThe awaited condition did NOT become true before the timeout; decide whether to continue waiting or give up.${waitSignals}`
+        + (snapshotAttached ? ' A full snapshot is attached with the current page and usable refs.' : '')
         // 项 2（2026-10-07）：ref 等待超时时，把元素此刻的三态之一讲破 ——
         // 「被隐藏」与「页面没移除它」是两回事，别把隐藏当成提交失败。
         + (value.ref_state === 'hidden'
@@ -285,7 +295,7 @@ export function formatMutationOutput(value: MutationOutput): string {
   const where = value.title.length > 0 ? `${value.url} — ${value.title}` : value.url
   // 紧挨着 `navigation` 那一段：两句话说的是同一件事的两个侧面（「我这次动作换页了没」与
   // 「页面在我之外换过没」），分开放进 notes 会让模型只读到其中一句（§6.3 的去重意图）。
-  const pageChanged = value.page_changed === undefined ? '' : `\n${formatPageChanged(value.page_changed)}`
+  const pageChanged = value.page_changed === undefined ? '' : `\n${formatPageChanged(value.page_changed, snapshotAttached)}`
   return [
     `${value.action} done on session_id=${value.session_id} (now at ${where}, ref epoch ${value.epoch}).`,
     opened,
@@ -313,7 +323,7 @@ export const SESSION_ID_PARAMETER = {
   description: 'Session id from webpage_open.',
 } as const
 
-/** 可操作 ref 的 schema，`refs` 数组与 `outline` 共用。 */
+/** ref 的 schema；anchor=true 只授予读取权限。 */
 export const REF_ITEM_SCHEMA = {
   type: 'object',
   additionalProperties: false,
@@ -321,6 +331,7 @@ export const REF_ITEM_SCHEMA = {
     ref: { type: 'string', required: true },
     role: { type: 'string', required: true },
     name: { type: 'string', required: true },
+    anchor: { type: 'boolean' },
   },
 } as const
 

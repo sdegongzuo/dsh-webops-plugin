@@ -93,10 +93,46 @@
  * @module dsh-webops-plugin/browser-electron/host
  */
 
-const { app, BaseWindow, BrowserWindow, WebContentsView, ipcMain, Menu } = require('electron')
+const { app, BaseWindow, BrowserWindow, WebContentsView, ipcMain, Menu, nativeImage } = require('electron')
 const { createActionOverlay } = require('./action-overlay.cjs')
 const net = require('node:net')
 const path = require('node:path')
+
+/** 后台页面暂时在活动页面下面参与合成；不切换活动标签、不抢焦点。 */
+async function captureScreenshot(entry, params, timeout) {
+  if (params.fromSurface === false) return entry.debugger.sendCommand('Page.captureScreenshot', params)
+  const background = entry.id !== activeTabId
+  if (background) {
+    shell.contentView.addChildView(entry.view, 0)
+    entry.view.setVisible(true)
+  }
+  try {
+    // 完整页面捕获会重配 surface；先等新帧就绪，避免沿用已释放的旧 surface。
+    await Promise.race([entry.view.webContents.capturePage(undefined, { stayHidden: false, stayAwake: true }), timeout])
+    if (params.clip === undefined) return await Promise.race([entry.debugger.sendCommand('Page.captureScreenshot', params), timeout])
+    // Electron 的后台 clip 路径可能不出帧，整页路径则可以完成；只在宿主内裁剪。
+    const zoom = await Promise.race([entry.debugger.sendCommand('Runtime.evaluate', {
+      expression: 'window.devicePixelRatio', returnByValue: true,
+    }), timeout])
+    const ratio = zoom.result?.value
+    if (!(typeof ratio === 'number' && Number.isFinite(ratio) && ratio > 0)) throw Error('元素截图无法确认设备缩放')
+    const { clip, ...fullParams } = params
+    const captured = await Promise.race([entry.debugger.sendCommand('Page.captureScreenshot', {
+      ...fullParams, captureBeyondViewport: true,
+    }), timeout])
+    const image = nativeImage.createFromBuffer(Buffer.from(captured.data, 'base64'), { scaleFactor: 1 })
+    const size = image.getSize()
+    const x = Math.max(0, Math.floor(clip.x * ratio))
+    const y = Math.max(0, Math.floor(clip.y * ratio))
+    const right = Math.min(size.width, Math.ceil((clip.x + clip.width) * ratio))
+    const bottom = Math.min(size.height, Math.ceil((clip.y + clip.height) * ratio))
+    if (!(right > x && bottom > y)) throw Error('元素截图范围在页面图像之外')
+    return { data: image.crop({ x, y, width: right - x, height: bottom - y }).toPNG().toString('base64') }
+  } finally {
+    // 用户可能在截图期间切标签，按当前活动状态恢复，不能覆盖用户选择。
+    if (background && !entry.view.webContents.isDestroyed()) entry.view.setVisible(entry.id === activeTabId)
+  }
+}
 
 // Windows 原生遮挡会把仍可操作的前台标签变成 hidden，真实输入准备门因此误拒。
 // 只关闭遮挡计算：后台标签准备、最小化拒写与人工控制门保持原有行为。
@@ -742,7 +778,10 @@ async function handle(command) {
         })
         let result
         try {
-          result = await Promise.race([entry.debugger.sendCommand(command.method, command.params ?? {}), timeout])
+          const operation = command.method === 'Page.captureScreenshot'
+            ? captureScreenshot(entry, command.params ?? {}, timeout)
+            : entry.debugger.sendCommand(command.method, command.params ?? {})
+          result = await Promise.race([operation, timeout])
         } finally {
           clearTimeout(timer)
         }

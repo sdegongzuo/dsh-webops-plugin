@@ -13,8 +13,9 @@ import {
 } from '../common-output.ts'
 import type { SnapshotCache } from '../snapshot-cache.ts'
 import { defineTool, callerOf, observeCall } from '../tool-runtime.ts'
-import { BROWSER_NAVIGATION_TIMEOUT_MS, BROWSER_OBSERVE_TIMEOUT_MS } from '../config.ts'
+import { BROWSER_NAVIGATION_TIMEOUT_MS, BROWSER_OBSERVE_TIMEOUT_MS, BROWSER_WAIT_TIMEOUT_MS } from '../config.ts'
 import type { BrowserMutationRequest } from '../../browser/index.ts'
+import { SNAPSHOT_OUTPUT_SCHEMA, formatSnapshotOutput, rememberBrowserSnapshot, type SnapshotOutput } from './observation.ts'
 
 /** 五个 mutation 工具共用的输出契约。 */
 const MUTATION_OUTPUT_SCHEMA = {
@@ -74,6 +75,7 @@ const WAIT_OUTPUT_SCHEMA = {
         network: { type: 'string', required: true },
       },
     },
+    snapshot: { ...SNAPSHOT_OUTPUT_SCHEMA, required: true },
   },
 } as const
 
@@ -100,7 +102,14 @@ function registerMutationTool(
     parameters: spec.parameters,
     output: {
       schema: spec.action === 'wait' ? WAIT_OUTPUT_SCHEMA : MUTATION_OUTPUT_SCHEMA,
-      render: (_args, value) => [{ type: 'text', text: formatMutationOutput(value as MutationOutput) }],
+      render: (_args, value) => {
+        const mutation = value as MutationOutput & { snapshot?: SnapshotOutput }
+        const hasSnapshot = mutation.snapshot !== undefined
+        const text = formatMutationOutput(mutation, hasSnapshot)
+        return [{ type: 'text', text: mutation.snapshot === undefined
+          ? text
+          : `${text}\n\nObservation after wait:\n${formatSnapshotOutput(mutation.snapshot, true)}` }]
+      },
     },
     timeoutMs: spec.timeoutMs,
     async execute(rawArgs, exec) {
@@ -109,17 +118,22 @@ function registerMutationTool(
       const result = await ctx.browser.mutate(spec.build(args, sessionId), callerOf(exec), exec.signal)
       // 导航过的会话，其 ref 与 find 缓存里的旧大纲一起作废（理由同 registerExecute）。
       if (result.navigated) cache.delete(result.sessionId)
+      const snapshot = result.snapshot === undefined ? undefined : rememberBrowserSnapshot(cache, result.snapshot)
+      if (spec.action === 'wait' && snapshot === undefined) {
+        throw new Error('webpage_wait completed without its required full snapshot')
+      }
       return {
         session_id: result.sessionId,
         action: result.action,
-        epoch: result.epoch,
-        url: result.url,
-        title: result.title,
+        epoch: result.snapshot?.epoch ?? result.epoch,
+        url: result.snapshot?.url ?? result.url,
+        title: result.snapshot?.title ?? result.title,
         navigated: result.navigated,
         ...result.pageChanged !== undefined ? { page_changed: toPageChangedOutput(result.pageChanged) } : {},
         ...result.satisfied !== undefined ? { satisfied: result.satisfied } : {},
         ...result.refState !== undefined ? { ref_state: result.refState } : {},
         ...result.signals !== undefined ? { signals: result.signals } : {},
+        ...snapshot !== undefined ? { snapshot } : {},
         ...result.openedTabs !== undefined ? { opened_tabs: result.openedTabs.map(toTabOutput) } : {},
         ...result.target !== undefined ? { target: result.target } : {},
         ...result.unconfirmed === true ? { unconfirmed: true } : {},
@@ -130,7 +144,7 @@ function registerMutationTool(
       'edit',
       (rawArgs as Record<string, unknown>)['ref'],
     ),
-  }))
+  }, cache))
 }
 
 /** 注册 `webpage_click` / `webpage_fill` / `webpage_press` / `webpage_scroll` / `webpage_wait`（可逐个关闭）。 */
@@ -143,18 +157,18 @@ export function registerMutations(
   // "from the latest webpage_snapshot" 是纯浪费（每个工具的 ref 参数描述里已经写了），
   // 而这段 ×4 是每一步都付的前缀成本（方案 §2.T-C2）。
   const STALE_NOTICE =
-    'Refs must come from the latest webpage_snapshot or a successful webpage_revalidate; an older epoch fails with BROWSER_STALE_REF — recover with webpage_revalidate, then a fresh snapshot if that fails.'
+    'BROWSER_STALE_REF: use the attached fresh snapshot when present; otherwise take a full snapshot. Never retry old refs.'
 
   if (enabled.click) registerMutationTool(ctx, cache, {
     name: 'webpage_click',
     action: 'click',
     description:
-      'Click an element by ref with real mouse events at its center (it is scrolled into view first). A click may navigate: navigated=true, and every earlier ref then becomes invalid. '
+      'Click a ref with real mouse events, scrolling it into view. navigated=true invalidates earlier refs. '
       // 点击 target=_blank / window.open 链接会在**同一个窗口**里开出一个新的受控标签页
       // （宿主的「弹窗转标签」通报异步收编）。2026-09-17 真机：点热搜第 5 条开出 t2，
       // 模型 6 分钟里毫不知情 —— 于是 provider 侧按会话差集把新标签页写进回执的
       // `opened_tabs`，这里只需告诉模型「看到这个字段就换到那个 session_id 去干活」。
-      + 'A link that opens a popup / target=_blank creates a NEW controlled tab in the SAME window, reported as `opened_tabs` with the new session_id(s) — switch to the tab that has your content instead of assuming a single tab. '
+      + 'Popup links return opened_tabs with new session_id(s) in the same window; switch to the content tab. '
       + STALE_NOTICE,
     parameters: {
       session_id: SESSION_ID_PARAMETER,
@@ -169,7 +183,7 @@ export function registerMutations(
     name: 'webpage_fill',
     action: 'fill',
     description:
-      'Fill an input or textarea by ref with value: it goes through the native setter and fires input + change, so framework-controlled fields (React etc.) notice it. A contenteditable element (rich-text editors such as Lexical / ProseMirror, used by AI chat pages) instead has its content selected and typed through the browser input pipeline, so beforeinput fires and the editor state — including its send button — updates. Any other non-editable element gets textContent replaced. '
+      'Replace text by ref. Inputs/textarea use the native setter plus input/change; contenteditable uses real browser text input (beforeinput), updating editor state. Other elements replace textContent. '
       + STALE_NOTICE,
     parameters: {
       session_id: SESSION_ID_PARAMETER,
@@ -185,12 +199,12 @@ export function registerMutations(
     name: 'webpage_press',
     action: 'press',
     description:
-      'Focus an element by ref and press a key. key is a named key (Enter, Tab, Escape, Backspace, Delete, ArrowUp/Down/Left/Right, Home, End, PageUp, PageDown, Space) or a single character. Only single ASCII characters can be produced this way — CJK and other composed text cannot go through key events, so use webpage_fill for text, especially into rich-text / contenteditable boxes. Pressing Enter on a form field may submit and navigate: navigated=true then means earlier refs are invalid. '
+      'Focus a ref and press a named key or one ASCII character. Use webpage_fill for CJK/composed text. Enter may submit; navigated=true invalidates earlier refs. '
       + STALE_NOTICE,
     parameters: {
       session_id: SESSION_ID_PARAMETER,
       ref: { type: 'string', required: true, description: 'Element ref to focus.' },
-      key: { type: 'string', required: true, description: 'Named key or a single character, e.g. Enter, Tab, ArrowDown, a.' },
+      key: { type: 'string', required: true, description: 'Enter, Tab, Escape, Backspace, Delete, ArrowUp/Down/Left/Right, Home, End, PageUp/Down, Space, or one ASCII character.' },
     },
     timeoutMs: BROWSER_NAVIGATION_TIMEOUT_MS,
     build: (args, sessionId) => ({ kind: 'press', sessionId, ref: args['ref'] as string, key: args['key'] as string }),
@@ -201,7 +215,7 @@ export function registerMutations(
     name: 'webpage_scroll',
     action: 'scroll',
     description:
-      'Scroll by dispatching a real mouse-wheel event. With ref the event lands at the centre of that element, so the scrollable container under it moves; WITHOUT ref it lands at the viewport centre and scrolls the page itself — use that on long pages and on pages with no actionable elements at all (it needs no snapshot). Give deltaX and/or deltaY in pixels (positive = right/down). '
+      'Real wheel scroll: with ref, target its container; WITHOUT ref, target the viewport centre (no snapshot needed). Give delta_x and/or delta_y in pixels; positive = right/down. '
       + STALE_NOTICE,
     parameters: {
       session_id: SESSION_ID_PARAMETER,
@@ -229,19 +243,19 @@ export function registerMutations(
     name: 'webpage_wait',
     action: 'wait',
     description:
-      'Wait for exactly ONE condition: time_ms (sleep), text (page contains it), ref (element leaves the document), or until="stable" (document complete + DOM/network quiet, with a grace period for busy networks). ref_state="hidden" refines the ref condition: succeed as soon as the element is still attached but no longer visible (a send button that gets hidden after submit) — the default removal condition would never fire for a merely hidden element. For generated replies prefer text from the CURRENT reply marking completion; one such wait confirms submission too. Avoid separate echo/completion waits, sleep/stable or snapshot-polling. Text/ref waits use the provider wait timeout; stable defaults to 30000ms, shortened by timeout_ms (1-30000). A stable timeout returns satisfied=false with readyState/dom/network signals. '
+      'Wait for exactly ONE condition: time_ms, text, ref, or until="stable" (document complete + DOM/network quiet, not reply completion). Prefer completion text from the CURRENT reply; one such wait confirms submission too. time_ms is a fixed delay and cannot combine with timeout_ms. For text/ref/stable, timeout_ms is the shared 1-30000 ms deadline (default 10000); normal timeout returns satisfied=false. On success or normal timeout, returns a full snapshot with usable refs. '
       + STALE_NOTICE,
     parameters: {
       session_id: SESSION_ID_PARAMETER,
       // 「exactly one」只在顶层描述里说一次。四个参数各写一遍是纯重复（方案 §2.T-C2）。
       time_ms: { type: 'integer', description: 'Plain wait duration in milliseconds (1-30000).' },
       text: { type: 'string', description: 'Wait until the page text contains this string.' },
-      ref: { type: 'string', description: 'Wait until this ref is gone from the document (or, with ref_state="hidden", until it is merely hidden).' },
-      ref_state: { type: 'string', description: 'Only with ref: "hidden" = succeed when the element is still in the document but no longer visible; default "removed" = succeed when it leaves the document.' },
-      until: { type: 'string', description: 'Set to "stable" to wait until the page is quiet; combine with timeout_ms for the deadline.' },
-      timeout_ms: { type: 'integer', description: 'Deadline in milliseconds (1-30000) for until=stable. Default 30000; ignored for other modes.' },
+      ref: { type: 'string', description: 'Element to wait for; see ref_state.' },
+      ref_state: { type: 'string', enum: ['removed', 'hidden'], description: 'Only with ref: removed (default) = detached; hidden = attached but invisible.' },
+      until: { type: 'string', enum: ['stable'], description: 'Page quietness; timeout_ms sets the shared wait deadline.' },
+      timeout_ms: { type: 'integer', description: 'Shared deadline for text/ref/stable (1-30000 ms; default 10000). Cannot combine with time_ms.' },
     },
-    timeoutMs: BROWSER_NAVIGATION_TIMEOUT_MS,
+    timeoutMs: BROWSER_WAIT_TIMEOUT_MS,
     build: (args, sessionId) => ({
       kind: 'wait',
       sessionId,

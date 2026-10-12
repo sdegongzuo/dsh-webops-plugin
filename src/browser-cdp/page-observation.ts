@@ -17,7 +17,6 @@ import {
   boundsToBox,
   boxesIntersect,
 } from './snapshot.ts'
-import type { RefTarget } from './refs.ts'
 import type {
   SessionState,
   AxTreeResult,
@@ -109,6 +108,8 @@ export class PageObservation {
     // 晚一步会把人工之间的导航记成快照状态，方案 §5.1.1）。「一起」不是「同一瞬间」：粗门是启发式不是事务。
     const meta = await this.navigation.readPageMeta(session.connection, signal)
     const loaderId = regional ? undefined : await this.navigation.readMainLoaderId(session, signal)
+    // 超时/取消后不可发布新纪元，否则模型收到失败却丢掉手上的 ref。
+    signal?.throwIfAborted()
     // 脏标记要在**建立新锚点之前**取：它说的是「上**一**次快照之后」，而下面这次 publish 就是新锚点。
     const changed = session.dirty.report()
     const publication = regional
@@ -208,14 +209,11 @@ export class PageObservation {
     let clip: ScreenshotClip | undefined
     if (ref !== undefined) {
       // 解析放在发命令之前：ref 失效时应当立刻失败，而不是先截一张错的图。
-      const target: RefTarget = session.refs.resolve(ref)
-      clip = await this.nodes.elementClip(session, ref, target.backendNodeId, signal)
+      clip = await this.nodes.elementClip(session, ref, signal)
     }
-    // `fromSurface: false` 从渲染器取帧而不是合成器表面：默认的表面路径在
-    // 「看不见的页面」上不出帧会**永久挂起** —— [V33] 的 show:false 窗口、以及
-    // 多标签场景里 setVisible(false) 的后台标签（2026-09-13 多会话演示实测，
-    // 30s 超时前不返回）。渲染器路径对前台/后台标签都强制出一帧，没有这个坑。
-    const params: Record<string, unknown> = { format: 'png', fromSurface: false }
+    // 视口走 renderer；元素裁剪与整页必须走 surface，否则 Chromium 忽略范围。
+    // Electron 后台 surface 的出帧由窗口宿主处理，不切活动标签。
+    const params: Record<string, unknown> = { format: 'png', fromSurface: clip !== undefined || fullPage }
     if (clip !== undefined) {
       params['clip'] = clip
       params['captureBeyondViewport'] = true

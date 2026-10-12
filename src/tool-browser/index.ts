@@ -9,7 +9,7 @@ import { registerOpen, registerNavigate, registerSnapshot, registerScreenshot } 
 import { registerTabs } from './tools/tabs.ts'
 import { registerMutations } from './tools/mutations.ts'
 import { registerConsole, registerNetwork, registerExecute } from './tools/diagnostics.ts'
-import { registerFind, registerLocate, registerRevalidate } from './tools/discovery.ts'
+import { registerFind, registerLocate } from './tools/discovery.ts'
 import { registerSystemPrompt } from './system-prompt.ts'
 import { noteLoaded } from '../debug.ts'
 
@@ -56,7 +56,6 @@ export function apply(ctx: Context, config: Config = {}): void {
     execute: config.execute ?? true,
     find: config.find ?? true,
     locate: config.locate ?? true,
-    revalidate: config.revalidate ?? true,
   }
 
   // find 的「最近一次 snapshot」缓存：本插件的 tool 层持有，provider 不掺和（零状态检索）。
@@ -77,7 +76,7 @@ export function apply(ctx: Context, config: Config = {}): void {
   if (enabled.open) registerOpen(ctx)
   if (enabled.navigate) registerNavigate(ctx, snapshotCache)
   if (enabled.snapshot) registerSnapshot(ctx, snapshotCache)
-  if (enabled.screenshot) registerScreenshot(ctx)
+  if (enabled.screenshot) registerScreenshot(ctx, snapshotCache)
   if (enabled.tabs) registerTabs(ctx, snapshotCache)
   if (enabled.click || enabled.fill || enabled.press || enabled.scroll || enabled.wait) {
     registerMutations(ctx, snapshotCache, { click: enabled.click, fill: enabled.fill, press: enabled.press, scroll: enabled.scroll, wait: enabled.wait })
@@ -86,8 +85,7 @@ export function apply(ctx: Context, config: Config = {}): void {
   if (enabled.network) registerNetwork(ctx)
   if (enabled.execute) registerExecute(ctx, snapshotCache)
   if (enabled.find) registerFind(ctx, snapshotCache)
-  if (enabled.locate) registerLocate(ctx)
-  if (enabled.revalidate) registerRevalidate(ctx)
+  if (enabled.locate) registerLocate(ctx, snapshotCache)
 
   // 全部注册完再报，这样这一行同时证明 browser 能力与 systemPrompt / attachments
   // 都已就绪 —— 任一个 inject 没解析成功，本函数根本不会被执行。

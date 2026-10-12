@@ -352,7 +352,7 @@ export class RefRegistry {
       throw new BrowserError(
         `ref "${ref}" belongs to an obsolete observation epoch (current epoch ${this.epoch}); run webpage_snapshot again and use the refs it returns`,
         'BROWSER_STALE_REF',
-        { reason: 'obsolete_epoch' },
+        { reason: 'obsolete_epoch', dispatchState: 'not_dispatched' },
       )
     }
     return target

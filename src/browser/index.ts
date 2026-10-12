@@ -24,6 +24,8 @@ import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import { BrowserError } from './types.ts'
 import { TabLeaseRegistry } from './lease.ts'
+import { attachRefRecovery } from './ref-recovery.ts'
+import { TabCallQueue } from './tab-call-queue.ts'
 import type { TabLeaseReleaseListener } from './lease.ts'
 import type {
   BrowserCaller,
@@ -122,6 +124,8 @@ export class BrowserRuntime extends Service {
   })
 
   private readonly providers = new Map<string, BrowserProvider>()
+  /** 同标签调用互斥，包含失败后的恢复观察；不同标签仍可并行。 */
+  private readonly tabCalls = new TabCallQueue()
   private readonly providerId: string | undefined
   /** 标签占用表。内存态，插件卸载即清空（不从历史回执恢复权限）。 */
   private readonly lease: TabLeaseRegistry
@@ -197,6 +201,18 @@ export class BrowserRuntime extends Service {
     this.lease.assertHeld(provider.id, sessionId, owner.ownerId)
   }
 
+  /** 当前 owner 交还后仍需全页重观察的标签；不泄露其他 owner 的标签。 */
+  reobserveRequired(ownerId: string): readonly string[] {
+    if (!ownerId) return []
+    const pending: string[] = []
+    for (const provider of this.providers.values()) {
+      for (const tab of this.lease.listHeld(provider.id, ownerId)) {
+        if (provider.needsReobserve?.(tab.targetId) === true) pending.push(tab.targetId)
+      }
+    }
+    return pending
+  }
+
   /**
    * 相同网址的空闲受控标签优先领取复用，否则新建并登记给调用方。
    *
@@ -235,7 +251,7 @@ export class BrowserRuntime extends Service {
               const snapshot = await provider.observe({ kind: 'snapshot', sessionId: tab.sessionId }, signal)
               if (snapshot.kind !== 'snapshot') throw new BrowserError('reused tab did not return a snapshot', 'BROWSER_PROTOCOL_ERROR')
               return { id: tab.sessionId, url: snapshot.url, title: snapshot.title, epoch: snapshot.epoch }
-            })
+            }, signal)
           } catch (error) {
             // 失败只退还本次领取的租约，不覆盖期间发生的释放或移交。
             // 调用计数已在 finally 归零；无 await，核对与退还之间不会换主。
@@ -269,7 +285,7 @@ export class BrowserRuntime extends Service {
     caller: BrowserCaller | undefined,
     signal?: AbortSignal,
   ): Promise<BrowserSession> {
-    return this.withLease(request.sessionId, caller, (provider) => provider.navigate(request, signal))
+    return this.withLease(request.sessionId, caller, (provider) => provider.navigate(request, signal), signal)
   }
 
   /**
@@ -283,7 +299,8 @@ export class BrowserRuntime extends Service {
     caller: BrowserCaller | undefined,
     signal?: AbortSignal,
   ): Promise<BrowserObservation> {
-    return this.withLease(request.sessionId, caller, (provider) => provider.observe(request, signal))
+    return this.withLease(request.sessionId, caller, (provider) => provider.observe(request, signal), signal,
+      request.kind === 'screenshot' ? request.ref !== undefined : request.region?.ref !== undefined)
   }
 
   /**
@@ -385,8 +402,14 @@ export class BrowserRuntime extends Service {
   ): Promise<BrowserMutationResult> {
     return this.withLease(request.sessionId, caller, async (provider, ownerId) => {
       const result = await provider.mutate(request, signal)
-      return this.filterOpenedTabs(provider, ownerId, result)
-    })
+      const filtered = this.filterOpenedTabs(provider, ownerId, result)
+      if (request.kind !== 'wait') return filtered
+      const snapshot = await provider.observe({ kind: 'snapshot', sessionId: request.sessionId }, signal)
+      if (snapshot.kind !== 'snapshot') {
+        throw new BrowserError(`webpage_wait received a "${snapshot.kind}" observation`, 'BROWSER_PROTOCOL_ERROR')
+      }
+      return { ...filtered, epoch: snapshot.epoch, url: snapshot.url, title: snapshot.title, snapshot }
+    }, signal, true)
   }
 
   /**
@@ -428,7 +451,7 @@ export class BrowserRuntime extends Service {
     caller: BrowserCaller | undefined,
     signal?: AbortSignal,
   ): Promise<BrowserConsoleResult> {
-    return this.withLease(request.sessionId, caller, (provider) => provider.console(request, signal))
+    return this.withLease(request.sessionId, caller, (provider) => provider.console(request, signal), signal)
   }
 
   /**
@@ -442,7 +465,7 @@ export class BrowserRuntime extends Service {
     caller: BrowserCaller | undefined,
     signal?: AbortSignal,
   ): Promise<BrowserNetworkResult> {
-    return this.withLease(request.sessionId, caller, (provider) => provider.network(request, signal))
+    return this.withLease(request.sessionId, caller, (provider) => provider.network(request, signal), signal)
   }
 
   /**
@@ -456,7 +479,7 @@ export class BrowserRuntime extends Service {
     caller: BrowserCaller | undefined,
     signal?: AbortSignal,
   ): Promise<BrowserExecuteResult> {
-    return this.withLease(request.sessionId, caller, (provider) => provider.execute(request, signal))
+    return this.withLease(request.sessionId, caller, (provider) => provider.execute(request, signal), signal)
   }
 
   /**
@@ -470,7 +493,7 @@ export class BrowserRuntime extends Service {
     caller: BrowserCaller | undefined,
     signal?: AbortSignal,
   ): Promise<BrowserLocateResult> {
-    return this.withLease(request.sessionId, caller, (provider) => provider.locate(request, signal))
+    return this.withLease(request.sessionId, caller, (provider) => provider.locate(request, signal), signal, true)
   }
 
   /**
@@ -484,7 +507,7 @@ export class BrowserRuntime extends Service {
     caller: BrowserCaller | undefined,
     signal?: AbortSignal,
   ): Promise<BrowserRevalidateResult> {
-    return this.withLease(request.sessionId, caller, (provider) => provider.revalidate(request, signal))
+    return this.withLease(request.sessionId, caller, (provider) => provider.revalidate(request, signal), signal)
   }
 
   /**
@@ -555,14 +578,29 @@ export class BrowserRuntime extends Service {
     sessionId: string,
     caller: BrowserCaller | undefined,
     run: (provider: BrowserProvider, ownerId: string) => Promise<T>,
+    signal?: AbortSignal,
+    recoverRefs = false,
   ): Promise<T> {
     const owner = this.requireCaller(caller)
     const provider = this.resolve()
+    const key = `${provider.id}:${sessionId}`
+    // 排队也计入本租约的在途调用，避免候补跨越释放后同 owner 重新领取的代次。
     const generation = this.lease.beginCall(provider.id, sessionId, owner.ownerId)
     try {
-      // 派发前的二次核对：归属在这一刻变了（另一个对话刚领走 / 刚释放）就不能动页面。
-      this.lease.assertHeld(provider.id, sessionId, owner.ownerId)
-      return await run(provider, owner.ownerId)
+      const controlGeneration = provider.refRecoveryState?.(sessionId)
+      const acquisition = this.tabCalls.acquire(key, signal)
+      const release = typeof acquisition === 'function' ? acquisition : await acquisition
+      try {
+        // 排队后重新核对归属；候补期间可能已释放或移交。
+        this.lease.assertHeld(provider.id, sessionId, owner.ownerId)
+        return await run(provider, owner.ownerId)
+      } catch (error) {
+        if (recoverRefs) await attachRefRecovery(error, provider, sessionId, controlGeneration,
+          () => this.lease.assertHeld(provider.id, sessionId, owner.ownerId), signal)
+        throw error
+      } finally {
+        release()
+      }
     } finally {
       this.lease.endCall(provider.id, sessionId, generation)
     }
