@@ -222,12 +222,15 @@ export class TabLeaseRegistry {
    * @returns 是否登记成功。
    */
   adoptChild(providerId: string, childTargetId: string, parentTargetId: string): boolean {
+    this.expire()
     const parentKey = leaseKey(providerId, parentTargetId)
     const parent = this.entries.get(parentKey)
     if (parent === undefined) return false
     // 父自己没有主人时（available）也不留空子：子照样是空闲的，但必须**留记录**，
     // 否则它连空闲清单都进不去，成了谁也拿不到的僵尸标签。
     const key = leaseKey(providerId, childTargetId)
+    // created 已登记的家族在 debugger-ready 后再次通报；不重置代次和在途调用。
+    if (this.entries.get(key)?.parentKey === parentKey) return true
     this.entries.set(key, {
       state: parent.state,
       ownerId: parent.ownerId,

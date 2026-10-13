@@ -8,7 +8,7 @@
 
 import { describe, expect, it, vi } from 'vitest'
 import Module from 'node:module'
-import { readFileSync } from 'node:fs'
+import { readdirSync, readFileSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { fileURLToPath } from 'node:url'
 import type { ChildProcess } from 'node:child_process'
@@ -18,6 +18,7 @@ import { BridgeError, ElectronWindowBridge } from './bridge.ts'
 import type { BridgeControl, BridgeDevTools, BridgeTab, BridgeTabBar, ControlHolder, ControlListener, EventListener, TabHostChannel, TakeoverListener, TabOpenedListener } from './bridge.ts'
 import { parseAnnouncedAddress, resolveHostLaunch } from './bridge.ts'
 import { formatHostOutput } from './bridge.ts'
+import type { InputRevoked, InputTicket } from './bridge.ts'
 import { ElectronBrowserProvider } from './provider.ts'
 import { WindowCdpSocket } from './socket.ts'
 import { ElectronWindowTransport, tabHandle, tabIdFromHandle } from './transport.ts'
@@ -54,7 +55,7 @@ const { normalizeAddress, handleNav, shouldBlockPageInput, shouldBlockEditAction
 
 /** 一个可编程的假窗口宿主（一个壳窗口、多个标签页）。 */
 class FakeHost implements TabHostChannel {
-  readonly commands: { tabId: string; method: string; params: Record<string, unknown> }[] = []
+  readonly commands: { tabId: string; method: string; params: Record<string, unknown>; ticket?: unknown }[] = []
   readonly closedTabs: string[] = []
   readonly opened: string[] = []
   readonly activated: string[] = []
@@ -65,7 +66,14 @@ class FakeHost implements TabHostChannel {
   private readonly eventListeners = new Map<string, Set<EventListener>>()
   private readonly takeoverListeners = new Set<TakeoverListener>()
   private readonly tabOpenedListeners = new Set<TabOpenedListener>()
+  private readonly inputRevokedListeners = new Set<(revoked: InputRevoked) => void>()
   private readonly closeListeners = new Set<() => void>()
+  /** 输入权申请的应答；undefined = 拒（排队超时 / 取消）。 */
+  inputTicket: InputTicket | undefined = {
+    ticketId: 'tk-1', requestId: 'r1', tabId: 't1', epoch: 0, controlEpoch: 0, selectEpoch: 0, acquiredAt: 0,
+  }
+  readonly releasedTickets: string[] = []
+  readonly cancelledInputs: string[] = []
 
   open(url: string): Promise<BridgeTab> {
     if (this.isClosed) return Promise.reject(new Error('the window host channel closed'))
@@ -85,8 +93,8 @@ class FakeHost implements TabHostChannel {
     })))
   }
 
-  command(tabId: string, method: string, params: Record<string, unknown>): Promise<unknown> {
-    this.commands.push({ tabId, method, params })
+  command(tabId: string, method: string, params: Record<string, unknown>, ticket?: unknown): Promise<unknown> {
+    this.commands.push({ tabId, method, params, ...(ticket === undefined ? {} : { ticket }) })
     const result = this.respond(tabId, method, params)
     return result instanceof Error ? Promise.reject(result) : Promise.resolve(result)
   }
@@ -174,6 +182,33 @@ class FakeHost implements TabHostChannel {
   onTabOpened(listener: TabOpenedListener): () => void {
     this.tabOpenedListeners.add(listener)
     return () => { this.tabOpenedListeners.delete(listener) }
+  }
+
+  acquireInput(request: { tabId: string; requestId: string; budgetMs: number }): Promise<InputTicket | undefined> {
+    if (this.inputTicket === undefined) return Promise.resolve(undefined)
+    return Promise.resolve({ ...this.inputTicket, tabId: request.tabId, requestId: request.requestId })
+  }
+
+  releaseInput(ticketId: string): Promise<void> {
+    this.releasedTickets.push(ticketId)
+    return Promise.resolve()
+  }
+
+  cancelInput(ticketIdOrRequestId: string): Promise<{ status: string; stage: string }> {
+    this.cancelledInputs.push(ticketIdOrRequestId)
+    return Promise.resolve({ status: 'cancelled', stage: 'preparing' })
+  }
+
+  resolveBlocked(ticketId: string, _evidence: string): Promise<boolean> {
+    this.resolvedBlocked.push(ticketId)
+    return Promise.resolve(true)
+  }
+
+  readonly resolvedBlocked: string[] = []
+
+  onInputRevoked(listener: (revoked: InputRevoked) => void): () => void {
+    this.inputRevokedListeners.add(listener)
+    return () => { this.inputRevokedListeners.delete(listener) }
   }
 
   onClose(listener: () => void): () => void {
@@ -1110,5 +1145,27 @@ describe('宿主启动失败的现场回执（2026-09-24 补：CI 上整 20s 超
     const source = readFileSync(fileURLToPath(new URL('./host.cjs', import.meta.url)), 'utf8')
     expect(source).toContain("announce('host-loaded')")
     expect(source).toContain("announce('host-ready')")
+  })
+})
+
+describe('打包资产清单（copy-assets 与 src 的一致性）', () => {
+  /**
+   * 漏搬一个 .cjs = 打包态 host.cjs require 不到兄弟模块，插件整个不加载
+   * （全部 webpage_* 消失，而单测全绿——构建脚本在 vitest include 之外）。
+   * 这条断言就是防这个：新增运行时资产忘了登记清单，这里立刻红。
+   */
+  it('browser-electron 下每个运行时 .cjs/.html 都在 copy-assets 清单里', () => {
+    const raw = readFileSync(
+      fileURLToPath(new URL('../../scripts/copy-assets.mjs', import.meta.url)),
+      'utf8',
+    )
+    // 先剥行注释再匹配 —— 否则注释掉的条目会把守门骗过去（反向验证实测）。
+    const script = raw.replace(/^\s*\/\/.*$/gm, '')
+    const listed = [...script.matchAll(/'src\/browser-electron\/([^']+)'/g)].map(match => match[1])
+    const here = fileURLToPath(new URL('.', import.meta.url))
+    const runtime = readdirSync(here)
+      .filter(name => (name.endsWith('.cjs') || name.endsWith('.html')) && !name.includes('.test.'))
+    const missing = runtime.filter(name => !listed.includes(name))
+    expect(missing).toEqual([])
   })
 })

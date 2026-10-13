@@ -17,8 +17,8 @@
  * @module dsh-webops-plugin/browser-electron/transport
  */
 
-import { CdpConnection, type CdpTarget, type CdpTransport, type CdpVersion } from '../browser-cdp/protocol.ts'
-import { ElectronWindowBridge, type BridgeControl, type BridgeDevTools, type BridgeOptions, type BridgeTabBar, type TabHostChannel } from './bridge.ts'
+import { CdpConnection, type CdpTarget, type CdpTransport, type CdpVersion, type CdpWindowInputCapability, type CdpWindowTicket } from '../browser-cdp/protocol.ts'
+import { ElectronWindowBridge, type BridgeControl, type BridgeDevTools, type BridgeOptions, type BridgeTabBar, type TabHostChannel, type TabCreatedListener } from './bridge.ts'
 import type { ControlHolder, ControlListener, TakeoverListener, TabOpenedListener } from './bridge.ts'
 import { DEFAULT_BRIDGE_COMMAND_TIMEOUT_MS } from './bridge.ts'
 import { WindowCdpSocket } from './socket.ts'
@@ -96,9 +96,9 @@ export class ElectronWindowTransport implements CdpTransport {
   }
 
   /** @inheritdoc */
-  async newTab(url: string): Promise<CdpTarget> {
+  async newTab(url: string, signal?: AbortSignal, ticket?: CdpWindowTicket): Promise<CdpTarget> {
     const bridge = await this.requireBridge()
-    const tab = await bridge.open(url, { keepAlive: this.keepAlive })
+    const tab = await bridge.open(url, { keepAlive: this.keepAlive, ...(ticket === undefined ? {} : { ticket }) })
     return {
       id: tab.id,
       type: 'page',
@@ -126,11 +126,46 @@ export class ElectronWindowTransport implements CdpTransport {
   /**
    * 把某个标签页切到前台。
    * @param targetId - 标签 id。
+   * @param ticket - 窗口输入票；agent 引起的激活必须带（宿主验票后才切）。
    */
-  async activateTarget(targetId: string): Promise<void> {
+  async activateTarget(targetId: string, signal?: AbortSignal, ticket?: CdpWindowTicket): Promise<void> {
     const bridge = await this.requireBridge()
-    await bridge.activate(targetId)
+    await bridge.activate(targetId, ticket)
   }
+
+  /**
+   * 窗口输入权能力（方案 §4）：本传输层控制的是**一个真实共享窗口**，所以由宿主
+   * 调度器当权威。外部 Chrome 的传输层没有这个成员 —— provider 据此回退。
+   *
+   * 每次访问返回同一个委托对象（内部按需起桥）；订阅会启动宿主，与其它能力一致。
+   */
+  get windowInput(): CdpWindowInputCapability {
+    return this.windowInputCapability ??= {
+      acquire: async (request) => {
+        const bridge = await this.requireBridge()
+        const ticket = await bridge.acquireInput(request)
+        return ticket === undefined ? undefined : { ...ticket }
+      },
+      release: async (ticketId) => {
+        const bridge = await this.requireBridge()
+        await bridge.releaseInput(ticketId)
+      },
+      cancel: async (ticketIdOrRequestId) => {
+        const bridge = await this.requireBridge()
+        return bridge.cancelInput(ticketIdOrRequestId)
+      },
+      resolveBlocked: async (ticketId, evidence) => {
+        const bridge = await this.requireBridge()
+        return bridge.resolveBlocked(ticketId, evidence)
+      },
+      onRevoked: async (listener) => {
+        const bridge = await this.requireBridge()
+        return bridge.onInputRevoked(listener)
+      },
+    }
+  }
+
+  private windowInputCapability: CdpWindowInputCapability | undefined
 
   /**
    * 切换活动标签的开发者工具，等宿主把状态落定后返回。
@@ -198,6 +233,11 @@ export class ElectronWindowTransport implements CdpTransport {
   async onTabOpened(listener: TabOpenedListener): Promise<() => void> {
     const bridge = await this.requireBridge()
     return bridge.onTabOpened(listener)
+  }
+
+  async onTabCreated(listener: TabCreatedListener): Promise<() => void> {
+    const bridge = await this.requireBridge()
+    return bridge.onTabCreated?.(listener) ?? (() => {})
   }
 
   /**

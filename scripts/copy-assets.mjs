@@ -24,6 +24,9 @@ const ASSETS = [
   ['src/browser-electron/host.cjs', 'lib/browser-electron/host.cjs'],
   ['src/browser-electron/tabbar.html', 'lib/browser-electron/tabbar.html'],
   ['src/browser-electron/tabbar-preload.cjs', 'lib/browser-electron/tabbar-preload.cjs'],
+  // 窗口输入权调度器（方案 §4）：host.cjs 的兄弟模块，漏搬 = 打包态 require 失败、
+  // 插件整个不加载（全部 webpage_* 消失）。覆盖由 index.test.ts 的清单断言守着。
+  ['src/browser-electron/window-input-queue.cjs', 'lib/browser-electron/window-input-queue.cjs'],
 ]
 
 for (const [from, to] of ASSETS) {

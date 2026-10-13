@@ -18,6 +18,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { noteLoaded } from '../debug.ts'
 import { connectLoopback, loopbackCandidates } from '../loopback.ts'
+import { BrowserError } from '../browser/types.ts'
 
 /**
  * 宿主脚本路径的传递变量（打包应用模式专用）。
@@ -197,6 +198,49 @@ export type ControlHolder = 'agent' | 'human'
 /** 控制权变化的监听器；`tabId` 就是 provider 的会话 id。 */
 export type ControlListener = (tabId: string, holder: ControlHolder) => void
 
+/**
+ * 窗口输入票（方案 §4）：宿主调度器颁发的内部凭证。
+ *
+ * 绑定宿主启动代次（`epoch`）、内部控制代次（`controlEpoch`）、人工选择代次
+ * （`selectEpoch`）与目标标签。**不可复用**：迟到旧票在宿主最终投递边界被拒。
+ * 它是内部调度凭证，不替代 BrowserRuntime 的调用方与租约校验。
+ *
+ * **镜像类型**：与父进程侧 `CdpWindowTicket`（`browser-cdp/protocol.ts`）同结构 ——
+ * 父 / 子进程各自编译、经 socket 传 JSON；字段增删必须同步改。
+ */
+export interface InputTicket {
+  readonly ticketId: string
+  readonly requestId: string
+  readonly tabId: string
+  readonly epoch: number
+  readonly controlEpoch: number
+  readonly selectEpoch: number
+  readonly acquiredAt: number
+}
+
+/** 宿主通知的「输入权被撤销」（人工接管 / 控制代次变化 / 窗口销毁 / dispose）。
+ *
+ * **镜像类型**：与父进程侧 `CdpWindowInputRevoked`（`browser-cdp/protocol.ts`）同结构，
+ * 经 socket 传 JSON；`stage` / `dispatched` 的「已派发或状态未知」事实必须一起带到
+ * 父进程，回执据此说话。 */
+export interface InputRevoked {
+  readonly ticketId: string
+  readonly tabId: string
+  /** 撤销时票据所处的阶段（`preparing` = 未派发；`dispatching` = 已派发、结果未知）。 */
+  readonly stage: string
+  /** 撤销时是否已有输入命令到达宿主。true 时父进程不得自动重放。 */
+  readonly dispatched: boolean
+  readonly reason: string
+}
+
+/**
+ * blocked 解除证据（方案 §4）：旧输入已 settle，或承载端点已销毁。
+ *
+ * **镜像类型**：与父进程侧 `CdpWindowBlockedEvidence`（`browser-cdp/protocol.ts`）
+ * 同值域，经 socket 传字符串；两边必须同时改。
+ */
+export type BlockedEvidence = 'settled' | 'endpoint-destroyed'
+
 /** 宿主回报的控制权切换结果，见 {@link TabHostChannel.setControl}。 */
 export interface BridgeControl {
   /** 被切换的标签 id。 */
@@ -222,6 +266,8 @@ export type TabOpenedListener = (
   openerTabId?: string,
 ) => void
 
+export type TabCreatedListener = (tabId: string, openerTabId: string) => boolean
+
 /**
  * 窗口宿主通道的公共面。
  *
@@ -243,10 +289,32 @@ export interface TabHostChannel {
    * 不必靠人眼看屏幕。
    */
   bar: () => Promise<BridgeTabBar>
-  /** 发一条 CDP 命令。 */
-  command: (tabId: string, method: string, params: Record<string, unknown>) => Promise<unknown>
-  /** 把某个标签页切到前台。 */
-  activate: (tabId: string) => Promise<void>
+  /** 发一条 CDP 命令。`ticket` 是窗口输入票（真实输入 / bringToFront 必带）。 */
+  command: (tabId: string, method: string, params: Record<string, unknown>, ticket?: InputTicket) => Promise<unknown>
+  /** 把某个标签页切到前台。`ticket` 是窗口输入票（agent 引起的激活必带）。 */
+  activate: (tabId: string, ticket?: InputTicket) => Promise<void>
+  /**
+   * 申请窗口输入权（方案 §4）。
+   *
+   * @param request - 目标标签、父进程生成的 requestId 与排队预算（毫秒）。
+   *   `tabId` 为空串 = 窗口级申请（`open` 的展示段，标签还没建）。
+   * @returns 成功拿到票；`undefined` = 被拒。宿主 `input-denied` 的 reason 取值
+   *   `timeout` / `cancelled` / `unknown-tab`，本层收敛为 `undefined`（调用方
+   *   按超时口径回执：等待输入权阶段、动作未派发、候补已移除）。
+   */
+  acquireInput: (request: {
+    readonly tabId: string
+    readonly requestId: string
+    readonly budgetMs: number
+  }) => Promise<InputTicket | undefined>
+  /** 释放输入权。幂等；迟到旧票由宿主拒绝。 */
+  releaseInput: (ticketId: string) => Promise<void>
+  /** 取消候补（requestId）或当前票（ticketId）。 */
+  cancelInput: (ticketIdOrRequestId: string) => Promise<{ status: string; stage: string }>
+  /** 带证据解除 blocked；证据不合法时宿主拒绝。 */
+  resolveBlocked: (ticketId: string, evidence: BlockedEvidence) => Promise<boolean>
+  /** 订阅「输入权被撤销」通知（人工接管 / 窗口销毁等）。 */
+  onInputRevoked: (listener: (revoked: InputRevoked) => void) => () => void
   /**
    * 切换活动标签的开发者工具。
    *
@@ -286,6 +354,7 @@ export interface TabHostChannel {
   onControl: (listener: ControlListener) => () => void
   /** 订阅「宿主自己开的新标签」通报（页面弹窗 / 标签条「+」）。 */
   onTabOpened: (listener: TabOpenedListener) => () => void
+  onTabCreated?: (listener: TabCreatedListener) => () => void
   /** 订阅通道断开。 */
   onClose: (listener: () => void) => () => void
 }
@@ -306,6 +375,8 @@ export class ElectronWindowBridge implements TabHostChannel {
   private readonly takeoverListeners = new Set<TakeoverListener>()
   private readonly controlListeners = new Set<ControlListener>()
   private readonly tabOpenedListeners = new Set<TabOpenedListener>()
+  private readonly tabCreatedListeners = new Set<TabCreatedListener>()
+  private readonly inputRevokedListeners = new Set<(revoked: InputRevoked) => void>()
   private readonly closeListeners = new Set<() => void>()
   private readonly windowSize: { readonly width: number; readonly height: number } | undefined
   private readonly keepAlive: boolean
@@ -489,25 +560,43 @@ export class ElectronWindowBridge implements TabHostChannel {
     return () => this.tabOpenedListeners.delete(listener)
   }
 
+  onTabCreated(listener: TabCreatedListener): () => void {
+    this.tabCreatedListeners.add(listener)
+    return () => { this.tabCreatedListeners.delete(listener) }
+  }
+
+  /** @inheritdoc */
+  onInputRevoked(listener: (revoked: InputRevoked) => void): () => void {
+    this.inputRevokedListeners.add(listener)
+    return () => this.inputRevokedListeners.delete(listener)
+  }
+
   /**
    * 让宿主开一个标签页（同一个壳窗口里）。
    *
    * @param url - 初始地址。
-   * @param options - `keepAlive`：父进程断连后窗口仍然留在屏幕上。
-   * @returns 新标签摘要。
+   * @param options - `keepAlive`：父进程断连后窗口仍然留在屏幕上；`foreground`：
+   *   是否进入前台（`false` = 只建后台标签）；`ticket`：覆盖展示段的输入票。
+   * @returns 新标签摘要；`active` 反映展示段是否真的落了前台。
    */
-  async open(url: string, options: { readonly keepAlive?: boolean } = {}): Promise<BridgeTab> {
+  async open(
+    url: string,
+    options: { readonly keepAlive?: boolean; readonly foreground?: boolean; readonly ticket?: InputTicket } = {},
+  ): Promise<BridgeTab> {
     const response = await this.request({
       op: 'open',
       url,
       ...this.windowSize === undefined ? {} : { size: this.windowSize },
       ...this.keepAlive || options.keepAlive === true ? { keepAlive: true } : {},
+      ...options.foreground === false ? { foreground: false } : {},
+      ...options.ticket === undefined ? {} : { ticket: options.ticket },
     })
     return {
       id: String(response['tabId']),
       url: typeof response['url'] === 'string' ? response['url'] : url,
       title: typeof response['title'] === 'string' ? response['title'] : '',
-      active: true,
+      // 宿主明确回报了前台状态才用它；缺字段按老行为（开出来就在前台）。
+      active: response['foreground'] === false ? false : true,
     }
   }
 
@@ -548,19 +637,87 @@ export class ElectronWindowBridge implements TabHostChannel {
    * @param tabId - 标签 id。
    * @param method - CDP 方法名。
    * @param params - 方法参数。
+   * @param ticket - 窗口输入票。`Input.*` / `Page.bringToFront` 必带（宿主验票后
+   *   才派发）；其余命令带上无害（宿主忽略）。
    * @returns 该方法的 `result`。
    */
-  async command(tabId: string, method: string, params: Record<string, unknown>): Promise<unknown> {
-    const response = await this.request({ op: 'cdp', tabId, method, params })
+  async command(
+    tabId: string,
+    method: string,
+    params: Record<string, unknown>,
+    ticket?: InputTicket,
+  ): Promise<unknown> {
+    const response = await this.request({
+      op: 'cdp',
+      tabId,
+      method,
+      params,
+      ...ticket === undefined ? {} : { ticket },
+    })
     return response['result']
   }
 
   /**
    * 把某个标签页切到前台。
    * @param tabId - 标签 id。
+   * @param ticket - 窗口输入票。agent 引起的激活必须带（宿主验票后才切）。
    */
-  async activate(tabId: string): Promise<void> {
-    await this.request({ op: 'activate', tabId })
+  async activate(tabId: string, ticket?: InputTicket): Promise<void> {
+    await this.request({
+      op: 'activate',
+      tabId,
+      ...ticket === undefined ? {} : { ticket },
+    })
+  }
+
+  /** @inheritdoc */
+  async acquireInput(request: {
+    readonly tabId: string
+    readonly requestId: string
+    readonly budgetMs: number
+  }): Promise<InputTicket | undefined> {
+    const response = await this.request({
+      op: 'acquire-input',
+      tabId: request.tabId,
+      requestId: request.requestId,
+      budgetMs: request.budgetMs,
+    })
+    const ticket = response['ticket']
+    if (response['reason'] === 'human-foreground') {
+      throw new BrowserError('窗口前台由人工使用。等待输入权已到期，动作未派发，候补已移除；请等待人工交还或主动切到 agent 标签，不要自动切走人工页面。', 'BROWSER_WINDOW_HUMAN_FOREGROUND', { dispatchState: 'not_dispatched' })
+    }
+    if (ticket === undefined || ticket === null || typeof ticket !== 'object') return undefined
+    const record = ticket as Record<string, unknown>
+    if (typeof record['ticketId'] !== 'string' || typeof record['tabId'] !== 'string') return undefined
+    return {
+      ticketId: record['ticketId'],
+      requestId: typeof record['requestId'] === 'string' ? record['requestId'] : request.requestId,
+      tabId: record['tabId'],
+      epoch: typeof record['epoch'] === 'number' ? record['epoch'] : 0,
+      controlEpoch: typeof record['controlEpoch'] === 'number' ? record['controlEpoch'] : 0,
+      selectEpoch: typeof record['selectEpoch'] === 'number' ? record['selectEpoch'] : 0,
+      acquiredAt: typeof record['acquiredAt'] === 'number' ? record['acquiredAt'] : 0,
+    }
+  }
+
+  /** @inheritdoc */
+  async releaseInput(ticketId: string): Promise<void> {
+    await this.request({ op: 'release-input', ticketId })
+  }
+
+  /** @inheritdoc */
+  async cancelInput(ticketIdOrRequestId: string): Promise<{ status: string; stage: string }> {
+    const response = await this.request({ op: 'cancel-input', ticketId: ticketIdOrRequestId })
+    return {
+      status: typeof response['status'] === 'string' ? response['status'] : 'unknown',
+      stage: typeof response['stage'] === 'string' ? response['stage'] : 'unknown',
+    }
+  }
+
+  /** @inheritdoc */
+  async resolveBlocked(ticketId: string, evidence: BlockedEvidence): Promise<boolean> {
+    const response = await this.request({ op: 'resolve-blocked', ticketId, evidence })
+    return response['ok'] === true
   }
 
   /**
@@ -708,6 +865,28 @@ export class ElectronWindowBridge implements TabHostChannel {
       return
     }
 
+    if (type === 'input-revoked') {
+      // 窗口输入权被撤销（方案 §4）：人工接管 / 控制代次变化 / 窗口销毁。
+      // 同样是私有编排消息，**不进 CDP 事件流**。`dispatched=true` 时父进程必须
+      // 按「已派发、结果未知」处理，不得自动重放。
+      const revoked: InputRevoked = {
+        ticketId: String(message['ticketId']),
+        tabId: String(message['tabId']),
+        stage: typeof message['stage'] === 'string' ? message['stage'] : 'unknown',
+        dispatched: message['dispatched'] === true,
+        reason: typeof message['reason'] === 'string' ? message['reason'] : 'unknown',
+      }
+      for (const listener of [...this.inputRevokedListeners]) listener(revoked)
+      return
+    }
+
+    if (type === 'created') {
+      const tabId = String(message['tabId']), openerTabId = String(message['openerTabId'])
+      const accepted = [...this.tabCreatedListeners].some(listener => listener(tabId, openerTabId))
+      void this.request({ op: 'register-created', tabId, creationId: message['creationId'], accepted }).catch(() => undefined)
+      return
+    }
+
     if (type === 'opened' && typeof id !== 'number') {
       // 宿主自己开的标签（页面弹窗 / 标签条「+」）在 dom-ready 后的通报。
       // 带 command id 的 'opened' 是 open 命令的应答，走下面的 pending 关联，别截胡。
@@ -791,6 +970,7 @@ export class ElectronWindowBridge implements TabHostChannel {
     this.takeoverListeners.clear()
     this.controlListeners.clear()
     this.tabOpenedListeners.clear()
+    this.inputRevokedListeners.clear()
     try {
       this.socket.destroy()
     } catch {

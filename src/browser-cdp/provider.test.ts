@@ -9,7 +9,7 @@ import { CdpBrowserProvider } from './provider.ts'
 import type { BrowserHolder } from './provider.ts'
 import { PAGE_DOCUMENT_STATE_KEY } from './state.ts'
 import { CdpConnection } from './protocol.ts'
-import type { CdpSocket, CdpTarget, CdpTransport, CdpVersion } from './protocol.ts'
+import type { CdpSocket, CdpTarget, CdpTransport, CdpVersion, CdpWindowInputRevoked, CdpWindowTicket } from './protocol.ts'
 import type { AxNode } from './snapshot.ts'
 import type { PageObservation } from './page-observation.ts'
 
@@ -27,7 +27,7 @@ function pngBytes(width: number, height: number): Uint8Array {
 
 /** 一个可编程的假 Chrome：按方法名回结果，并记录收到的每一条命令。 */
 class FakeChrome {
-  readonly calls: { method: string; params: Record<string, unknown> }[] = []
+  readonly calls: { method: string; params: Record<string, unknown>; ticket?: CdpWindowTicket | undefined }[] = []
   readonly sockets: FakeSocket[] = []
   readonly closedTargets: string[] = []
   readonly targets: CdpTarget[] = []
@@ -196,11 +196,40 @@ class FakeChrome {
     { backendNodeId: 9, bounds: [0, 90, 200, 30] },
   ]
   layoutMetricsOverride: unknown
+  /**
+   * 窗口输入权（并发网页操作方案 §4）：transport 有没有这个能力面。缺省**不挂** ——
+   * 外部 Chrome 就是这个形状（没有共享窗口概念，不宣称窗口级隔离保护），既有用例
+   * 正是在验「没有输入权保护时照旧派发」。要测临界区的用例自己显式打开。
+   */
+  windowInputEnabled = false
+  /** false = 模拟排队超时：acquire 回 `undefined`（宿主没在预算内颁票）。 */
+  windowInputGrantsTicket = true
+  /** true = acquire 返回手工控制的 promise（测试精确控制「票何时到」，见 `windowInputPending`）。 */
+  windowInputDeferredAcquire = false
+  /** 每条 CDP 命令处理前的钩子 —— 测试用它把「宿主撤销通报」搭在临界区中段。 */
+  onCall: ((method: string, params: Record<string, unknown>) => void) | undefined
+  /** 输入权申请流水（按申请次序）。 */
+  readonly windowInputAcquires: { tabId: string; requestId: string; budgetMs: number }[] = []
+  /** 宿主自动颁出的票据流水（按颁出次序；超时与手工 acquire 不进这里）。 */
+  readonly windowInputGranted: CdpWindowTicket[] = []
+  /** 已释放的 ticketId 流水。 */
+  readonly windowInputReleases: string[] = []
+  /** 已取消的 requestId 流水。 */
+  readonly windowInputCancels: string[] = []
+  /** `resolveBlocked` 调用流水。 */
+  readonly windowInputResolved: { ticketId: string; evidence: string }[] = []
+  /** 手工 acquire 的 resolve 钩子（按申请次序；带 requestId 便于按申请精确颁票）。 */
+  readonly windowInputPending: { requestId: string; resolve: (ticket: CdpWindowTicket | undefined) => void }[] = []
+  /** `newTab` 收到的票上下文流水（`undefined` = 无票建标签）。 */
+  readonly newTabTickets: (CdpWindowTicket | undefined)[] = []
+  /** 宿主撤销通报的订阅者（provider 构造时注册；测试触发它模拟人工接管）。 */
+  windowInputRevokedListener: ((revoked: CdpWindowInputRevoked) => void) | undefined
 
   /** 记录一条命令并给出它的结果。 */
   handle(socket: FakeSocket, method: string, params: Record<string, unknown>): unknown {
     if (this.detachError !== undefined) throw new Error(this.detachError)
-    this.calls.push({ method, params })
+    this.onCall?.(method, params)
+    this.calls.push({ method, params, ticket: socket.ticket })
     switch (method) {
       case 'Page.enable':
       case 'Runtime.enable':
@@ -483,19 +512,72 @@ class FakeChrome {
         : {},
       ...chrome.canActivate
         ? {
-          activateTarget: (targetId: string): Promise<void> => {
-            chrome.activateCalls.push(targetId)
-            if (chrome.visibilityAfterActivate !== undefined) chrome.visibilityState = chrome.visibilityAfterActivate
-            return Promise.resolve()
-          },
-        }
+            activateTarget: (targetId: string): Promise<void> => {
+              chrome.activateCalls.push(targetId)
+              if (chrome.visibilityAfterActivate !== undefined) chrome.visibilityState = chrome.visibilityAfterActivate
+              return Promise.resolve()
+            },
+          }
+        : {},
+      // 窗口输入权能力面（方案 §4）：只有控制真实共享窗口的传输层（Electron 宿主）有它。
+      ...chrome.windowInputEnabled
+        ? {
+            windowInput: {
+              acquire: (request: { tabId: string; requestId: string; budgetMs: number }): Promise<CdpWindowTicket | undefined> => {
+                chrome.windowInputAcquires.push({ tabId: request.tabId, requestId: request.requestId, budgetMs: request.budgetMs })
+                if (chrome.windowInputDeferredAcquire) {
+                  return new Promise<CdpWindowTicket | undefined>((resolve) => {
+                    // 颁票即离队（宿主放行后不再算候补）—— 与真调度器 startNext 的形状一致。
+                    const entry = {
+                      requestId: request.requestId,
+                      resolve: (ticket: CdpWindowTicket | undefined): void => {
+                        const index = chrome.windowInputPending.indexOf(entry)
+                        if (index >= 0) chrome.windowInputPending.splice(index, 1)
+                        resolve(ticket)
+                      },
+                    }
+                    chrome.windowInputPending.push(entry)
+                  })
+                }
+                if (!chrome.windowInputGrantsTicket) return Promise.resolve(undefined)
+                const ticket: CdpWindowTicket = {
+                  ticketId: `ticket-${String(chrome.windowInputGranted.length + 1)}`,
+                  requestId: request.requestId,
+                  tabId: request.tabId,
+                  epoch: 1,
+                  controlEpoch: 0,
+                  selectEpoch: 0,
+                  acquiredAt: Date.now(),
+                }
+                chrome.windowInputGranted.push(ticket)
+                return Promise.resolve(ticket)
+              },
+              release: (ticketId: string): Promise<void> => {
+                chrome.windowInputReleases.push(ticketId)
+                return Promise.resolve()
+              },
+              cancel: (ticketIdOrRequestId: string): Promise<{ status: string; stage: string }> => {
+                chrome.windowInputCancels.push(ticketIdOrRequestId)
+                return Promise.resolve({ status: 'cancelled', stage: 'queued' })
+              },
+              resolveBlocked: (ticketId: string, evidence: 'settled' | 'endpoint-destroyed'): Promise<boolean> => {
+                chrome.windowInputResolved.push({ ticketId, evidence })
+                return Promise.resolve(true)
+              },
+              onRevoked: (listener: (revoked: CdpWindowInputRevoked) => void): Promise<() => void> => {
+                chrome.windowInputRevokedListener = listener
+                return Promise.resolve(() => { chrome.windowInputRevokedListener = undefined })
+              },
+            },
+          }
         : {},
       version: (): Promise<CdpVersion> => chrome.versionError !== undefined
         ? Promise.reject(chrome.versionError)
         : Promise.resolve({ browser: 'Chrome/test', webSocketDebuggerUrl: 'ws://127.0.0.1:9222/devtools/browser/x' }),
       list: (): Promise<readonly CdpTarget[]> => Promise.resolve(chrome.targets),
-      newTab: (url: string): Promise<CdpTarget> => {
+      newTab: (url: string, _signal?: AbortSignal, ticket?: CdpWindowTicket): Promise<CdpTarget> => {
         if (chrome.newTabError !== undefined) return Promise.reject(chrome.newTabError)
+        chrome.newTabTickets.push(ticket)
         const target: CdpTarget = {
           id: `tab-${chrome.targets.length + 1}`,
           type: 'page',
@@ -522,9 +604,16 @@ class FakeChrome {
 /** 收到命令就排队回一条结果的假 socket。 */
 class FakeSocket implements CdpSocket {
   closed = false
+  /** 当前票上下文：provider 临界区内 `setWindowTicket` 设的，随每条命令记进 `calls`。 */
+  ticket: CdpWindowTicket | undefined
   private readonly handlers = new Map<string, ((event: unknown) => void)[]>()
 
   constructor(private readonly chrome: FakeChrome) {}
+
+  /** provider 侧临界区凭证的落点（`CdpConnection.setWindowTicket` 委托到这里）。 */
+  setWindowTicket(ticket: CdpWindowTicket | undefined): void {
+    this.ticket = ticket
+  }
 
   send(data: string): void {
     const request = JSON.parse(data) as { id: number; method: string; params?: Record<string, unknown> }
@@ -3490,5 +3579,350 @@ describe('§6.2 决策时通知（P2）+ D-5 + D-19', () => {
     if (regional.kind !== 'snapshot') throw new Error('expected a snapshot')
 
     expect(regional.reboundRefs).toBeUndefined()
+  })
+})
+
+describe('CdpBrowserProvider 窗口输入权（并发网页操作方案 §4）', () => {
+  let chrome: FakeChrome
+  let provider: AdoptableProvider
+
+  beforeEach(() => {
+    chrome = new FakeChrome()
+    chrome.axeNodes = PAGE_TREE
+    // 挂上输入权能力面 —— Electron 宿主就是这个角色；外部 Chrome 的「没有」由下面的
+    // 回退用例显式验（缺省关闭，既有用例全部不受影响）。
+    chrome.windowInputEnabled = true
+    provider = new AdoptableProvider({ navigationTimeoutMs: 200 }, chrome.transport())
+  })
+
+  /** 开会话并 snapshot，返回 sessionId 与第一个可操作 ref。 */
+  async function openWithRef(target: AdoptableProvider = provider): Promise<{ sessionId: string; ref: string }> {
+    const session = await target.open({})
+    const snapshot = await target.observe({ kind: 'snapshot', sessionId: session.id })
+    if (snapshot.kind !== 'snapshot') throw new Error('expected a snapshot')
+    const first = snapshot.refs.find(item => item.anchor !== true)
+    if (first === undefined) throw new Error('快照里一个可操作 ref 都没有')
+    return { sessionId: session.id, ref: first.ref }
+  }
+
+  /** 按 requestId 给挂起的 acquire 颁票（模拟宿主在预算内放行）。 */
+  function grant(requestId: string, ticketId: string, tabId: string): void {
+    const entry = chrome.windowInputPending.find(item => item.requestId === requestId)
+    if (entry === undefined) throw new Error(`没有挂起的输入权申请：${requestId}`)
+    entry.resolve({
+      ticketId,
+      requestId,
+      tabId,
+      epoch: 1,
+      controlEpoch: 0,
+      selectEpoch: 0,
+      acquiredAt: Date.now(),
+    })
+  }
+
+  it('click：临界区内 Input.* 带票，结束即清票并释放票据', async () => {
+    const { sessionId, ref } = await openWithRef()
+
+    const result = await provider.mutate({ kind: 'click', sessionId, ref })
+    expect(result).toMatchObject({ action: 'click' })
+
+    // open 的展示段先取一张窗口级票；click 再取一张标签票（方案 §3 open/click 行）。
+    expect(chrome.windowInputAcquires.map(entry => entry.tabId)).toEqual(['', sessionId])
+    const ticket = chrome.windowInputGranted.at(-1)
+    expect(ticket?.requestId).toBe(`wi-${sessionId}-2`)
+    const presses = chrome.calls.filter(call => call.method === 'Input.dispatchMouseEvent')
+    expect(presses).toHaveLength(2)
+    expect(presses.every(call => call.ticket?.ticketId === ticket?.ticketId)).toBe(true)
+    // 临界区结束后票上下文清掉：settleMutation 等收尾命令不再带票。
+    expect(chrome.calls.at(-1)?.ticket).toBeUndefined()
+    // 两张票都归还了宿主（释放 ≠ 业务动作成功，只是窗口可交给下一动作）。
+    expect(chrome.windowInputReleases).toEqual(['ticket-1', 'ticket-2'])
+  })
+
+  it('press：keyDown/keyUp 在同一张票的临界区内派发', async () => {
+    const { sessionId, ref } = await openWithRef()
+
+    await provider.mutate({ kind: 'press', sessionId, ref, key: 'Enter' })
+
+    const keys = chrome.calls.filter(call => call.method === 'Input.dispatchKeyEvent')
+    expect(keys.map(call => call.params['type'])).toEqual(['keyDown', 'keyUp'])
+    expect(keys.every(call => call.ticket?.ticketId === chrome.windowInputGranted.at(-1)?.ticketId)).toBe(true)
+    expect(chrome.windowInputReleases).toContain(chrome.windowInputGranted.at(-1)?.ticketId)
+  })
+
+  it('fill：Input.insertText 带票（富文本输入路径）', async () => {
+    chrome.fillEditable = true
+    const { sessionId, ref } = await openWithRef()
+
+    await provider.mutate({ kind: 'fill', sessionId, ref, value: 'hello' })
+
+    const inserts = chrome.calls.filter(call => call.method === 'Input.insertText')
+    expect(inserts).toHaveLength(1)
+    expect(inserts[0]?.ticket?.ticketId).toBe(chrome.windowInputGranted.at(-1)?.ticketId)
+  })
+
+  it('scroll：后台标签先带票激活，activateTarget 收到同一张票', async () => {
+    chrome.canActivate = true
+    chrome.activeTargetId = 'other-tab'
+    const activatedTickets: (CdpWindowTicket | undefined)[] = []
+    const activating: CdpTransport = {
+      ...chrome.transport(),
+      activateTarget: (targetId: string, _signal?: AbortSignal, ticket?: CdpWindowTicket): Promise<void> => {
+        chrome.activateCalls.push(targetId)
+        activatedTickets.push(ticket)
+        return Promise.resolve()
+      },
+    }
+    provider = new AdoptableProvider({ navigationTimeoutMs: 200 }, activating)
+    const { sessionId } = await openWithRef()
+
+    await provider.mutate({ kind: 'scroll', sessionId, deltaY: 120 })
+
+    expect(chrome.activateCalls).toContain(sessionId)
+    expect(activatedTickets.at(-1)).toMatchObject({ tabId: sessionId })
+  })
+
+  it('tabs(activate)：agent 引起的前台变更同样走输入权，带票激活', async () => {
+    chrome.canActivate = true
+    const activatedTickets: (CdpWindowTicket | undefined)[] = []
+    const activating: CdpTransport = {
+      ...chrome.transport(),
+      activateTarget: (targetId: string, _signal?: AbortSignal, ticket?: CdpWindowTicket): Promise<void> => {
+        chrome.activateCalls.push(targetId)
+        activatedTickets.push(ticket)
+        return Promise.resolve()
+      },
+    }
+    provider = new AdoptableProvider({ navigationTimeoutMs: 200 }, activating)
+    const { sessionId } = await openWithRef()
+
+    await provider.tabs({ kind: 'activate', sessionId })
+
+    expect(chrome.activateCalls).toEqual([sessionId])
+    expect(activatedTickets.at(-1)).toMatchObject({ tabId: sessionId })
+  })
+
+  it('locate：scroll=false 纯读不申请输入权；scroll=true 才申请', async () => {
+    const { sessionId, ref } = await openWithRef()
+    const before = chrome.windowInputAcquires.length
+
+    await provider.locate({ sessionId, ref })
+    expect(chrome.windowInputAcquires).toHaveLength(before)
+
+    await provider.locate({ sessionId, ref, scroll: true })
+    expect(chrome.windowInputAcquires).toHaveLength(before + 1)
+    expect(chrome.windowInputAcquires.at(-1)?.tabId).toBe(sessionId)
+  })
+
+  it('open 的展示段：取到票时随建标签命令下发，用完即还', async () => {
+    const session = await provider.open({})
+
+    expect(chrome.windowInputAcquires[0]).toMatchObject({ tabId: '', requestId: 'wi-window-1' })
+    expect(chrome.newTabTickets[0]?.ticketId).toBe('ticket-1')
+    expect(chrome.windowInputReleases).toContain('ticket-1')
+    expect(session).toMatchObject({ id: 'tab-1' })
+  })
+
+  it('open 的展示段排队超时：不阻止建标签（宿主按无票自动展示排队）', async () => {
+    chrome.windowInputGrantsTicket = false
+
+    const session = await provider.open({ url: 'https://example.com/' })
+
+    expect(session).toMatchObject({ id: 'tab-1' })
+    expect(chrome.windowInputAcquires.map(entry => entry.tabId)).toEqual([''])
+    expect(chrome.newTabTickets).toEqual([undefined])
+  })
+
+  it('排队超时回执明确「等待输入权阶段、动作未派发、候补已移除」，且零输入副作用', async () => {
+    const { sessionId, ref } = await openWithRef()
+    chrome.windowInputGrantsTicket = false
+
+    let caught: unknown
+    try {
+      await provider.mutate({ kind: 'click', sessionId, ref })
+    } catch (error: unknown) {
+      caught = error
+    }
+    expect(caught).toMatchObject({ code: 'BROWSER_WINDOW_INPUT_TIMEOUT' })
+    // 回执文案（方案 §6.3）：等待输入权阶段、动作未派发、候补已移除。
+    expect((caught as Error).message).toMatch(/waiting for window input rights/)
+    expect((caught as Error).message).toMatch(/removed from the window queue/)
+    // 一次鼠标/键盘/插入都不许出去：超时发生在派发之前。
+    expect(chrome.calls.filter(call => call.method.startsWith('Input.'))).toHaveLength(0)
+    // 没拿到票就没有可释放的票据（不制造幽灵释放）。
+    expect(chrome.windowInputReleases).toEqual(['ticket-1'])
+  })
+
+  it('宿主迟迟不颁票：provider 按 budgetMs 等，不自己提前超时', async () => {
+    const { sessionId, ref } = await openWithRef()
+    chrome.windowInputDeferredAcquire = true
+
+    const pending = provider.mutate({ kind: 'click', sessionId, ref })
+    await vi.waitFor(() => expect(chrome.windowInputPending).toHaveLength(1))
+    expect(chrome.windowInputAcquires.at(-1)).toMatchObject({ tabId: sessionId, budgetMs: 15_000 })
+
+    // 宿主在预算内放行：动作必须照常完成（provider 没有更短的本地时限）。
+    grant(`wi-${sessionId}-2`, 'ticket-late', sessionId)
+    await expect(pending).resolves.toMatchObject({ action: 'click' })
+    expect(chrome.windowInputReleases).toContain('ticket-late')
+  })
+
+  it('输入权预算可配置：inputQueueBudgetMs 原样传给宿主申请', async () => {
+    const tight = new AdoptableProvider({ navigationTimeoutMs: 200, inputQueueBudgetMs: 1234 }, chrome.transport())
+    const { sessionId, ref } = await openWithRef(tight)
+
+    expect(chrome.windowInputAcquires[0]).toMatchObject({ budgetMs: 1234 })
+    await tight.mutate({ kind: 'click', sessionId, ref })
+    expect(chrome.windowInputAcquires.at(-1)).toMatchObject({ tabId: sessionId, budgetMs: 1234 })
+  })
+
+  it('等待输入权期间取消：本地立刻拒绝，并走宿主取消协议确认候补移除', async () => {
+    const { sessionId, ref } = await openWithRef()
+    chrome.windowInputDeferredAcquire = true
+    const controller = new AbortController()
+
+    const pending = provider.mutate({ kind: 'click', sessionId, ref }, controller.signal)
+    await vi.waitFor(() => expect(chrome.windowInputPending).toHaveLength(1))
+    controller.abort()
+
+    let caught: unknown
+    try {
+      await pending
+    } catch (error: unknown) {
+      caught = error
+    }
+    expect((caught as Error).name).toBe('AbortError')
+    // 宿主取消协议带的是本次申请的 requestId（可追可取消）。
+    expect(chrome.windowInputCancels).toEqual([`wi-${sessionId}-2`])
+  })
+
+  it('取消之后宿主迟到的颁票不被使用（本地已拒绝，迟票不进临界区）', async () => {
+    const { sessionId, ref } = await openWithRef()
+    chrome.windowInputDeferredAcquire = true
+    const controller = new AbortController()
+
+    const pending = provider.mutate({ kind: 'click', sessionId, ref }, controller.signal)
+    await vi.waitFor(() => expect(chrome.windowInputPending).toHaveLength(1))
+    controller.abort()
+    await pending.catch(() => undefined)
+
+    // 宿主在取消确认之后才放行 —— provider 早已收手：迟票不进任何临界区。
+    grant(`wi-${sessionId}-2`, 'ticket-late', sessionId)
+    await new Promise(resolve => setTimeout(resolve, 20))
+    expect(chrome.calls.filter(call => call.method.startsWith('Input.'))).toHaveLength(0)
+    expect(chrome.windowInputReleases).not.toContain('ticket-late')
+    expect(chrome.windowInputCancels).toContain('ticket-late')
+  })
+
+  it('人工接管撤销：派发前最后一道门拒绝，零输入副作用，票据仍归还', async () => {
+    const { sessionId, ref } = await openWithRef()
+    // 撤销通报搭在 click 临界区中段的第一次 evaluate 上（宿主异步通知的形状）。
+    let fired = false
+    chrome.onCall = (method: string): void => {
+      if (fired || method !== 'Runtime.evaluate') return
+      fired = true
+      const ticket = chrome.windowInputGranted.at(-1)
+      if (ticket === undefined) return
+      chrome.windowInputRevokedListener?.({
+        ticketId: ticket.ticketId,
+        tabId: ticket.tabId,
+        stage: 'dispatching',
+        dispatched: false,
+        reason: 'human-takeover',
+      })
+    }
+
+    await expect(provider.mutate({ kind: 'click', sessionId, ref }))
+      .rejects.toThrow(expect.objectContaining({ code: 'BROWSER_WINDOW_INPUT_REVOKED' }))
+
+    expect(chrome.calls.filter(call => call.method.startsWith('Input.'))).toHaveLength(0)
+    // 临界区有界：拒绝也走 finally，票据归还宿主，不占着窗口不放。
+    expect(chrome.windowInputReleases).toContain(chrome.windowInputGranted.at(-1)?.ticketId)
+  })
+
+  it('撤销时已派发（含 blocked）：回执说「结果未知、禁止盲目重放」，不宣称零副作用', async () => {
+    const { sessionId, ref } = await openWithRef()
+    // 宿主在 blocked 里被控制代次变化撤销：stage='blocked'、dispatched=true
+    // （window-input-queue.revokeAll 的形状）—— 输入可能已落地、结果未知。
+    let fired = false
+    chrome.onCall = (method: string): void => {
+      if (fired || method !== 'Runtime.evaluate') return
+      fired = true
+      const ticket = chrome.windowInputGranted.at(-1)
+      if (ticket === undefined) return
+      chrome.windowInputRevokedListener?.({
+        ticketId: ticket.ticketId,
+        tabId: ticket.tabId,
+        stage: 'blocked',
+        dispatched: true,
+        reason: 'control-changed',
+      })
+    }
+
+    let caught: unknown
+    try {
+      await provider.mutate({ kind: 'click', sessionId, ref })
+    } catch (error: unknown) {
+      caught = error
+    }
+    expect(caught).toMatchObject({ code: 'BROWSER_WINDOW_INPUT_REVOKED' })
+    // 已派发 / 结果未知的口径：不宣称「没有输入替你发出」，只要求先观察再决定。
+    expect((caught as Error).message).toMatch(/may already have been dispatched/)
+    expect((caught as Error).message).toMatch(/effect on the page is unknown/)
+    expect((caught as Error).message).not.toMatch(/No input was dispatched/)
+    expect(chrome.calls.filter(call => call.method.startsWith('Input.'))).toHaveLength(0)
+  })
+
+  it('mousePressed 已返回后撤销：不继续业务抬起，回执保留部分派发事实', async () => {
+    const { sessionId, ref } = await openWithRef()
+    let fired = false
+    chrome.onCall = method => {
+      if (fired || method !== 'Input.dispatchMouseEvent') return
+      fired = true
+      const ticket = chrome.windowInputGranted.at(-1)!
+      chrome.windowInputRevokedListener?.({ ticketId: ticket.ticketId, tabId: ticket.tabId,
+        stage: 'finishing', dispatched: true, reason: 'human-takeover' })
+    }
+    await expect(provider.mutate({ kind: 'click', sessionId, ref })).rejects.toThrow(/may already have been dispatched/)
+    expect(chrome.calls.filter(call => call.method === 'Input.dispatchMouseEvent').map(call => call.params['type'])).toEqual(['mousePressed'])
+  })
+
+  it('transport 没有输入权能力（外部 Chrome）：回退老路径照旧派发，不宣称窗口级保护', async () => {
+    const plain = new FakeChrome()
+    plain.axeNodes = PAGE_TREE
+    provider = new AdoptableProvider({ navigationTimeoutMs: 200 }, plain.transport())
+    const { sessionId, ref } = await openWithRef()
+
+    const result = await provider.mutate({ kind: 'click', sessionId, ref })
+    expect(result).toMatchObject({ action: 'click' })
+    expect(plain.windowInputAcquires).toHaveLength(0)
+    expect(plain.calls.filter(call => call.method === 'Input.dispatchMouseEvent')).toHaveLength(2)
+  })
+
+  it('两个对话共享一个窗口：申请各自排队，宿主按序颁票，provider 只等不抢', async () => {
+    const other = new AdoptableProvider({ navigationTimeoutMs: 200 }, chrome.transport())
+    const a = await openWithRef(provider)
+    const b = await openWithRef(other)
+    // 两个会话都开好之后再挂起颁票 —— 只让两个 click 的申请排队。
+    chrome.windowInputDeferredAcquire = true
+
+    // 两个动作同时进入输入权申请（互斥由宿主强制执行，provider 侧只是排队等）。
+    const pendingA = provider.mutate({ kind: 'click', sessionId: a.sessionId, ref: a.ref })
+    const pendingB = other.mutate({ kind: 'click', sessionId: b.sessionId, ref: b.ref })
+    await vi.waitFor(() => expect(chrome.windowInputPending).toHaveLength(2))
+
+    const tail = chrome.windowInputAcquires.slice(-2)
+    expect(tail.map(entry => entry.tabId).sort()).toEqual([a.sessionId, b.sessionId].sort())
+    expect(tail.every(entry => entry.budgetMs === 15_000)).toBe(true)
+
+    // 宿主先放行 A：A 的临界区跑完并归还票据，B 仍在候补（没有被本地超时打掉）。
+    grant(`wi-${a.sessionId}-2`, 'ticket-A', a.sessionId)
+    await expect(pendingA).resolves.toMatchObject({ action: 'click' })
+    expect(chrome.windowInputReleases).toContain('ticket-A')
+    expect(chrome.windowInputPending.map(entry => entry.requestId)).toEqual([`wi-${b.sessionId}-2`])
+
+    grant(`wi-${b.sessionId}-2`, 'ticket-B', b.sessionId)
+    await expect(pendingB).resolves.toMatchObject({ action: 'click' })
+    expect(chrome.windowInputReleases).toContain('ticket-B')
   })
 })

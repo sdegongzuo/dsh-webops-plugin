@@ -1,6 +1,6 @@
 /** CDP provider 入口：受控会话生命周期、控制权门禁、输入派发与操作编排。 */
 
-import { type CdpTransport, HttpCdpTransport, type CdpConnection, type CdpTarget } from './protocol.ts'
+import { type CdpTransport, HttpCdpTransport, type CdpConnection, type CdpTarget, type CdpWindowInputCapability, type CdpWindowTicket } from './protocol.ts'
 import { StaleRefMetrics } from './metrics.ts'
 import { TargetStateRegistry, PAGE_DOCUMENT_STATE_KEY } from './state.ts'
 import { validateEndpoint, validateTargetUrl } from './url-policy.ts'
@@ -92,6 +92,31 @@ export {
 } from './page-scripts.ts'
 
 /** 生命周期与状态仍由 provider 统一持有，内部模块不持有会话注册表。 */
+
+/**
+ * 窗口输入权租约（方案 §4）：provider 侧的临界区凭证。
+ *
+ * `ticket` 同时是 CDP 命令的票上下文（`connection.setWindowTicket`）—— 临界区内
+ * 的 `Input.*` 派发由宿主在最终投递边界验票；`release` 只表示共享窗口可以交给
+ * 下一动作，不表示业务动作成功。
+ */
+interface WindowInputLease {
+  readonly ticket: CdpWindowTicket
+  release(): Promise<void>
+}
+
+/**
+ * 撤销通报里的事实（宿主快照 → 父进程回执，方案 §4/§6）。
+ *
+ * `dispatched=true` = 撤销时输入可能已落地、结果未知 —— 回执禁止宣称「零副作用」，
+ * 也禁止自动重放；`stage` / `reason` 原样带上，供诊断。
+ */
+interface WindowInputRevokedFact {
+  readonly stage: string
+  readonly dispatched: boolean
+  readonly reason: string
+}
+
 export class CdpBrowserProvider implements BrowserProvider {
   private readonly nodes: PageNodes
   private readonly observation: PageObservation
@@ -125,10 +150,22 @@ export class CdpBrowserProvider implements BrowserProvider {
    * 子标签（实施方案 §5.2）—— 租约表住在能力缝隙那一层，provider 看不见它，只能通报事实。
    */
   private readonly adoptListeners = new Set<(targetId: string, openerTargetId: string | undefined) => void>()
+  private readonly createdListeners = new Set<(targetId: string, openerTargetId: string) => boolean>()
 
   private probe: { readonly at: number; readonly ok: boolean } | undefined
 
   private probing: Promise<boolean> | undefined
+
+  /**
+   * 窗口输入权的撤销簿记（方案 §4）：宿主通知撤销后，对应票在派发前一律拒绝。
+   * 键是 tabId（即 sessionId），内层键是 ticketId，值是撤销时的**事实** ——
+   * `dispatched=true` 表示输入可能已落地、结果未知，回执必须如实说明，
+   * 不许宣称「零副作用」（方案 §6 的部分派发口径）。
+   */
+  private readonly revokedInputs = new Map<string, Map<string, WindowInputRevokedFact>>()
+
+  /** 输入权申请的请求序号（父进程侧生成 requestId，保证可取消可追）。 */
+  private inputRequestSeq = 0
 
   /**
    * @param config - 端点与各类超时；全部有默认值。
@@ -146,11 +183,27 @@ export class CdpBrowserProvider implements BrowserProvider {
       waitTimeoutMs: config.waitTimeoutMs ?? DEFAULT_CONFIG.waitTimeoutMs,
       stableQuietWindowMs: config.stableQuietWindowMs ?? DEFAULT_CONFIG.stableQuietWindowMs,
       stableNetworkGraceMs: config.stableNetworkGraceMs ?? DEFAULT_CONFIG.stableNetworkGraceMs,
+      inputQueueBudgetMs: config.inputQueueBudgetMs ?? DEFAULT_CONFIG.inputQueueBudgetMs,
     }
     this.transport = transport ?? new HttpCdpTransport(this.config.endpoint, {
       requestTimeoutMs: this.config.requestTimeoutMs,
       commandTimeoutMs: this.config.commandTimeoutMs,
     })
+    // 窗口输入权撤销订阅：只有控制真实共享窗口的传输层（Electron 宿主）有这能力。
+    // 外部 Chrome 没有这个成员 —— 不订阅，provider 回退到本地行为，不宣称窗口级
+    // 隔离保护（方案 §7.1 的能力边界）。
+    const windowInput = this.transport.windowInput
+    if (windowInput !== undefined) {
+      void windowInput.onRevoked((revoked) => {
+        const facts = this.revokedInputs.get(revoked.tabId) ?? new Map<string, WindowInputRevokedFact>()
+        facts.set(revoked.ticketId, {
+          stage: revoked.stage,
+          dispatched: revoked.dispatched,
+          reason: revoked.reason,
+        })
+        this.revokedInputs.set(revoked.tabId, facts)
+      }).catch(() => undefined)
+    }
     this.navigation = new PageNavigation(this.config)
     this.nodes = new PageNodes(this.config, this.metrics)
     this.observation = new PageObservation(this.config, this.nodes, this.navigation)
@@ -178,19 +231,49 @@ export class CdpBrowserProvider implements BrowserProvider {
   /** @inheritdoc */
   async open(request: BrowserOpenRequest, signal?: AbortSignal): Promise<BrowserSession> {
     const url = request.url === undefined ? 'about:blank' : validateTargetUrl(request.url)
-    // 先建一个空白页，再显式 `Page.navigate` 到目标地址。
-    //
-    // 为什么不直接把 url 交给 `/json/new`：那样标签页建好后导航是**异步**开始的，
-    // 此刻 `document.readyState` 已经是 `complete`（空白页本来就 complete），
-    // 「等加载完成」会立刻返回，于是 url / title / 大纲全在空白页上读了一遍 ——
-    // 实测表现是 `open` 成功、返回的 url 却是 `about:blank`、snapshot 零字符。
-    // 显式 navigate 之后，「等加载」等到的才是目标文档。
-    const target = await this.createTarget('about:blank', signal)
+    // open 的展示段（进入前台）走窗口输入权（方案 §3 open 行）：**先取票再建标签**，
+    // 票随 open 命令下发，宿主的展示段由它覆盖，与别的对话的输入临界区互斥。
+    // 拿不到票（排队超时）不阻止建标签 —— 宿主按无票自动展示排队，期间人工切走
+    // 则取消自动展示（选择代次栅栏），标签保留在后台。
+    let lease: WindowInputLease | undefined
+    try {
+      lease = await this.acquireWindowInput('', signal)
+    } catch (error: unknown) {
+      if (!(error instanceof BrowserError) || error.code !== 'BROWSER_WINDOW_INPUT_TIMEOUT') throw error
+    }
+    // 建标签 → 放权：宿主的 open 命令在应答前已等展示段落定（`await foregroundReady`），
+    // 所以 createTarget 一返回，票的使命（覆盖展示与布局）就结束。接线 / 导航 / 等
+    // 加载 / 登记都不再占窗口资源（方案 §3：输入权只覆盖展示和布局，网络加载与
+    // 快照是释放后的工作）—— 否则一个慢页面会把别的对话的输入堵到预算耗尽。
+    let target: CdpTarget
+    try {
+      // 先建一个空白页，再显式 `Page.navigate` 到目标地址。
+      //
+      // 为什么不直接把 url 交给 `/json/new`：那样标签页建好后导航是**异步**开始的，
+      // 此刻 `document.readyState` 已经是 `complete`（空白页本来就 complete），
+      // 「等加载完成」会立刻返回，于是 url / title / 大纲全在空白页上读了一遍 ——
+      // 实测表现是 `open` 成功、返回的 url 却是 `about:blank`、snapshot 零字符。
+      // 显式 navigate 之后，「等加载」等到的才是目标文档。
+      target = await this.createTarget('about:blank', signal, lease?.ticket)
+      request.onCreated?.(target.id)
+    } finally {
+      if (lease !== undefined) await lease.release()
+    }
+    return await this.openWithTarget(request, url, target, signal)
+  }
+
+  /** `open` 的本体（建标签之后）：接线 → 导航 → 登记会话。 */
+  private async openWithTarget(
+    request: BrowserOpenRequest,
+    url: string,
+    target: CdpTarget,
+    signal?: AbortSignal,
+  ): Promise<BrowserSession> {
     this.probe = { at: Date.now(), ok: true }
 
     let connection: CdpConnection
     try {
-      connection = await this.transport.connect(target.webSocketDebuggerUrl, signal)
+      connection = await this.transport.connect(target.webSocketDebuggerUrl)
     } catch (error: unknown) {
       // 连不上就立刻回收刚开的标签页，不给用户留一个孤儿标签。
       await this.transport.closeTarget(target.id).catch(() => undefined)
@@ -220,6 +303,13 @@ export class CdpBrowserProvider implements BrowserProvider {
       needsReobserve: false,
       highlightPainted: false,
     }
+    // 创建即登记；open 导航中的早期弹窗能核对有效父，取消也保留已创建标签。
+    this.sessions.set(session.targetId, session)
+    connection.onClose(() => {
+      if (this.sessions.get(session.targetId) !== session) return
+      this.sessions.delete(session.targetId)
+      this.stateRegistry.forget(session.targetId)
+    })
     try {
       await connection.send('Page.enable', {}, { signal, timeoutMs: this.config.commandTimeoutMs })
       // 立刻打开 console / network 两路采集，让「实时落缓冲」从这一刻起生效，而不是等到第一次
@@ -248,19 +338,12 @@ export class CdpBrowserProvider implements BrowserProvider {
       // 就会报一句无中生有的「页面变过」。迟到几毫秒的事件由上面那笔赊账接住。
       session.dirty.reset()
     } catch (error: unknown) {
+      if (signal?.aborted) throw error
       connection.close()
       await this.transport.closeTarget(target.id).catch(() => undefined)
       throw error
     }
 
-    this.sessions.set(session.targetId, session)
-    // 用户自己关掉标签页时同步摘掉会话，避免留下一个永远连不上的死会话。
-    connection.onClose(() => {
-      if (this.sessions.get(session.targetId) !== session) return
-      this.sessions.delete(session.targetId)
-      // §6.5：连接断了（用户自己关了标签页）时，控制权簿记同样要清。
-      this.stateRegistry.forget(session.targetId)
-    })
     return this.toSession(session)
   }
 
@@ -352,6 +435,17 @@ export class CdpBrowserProvider implements BrowserProvider {
     return () => this.adoptListeners.delete(listener)
   }
 
+  onSessionCreated(listener: (targetId: string, openerTargetId: string) => boolean): () => void {
+    this.createdListeners.add(listener)
+    return () => { this.createdListeners.delete(listener) }
+  }
+
+  /** debugger 尚未就绪也能先登记家族；不存在有效父时不猜主人。 */
+  protected registerCreatedSession(targetId: string, openerTargetId: string): boolean {
+    if (!this.sessions.has(openerTargetId)) return false
+    return [...this.createdListeners].some(listener => listener(targetId, openerTargetId))
+  }
+
   /**
    * 占用归属变了（释放 / 移交 / 空闲超时回收 → 见实施方案 §3.2）：作废该会话的 ref 纪元。
    *
@@ -372,10 +466,13 @@ export class CdpBrowserProvider implements BrowserProvider {
    * 悄悄接管并导航它，等于把用户正在看的东西弄没 —— 这个代价远大于「open 失败」。
    * 而嵌入式的 Chromium（Electron 系，**包括 dsh 桌面端自己**）的 DevTools 端点根本不实现
    * `PUT /json/new`，那是一个应该被明确报告的部署问题，不是一次顺手接管的机会。
+   *
+   * @param ticket - 窗口输入票（`open` 的展示段）。宿主据此把「进入前台」纳入输入权
+   *   临界区；不带票时按无票自动展示排队（人工新选择优先）。
    */
-  private async createTarget(url: string, signal?: AbortSignal): Promise<CdpTarget> {
+  private async createTarget(url: string, signal?: AbortSignal, ticket?: CdpWindowTicket): Promise<CdpTarget> {
     try {
-      return await this.transport.newTab(url, signal)
+      return await this.transport.newTab(url, signal, ticket)
     } catch (error: unknown) {
       if (!(error instanceof BrowserError) || error.code !== 'BROWSER_PROTOCOL_ERROR') throw error
       const pages = await this.transport.list(signal)
@@ -610,7 +707,14 @@ export class CdpBrowserProvider implements BrowserProvider {
           'BROWSER_NOT_IMPLEMENTED',
         )
       }
-      await activate.call(this.transport, session.targetId, signal)
+      // 激活是 agent 引起的前台变更（方案 §3 activate 行）：走窗口输入权，
+      // 与别的对话的输入临界区互斥。
+      const lease = await this.acquireWindowInput(session.targetId, signal)
+      try {
+        await activate.call(this.transport, session.targetId, signal, lease?.ticket)
+      } finally {
+        if (lease !== undefined) await lease.release()
+      }
       return { action: 'activate', sessionId: session.targetId, tabs: await this.listTabs(signal) }
     }
     // close：与 close() 同一语义（幂等），只是把剩余清单一并带回去。
@@ -1045,6 +1149,90 @@ export class CdpBrowserProvider implements BrowserProvider {
     )
   }
 
+  /**
+   * 申请窗口输入权（方案 §4）。
+   *
+   * 传输层没有这能力时返回 `undefined`（外部 Chrome：没有共享窗口可调度）——
+   * 调用方按老路径执行，**不宣称**窗口级隔离保护。
+   *
+   * - 排队超时 → `BROWSER_WINDOW_INPUT_TIMEOUT`（回执明确「等待输入权阶段、
+   *   动作未派发、候补已移除」，方案 §6.3；输入临界区有界，重试通常能进）。
+   * - 等待期间取消 → 本地立刻拒绝，同时走宿主取消协议确认候补移除；本地 promise
+   *   拒绝不作为「底层已结束」的证据。
+   *
+   * @param tabId - 目标标签；空串 = 窗口级申请（`open` 的展示段，标签还没建）。
+   */
+  private async acquireWindowInput(
+    tabId: string,
+    signal?: AbortSignal,
+  ): Promise<WindowInputLease | undefined> {
+    const capability = this.transport.windowInput
+    if (capability === undefined) return undefined
+    signal?.throwIfAborted()
+    const requestId = `wi-${tabId || 'window'}-${String(++this.inputRequestSeq)}`
+    const acquire = capability.acquire({
+      tabId,
+      requestId,
+      budgetMs: this.config.inputQueueBudgetMs,
+    })
+    // 取消与颁票可交叉：迟到票也必须撤销，不能只让本地 promise 拒绝后遗留持权。
+    void acquire.then(async ticket => {
+      if (signal?.aborted && ticket !== undefined) await capability.cancel(ticket.ticketId)
+    }).catch(() => undefined)
+    const settle = async (ticket: CdpWindowTicket | undefined): Promise<WindowInputLease> => {
+      signal?.throwIfAborted()
+      if (ticket === undefined) {
+        throw new BrowserError(
+          `the shared browser window did not grant the input lease within ${String(this.config.inputQueueBudgetMs)}ms `
+          + `(another action's input critical section is still running, or the window is blocked). `
+          + 'The action was still waiting for window input rights and was NOT dispatched; '
+          + 'the queued request has been removed from the window queue. '
+          + 'Input critical sections are bounded — retry once.',
+          'BROWSER_WINDOW_INPUT_TIMEOUT',
+        )
+      }
+      return { ticket, release: () => capability.release(ticket.ticketId) }
+    }
+    if (signal === undefined) return settle(await acquire)
+    let abortCancel: (() => void) | undefined
+    const cancelled = new Promise<never>((_resolve, reject) => {
+      abortCancel = () => {
+        // 宿主侧取消确认候补移除；本地拒绝只是让调用方尽快收手。
+        void capability.cancel(requestId).then(() => reject(signal.reason), reject)
+      }
+      signal.addEventListener('abort', abortCancel, { once: true })
+    })
+    try {
+      return settle(await Promise.race([acquire, cancelled]))
+    } finally {
+      if (abortCancel !== undefined) signal.removeEventListener('abort', abortCancel)
+    }
+  }
+
+  /**
+   * 派发前的最后一道输入权门：这张票已被撤销（人工接管 / 窗口销毁 / 控制代次变化）
+   * 就拒绝派发。撤销时可能已有部分派发、结果未知 —— 不自动重放（方案 §4）。
+   *
+   * 回执分两种诚实说法：撤销时未派发（零页面副作用）与已派发 / 状态未知
+   * （`dispatched=true`，可能是 blocked：底层执行无法确认终止）—— 后者不许
+   * 宣称「没有输入替你发出」，只提示先观察页面再决定。
+   */
+  private assertInputNotRevoked(lease: WindowInputLease | undefined): void {
+    if (lease === undefined) return
+    const fact = this.revokedInputs.get(lease.ticket.tabId)?.get(lease.ticket.ticketId)
+    if (fact === undefined) return
+    const message = fact.dispatched
+      ? 'the window input lease was revoked after input may already have been dispatched '
+        + `(stage "${fact.stage}", reason "${fact.reason}") — the effect on the page is unknown. `
+        + 'Do NOT replay the action blindly: a second click/fill/press could double the effect. '
+        + 'Take a fresh webpage_snapshot first and decide from what the page actually shows.'
+      : 'the window input lease was revoked before dispatch '
+        + `(a human took over, the window was torn down, or the control generation changed; `
+        + `stage "${fact.stage}", reason "${fact.reason}"). No input was dispatched on your behalf. `
+        + 'Do NOT replay the action blindly — take a fresh webpage_snapshot first.'
+    throw new BrowserError(message, 'BROWSER_WINDOW_INPUT_REVOKED')
+  }
+
   /** 后台刷新一次端点探测结果。 */
   private refreshProbe(): Promise<boolean> {
     if (this.probing !== undefined) return this.probing
@@ -1094,7 +1282,11 @@ export class CdpBrowserProvider implements BrowserProvider {
   }
 
   /**
-   * 点击：解析 ref → 滚到可视区 → **问一句落点上是谁** → 在元素中心派发真实的鼠标按下/抬起。
+   * 点击：解析 ref → 取窗口输入权 → 激活并确认可见 → 重新测量 → 遮挡检查 → 派发。
+   *
+   * 输入临界区（方案 §5）：**激活 → 解析目标 → 滚入视口 → 测量 → 遮挡检查 →
+   * mousePressed / mouseReleased** 全程持票，派发后即释放；导航等待与观察不占
+   * 窗口资源。等待输入权期间不激活、不滚动、不测量；排队前测得的坐标不得用于派发。
    *
    * 落点校验（B1-d）见 {@link hitTest}。命中测试证实落点被别的元素盖住时（`hit === 'other'`）
    * **在派发前拒绝**（2026-10-07 独立验收，`BROWSER_TARGET_OCCLUDED`）：旧实现「事件照发、
@@ -1106,46 +1298,66 @@ export class CdpBrowserProvider implements BrowserProvider {
     const beforeUrl = session.url
     const target = session.refs.resolve(ref)
     this.assertInteractive(target, 'webpage_click')
-    const objectId = await this.nodes.resolveObjectId(session, ref, signal)
+    let objectId: string | undefined
     let hit: HitTestOutcome | undefined
     try {
-      // 后台页面的 smooth 滚动可能暂停；先准备可见标签，再滚动和量落点。
-      // 否则激活后布局已经改变，却仍把之前的视口外坐标用于真实输入。
-      await this.ensureInputDispatchable(session, signal)
-      const box = await this.nodes.elementViewportBox(session, objectId, signal)
-      const point = { x: box.x + box.width / 2, y: box.y + box.height / 2 }
-      if ((box.viewportWidth !== undefined && (point.x < 0 || point.x >= box.viewportWidth))
-        || (box.viewportHeight !== undefined && (point.y < 0 || point.y >= box.viewportHeight))) {
-        throw new BrowserError(
-          'the target centre is still outside the viewport after scrolling; no mouse event was dispatched. '
-            + 'Use webpage_locate to verify its position or take a fresh snapshot before retrying.',
-          'BROWSER_PROTOCOL_ERROR',
-        )
+      // 窗口输入权（方案 §4）：一个窗口同时最多一个有效票，候补至预算到期。
+      const lease = await this.acquireWindowInput(session.targetId, signal)
+      try {
+        // 取得票后重新过门禁：排队期间可能已释放 / 移交 / 人工接管 / 交还待重观察。
+        this.assertWritable(session)
+        if (lease !== undefined) session.connection.setWindowTicket(lease.ticket)
+        // 后台页面的 smooth 滚动可能暂停；先准备可见标签，再滚动和量落点。
+        // 否则激活后布局已经改变，却仍把之前的视口外坐标用于真实输入。
+        await this.ensureInputDispatchable(session, signal, true, lease?.ticket)
+        objectId = await this.nodes.resolveObjectId(session, ref, signal)
+        const box = await this.nodes.elementViewportBox(session, objectId, signal)
+        const point = { x: box.x + box.width / 2, y: box.y + box.height / 2 }
+        if ((box.viewportWidth !== undefined && (point.x < 0 || point.x >= box.viewportWidth))
+          || (box.viewportHeight !== undefined && (point.y < 0 || point.y >= box.viewportHeight))) {
+          throw new BrowserError(
+            'the target centre is still outside the viewport after scrolling; no mouse event was dispatched. '
+              + 'Use webpage_locate to verify its position or take a fresh snapshot before retrying.',
+            'BROWSER_PROTOCOL_ERROR',
+          )
+        }
+        hit = await this.nodes.hitTest(session, objectId, point, signal)
+        // 命中测试证实落点被别的元素盖住 → **派发前拒绝**（2026-10-07 独立验收：零页面
+        // 副作用）。旧实现「事件照发、回执如实」会把鼠标事件实际打到遮罩上 —— 真实对话
+        // 复验里连续三次被盖点击全部 DISPATCHED，页面可能被误触。命中测试查不出来
+        // （`undefined`）不拒绝：无证据不误拒，宁可放过一次遮挡。
+        if (hit?.hit === 'other') {
+          throw new BrowserError(this.occludedMessage(hit), 'BROWSER_TARGET_OCCLUDED')
+        }
+        // L2（2026-10-08 独立验收）：后台 reload 后的标签 `visibilityState=hidden` —— 布局、
+        // elementFromPoint 全都正常，但真实鼠标事件派给一个不可见页面后**页面收不到**：
+        // 回执 done、页面计数不动（submits=0）。innerWidth>0 与命中测试都判不出这个坑，
+        // 所以派发前把本标签切到前台并确认页面真的可见；
+        // 激活后仍不可见就在派发前拒绝，零副作用。
+        this.assertWritable(session)
+        this.assertInputNotRevoked(lease)
+        // 量点后若被另一会话切到后台，拒绝而不再次激活，避免恢复滚动后复用旧坐标。
+        await this.ensureInputDispatchable(session, signal, false, lease?.ticket)
+        const options = { signal, timeoutMs: this.config.commandTimeoutMs }
+        await session.connection.send('Input.dispatchMouseEvent', {
+          type: 'mousePressed', ...point, button: 'left', clickCount: 1,
+        }, options)
+        this.assertInputNotRevoked(lease)
+        await session.connection.send('Input.dispatchMouseEvent', {
+          type: 'mouseReleased', ...point, button: 'left', clickCount: 1,
+        }, options)
+      } catch (error) {
+        this.assertInputNotRevoked(lease)
+        throw error
+      } finally {
+        // 临界区结束：清票上下文并释放窗口资源（释放 ≠ 业务动作成功）。
+        if (lease !== undefined) {
+          session.connection.setWindowTicket(undefined)
+          await lease.release()
+        }
       }
-      hit = await this.nodes.hitTest(session, objectId, point, signal)
-      // 命中测试证实落点被别的元素盖住 → **派发前拒绝**（2026-10-07 独立验收：零页面
-      // 副作用）。旧实现「事件照发、回执如实」会把鼠标事件实际打到遮罩上 —— 真实对话
-      // 复验里连续三次被盖点击全部 DISPATCHED，页面可能被误触。命中测试查不出来
-      // （`undefined`）不拒绝：无证据不误拒，宁可放过一次遮挡。
-      if (hit?.hit === 'other') {
-        throw new BrowserError(this.occludedMessage(hit), 'BROWSER_TARGET_OCCLUDED')
-      }
-      // L2（2026-10-08 独立验收）：后台 reload 后的标签 `visibilityState=hidden` —— 布局、
-      // elementFromPoint 全都正常，但真实鼠标事件派给一个不可见页面后**页面收不到**：
-      // 回执 done、页面计数不动（submits=0）。innerWidth>0 与命中测试都判不出这个坑，
-      // 所以派发前把本标签切到前台并确认页面真的可见；
-      // 激活后仍不可见就在派发前拒绝，零副作用。
-      this.assertWritable(session)
-      // 量点后若被另一会话切到后台，拒绝而不再次激活，避免恢复滚动后复用旧坐标。
-      await this.ensureInputDispatchable(session, signal, false)
-      const options = { signal, timeoutMs: this.config.commandTimeoutMs }
-      await session.connection.send('Input.dispatchMouseEvent', {
-        type: 'mousePressed', ...point, button: 'left', clickCount: 1,
-      }, options)
-      await session.connection.send('Input.dispatchMouseEvent', {
-        type: 'mouseReleased', ...point, button: 'left', clickCount: 1,
-      }, options)    } finally {
-      this.nodes.releaseObject(session, objectId, signal)
+    } finally {
+      if (objectId !== undefined) this.nodes.releaseObject(session, objectId, signal)
     }
     const result = await this.navigation.settleMutation(session, 'click', beforeUrl, true, signal)
     return this.describeClick(result, target, hit)
@@ -1206,7 +1418,12 @@ export class CdpBrowserProvider implements BrowserProvider {
     }
   }
 
-  /** 填写：走原型链上的原生 value setter（React 受控组件也认），再补 input/change 事件。 */
+  /**
+   * 填写：取窗口输入权 → 激活 → 原生 setter 写入 → contenteditable 走 insertText。
+   *
+   * 首版整体纳入窗口输入权（方案 §3）：避免 setter 路径与 contenteditable 原生输入
+   * 路径形成调度漏洞。不自动提交。
+   */
   private async fill(
     session: SessionState,
     ref: string,
@@ -1215,30 +1432,43 @@ export class CdpBrowserProvider implements BrowserProvider {
   ): Promise<BrowserMutationResult> {
     const beforeUrl = session.url
     this.assertInteractive(session.refs.resolve(ref), 'webpage_fill')
-    const objectId = await this.nodes.resolveObjectId(session, ref, signal)
+    let objectId: string | undefined
     try {
-      const outcome = await session.connection.send<EvaluateResult>(
-        'Runtime.callFunctionOn',
-        { objectId, functionDeclaration: FILL_FUNCTION, arguments: [{ value }], returnByValue: true },
-        { signal, timeoutMs: this.config.commandTimeoutMs },
-      )
-      await this.transport.projectTyping?.(session.targetId, objectId).catch(() => undefined)
-      this.assertWritable(session)
-      if (outcome.result?.value === 'editable') {
-        // 上一步已聚焦 + 全选，这里由浏览器原生输入管线写入（理由见 FILL_FUNCTION 注释）。
-        await session.connection.send(
-          'Input.insertText',
-          { text: value },
+      const lease = await this.acquireWindowInput(session.targetId, signal)
+      try {
+        this.assertWritable(session)
+        if (lease !== undefined) session.connection.setWindowTicket(lease.ticket)
+        await this.ensureInputDispatchable(session, signal, true, lease?.ticket)
+        objectId = await this.nodes.resolveObjectId(session, ref, signal)
+        const outcome = await session.connection.send<EvaluateResult>(
+          'Runtime.callFunctionOn',
+          { objectId, functionDeclaration: FILL_FUNCTION, arguments: [{ value }], returnByValue: true },
           { signal, timeoutMs: this.config.commandTimeoutMs },
         )
+        await this.transport.projectTyping?.(session.targetId, objectId).catch(() => undefined)
+        this.assertWritable(session)
+        this.assertInputNotRevoked(lease)
+        if (outcome.result?.value === 'editable') {
+          // 上一步已聚焦 + 全选，这里由浏览器原生输入管线写入（理由见 FILL_FUNCTION 注释）。
+          await session.connection.send(
+            'Input.insertText',
+            { text: value },
+            { signal, timeoutMs: this.config.commandTimeoutMs },
+          )
+        }
+      } finally {
+        if (lease !== undefined) {
+          session.connection.setWindowTicket(undefined)
+          await lease.release()
+        }
       }
     } finally {
-      this.nodes.releaseObject(session, objectId, signal)
+      if (objectId !== undefined) this.nodes.releaseObject(session, objectId, signal)
     }
     return this.navigation.settleMutation(session, 'fill', beforeUrl, false, signal)
   }
 
-  /** 按键：先聚焦元素，再用 `Input.dispatchKeyEvent` 派发 keyDown/keyUp。 */
+  /** 按键：取窗口输入权 → 激活 → **再聚焦** → 派发 keyDown/keyUp（方案 §5：激活会改变焦点，聚焦若先于激活就白做了）。 */
   private async press(
     session: SessionState,
     ref: string,
@@ -1248,42 +1478,63 @@ export class CdpBrowserProvider implements BrowserProvider {
     const beforeUrl = session.url
     const keyInfo = describeKey(key)
     this.assertInteractive(session.refs.resolve(ref), 'webpage_press')
-    const objectId = await this.nodes.resolveObjectId(session, ref, signal)
+    let objectId: string | undefined
     try {
-      await session.connection.send(
-        'Runtime.callFunctionOn',
-        { objectId, functionDeclaration: 'function () { this.focus(); }', returnByValue: true },
-        { signal, timeoutMs: this.config.commandTimeoutMs },
-      )
-      await this.transport.projectTyping?.(session.targetId, objectId).catch(() => undefined)
-      this.assertWritable(session)
-      // L2（2026-10-08）：press 与 click 同一条真实输入路径 —— 后台 reload 后的键盘事件
-      // 同样落不进不可见页面（MDN 第二轮六次 press/click 回执成功都不导航）。同样先准备。
-      await this.ensureInputDispatchable(session, signal)
-      const options = { signal, timeoutMs: this.config.commandTimeoutMs }
-      await session.connection.send('Input.dispatchKeyEvent', {
-        type: 'keyDown',
-        key: keyInfo.key,
-        code: keyInfo.code,
-        windowsVirtualKeyCode: keyInfo.virtualKeyCode,
-        nativeVirtualKeyCode: keyInfo.virtualKeyCode,
-        ...keyInfo.text !== undefined ? { text: keyInfo.text } : {},
-      }, options)
-      await session.connection.send('Input.dispatchKeyEvent', {
-        type: 'keyUp',
-        key: keyInfo.key,
-        code: keyInfo.code,
-        windowsVirtualKeyCode: keyInfo.virtualKeyCode,
-        nativeVirtualKeyCode: keyInfo.virtualKeyCode,
-      }, options)
+      const lease = await this.acquireWindowInput(session.targetId, signal)
+      try {
+        this.assertWritable(session)
+        if (lease !== undefined) session.connection.setWindowTicket(lease.ticket)
+        // L2（2026-10-08）：press 与 click 同一条真实输入路径 —— 后台 reload 后的键盘事件
+        // 同样落不进不可见页面（MDN 第二轮六次 press/click 回执成功都不导航）。同样先准备。
+        await this.ensureInputDispatchable(session, signal, true, lease?.ticket)
+        objectId = await this.nodes.resolveObjectId(session, ref, signal)
+        const options = { signal, timeoutMs: this.config.commandTimeoutMs }
+        // 聚焦放在激活**之后**：激活会改变焦点，先聚焦再激活等于白聚焦。
+        await session.connection.send(
+          'Runtime.callFunctionOn',
+          { objectId, functionDeclaration: 'function () { this.focus(); }', returnByValue: true },
+          options,
+        )
+        await this.transport.projectTyping?.(session.targetId, objectId).catch(() => undefined)
+        this.assertWritable(session)
+        this.assertInputNotRevoked(lease)
+        await session.connection.send('Input.dispatchKeyEvent', {
+          type: 'keyDown',
+          key: keyInfo.key,
+          code: keyInfo.code,
+          windowsVirtualKeyCode: keyInfo.virtualKeyCode,
+          nativeVirtualKeyCode: keyInfo.virtualKeyCode,
+          ...keyInfo.text !== undefined ? { text: keyInfo.text } : {},
+        }, options)
+        this.assertInputNotRevoked(lease)
+        await session.connection.send('Input.dispatchKeyEvent', {
+          type: 'keyUp',
+          key: keyInfo.key,
+          code: keyInfo.code,
+          windowsVirtualKeyCode: keyInfo.virtualKeyCode,
+          nativeVirtualKeyCode: keyInfo.virtualKeyCode,
+        }, options)
+      } catch (error) {
+        this.assertInputNotRevoked(lease)
+        throw error
+      } finally {
+        if (lease !== undefined) {
+          session.connection.setWindowTicket(undefined)
+          await lease.release()
+        }
+      }
     } finally {
-      this.nodes.releaseObject(session, objectId, signal)
+      if (objectId !== undefined) this.nodes.releaseObject(session, objectId, signal)
     }
     return this.navigation.settleMutation(session, 'press', beforeUrl, true, signal)
   }
 
   /**
-   * 滚动：在元素中心派发真实的滚轮事件（滚的是元素所在的可滚动容器）。
+   * 滚动：取窗口输入权 → 切前台 → 量落点 → 派发滚轮。
+   *
+   * 临界区覆盖「激活、测量落点、wheel 派发、滚动有界稳定检查」（方案 §3 scroll 行）；
+   * wheel 回包等待有界（{@link WHEEL_ACK_TIMEOUT_MS}），持续动画或无回包不能无限
+   * 占住窗口 —— 到期如实返回未确认状态。
    *
    * `ref` 省略时落在**视口中心**（等价于整页滚动）—— 报告 S3/S5 的能力边界就在这：
    * 长文页与「只有标题、零可操作元素」的页面上根本没有 ref 可给，要求必须带 ref 等于
@@ -1301,24 +1552,33 @@ export class CdpBrowserProvider implements BrowserProvider {
     if (dx === 0 && dy === 0) {
       throw new BrowserError('webpage_scroll needs a non-zero deltaX or deltaY', 'BROWSER_PROTOCOL_ERROR')
     }
-    // 后台标签收不到滚轮（真实鼠标事件只送前台），先切前台；切不动就**明确拒绝**，
-    // 绝不让它干等到超时 —— 那条路径以前表现为「工具超时 30s」（J6）。
-    await this.ensureForeground(session, signal)
-    const beforeUrl = session.url
-    const point = ref === undefined
-      ? await this.nodes.viewportCenter(session, signal)
-      : await (async (): Promise<{ x: number; y: number }> => {
-        const objectId = await this.nodes.resolveObjectId(session, ref, signal)
-        try {
-          const box = await this.nodes.elementViewportBox(session, objectId, signal)
-          return { x: box.x + box.width / 2, y: box.y + box.height / 2 }
-        } finally {
-          this.nodes.releaseObject(session, objectId, signal)
-        }
-      })()
-    const acked = await this.dispatchWheel(session, point, dx, dy, signal)
-    const result = await this.navigation.settleMutation(session, 'scroll', beforeUrl, false, signal)
-    return acked ? result : { ...result, unconfirmed: true }
+    const lease = await this.acquireWindowInput(session.targetId, signal)
+    try {
+      if (lease !== undefined) session.connection.setWindowTicket(lease.ticket)
+      // 后台标签收不到滚轮（真实鼠标事件只送前台），先切前台；切不动就**明确拒绝**，
+      // 绝不让它干等到超时 —— 那条路径以前表现为「工具超时 30s」（J6）。
+      await this.ensureForeground(session, signal, lease?.ticket)
+      const beforeUrl = session.url
+      const point = ref === undefined
+        ? await this.nodes.viewportCenter(session, signal)
+        : await (async (): Promise<{ x: number; y: number }> => {
+          const objectId = await this.nodes.resolveObjectId(session, ref, signal)
+          try {
+            const box = await this.nodes.elementViewportBox(session, objectId, signal)
+            return { x: box.x + box.width / 2, y: box.y + box.height / 2 }
+          } finally {
+            this.nodes.releaseObject(session, objectId, signal)
+          }
+        })()
+      const acked = await this.dispatchWheel(session, point, dx, dy, signal)
+      const result = await this.navigation.settleMutation(session, 'scroll', beforeUrl, false, signal)
+      return acked ? result : { ...result, unconfirmed: true }
+    } finally {
+      if (lease !== undefined) {
+        session.connection.setWindowTicket(undefined)
+        await lease.release()
+      }
+    }
   }
 
   /**
@@ -1326,8 +1586,10 @@ export class CdpBrowserProvider implements BrowserProvider {
    *
    * 滚轮事件只送给前台标签，后台标签上它既不会滚、也不报错 —— 沉默地等到超时是这个场景里
    * 最坏的结局。transport 答不出「谁在前台」时（外部 Chrome）不折腾：那是能力缺口，不是错误。
+   *
+   * @param ticket - 窗口输入票；带票激活由宿主验票后才切（方案 §4）。
    */
-  private async ensureForeground(session: SessionState, signal?: AbortSignal): Promise<void> {
+  private async ensureForeground(session: SessionState, signal?: AbortSignal, ticket?: CdpWindowTicket): Promise<void> {
     const activeTargetId = this.transport.activeTargetId
     if (activeTargetId === undefined) return
     const activeId = await activeTargetId.call(this.transport).catch(() => undefined)
@@ -1340,7 +1602,7 @@ export class CdpBrowserProvider implements BrowserProvider {
         'BROWSER_NOT_IMPLEMENTED',
       )
     }
-    await activate.call(this.transport, session.targetId, signal)
+    await activate.call(this.transport, session.targetId, signal, ticket)
   }
 
   /** 读页面级可见性（L2）；读不到（evaluate 失败）返回 `undefined`，不做无证据的拒绝。 */
@@ -1370,8 +1632,10 @@ export class CdpBrowserProvider implements BrowserProvider {
    *
    * 边界：不能抢人工持有的标签（hold 门在更早的写入前检查里已拒）；不跨模型调用锁前台
    * （这里只为本一次派发准备，之后的可见性由下一次动作自己重新确认）。
+   *
+   * @param ticket - 窗口输入票；带票激活由宿主验票后才切（方案 §4）。
    */
-  private async ensureInputDispatchable(session: SessionState, signal?: AbortSignal, allowActivation = true): Promise<void> {
+  private async ensureInputDispatchable(session: SessionState, signal?: AbortSignal, allowActivation = true, ticket?: CdpWindowTicket): Promise<void> {
     const state = await this.readVisibilityState(session, signal)
     if (state === undefined || state === 'visible') return
     if (!allowActivation) {
@@ -1391,7 +1655,7 @@ export class CdpBrowserProvider implements BrowserProvider {
       )
     }
     // 激活拒绝（包括准备期间人工接管）必须原码上抛，不能吞掉后误报不可见。
-    await activate.call(this.transport, session.targetId, signal)
+    await activate.call(this.transport, session.targetId, signal, ticket)
     let last = state
     for (let attempt = 0; attempt < 5; attempt += 1) {
       const probe = await this.readVisibilityState(session, signal)
@@ -1460,7 +1724,22 @@ export class CdpBrowserProvider implements BrowserProvider {
 
   /** 按 ref 定位；会话查询仍由入口负责。 */
   async locate(request: BrowserLocateRequest, signal?: AbortSignal): Promise<BrowserLocateResult> {
-    return this.nodes.locate(this.require(request.sessionId), request, signal)
+    const session = this.require(request.sessionId)
+    // scroll=false 是纯读：不申请输入权（方案 §3 表）。
+    if (request.scroll !== true) return this.nodes.locate(session, request, signal)
+    // scroll=true 的临界区（方案 §3 locate 行）：激活、滚动、等待有界稳定、最终几何
+    // 测量全程持票 —— 它是 click 的前置验证，测量必须反映可见布局。
+    const lease = await this.acquireWindowInput(session.targetId, signal)
+    try {
+      if (lease !== undefined) session.connection.setWindowTicket(lease.ticket)
+      await this.ensureInputDispatchable(session, signal, true, lease?.ticket)
+      return await this.nodes.locate(session, request, signal)
+    } finally {
+      if (lease !== undefined) {
+        session.connection.setWindowTicket(undefined)
+        await lease.release()
+      }
+    }
   }
 
 }

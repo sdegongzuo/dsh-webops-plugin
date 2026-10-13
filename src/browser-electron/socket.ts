@@ -8,7 +8,7 @@
  * @module dsh-webops-plugin/browser-electron/socket
  */
 
-import type { CdpSocket } from '../browser-cdp/protocol.ts'
+import type { CdpSocket, CdpWindowTicket } from '../browser-cdp/protocol.ts'
 import type { TabHostChannel } from './bridge.ts'
 
 /** 支持的事件名。 */
@@ -18,12 +18,16 @@ type SocketEvent = 'open' | 'message' | 'close' | 'error'
  * 一条通往受控标签页的 CDP 通道。
  *
  * 断开来源有两个，都归到 `close` 上：桥本身断了，或宿主报告该标签页被关掉。
+ *
+ * 窗口输入票上下文（方案 §4）：`setWindowTicket` 之后，本通道的命令都带上该票 ——
+ * 宿主只对 `Input.*` / `Page.bringToFront` 验票，读命令原样放行。
  */
 export class WindowCdpSocket implements CdpSocket {
   private readonly listeners = new Map<SocketEvent, Set<(event: unknown) => void>>()
   private readonly detachEvents: () => void
   private readonly detachClose: () => void
   private closed = false
+  private ticket: CdpWindowTicket | undefined
 
   /**
    * @param bridge - 活着的窗口宿主通道。
@@ -42,6 +46,11 @@ export class WindowCdpSocket implements CdpSocket {
     queueMicrotask(() => { this.emit('open', {}) })
   }
 
+  /** 设置 / 清除窗口输入票上下文（输入临界区的起止边界）。 */
+  setWindowTicket(ticket: CdpWindowTicket | undefined): void {
+    this.ticket = ticket
+  }
+
   /** @inheritdoc */
   send(data: string): void {
     if (this.closed) return
@@ -57,7 +66,7 @@ export class WindowCdpSocket implements CdpSocket {
     const params = message.params === undefined || message.params === null
       ? {}
       : message.params as Record<string, unknown>
-    void this.bridge.command(this.tabId, method, params).then(
+    void this.bridge.command(this.tabId, method, params, this.ticket).then(
       (result) => {
         this.emit('message', { data: JSON.stringify({ id, result: result ?? {} }) })
       },

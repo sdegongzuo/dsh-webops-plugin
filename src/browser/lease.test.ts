@@ -271,6 +271,17 @@ describe('TabLeaseRegistry idle recycling', () => {
 })
 
 describe('TabLeaseRegistry popup families', () => {
+  it('创建与 debugger-ready 重复登记不重置在途调用和归属代次', () => {
+    const { registry } = makeRegistry()
+    registry.register(PROVIDER, 'parent', ALICE)
+    expect(registry.adoptChild(PROVIDER, 'child', 'parent')).toBe(true)
+    const generation = registry.beginCall(PROVIDER, 'child', ALICE)
+    expect(registry.adoptChild(PROVIDER, 'child', 'parent')).toBe(true)
+    expectCode(() => registry.release(PROVIDER, 'parent', ALICE), 'BROWSER_TAB_BUSY')
+    registry.endCall(PROVIDER, 'child', generation)
+    registry.release(PROVIDER, 'parent', ALICE)
+    expect(registry.listAvailable(PROVIDER).sort()).toEqual(['child', 'parent'])
+  })
   it('inherits the parent state, and refuses to register a child with no parent record', () => {
     const { registry } = makeRegistry()
     registry.register(PROVIDER, 't1', ALICE)

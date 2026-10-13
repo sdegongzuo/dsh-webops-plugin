@@ -34,6 +34,14 @@ export interface CdpProviderConfig {
   readonly stableQuietWindowMs?: number
   /** `until: 'stable'` 网络忙宽限期（毫秒）。默认 3000。 */
   readonly stableNetworkGraceMs?: number
+  /**
+   * 窗口输入权排队预算（毫秒，方案 §4）。默认 15000。
+   *
+   * 这是「等另一个对话的输入临界区结束」的上限，不是业务动作的总预算 ——
+   * 取得输入权不重置业务预算。排队超时回执明确「等待输入权阶段、动作未派发」。
+   * 只有控制真实共享窗口的传输层（Electron 宿主）用到它。
+   */
+  readonly inputQueueBudgetMs?: number
 }
 
 /** 配置补齐默认值之后的样子。 */
@@ -47,6 +55,7 @@ export interface ResolvedConfig {
   readonly waitTimeoutMs: number
   readonly stableQuietWindowMs: number
   readonly stableNetworkGraceMs: number
+  readonly inputQueueBudgetMs: number
 }
 
 export const DEFAULT_CONFIG: ResolvedConfig = {
@@ -59,6 +68,7 @@ export const DEFAULT_CONFIG: ResolvedConfig = {
   waitTimeoutMs: 10_000,
   stableQuietWindowMs: 500,
   stableNetworkGraceMs: 3_000,
+  inputQueueBudgetMs: 15_000,
 }
 
 /** `wait` 的纯等待上限（毫秒）；再长就是部署配错了。`until: 'stable'` 默认也用这个。 */
@@ -145,6 +155,7 @@ export function validateProviderConfig(config: CdpProviderConfig = {}): void {
     navigationTimeoutMs: config.navigationTimeoutMs,
     probeTtlMs: config.probeTtlMs,
     waitTimeoutMs: config.waitTimeoutMs,
+    inputQueueBudgetMs: config.inputQueueBudgetMs,
   })) {
     if (value === undefined) continue
     if (!Number.isFinite(value) || value <= 0) {

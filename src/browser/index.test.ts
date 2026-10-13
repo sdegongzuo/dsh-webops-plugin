@@ -400,6 +400,34 @@ describe('BrowserRuntime forwarding', () => {
 })
 
 describe('BrowserRuntime tab ownership', () => {
+  it('open 创建后、加载取消前登记归属；取消保留页面且不把归属交给其他对话', async () => {
+    const { browser, provider } = await mountWithProvider()
+    const controller = new AbortController()
+    provider.open = async request => {
+      provider.sessions.set('early', { sessionId: 'early', ...SESSION })
+      request.onCreated?.('early')
+      browser.assertHeld('early', ALICE)
+      controller.abort()
+      throw controller.signal.reason
+    }
+    await expect(browser.open({}, ALICE, controller.signal)).rejects.toMatchObject({ name: 'AbortError' })
+    browser.assertHeld('early', ALICE)
+    expect(() => browser.assertHeld('early', BOB)).toThrow(expect.objectContaining({ code: 'BROWSER_TAB_NOT_HELD' }))
+    expect(provider.sessions.has('early')).toBe(true)
+  })
+
+  it('早期 created 只登记有效父的家族，不给无主弹窗猜归属', async () => {
+    const browser = await mountBrowser()
+    const provider = makeProvider('cdp', true)
+    let created!: (target: string, opener: string) => boolean
+    provider.onSessionCreated = listener => { created = listener; return () => {} }
+    browser.registerProvider(provider)
+    const parent = await browser.open({}, ALICE)
+    expect(created('child', parent.id)).toBe(true)
+    browser.assertHeld('child', ALICE)
+    expect(created('orphan', 'missing')).toBe(false)
+    expect(() => browser.assertHeld('orphan', ALICE)).toThrow(expect.objectContaining({ code: 'BROWSER_TAB_NOT_HELD' }))
+  })
   it('refuses a call that carries no caller identity, and never reaches the provider', async () => {
     const { browser, provider } = await mountWithProvider()
     await expect(browser.open({}, undefined))

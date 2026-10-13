@@ -62,8 +62,8 @@ export interface CdpTransport {
   version(signal?: AbortSignal): Promise<CdpVersion>
   /** 列出当前所有 target。 */
   list(signal?: AbortSignal): Promise<readonly CdpTarget[]>
-  /** 新开一个标签页并返回它的 target。 */
-  newTab(url: string, signal?: AbortSignal): Promise<CdpTarget>
+  /** 新开一个标签页并返回它的 target。`ticket` 是窗口输入票（`open` 的展示段）。 */
+  newTab(url: string, signal?: AbortSignal, ticket?: CdpWindowTicket): Promise<CdpTarget>
   /** 关闭一个 target。target 已消失视为成功。 */
   closeTarget(targetId: string, signal?: AbortSignal): Promise<void>
   /** 建立命令通道。 */
@@ -72,13 +72,86 @@ export interface CdpTransport {
    * 把一个 target 切到前台（可选能力）。外部 Chrome 走 `/json/activate`；
    * Electron 窗口宿主走 `{ op: 'activate' }`。没有实现时标签页管理会报
    * `BROWSER_NOT_IMPLEMENTED`。
+   *
+   * @param ticket - 窗口输入票（可选）。控制真实共享窗口的传输层要求 agent 引起的
+   *   激活带票；不带票时由宿主裁决（可能拒绝）。
    */
-  activateTarget?(targetId: string, signal?: AbortSignal): Promise<void>
+  activateTarget?(targetId: string, signal?: AbortSignal, ticket?: CdpWindowTicket): Promise<void>
   /**
    * 当前前台 target 的 id（可选能力）。Electron 宿主自己知道；外部 Chrome
    * 没有可靠信号，默认不实现。
    */
   activeTargetId?(): Promise<string | undefined>
+  /**
+   * 窗口输入权调度（可选能力，并发网页操作方案 §4）。
+   *
+   * **只有控制真实共享窗口的传输层实现它**（Electron 窗口宿主）。外部 Chrome
+   * 没有「一个窗口多个 agent 标签」的共享前台，不实现 —— 那类部署下 provider
+   * 回退到本地行为，不宣称窗口级隔离保护。
+   */
+  windowInput?: CdpWindowInputCapability
+}
+
+/**
+ * 窗口输入票的最小协议形状（宿主颁发的内部调度凭证）。
+ *
+ * 绑定宿主启动代次、内部控制代次、人工选择代次与目标标签；不可复用，
+ * 迟到旧票在宿主最终投递边界被拒。
+ *
+ * **镜像类型**：与宿主侧 `InputTicket`（`browser-electron/bridge.ts`）同结构 ——
+ * 父 / 子进程各自编译、经 socket 传 JSON，只能各有一份声明；字段增删必须同步改。
+ */
+export interface CdpWindowTicket {
+  readonly ticketId: string
+  readonly requestId: string
+  readonly tabId: string
+  readonly epoch: number
+  readonly controlEpoch: number
+  readonly selectEpoch: number
+  readonly acquiredAt: number
+}
+
+/**
+ * blocked 解除证据：旧输入已 settle，或承载端点已销毁。
+ *
+ * **镜像类型**：与宿主侧 `BlockedEvidence`（`browser-electron/bridge.ts`）同值域，
+ * 经 socket 传字符串；两边必须同时改。
+ */
+export type CdpWindowBlockedEvidence = 'settled' | 'endpoint-destroyed'
+
+/**
+ * 宿主通知的「输入权被撤销」。
+ *
+ * `stage` / `dispatched` 承载「已派发或状态未知」的事实，父进程回执据此说话 ——
+ * 不允许只传 ticketId、把事实丢在宿主里。
+ *
+ * **镜像类型**：与宿主侧 `InputRevoked`（`browser-electron/bridge.ts`）同结构，
+ * 经 socket 传 JSON；字段增删必须同步改。
+ */
+export interface CdpWindowInputRevoked {
+  readonly ticketId: string
+  readonly tabId: string
+  /** 撤销时票据所处阶段；`dispatching` = 已派发、结果未知。 */
+  readonly stage: string
+  readonly dispatched: boolean
+  readonly reason: string
+}
+
+/** 窗口输入权能力面（{@link CdpTransport.windowInput}）。 */
+export interface CdpWindowInputCapability {
+  acquire(request: {
+    readonly tabId: string
+    readonly requestId: string
+    readonly budgetMs: number
+  }): Promise<CdpWindowTicket | undefined>
+  release(ticketId: string): Promise<void>
+  cancel(ticketIdOrRequestId: string): Promise<{ status: string; stage: string }>
+  resolveBlocked(ticketId: string, evidence: CdpWindowBlockedEvidence): Promise<boolean>
+  /**
+   * 订阅「输入权被撤销」。起桥是异步的，所以返回退订函数也是异步的 ——
+   * 订阅调用方拿 Promise，解掉之后才真正挂到宿主通道上。
+   */
+  onRevoked(listener: (revoked: CdpWindowInputRevoked) => void): Promise<() => void>
 }
 
 /** 默认的单条 CDP 命令超时。 */
@@ -139,6 +212,18 @@ export class CdpConnection {
     }
     this.closeListeners.add(listener)
     return () => this.closeListeners.delete(listener)
+  }
+
+  /**
+   * 设置 / 清除**窗口输入票上下文**（可选能力，方案 §4）。
+   *
+   * 设置后，本连接发出的命令都带上该票 —— 宿主只对 `Input.*` / `Page.bringToFront`
+   * 验票，其余命令忽略。输入临界区开始时设置、`finally` 里清除；没有实现该能力的
+   * socket（外部 Chrome 直连）调用它是无操作。
+   */
+  setWindowTicket(ticket: CdpWindowTicket | undefined): void {
+    const socket = this.socket as { setWindowTicket?: (ticket: CdpWindowTicket | undefined) => void }
+    socket.setWindowTicket?.(ticket)
   }
 
   /**

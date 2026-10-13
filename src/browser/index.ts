@@ -194,8 +194,14 @@ export class BrowserRuntime extends Service {
         if (openerTargetId === undefined) return
         lease.adoptChild(provider.id, targetId, openerTargetId)
       })
+      const stopCreated = provider.onSessionCreated?.((targetId, openerTargetId) => {
+        const parent = lease.view(provider.id, openerTargetId)
+        if (parent === undefined) return false
+        return lease.adoptChild(provider.id, targetId, openerTargetId)
+      })
       yield () => {
         stopAdopt?.()
+        stopCreated?.()
         store.delete(provider.id)
       }
     }, 'browser.registerProvider()')
@@ -289,9 +295,19 @@ export class BrowserRuntime extends Service {
         }
       }
     }
-    const session = await provider.open(request, signal)
+    let createdId: string | undefined
+    const session = await provider.open({
+      ...request,
+      onCreated: id => {
+        this.lease.register(provider.id, id, owner.ownerId)
+        createdId = id
+      },
+    }, signal).catch(error => {
+      if (createdId !== undefined && !signal?.aborted) this.lease.forget(provider.id, createdId)
+      throw error
+    })
     try {
-      this.lease.register(provider.id, session.id, owner.ownerId)
+      if (createdId !== session.id) this.lease.register(provider.id, session.id, owner.ownerId)
     } catch (error: unknown) {
       await provider.close(session.id).catch(() => undefined)
       throw error

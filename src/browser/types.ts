@@ -84,6 +84,8 @@ export type BrowserErrorCode =
    * 交还**不**恢复任何旧 ref）。
    */
   | 'BROWSER_HUMAN_HOLDING'
+  /** 目标仍归 agent，但同窗口另一前台标签归人工；等待到期且输入未派发。 */
+  | 'BROWSER_WINDOW_HUMAN_FOREGROUND'
   /**
    * 多会话占用：这次工具调用没有拿到宿主对话身份（`exec.agent.id` 缺失）。
    *
@@ -132,6 +134,16 @@ export type BrowserErrorCode =
   | 'BROWSER_WINDOW_NOT_VISIBLE'
   | 'BROWSER_TAB_NOT_VISIBLE'
   | 'BROWSER_READ_ONLY_ANCHOR'
+  /**
+   * 窗口输入权：排队等待超过预算仍未取得共享窗口的前台（另一个对话的输入临界区
+   * 还没结束，或窗口处于 blocked）。**动作未派发** —— 重试通常能进（临界区有界）。
+   */
+  | 'BROWSER_WINDOW_INPUT_TIMEOUT'
+  /**
+   * 窗口输入权：等待 / 准备期间输入权被撤销（人工接管、窗口销毁、控制代次变化）。
+   * **不重放**：撤销时可能已有部分派发、结果未知。
+   */
+  | 'BROWSER_WINDOW_INPUT_REVOKED'
 
 /** 能力缝隙与 provider 唯一抛出的错误类型。 */
 /**
@@ -216,6 +228,7 @@ const BROWSER_ERROR_RECOVERY: Readonly<Partial<Record<BrowserErrorCode, string>>
   BROWSER_EXECUTE_TIMEOUT: 'inspect the page state before retrying; the result is unconfirmed and page code may still finish.',
   BROWSER_EXECUTE_NOT_ALLOWED: 'this internal CDP command is not exposed by webpage_execute; use its documented session_id, code, and optional timeout_ms interface.',
   BROWSER_HUMAN_HOLDING: 'a human is holding this tab — do not retry; wait for them to release it, then take a fresh webpage_snapshot (old refs stay invalid).',
+  BROWSER_WINDOW_HUMAN_FOREGROUND: '窗口前台由人工使用；不要自动切换或重试。等待人工交还或主动选择 agent 标签后再操作，目标标签的归属未因此改变。',
   BROWSER_CALLER_REQUIRED: 'the runtime did not pass a caller identity; report this as an environment problem.',
   BROWSER_TAB_NOT_HELD: 'if the tab is idle, claim it with webpage_tabs(action=claim); if another conversation holds it, wait for release or an explicit handover instead of trying to take it over. After acquiring it, take a fresh webpage_snapshot.',
   BROWSER_TAB_OCCUPIED: 'another conversation holds this tab — do not fight for it; use another tab or wait for release.',
@@ -225,6 +238,8 @@ const BROWSER_ERROR_RECOVERY: Readonly<Partial<Record<BrowserErrorCode, string>>
   BROWSER_WINDOW_NOT_VISIBLE: 'restore the browser window (un-minimize or show it), then retry; do not retry while the window stays hidden or minimized.',
   BROWSER_TAB_NOT_VISIBLE: 'real mouse/keyboard input only lands on a visible tab (visibilityState=hidden) — activate the tab with webpage_tabs(action=activate), make sure the browser window itself is shown, then retry; do not dispatch input into a hidden tab.',
   BROWSER_READ_ONLY_ANCHOR: 'this [anchor=eN] only locates content for reading. Click/fill/press need an actionable [ref=eN] control (button/link/textbox) from your latest observation; choose that control without re-snapshotting if it is already present.',
+  BROWSER_WINDOW_INPUT_TIMEOUT: 'the shared browser window was busy with another action and the input lease was not granted in time — nothing was dispatched; retry once (input critical sections are bounded).',
+  BROWSER_WINDOW_INPUT_REVOKED: '输入权已撤销；以回执中的派发阶段和已派发事实为准，不能假定页面没有副作用。不要自动重放，先重新观察。',
 }
 
 /**
@@ -260,6 +275,8 @@ export function presentBrowserError(error: unknown): unknown {
  */
 export interface BrowserOpenRequest {
   readonly url?: string
+  /** 内部生命周期回调：创建后、导航前登记归属，不作为模型参数公开。 */
+  readonly onCreated?: (sessionId: string) => void
 }
 
 /**
@@ -1027,6 +1044,8 @@ export interface BrowserProvider {
    * @returns 退订函数。
    */
   onSessionAdopted?(listener: (targetId: string, openerTargetId: string | undefined) => void): () => void
+  /** 弹窗创建时同步确认家族登记；确认前宿主不得自动展示为 agent 页面。 */
+  onSessionCreated?(listener: (targetId: string, openerTargetId: string) => boolean): () => void
   /**
    * 占用归属变了（释放 / 移交 / 空闲超时回收）：把该会话的 ref 纪元与快照缓存作废。
    *

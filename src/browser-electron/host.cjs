@@ -59,9 +59,13 @@
  * ## 协议（一条 TCP 连接，JSON Lines）
  *
  * 父 → 子：
- * - `{ op: 'open', id, url, size?, keepAlive? }`
- * - `{ op: 'cdp', id, tabId, method, params }`
- * - `{ op: 'activate', id, tabId }`
+ * - `{ op: 'open', id, url, size?, keepAlive?, foreground?, ticket? }`
+ * - `{ op: 'cdp', id, tabId, method, params, ticket? }`
+ * - `{ op: 'activate', id, tabId, ticket? }`
+ * - `{ op: 'acquire-input', id, requestId, tabId, budgetMs }`
+ * - `{ op: 'release-input', id, ticketId }`
+ * - `{ op: 'cancel-input', id, ticketId }`（候补按 requestId、当前票按 ticketId）
+ * - `{ op: 'resolve-blocked', id, ticketId, evidence }`（`settled` / `endpoint-destroyed`）
  * - `{ op: 'devtools', id }`（切换活动标签的开发者工具；等状态落定才回）
  * - `{ op: 'control', id, tabId?, holder }`（§6.5 切控制权；`tabId` 省略时用前台标签）
  * - `{ op: 'close', id, tabId }`
@@ -71,10 +75,19 @@
  *
  * 子 → 父：
  * - `{ type: 'listening', port, host }`（`host` 是**实际**监听的回环名，父进程照它连）
- * - `{ type: 'opened', id, tabId, url, title }`
+ * - `{ type: 'opened', id, tabId, url, title, foreground }`（无 `id` = 宿主自己开的标签通报；
+ *   `foreground` 表示展示段是否真的落了前台）
  * - `{ type: 'cdp', id, result | error }`
+ * - `{ type: 'activated', id, tabId | error }`
+ * - `{ type: 'input-ticket', id, ticket }` / `{ type: 'input-denied', id, reason }`
+ * - `{ type: 'input-released', id, ok, stage? }`
+ * - `{ type: 'input-cancel-ack', id, status, stage }`
+ * - `{ type: 'input-block-resolved', id, ok }`
  * - `{ type: 'devtools', id, tabId, action, isOpen }`（`isOpen` 是**真实**状态，用来把
  *   `openDevTools` 的静默失败暴露给调用方）
+ * - `{ type: 'input-revoked', ticketId, tabId, stage, dispatched, reason }`（无 `id` 的通知：
+ *   人工接管 / 控制代次变化 / 窗口销毁撤销了输入权；`dispatched=true` 表示已派发、
+ *   结果未知，父进程不得自动重放）
  * - `{ type: 'closed', id?, tabId }`（无 `id` 表示用户自己关的）
  * - `{ type: 'list', id, tabs }`
  * - `{ type: 'bar', id, tabs, rendered, active }`（`rendered` 是标签条 DOM 里的 `.tab` 数，`-1` = 没画出来）
@@ -95,43 +108,61 @@
 
 const { app, BaseWindow, BrowserWindow, WebContentsView, ipcMain, Menu, nativeImage } = require('electron')
 const { createActionOverlay } = require('./action-overlay.cjs')
+const { WindowInputQueue, WRITE_AGENT, WRITE_BG_READ, WRITE_HUMAN } = require('./window-input-queue.cjs')
 const net = require('node:net')
 const path = require('node:path')
 
-/** 后台页面暂时在活动页面下面参与合成；不切换活动标签、不抢焦点。 */
+/**
+ * 后台页面暂时在活动页面下面参与合成；不切换活动标签、不抢焦点。
+ *
+ * 后台路径的「临时可见性 + 合成层级变更」属于**共享窗口写入**（方案 §3 截图行）：
+ * 排进窗口写队列，与输入派发互斥；有界由父进程的命令超时兜底。`WRITE_BG_READ` 让它在
+ * 人工接管期间也继续 —— 后台读取不受人工前台保护限制。
+ */
 async function captureScreenshot(entry, params, timeout) {
   if (params.fromSurface === false) return entry.debugger.sendCommand('Page.captureScreenshot', params)
   const background = entry.id !== activeTabId
   if (background) {
-    shell.contentView.addChildView(entry.view, 0)
-    entry.view.setVisible(true)
+    // 任务的结果（截图数据）原样带回；可见性恢复在 finally 里，不覆盖返回值。
+    return inputQueue.enqueueWindowWrite(async () => {
+      // 排队期间标签可能已被关掉 / 掉出视图树：没了就直接失败，别动一个不存在的视图。
+      if (tabs.get(entry.id) !== entry) throw Error('元素截图目标标签已关闭')
+      shell.contentView.addChildView(entry.view, 0)
+      entry.view.setVisible(true)
+      try {
+        return await captureBackgroundBody(entry, params, timeout)
+      } finally {
+        // 用户可能在截图期间切标签，按当前活动状态恢复，不能覆盖用户选择。
+        if (!entry.view.webContents.isDestroyed()) entry.view.setVisible(entry.id === activeTabId)
+      }
+    }, { kind: WRITE_BG_READ })
   }
-  try {
-    // 完整页面捕获会重配 surface；先等新帧就绪，避免沿用已释放的旧 surface。
-    await Promise.race([entry.view.webContents.capturePage(undefined, { stayHidden: false, stayAwake: true }), timeout])
-    if (params.clip === undefined) return await Promise.race([entry.debugger.sendCommand('Page.captureScreenshot', params), timeout])
-    // Electron 的后台 clip 路径可能不出帧，整页路径则可以完成；只在宿主内裁剪。
-    const zoom = await Promise.race([entry.debugger.sendCommand('Runtime.evaluate', {
-      expression: 'window.devicePixelRatio', returnByValue: true,
-    }), timeout])
-    const ratio = zoom.result?.value
-    if (!(typeof ratio === 'number' && Number.isFinite(ratio) && ratio > 0)) throw Error('元素截图无法确认设备缩放')
-    const { clip, ...fullParams } = params
-    const captured = await Promise.race([entry.debugger.sendCommand('Page.captureScreenshot', {
-      ...fullParams, captureBeyondViewport: true,
-    }), timeout])
-    const image = nativeImage.createFromBuffer(Buffer.from(captured.data, 'base64'), { scaleFactor: 1 })
-    const size = image.getSize()
-    const x = Math.max(0, Math.floor(clip.x * ratio))
-    const y = Math.max(0, Math.floor(clip.y * ratio))
-    const right = Math.min(size.width, Math.ceil((clip.x + clip.width) * ratio))
-    const bottom = Math.min(size.height, Math.ceil((clip.y + clip.height) * ratio))
-    if (!(right > x && bottom > y)) throw Error('元素截图范围在页面图像之外')
-    return { data: image.crop({ x, y, width: right - x, height: bottom - y }).toPNG().toString('base64') }
-  } finally {
-    // 用户可能在截图期间切标签，按当前活动状态恢复，不能覆盖用户选择。
-    if (background && !entry.view.webContents.isDestroyed()) entry.view.setVisible(entry.id === activeTabId)
-  }
+  return captureBackgroundBody(entry, params, timeout)
+}
+
+/** 前台 / 已临时置可见的后台标签共用的捕获本体（超时与原语义不变）。 */
+async function captureBackgroundBody(entry, params, timeout) {
+  // 完整页面捕获会重配 surface；先等新帧就绪，避免沿用已释放的旧 surface。
+  await Promise.race([entry.view.webContents.capturePage(undefined, { stayHidden: false, stayAwake: true }), timeout])
+  if (params.clip === undefined) return await Promise.race([entry.debugger.sendCommand('Page.captureScreenshot', params), timeout])
+  // Electron 的后台 clip 路径可能不出帧，整页路径则可以完成；只在宿主内裁剪。
+  const zoom = await Promise.race([entry.debugger.sendCommand('Runtime.evaluate', {
+    expression: 'window.devicePixelRatio', returnByValue: true,
+  }), timeout])
+  const ratio = zoom.result?.value
+  if (!(typeof ratio === 'number' && Number.isFinite(ratio) && ratio > 0)) throw Error('元素截图无法确认设备缩放')
+  const { clip, ...fullParams } = params
+  const captured = await Promise.race([entry.debugger.sendCommand('Page.captureScreenshot', {
+    ...fullParams, captureBeyondViewport: true,
+  }), timeout])
+  const image = nativeImage.createFromBuffer(Buffer.from(captured.data, 'base64'), { scaleFactor: 1 })
+  const size = image.getSize()
+  const x = Math.max(0, Math.floor(clip.x * ratio))
+  const y = Math.max(0, Math.floor(clip.y * ratio))
+  const right = Math.min(size.width, Math.ceil((clip.x + clip.width) * ratio))
+  const bottom = Math.min(size.height, Math.ceil((clip.y + clip.height) * ratio))
+  if (!(right > x && bottom > y)) throw Error('元素截图范围在页面图像之外')
+  return { data: image.crop({ x, y, width: right - x, height: bottom - y }).toPNG().toString('base64') }
 }
 
 // Windows 原生遮挡会把仍可操作的前台标签变成 hidden，真实输入准备门因此误拒。
@@ -244,6 +275,33 @@ let activeTabId
 let sequence = 0
 let connection
 
+/**
+ * 窗口输入权调度器（并发网页操作方案 §4）。
+ *
+ * 宿主是**唯一**的窗口调度权威：一个窗口同时最多一个有效输入票；所有 agent 引起的
+ * 前台变更（激活、真实输入、open 展示、关闭替补）与截图的临时可见性都经过它或它的
+ * 写队列。撤销（人工接管 / 控制代次变化 / 窗口销毁）立刻通知父进程，父进程放弃派发，
+ * 已派发或状态未知的一律不自动重放。
+ */
+const inputQueue = new WindowInputQueue({
+  onStateChange: () => { sendControlState() },
+  onRevoke: (snapshot) => {
+    send({
+      type: 'input-revoked',
+      ticketId: snapshot.ticketId,
+      tabId: snapshot.tabId,
+      stage: snapshot.stage,
+      dispatched: snapshot.dispatched,
+      reason: snapshot.reason,
+    })
+  },
+  // 活动标签归人工时，agent 的自动展示（open / 弹窗 / 替补）暂缓 —— 窗口前台保留给人工。
+  humanForegroundAllows: () => {
+    const entry = activeTabId !== undefined ? tabs.get(activeTabId) : undefined
+    return entry?.holder === 'human'
+  },
+})
+
 /** 父进程断连后是否继续活着（演示用：让窗口留在屏幕上）。 */
 let keepAlive = process.env['DSH_BROWSER_WINDOW_KEEP_ALIVE'] === '1'
 
@@ -257,6 +315,11 @@ function send(message) {
 function sendTabBar() {
   sendNavState()
   sendControlState()
+  sendTabList()
+}
+
+/** 只推标签清单（不等地址栏 / 控制权状态 —— 关闭前台标签时那两项要等替补落定）。 */
+function sendTabList() {
   if (tabBar === undefined || tabBar.webContents.isDestroyed()) return
   tabBar.webContents.send('dsh-tabs', [...tabs.values()].map(tab => ({
     id: tab.id,
@@ -300,10 +363,13 @@ function sendNavState() {
 function sendControlState() {
   if (tabBar === undefined || tabBar.webContents.isDestroyed()) return
   const entry = activeTabId !== undefined ? tabs.get(activeTabId) : undefined
-  actionOverlay?.setControl(entry?.id, entry?.holder)
+  const inputBlocked = inputQueue.status().blocked
+  // 旧输入未结束时仍消费人工输入，避免与旧按下状态混合；归属本身立即切换。
+  actionOverlay?.setControl(entry?.id, inputBlocked ? 'agent' : entry?.holder)
   tabBar.webContents.send('dsh-control-state', {
     tabId: entry === undefined ? '' : entry.id,
     holder: entry === undefined ? 'agent' : entry.holder,
+    inputBlocked,
   })
 }
 
@@ -323,15 +389,18 @@ function setHolder(tabId, holder) {
   const entry = tabs.get(tabId)
   if (entry === undefined || entry.holder === holder) return
   entry.holder = holder
+  // 控制代次变化：旧输入票全部失效（方案 §4 内部控制代次；人工接管立即撤销）。
+  inputQueue.bumpControlEpoch()
   clearAction()
   send({ type: 'control', tabId, holder })
   sendControlState()
+  inputQueue.foregroundChanged()
 }
 
 /** 原生编辑菜单不保证经过页面的 before-input-event；agent 持有时禁止向页面派发菜单编辑。 */
 function runEditAction(action) {
   const page = [...tabs.values()].find(tab => tab.view.webContents.isFocused())
-  if (shouldBlockEditAction(page?.holder, action)) return
+  if (shouldBlockEditAction(inputQueue.status().blocked ? 'agent' : page?.holder, action)) return
   const target = page?.view.webContents
     ?? (tabBar !== undefined && !tabBar.webContents.isDestroyed() && tabBar.webContents.isFocused()
       ? tabBar.webContents : undefined)
@@ -414,7 +483,6 @@ function layout() {
  */
 function ensureShell(size) {
   if (shell !== undefined && !shell.isDestroyed()) {
-    shell.focus()
     return shell
   }
   shell = new BaseWindow({
@@ -438,7 +506,8 @@ function ensureShell(size) {
   shell.contentView.addChildView(tabBar)
   layout()
   void tabBar.webContents.loadFile(path.join(__dirname, 'tabbar.html'))
-  shell.on('resize', layout)
+  shell.on('resize', () => { inputQueue.revokeAll('window-resized'); layout() })
+  shell.on('minimize', () => { inputQueue.revokeAll('window-minimized') })
   // 恢复 / 重新显示时补跑一次。两道保险各管一类：
   //   - `layout()` 的最小化守卫会跳过「窗口不可见期间的 layout」，那期间新开的标签
   //     视图还没拿到过尺寸，靠这里补；
@@ -450,6 +519,8 @@ function ensureShell(size) {
     clearAction()
     actionOverlay = undefined
     shell = undefined
+    // 壳没了 = 窗口重建代次：任何在途输入票都不可能再落地，全部撤销。
+    inputQueue.bumpWindowEpoch()
     // 壳没了，标签页跟着全没；把剩下的一并通报给父进程。
     for (const id of [...tabs.keys()]) {
       tabs.delete(id)
@@ -466,7 +537,10 @@ function ensureShell(size) {
  * @param options - `announce: true` 时在 dom-ready 后向父进程通报 `{ type: 'opened' }`。
  *   **只有非命令创建的标签需要通报**（页面弹窗、标签条「+」）：父进程的会话注册表
  *   只认识 `open` 命令的应答，不通报的话这些标签对 `provider.tabs(list)` 永远不可见。
- * @returns 描述这个标签的记录。
+ *   `foreground: false` 时只建后台标签、不展示（open 的「准备」段，方案 §3）。
+ *   `ticket` 是 `open` 命令带来的输入票：展示段由它覆盖，与 Input 派发互斥，
+ *   迟到 / 失效即不展示（保留后台标签）。
+ * @returns 描述这个标签的记录；`foregroundReady` 等展示段落定（总有终点）。
  */
 function openTab(url, size, options) {
   const window = ensureShell(size)
@@ -474,6 +548,7 @@ function openTab(url, size, options) {
   const view = new WebContentsView({
     webPreferences: { nodeIntegration: false, contextIsolation: true, sandbox: true },
   })
+  view.setVisible(false)
   window.contentView.addChildView(view)
 
   const entry = {
@@ -489,6 +564,10 @@ function openTab(url, size, options) {
     // human 时放开，并且父进程侧会作废 ref 纪元、拒掉 agent 的写操作。
     // 与 `lettingGo` 一样是**幂等状态位**，不是计数器。
     holder: 'agent',
+    creationId: `${inputQueue.epoch}:${id}`,
+    openerTabId: options?.openerTabId,
+    openerControlEpoch: inputQueue.controlEpoch,
+    displayRegistered: options?.openerTabId === undefined,
   }
   // 调试器的监听只注册一次（对象与 view 同生命周期），attach/detach 可反复。
   entry.debugger.on('message', (_event, method, params) => {
@@ -524,7 +603,7 @@ function openTab(url, size, options) {
   // 所以 agent 的 webpage_press 仍可用。char 拦截同时覆盖经键盘事件提交的输入法字符。
   view.webContents.on('before-input-event', (event, input) => {
     // 拦截快捷键（含粘贴）、Shift+Insert、普通按键及字符输入；放行 keyUp 以保持 CDP 按键完整。
-    if (!shouldBlockPageInput(entry.holder, input)) return
+    if (!shouldBlockPageInput(inputQueue.status().blocked ? 'agent' : entry.holder, input)) return
     event.preventDefault()
   })
 
@@ -537,6 +616,7 @@ function openTab(url, size, options) {
       send({ type: 'error', tabId: id, message: `renderer gone: ${JSON.stringify(details)}` })
     })
   })
+  view.webContents.once('destroyed', () => { inputQueue.confirmEndpointDestroyed(id) })
   // 兜底：正常情况下 `toggleDevTools` 在 `devtools-opened` 时就把调试器接回来了，
   // 这一条只保证「关掉 DevTools 之后一定还连着」（`attachDebugger` 是幂等的）。
   view.webContents.on('devtools-closed', () => { attachDebugger(entry) })
@@ -556,17 +636,50 @@ function openTab(url, size, options) {
   view.webContents.on('did-finish-load', () => { sendTabBar() })
 
   tabs.set(id, entry)
-  clearAction()
-  activeTabId = id
-  layout()
-  sendTabBar()
+  // 新后台视图只设置自己的尺寸，不在 A 测量/派发期间重排所有已有视图。
+  const bounds = window.getContentBounds()
+  if (bounds.width > 0 && bounds.height > TAB_BAR_HEIGHT) view.setBounds({ x: 0, y: TAB_BAR_HEIGHT, width: bounds.width, height: bounds.height - TAB_BAR_HEIGHT })
+  sendTabList()
+
+  const registrationReady = options?.openerTabId === undefined ? Promise.resolve(true) : new Promise(resolve => {
+    entry.registerCreated = accepted => { clearTimeout(entry.registrationTimer); resolve(accepted) }
+    entry.registrationTimer = setTimeout(() => entry.registerCreated(false), 15000)
+    // 在 debugger-ready 和页面加载之前发送。父进程先同步登记家族，再确认展示。
+    send({ type: 'created', tabId: id, openerTabId: options.openerTabId, creationId: entry.creationId })
+  })
+
+  // 展示段（方案 §3 open 行）：创建不改变前台，**进入前台**才走调度。
+  // - 命令 open 带 ticket：展示由票覆盖，与 Input 派发互斥；票迟到 / 失效即不展示。
+  // - 宿主自己开的标签（弹窗 / 「+」）无票：按 agent 自动展示排写队列，等当前输入权
+  //   释放；期间人工切了标签（选择代次变化）就取消自动展示，保留后台标签。
+  const capturedSelectEpoch = inputQueue.selectEpoch
+  const ticket = options?.ticket
+  entry.foregrounded = false
+  entry.foregroundReady = options?.foreground === false
+    ? Promise.resolve()
+    : registrationReady.then(accepted => accepted ? inputQueue.enqueueWindowWrite(() => {
+      // 迟到的人工选择优先：创建后人工切走了，就不抢前台（方案 §6）。
+      if (!inputQueue.autoDisplayEpochAllowed(capturedSelectEpoch)) return
+      if (entry.openerTabId !== undefined && (!tabs.has(entry.openerTabId) || entry.openerControlEpoch !== inputQueue.controlEpoch)) return
+      activateTab(id)
+      entry.foregrounded = true
+    }, {
+      kind: WRITE_AGENT,
+      ...(ticket === undefined ? {} : { ticket }),
+    }) : undefined)
 
   // 必须显式加载：不加载就没有导航，`dom-ready` 不会来，`entry.ready` 永远挂起。
-  void view.webContents.loadURL(url === undefined || url === '' ? 'about:blank' : url)
+  const requestedUrl = url === undefined || url === '' ? 'about:blank' : url
+  // 弹窗先建可 attach 的空白端点，慢/失败页面不推迟 created 登记与 debugger-ready。
+  void view.webContents.loadURL(options?.openerTabId === undefined ? requestedUrl : 'about:blank').catch(() => undefined)
   if (options?.announce === true) {
     // 通报放在 dom-ready 之后：此刻调试器已接上（dom-ready 处理器先 attach 再 resolve），
     // 父进程立刻收编会话时 CDP 通道就是可用的；url/title 也已是真实值而非 about:blank。
-    entry.ready.then(() => {
+    entry.ready.then(async () => {
+      if (options.openerTabId !== undefined && !await registrationReady) {
+        void view.webContents.loadURL(requestedUrl).catch(() => undefined)
+        return
+      }
       send({
         type: 'opened',
         tabId: id,
@@ -576,6 +689,7 @@ function openTab(url, size, options) {
         // 页面不猜主人，父进程会把它留在台账之外（实施方案 §5.2）。
         ...options.openerTabId === undefined ? {} : { openerTabId: options.openerTabId },
       })
+      if (options.openerTabId !== undefined) void view.webContents.loadURL(requestedUrl).catch(() => undefined)
     }).catch(() => undefined)
   }
   return entry
@@ -591,21 +705,23 @@ function activateTab(id) {
   activeTabId = id
   layout()
   sendTabBar()
+  inputQueue.foregroundChanged()
 }
 
 /**
  * 关掉一个标签页。
+ *
+ * 关掉的是前台标签时，**替补激活**属于共享窗口写入（方案 §3 close 行）：排进写队列，
+ * 不与 Input 派发交叉。等待期间内容区短暂空白（原行为也是先摘视图再重排）。
  * @param id - 标签 id。
  */
 function closeTab(id) {
   const entry = tabs.get(id)
   if (entry === undefined) return
-  if (id === activeTabId) clearAction()
+  const wasActive = id === activeTabId
+  if (wasActive) clearAction()
   tabs.delete(id)
-  if (activeTabId === id) {
-    const next = [...tabs.keys()].at(-1)
-    activeTabId = next
-  }
+  const next = wasActive ? [...tabs.keys()].at(-1) : undefined
   try {
     if (shell !== undefined && !shell.isDestroyed()) shell.contentView.removeChildView(entry.view)
   } catch {
@@ -613,8 +729,22 @@ function closeTab(id) {
   }
   // `close()` 走的是「页面请求关闭」的路径，比直接 destroy 温和；关不掉再强杀。
   if (!entry.view.webContents.isDestroyed()) entry.view.webContents.close()
-  layout()
-  sendTabBar()
+  if (wasActive) {
+    // 先摘掉活动位：等待替补期间没有活动标签，别让旧 id 继续当前台。
+    activeTabId = undefined
+    // 清单立即更新（标签数变了）；地址栏 / 控制权状态等替补落定再推。
+    sendTabList()
+    void inputQueue.enqueueWindowWrite(() => {
+      if (next !== undefined && tabs.has(next)) activateTab(next)
+      else {
+        layout()
+        sendTabBar()
+      }
+    }, { kind: WRITE_AGENT })
+  } else {
+    layout()
+    sendTabBar()
+  }
   send({ type: 'closed', tabId: id })
 }
 
@@ -729,19 +859,51 @@ async function toggleDevTools() {
   return { entry, action: 'opened', isOpen: true }
 }
 
+/** 仅释放原动作确实按下的按钮/按键；底层未结束或人工页面不安全时保持 blocked。 */
+async function finishBlockedInput(ticketId) {
+  const current = inputQueue.current
+  if (!current || current.view.ticketId !== ticketId || current.stage !== 'blocked') return
+  const releases = inputQueue.pendingReleases(ticketId)
+  if (releases === undefined) return
+  const entry = tabs.get(current.tabId)
+  if (releases.length > 0) {
+    if (!entry || entry.holder === 'human' || activeTabId !== entry.id || entry.view.webContents.isDestroyed()) return
+    for (const held of releases) {
+      const params = { ...held.params, type: held.method === 'Input.dispatchMouseEvent' ? 'mouseReleased' : 'keyUp' }
+      // 收尾可触发业务事件；不补发按下，不重放原动作。仍用原票记底层占用。
+      inputQueue.noteDispatched(ticketId, held.method, params)
+      inputQueue.blockCurrent()
+      try {
+        await entry.debugger.sendCommand(held.method, params)
+        inputQueue.noteSettled(ticketId, held.method, params)
+      } catch {
+        inputQueue.noteSettled(ticketId)
+        return
+      }
+    }
+  }
+  inputQueue.resolveBlocked(ticketId, 'settled')
+}
+
 /** 处理一条来自父进程的命令。 */
 async function handle(command) {
   switch (command.op) {
     case 'open': {
       if (command.keepAlive === true) keepAlive = true
-      const entry = openTab(command.url, command.size)
+      const entry = openTab(command.url, command.size, {
+        foreground: command.foreground !== false,
+        ...(command.ticket === undefined || command.ticket === null ? {} : { ticket: command.ticket }),
+      })
       await entry.ready
+      // 展示段也等落定：回执的 foreground 表示这个标签是否真的落在了前台。
+      await entry.foregroundReady
       send({
         type: 'opened',
         id: command.id,
         tabId: entry.id,
         url: entry.view.webContents.getURL(),
         title: entry.view.webContents.getTitle(),
+        foreground: entry.foregrounded,
       })
       return
     }
@@ -756,6 +918,22 @@ async function handle(command) {
         // 在最后投递边界裁决，防止父进程检查后、异步准备期间发生接管。
         if (entry.holder === 'human' && (command.method.startsWith('Input.') || command.method === 'Page.navigate')) {
           throw new Error(`BROWSER_HUMAN_HOLDING: tab ${entry.id} is under human control`)
+        }
+        // 真实输入与 bringToFront 是窗口级前台写入：必须带有效输入票（方案 §4）。
+        // 票在「测量 → 派发」之间被撤销 / 代次变化时，这里拒绝派发 —— 零页面副作用。
+        const needsTicket = command.method.startsWith('Input.') || command.method === 'Page.bringToFront'
+        if (command.ticket !== undefined) {
+          const verdict = inputQueue.verifyTicket(command.ticket, command.tabId)
+          if (verdict !== 'ok') {
+            throw new Error(`BROWSER_WINDOW_INPUT_${verdict.toUpperCase().replace(/-/g, '_')}: input dispatch refused (${verdict})`)
+          }
+        }
+        if (needsTicket && command.ticket === undefined) throw new Error('BROWSER_WINDOW_INPUT_MISSING_TICKET: input dispatch refused')
+        if (command.method.startsWith('Input.')) {
+          if (entry.id !== activeTabId || shell?.isMinimized() || !shell?.isVisible()) {
+            throw new Error('BROWSER_TAB_NOT_VISIBLE: input target is not the active visible tab')
+          }
+          inputQueue.noteDispatched(command.ticket.ticketId, command.method, command.params)
         }
         // 私有宿主方法不发送给 Chromium；仅按已解析的节点投影输入位置。
         if (command.method === 'Dsh.projectTyping') {
@@ -780,7 +958,22 @@ async function handle(command) {
         try {
           const operation = command.method === 'Page.captureScreenshot'
             ? captureScreenshot(entry, command.params ?? {}, timeout)
-            : entry.debugger.sendCommand(command.method, command.params ?? {})
+            : command.ticket !== undefined && !command.method.startsWith('Input.')
+              ? inputQueue.enqueueWindowWrite(() => entry.debugger.sendCommand(command.method, command.params ?? {}), { ticket: command.ticket, kind: WRITE_BG_READ })
+              : entry.debugger.sendCommand(command.method, command.params ?? {})
+          if (command.method.startsWith('Input.')) {
+            // 仅底层 promise 真正结束才核销；外层超时不会结束 Chromium 输入。
+            void operation.then(() => {
+              inputQueue.noteSettled(command.ticket.ticketId, command.method, command.params)
+              void finishBlockedInput(command.ticket.ticketId)
+            }, () => {
+              inputQueue.noteSettled(command.ticket.ticketId)
+              void finishBlockedInput(command.ticket.ticketId)
+            })
+          } else if (command.ticket !== undefined) {
+            // 节点释放等准备收尾也可能晚于 release；实际写完成后再解除占用。
+            void operation.then(() => finishBlockedInput(command.ticket.ticketId), () => finishBlockedInput(command.ticket.ticketId))
+          }
           result = await Promise.race([operation, timeout])
         } finally {
           clearTimeout(timer)
@@ -804,8 +997,81 @@ async function handle(command) {
         send({ type: 'activated', id: command.id, error: { message: 'BROWSER_HUMAN_HOLDING: tab is under human control' } })
         return
       }
+      if (tabs.get(command.tabId)?.displayRegistered === false) {
+        send({ type: 'activated', id: command.id, error: { message: 'BROWSER_TAB_NOT_HELD: popup registration has not been confirmed' } })
+        return
+      }
+      // 激活是 agent 引起的前台变更：必须带有效票（方案 §3 activate 行）。
+      const verdict = inputQueue.verifyTicket(command.ticket, command.tabId)
+      if (verdict !== 'ok') {
+        send({
+          type: 'activated',
+          id: command.id,
+          error: { message: `BROWSER_WINDOW_INPUT_${verdict.toUpperCase().replace(/-/g, '_')}: activation refused (${verdict})` },
+        })
+        return
+      }
       activateTab(command.tabId)
       send({ type: 'activated', id: command.id, tabId: command.tabId })
+      return
+    }
+    case 'acquire-input': {
+      // 窗口输入权申请（方案 §4）。候补至 budgetMs 到期，取消 / 超时明确返回。
+      const tabId = typeof command.tabId === 'string' ? command.tabId : undefined
+      // 空串 = 窗口级申请（open 的展示段：标签还没建，票覆盖「创建后进入前台」，
+      // 方案 §3 open 行）。只有非空且不存在才是 unknown-tab —— 把空串当不存在，
+      // open 的票就永远拿不到，只能静默回退无票路径。
+      if (tabId === undefined || (tabId !== '' && !tabs.has(tabId))) {
+        send({ type: 'input-denied', id: command.id, reason: 'unknown-tab' })
+        return
+      }
+      const requestId = typeof command.requestId === 'string' && command.requestId.length > 0
+        ? command.requestId
+        : `host-${String(command.id)}`
+      const budgetMs = typeof command.budgetMs === 'number' && Number.isFinite(command.budgetMs) && command.budgetMs > 0
+        ? command.budgetMs
+        : 15000
+      const result = await inputQueue.acquire({ requestId, tabId, budgetMs })
+      if (result.status === 'acquired') {
+        send({ type: 'input-ticket', id: command.id, ticket: result.ticket })
+      } else {
+        send({ type: 'input-denied', id: command.id, reason: result.status })
+      }
+      return
+    }
+    case 'register-created': {
+      const entry = tabs.get(command.tabId)
+      const accepted = entry !== undefined && entry.creationId === command.creationId
+        && command.accepted === true && tabs.has(entry.openerTabId)
+        && entry.openerControlEpoch === inputQueue.controlEpoch
+      if (entry && entry.creationId === command.creationId) {
+        entry.displayRegistered = accepted
+        entry.registerCreated?.(accepted)
+      }
+      send({ type: 'created-registered', id: command.id, accepted })
+      return
+    }
+    case 'release-input': {
+      const outcome = inputQueue.release(String(command.ticketId))
+      if (outcome.reason === 'blocked') await finishBlockedInput(String(command.ticketId))
+      send({ type: 'input-released', id: command.id, ok: outcome.ok, ...(outcome.stage === undefined ? {} : { stage: outcome.stage }) })
+      return
+    }
+    case 'cancel-input': {
+      const result = await inputQueue.cancel(String(command.ticketId))
+      if (result.status === 'blocked') await finishBlockedInput(inputQueue.current?.view.ticketId)
+      send({ type: 'input-cancel-ack', id: command.id, status: result.status, stage: result.stage })
+      return
+    }
+    case 'resolve-blocked': {
+      // 只有带证据的恢复命令能解除 blocked（方案 §4）：settled 或 endpoint-destroyed。
+      const current = inputQueue.current
+      if (command.evidence === 'endpoint-destroyed' && current?.view.ticketId === command.ticketId) {
+        const entry = tabs.get(current.tabId)
+        if (current.tabId !== '' && (entry === undefined || entry.view.webContents.isDestroyed())) inputQueue.confirmEndpointDestroyed(current.tabId)
+      }
+      const ok = inputQueue.resolveBlocked(String(command.ticketId), String(command.evidence))
+      send({ type: 'input-block-resolved', id: command.id, ok })
       return
     }
     case 'devtools': {
@@ -816,8 +1082,8 @@ async function handle(command) {
       //
       // `toggleDevTools` 落定才回，并把**真实**的 `isOpen` 一起带回：`openDevTools` 会
       // 静默失败（不抛错、`isDevToolsOpened()` 保持 false），回一个说谎的 ack 就是把这个
-      // 坑盖住。
-      const result = await toggleDevTools()
+      // 坑盖住。detach / attach 会动调试器，排进写队列防与 Input 派发交叉。
+      const result = await inputQueue.enqueueWindowWrite(() => toggleDevTools(), { kind: WRITE_BG_READ })
       if (result === undefined) {
         send({ type: 'devtools', id: command.id, error: { message: 'no active tab to toggle devtools on' } })
         return
@@ -886,6 +1152,8 @@ async function handle(command) {
       return
     }
     case 'dispose': {
+      // 窗口销毁：旧票全部失效（宿主退出后它们不可能再落地）。
+      inputQueue.revokeAll('disposed')
       send({ type: 'disposed', id: command.id })
       for (const id of [...tabs.keys()]) closeTab(id)
       if (shell !== undefined && !shell.isDestroyed()) shell.destroy()
@@ -907,7 +1175,24 @@ app.on('window-all-closed', () => {
 
 app.whenReady().then(() => {
   announce('host-ready')
-  ipcMain.on('dsh-tab-select', (_event, id) => { activateTab(id) })
+  // 人工切标签：更新选择代次（迟到自动展示据此取消），切换本身进写队列 ——
+  // 在输入临界区结束后应用，且连续多次只保留最后一次明确选择（方案 §6）。
+  let selectTarget
+  let selectWriteActive = false
+  ipcMain.on('dsh-tab-select', (_event, id) => {
+    if (!tabs.has(id)) return
+    inputQueue.noteHumanSelect()
+    selectTarget = id
+    // 队列里已有未执行的 select 任务：它会读到最新的 selectTarget，不必再排一个。
+    if (selectWriteActive) return
+    selectWriteActive = true
+    void inputQueue.enqueueWindowWrite(() => {
+      selectWriteActive = false
+      const target = selectTarget
+      selectTarget = undefined
+      if (target !== undefined && tabs.has(target)) activateTab(target)
+    }, { kind: WRITE_HUMAN })
+  })
   ipcMain.on('dsh-tab-close', (_event, id) => { closeTab(id) })
   ipcMain.on('dsh-tab-create', () => { void openTab('about:blank', undefined, { announce: true }) })
   ipcMain.on('dsh-nav', (_event, payload) => {

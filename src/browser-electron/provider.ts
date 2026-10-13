@@ -67,6 +67,9 @@ export class ElectronBrowserProvider extends CdpBrowserProvider {
    * 存在 —— 接管通知带 `tabId`，早挂少一次竞态。通道只有一条，后续会话共用（幂等）。
    */
   override async open(request: BrowserOpenRequest, signal?: AbortSignal): Promise<BrowserSession> {
+    // 导航可能在 open 返回前弹窗：创建通道必须先挂，避免丢掉 created 事件。
+    this.ensureTabOpenedChannel()
+    this.ensureControlChannel()
     const session = await super.open(request, signal)
     this.ensureTakeoverChannel()
     this.ensureTabOpenedChannel()
@@ -85,6 +88,7 @@ export class ElectronBrowserProvider extends CdpBrowserProvider {
   private ensureTabOpenedChannel(): void {
     const transport = this.windowTransport
     if (transport === undefined) return
+    this.tabCreatedChannel ??= transport.onTabCreated((tabId, openerTabId) => this.registerCreatedSession(tabId, openerTabId)).then(() => undefined)
     this.tabOpenedChannel ??= transport.onTabOpened((tabId, url, title, openerTabId) => {
       // open 命令自己开的标签不会发通报（宿主侧只对非命令创建的标签 announce），
       // 所以这里不存在「把 open 的会话再收编一遍」的去重问题。
@@ -98,6 +102,8 @@ export class ElectronBrowserProvider extends CdpBrowserProvider {
       )
     }).then(() => undefined, () => undefined)
   }
+
+  private tabCreatedChannel: Promise<void> | undefined
 
   /**
    * 订阅宿主的人工接管通道（只挂一次）。
@@ -141,7 +147,7 @@ export class ElectronBrowserProvider extends CdpBrowserProvider {
     if (this.windowTransport === undefined) {
       throw new BrowserError('this provider has no window host to activate tabs on', 'BROWSER_TARGET_NOT_FOUND')
     }
-    await this.windowTransport.activateTarget(sessionId)
+    await this.tabs({ kind: 'activate', sessionId })
   }
 
   /**
