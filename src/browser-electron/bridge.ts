@@ -104,11 +104,10 @@ const LEGACY_ANNOUNCED_HOST = '127.0.0.1'
  * 打包应用模式下第二个实例的 `--user-data-dir`。
  *
  * 必须和主应用**分开**：共享同一份 userData 会让第二个实例撞上 profile 锁（或污染主应用的
- * 本地状态）。放系统临时目录、用固定名字即可 —— 宿主是惰性创建且单例的，
- * 不需要按 pid 再细分。
+ * 本地状态）。便携版使用包内专属目录；其他运行方式沿用系统临时目录。
  */
 function hostUserDataDir(): string {
-  return join(tmpdir(), 'dsh-browser-electron-host')
+  return process.env.DSH_BROWSER_USER_DATA_DIR || join(tmpdir(), 'dsh-browser-electron-host')
 }
 
 /**

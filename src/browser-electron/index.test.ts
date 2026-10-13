@@ -982,6 +982,22 @@ describe('resolveHostLaunch（宿主启动参数）', () => {
     expect(environment.DSH_BROWSER_ELECTRON_HOST).toBeUndefined()
   })
 
+  it('便携浏览器使用专属 profile，不改变外部工具临时目录', () => {
+    const inheritedTemp = process.env.TEMP
+    try {
+      vi.stubEnv('DSH_BROWSER_USER_DATA_DIR', 'D:/实例甲/data/browser')
+      const first = resolveHostLaunch({ ...base, appMode: true })
+      vi.stubEnv('DSH_BROWSER_USER_DATA_DIR', 'D:/实例乙/data/browser')
+      const second = resolveHostLaunch({ ...base, appMode: true })
+      expect(first.args).toEqual(['--user-data-dir=D:/实例甲/data/browser'])
+      expect(second.args).toEqual(['--user-data-dir=D:/实例乙/data/browser'])
+      expect(first.environment.TEMP).toBe(inheritedTemp)
+      expect(second.environment.TEMP).toBe(inheritedTemp)
+    } finally {
+      vi.unstubAllEnvs()
+    }
+  })
+
   it('打包应用模式：脚本路径改走环境变量，argv 只带独立 userData', () => {
     const { args, environment } = resolveHostLaunch({ ...base, appMode: true })
 
