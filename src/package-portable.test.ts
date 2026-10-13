@@ -22,7 +22,7 @@ describe('便携实例的构建接线', () => {
     }
     const patch = readFileSync(new URL('../docs/harness-desktop-build.patch', import.meta.url), 'utf8')
     expect(patch).toContain('configurePortableData(app, process.execPath, process.env)')
-    for (const key of ['DSH_AGENTS_HOME', 'sessionData', 'LOCALAPPDATA', 'TMPDIR', 'npm_config_prefix']) {
+    for (const key of ['DSH_AGENTS_HOME', 'DSH_TEMP_DIR', 'DSH_BROWSER_USER_DATA_DIR', 'sessionData', 'crashDumps']) {
       expect(patch).toContain(`${key}:`)
     }
   })

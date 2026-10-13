@@ -10,7 +10,11 @@ describe('发布基包的目录隔离升级', () => {
     const source = portableSource(patch)
     expect(source).toContain('DSH_PORTABLE_DOCUMENTS_DIR:')
     expect(source).toContain('realpathSync(detected)')
-    expect(() => portableSource(patch.replace('@@ -0,0 +1,69 @@', '@@ -0,0 +1,70 @@'))).toThrow('长度不符')
+    // 补丁行数会随实现变化：从实际补丁取 hunk 长度，再故意写错一位验证长度校验。
+    const header = /@@ -0,0 \+1,(\d+) @@/u.exec(patch)?.[0]
+    expect(header, '补丁缺少 portable-data 新文件 hunk 头').toBeTruthy()
+    const count = Number(/@@ -0,0 \+1,(\d+) @@/u.exec(patch)?.[1])
+    expect(() => portableSource(patch.replace(header!, `@@ -0,0 +1,${count + 1} @@`))).toThrow('长度不符')
     expect(() => overlayPortableMain('未知桌面入口', source)).toThrow('替换目标必须唯一')
   })
   it('默认工作区使用包内目录，显式设置仍优先，已修改输入不会再次处理', () => {
