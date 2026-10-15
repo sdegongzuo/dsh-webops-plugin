@@ -4,7 +4,8 @@
  * 背景（2026-09-17 定位）：`run_code` 的实际执行体是 `@deepseek-ai/dsh-ptc-runtime-node`
  * 拉起的一个**子进程**。它在 spawn 时会把子进程环境清空到只剩
  * PATH/PATHEXT/SYSTEMROOT/WINDIR/TEMP/TMP，再按 `'pkg' in process` 这个 vercel/pkg 标记
- * 决定要不要补自己的启动变量；`nodeExecutable` 默认取 `process.execPath`。
+ * 决定要不要补自己的启动变量；`nodeExecutable`（当时的名字，现 `launch.executable`，
+ * 见下方 2026-10-15 段）默认取 `process.execPath`。
  *
  * 桌面端打包态里这两条同时踩雷：
  *   · `process.execPath` 是 Electron 主 exe（不是 node），它靠 host 子进程注入的
@@ -17,7 +18,8 @@
  * 修复：shell 在 `main.ts` 顶层把 `DSH_PTC_NODE` 指向包内自带的真 node
  * （alpha.2 起是 `resources\runtime\primary-runtime\dependencies\node\bin\node.exe`，
  * 不是已搬家的 `resources\runtime\node`，也不是 `runtime\bin\node.cmd` 那个 shim），
- * 再由一份 composition patch 把它写进 `ptc-runtime` 行的 `nodeExecutable`。
+ * 再由一份 composition patch 把它写进 `ptc-runtime` 行（0.2.1 起是 `launch.executable`，
+ * 见下方 2026-10-15 段）。
  *
  * ## 2026-09-18：这份 composition patch 搬家了（适配 dsh 0.1.6-alpha.2）
  *
@@ -34,8 +36,8 @@
  *   · 表达式的取值对不对。
  * 所以现在用**包内运行时自带的那套 patch 引擎**（`@deepseek-ai/cordis-plugin-include`
  * + `js-yaml` 的 `entryListSchema`）把「base bundle 层 → 出货插件层」真 compose 一遍，
- * 直接读回 `ptc-runtime` 行的 `nodeExecutable` 并求值断言。这一条才是「链真的接上了」
- * 的凭据（反面：把这行从插件补丁里删掉 → 转红）。
+ * 直接读回 `ptc-runtime` 行的 `launch.executable`（2026-10-15 前是顶层 `nodeExecutable`）
+ * 并求值断言。这一条才是「链真的接上了」的凭据（反面：把这行从插件补丁里删掉 → 转红）。
  *
  * 本脚本在**真产物的生产路径**上把这条链走一遍：起宿主 → 让 ptc 真跑一段 TS 程序 →
  * 断言返回值。只验「服务存在」不够 —— 服务一直在，挂的是子进程本身。
@@ -60,10 +62,30 @@
  *      运行时**里，直接问沙箱「你要用哪个程序起 runner」，断言它不是主 exe。
  *      —— 这一段是那个坑的唯一真凭据，删了它这个 bug 会再次静默复发。
  *
+ * ## 2026-10-15：上游把配置键改名，覆盖静默失效一整个大版本（适配 dsh 0.2.1-alpha.3）
+ *
+ * 上游 2026-09-12（`7c9bb5914c`，随 0.2.1 发货）把 ptc-runtime 的 config 键从顶层
+ * `nodeExecutable` 改成了 `launch.executable`（`kind: node-script` 与之配对）。插件
+ * 2026-10-04 升 0.2.1-alpha.1 时漏改，补丁一直是**死键**：schemastery 的 object
+ * schema 非 strict，多写的键被原样带进 config 然后忽略，**不报错**。症状依旧是
+ * 「打包态 run_code 挂到超时」，而上面所有判据全绿 —— 因为 [1/4] 只证了「补丁文本
+ * 能 compose 并求值」，没有一环验证「服务读不读这个键」。
+ *
+ * 修复与加固（三层）：
+ *   1. cordis.patch.yml 改写为 `launch: { kind: node-script, executable: !!js … }`；
+ *   2. [1/4] 新增**真 schema 判据**：把 compose 出的 config 喂给包内
+ *      `NodePtcRuntime.Config({ launch: { kind: 'node-script', executable } })`，
+ *      断言解析结果里 `launch.executable`/`launch.kind` 真落位（死键形状实测
+ *      `launch === undefined`，能转红）；
+ *   3. bundle-patch.test.ts 断言同步改，并加死键守卫 `not.toContain('nodeExecutable:')`。
+ *
+ * 教训：覆盖类补丁必须把 compose 结果喂给**服务的真 schema** 断言解析值；只读回
+ * 补丁文本，证不了「服务读不读这个键」。
+ *
  * ## 四段各自证什么（免得下次误以为某段覆盖了另一段）
  *
  *   [1/4] 前置件（真 node 在包里）+ **patch 链真命中**（base 层 → 出货插件层 compose，
- *         `ptc-runtime.nodeExecutable` 求值 = 包内真 node）—— PTC 子进程那条链的真凭据。
+ *         `ptc-runtime.launch.executable` 求值 = 包内真 node）—— PTC 子进程那条链的真凭据。
  *   [2/4] PTC 机制在生产路径上真跑得起来（宿主 + ptc 运行时 + 沙箱各跑一段程序）。
  *         注意它**不是** [1/4] 那条链的判据：这里宿主由普通 node 起，`process.execPath`
  *         本来就是 node，覆盖丢了也照样绿。（没法用它当判据：要在打包态暴露这个问题，
@@ -195,7 +217,7 @@ function findShippedPluginPatch(profile) {
  * @param runtimeDir - 包内 dsh 运行时目录（patch 引擎与 base bundle 都从这里解析）。
  * @param pluginPatchFile - 出货插件的 `cordis.patch.yml` 绝对路径。
  * @returns `{ skipped, raw, expr }`：dsh 记下的跳过警告（已成文的字符串）、`ptc-runtime` 行的
- *   `config.nodeExecutable` 原值、以及它的 `!!js` 表达式串（不是表达式节点时为 undefined）。
+ *   `config.launch.executable` 原值、以及它的 `!!js` 表达式串（不是表达式节点时为 undefined）。
  */
 async function composePtcRuntimeRow(runtimeDir, pluginPatchFile) {
   const include = await import(pathToFileURL(require.resolve('@deepseek-ai/cordis-plugin-include')).href)
@@ -208,7 +230,7 @@ async function composePtcRuntimeRow(runtimeDir, pluginPatchFile) {
     skipped.push(String(message).replace(/%C/g, () => JSON.stringify(args[index++])))
   })
   const row = rows.find(item => item?.id === 'ptc-runtime')
-  const raw = row?.config?.nodeExecutable
+  const raw = row?.config?.launch?.executable
   return { skipped, raw, expr: raw !== null && typeof raw === 'object' ? raw.__jsExpr : undefined }
 }
 
@@ -231,7 +253,7 @@ if (shipped !== undefined) {
     )
     check(
       composed.expr !== undefined,
-      `nodeExecutable 是 !!js 表达式（随环境变量取值），实际 ${JSON.stringify(composed.raw)}`,
+      `launch.executable 是 !!js 表达式（随环境变量取值），实际 ${JSON.stringify(composed.raw)}`,
     )
     if (typeof composed.expr === 'string') {
       // 求值口径与 dsh Loader 一致：表达式串直接在当前进程求值。
@@ -240,8 +262,36 @@ if (shipped !== undefined) {
       const resolved = String(evaluate())
       delete process.env.DSH_PTC_NODE
       const fallback = String(evaluate())
-      check(resolved === nodePath, `DSH_PTC_NODE 已设 → nodeExecutable = 包内真 node（实际 ${resolved}）`)
+      check(resolved === nodePath, `DSH_PTC_NODE 已设 → launch.executable = 包内真 node（实际 ${resolved}）`)
       check(fallback === process.execPath, `未设 DSH_PTC_NODE → 回落到 process.execPath（实际 ${fallback}）`)
+
+      // 「补丁文本对了」≠「服务读这个键」。2026-10-04 升级 0.2.1-alpha.1 时就是这样翻车的：
+      // 上游 2026-09-12 把 config 键从顶层 `nodeExecutable` 改成了 `launch.executable`，
+      // 而 schemastery 的 object 非 strict —— 死键被原样带进 config 然后被忽略，不报错。
+      // 补丁照旧能 compose、表达式照旧能求值，自检全绿，而 run_code 在打包态挂到超时。
+      // 所以这里把 compose 出来的 config 喂给**包内真 schema**（`NodePtcRuntime.Config`），
+      // 断言解析结果里 executable 真落在 launch 下、且取值正确 —— schema 是服务读的那本账。
+      let schemaProbe
+      try {
+        const runtimeEntry = require.resolve('@deepseek-ai/dsh-ptc-runtime-node')
+        const { NodePtcRuntime } = await import(pathToFileURL(runtimeEntry).href)
+        const parsed = NodePtcRuntime.Config({ launch: { kind: 'node-script', executable: resolved } })
+        schemaProbe = { executable: parsed?.launch?.executable, kind: parsed?.launch?.kind }
+      } catch (error) {
+        schemaProbe = { error: error instanceof Error ? error.message : String(error) }
+      }
+      if (schemaProbe.error !== undefined) {
+        check(false, `compose 出的 config 过不了 ptc-runtime-node 的真 schema：${schemaProbe.error}`)
+      } else {
+        check(
+          schemaProbe.executable === nodePath,
+          `真 schema 解析后 launch.executable = 包内真 node（实际 ${JSON.stringify(schemaProbe.executable)}）`,
+        )
+        check(
+          schemaProbe.kind === 'node-script',
+          `真 schema 解析后 launch.kind = node-script（实际 ${JSON.stringify(schemaProbe.kind)}）`,
+        )
+      }
     }
   }
 }

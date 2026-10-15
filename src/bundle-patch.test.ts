@@ -170,15 +170,24 @@ describe('出货 patch（cordis.patch.yml）', () => {
       .toContain('disabled: true')
   })
 
-  it('ptc-runtime 那行必须把 nodeExecutable 指到 DSH_PTC_NODE，并保留 process.execPath 兜底', () => {
-    // 2026-09-18 的教训：这条原本写在 harness 的 `desktop-host/config/desktop.cordis.patch.yml` 里，
-    // 0.1.6-alpha.2 把那个目录整个删掉之后，**没有任何源码再设置或读取 DSH_PTC_NODE** ——
-    // `run_code` 会在打包态静默挂到超时（PTC 子进程被 Electron 当 GUI 起）。搬进本文件后，
-    // 这条断言就是「下次它再被删掉」时的唯一警报。
+  it('ptc-runtime 那行必须把 launch.executable 指到 DSH_PTC_NODE，并保留 process.execPath 兜底', () => {
+    // 键名史：0.1.6 时代上游读顶层 `nodeExecutable`；2026-09-12（`7c9bb5914c`，随 0.2.1
+    // 发货）改成 `launch.executable`，顶层键变成**不被读取**的死键 —— schemastery 的
+    // object 非 strict，多写的键被原样带进 config 然后忽略，**不报错**。0.2.1-alpha.1
+    // 升级（2026-10-04）之后这条覆盖静默失效了一整个大版本：run_code 在打包态挂到超时，
+    // 而当时的自检只验「补丁文本能 compose」，验不出「服务读不读这个键」。
+    // 这条断言就是「下次它再退化成死键」时的唯一警报。
     // 它必须留在**顶层**（不是 insert 里）：这是对 base bundle 已有那一行的 config 覆盖。
     expect(hasRow(body, 'ptc-runtime'), '出货 patch 少了 ptc-runtime 的 config 覆盖').toBe(true)
     const block = rowBlock(body, 'ptc-runtime')
-    expect(block, '覆盖丢了，桌面端 run_code 会起不来').toContain('nodeExecutable:')
+    expect(block, '覆盖丢了，桌面端 run_code 会起不来').toContain('launch:')
+    expect(block, 'launch.kind 丢了 node-script：bootstrap 映射进执行世界的路径会变')
+      .toContain('kind: node-script')
+    expect(block, 'launch.executable 丢了，PTC 子进程会用 Electron 主 exe 起').toContain('executable:')
+    // 死键守卫：0.2.1 起顶层 nodeExecutable 已不被 ptc-runtime-node 读取，
+    // 写它等于自欺（补丁能 compose、服务不读）。
+    expect(block, '又写回了上游已不读取的顶层 nodeExecutable（死键，静默失效）')
+      .not.toContain('nodeExecutable:')
     // 兜底也必须留着：非桌面端没有这个变量，必须回落到 process.execPath（那本来就是 node）。
     expect(block, '少了 process.execPath 兜底，非桌面端会被写进一个不存在的路径')
       .toContain('process.env.DSH_PTC_NODE ?? process.execPath')

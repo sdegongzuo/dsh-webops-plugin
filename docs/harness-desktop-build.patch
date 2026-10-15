@@ -1,11 +1,37 @@
+diff --git a/apps/desktop/README.md b/apps/desktop/README.md
+index e0bb92c5b7..281761d92c 100644
+--- a/apps/desktop/README.md
++++ b/apps/desktop/README.md
+@@ -6,6 +6,8 @@ description: "Desktop runs the Harness workspace in a native application. This r
+ 
+ English | [中文](README.zh.md)
+ 
++Portable bundles use `<root>/app/<exe>` beside `<root>/home`. The bundle directory owns each instance and isolates DSH-owned data without changing inherited user or third-party tool environment settings: sessions, configuration, credentials, plugins and dependency runtimes live under `home`, and shared agent configuration under `home/.agents`. Electron user and session data, logs, crash reports, temporary files, update caches and journals live under `data`. External tools retain their original user directories, configuration and caches. Different bundle directories run concurrently; launching the same directory focuses its owner, with directory aliases resolved to the real path. Both the executable and launcher follow this rule. Portable mode neither registers the system `dsh://` protocol nor reads the system login shell to override bundle paths. Explicit workspace paths and external application installation directories remain accessible. Existing system Electron data is not imported automatically; see the [portable directory upgrade guide](../../docs/upgrade-guide/v0.2.1-alpha.2/portable-data/guide.md).
++
+ ## Summary
+ 
+ Desktop runs the Harness workspace in a native application. This reference covers application behavior, development and integration; the packaging, Windows signing and publication guides own build and release operations.
+diff --git a/apps/desktop/README.zh.md b/apps/desktop/README.zh.md
+index 430ac4ad3d..2a6a140384 100644
+--- a/apps/desktop/README.zh.md
++++ b/apps/desktop/README.zh.md
+@@ -6,6 +6,8 @@ description: "Desktop 在原生应用中运行 Harness 工作区。本参考文
+ 
+ [English](README.md) | 中文
+ 
++便携包采用 `<根目录>/app/<exe>` 与 `<根目录>/home` 布局。启动时由包目录决定实例归属，仅隔离 DSH 自有数据，保留继承的系统用户及第三方工具环境：会话、配置、凭据、插件与依赖运行时位于 `home`，共享智能体配置位于 `home/.agents`；Electron 用户数据及会话缓存、日志、崩溃报告、临时目录、更新缓存与日志位于 `data`；外部工具继续使用原用户目录、配置与缓存。不同包目录可并行运行，同目录重复启动聚焦原实例；目录别名按真实路径识别。exe 与启动脚本使用同一规则，便携模式不注册系统 `dsh://` 协议，也不读取系统登录 shell 来覆盖包内路径。用户明确指定的工作区与外部程序安装目录仍按实际路径访问。旧版的系统 Electron 数据不会自动导入，迁移说明见[便携目录升级指南](../../docs/upgrade-guide/v0.2.1-alpha.2/portable-data/guide.zh.md)。
++
+ ## 概述
+ 
+ Desktop 在原生应用中运行 Harness 工作区。本参考文档说明应用行为、开发与集成；打包、Windows 签名和发布指南分别维护构建与发布操作。
 diff --git a/apps/desktop/scripts/electron-builder-config.mjs b/apps/desktop/scripts/electron-builder-config.mjs
-index f08b783865..6ef6ef7f4b 100644
+index 4b9cd27a8d..aefeddd1b6 100644
 --- a/apps/desktop/scripts/electron-builder-config.mjs
 +++ b/apps/desktop/scripts/electron-builder-config.mjs
-@@ -135,13 +135,17 @@ export function createElectronBuilderConfig(
-       'lib/preload-welcome.cjs',
-       'renderer/**/*',
+@@ -145,13 +145,17 @@ export function createElectronBuilderConfig(
        'package.json',
+       '!node_modules/**/*.{js,cjs,mjs,ts,cts,mts,css}.map',
+       '!node_modules/**/*.tsbuildinfo',
 -      { from: buildPaths.dsh, to: 'dsh', filter: ['**/*'] },
 -      // electron-builder excludes a source directory's root node_modules.
 -      { from: join(buildPaths.dsh, 'node_modules'), to: 'dsh/node_modules', filter: ['**/*'] },
@@ -24,10 +50,10 @@ index f08b783865..6ef6ef7f4b 100644
        // Windows tray bitmaps; macOS keeps the Dock and ships no menu bar icon.
        ...(packagesWindows ? [{ from: fileURLToPath(new URL('../resources/tray-windows.ico', import.meta.url)), to: 'tray.ico' }] : []),
 diff --git a/apps/desktop/scripts/prepare-dsh.ts b/apps/desktop/scripts/prepare-dsh.ts
-index 7d290b945a..549e0c2c0c 100644
+index 9de39d3ff2..daf7a8e7e0 100644
 --- a/apps/desktop/scripts/prepare-dsh.ts
 +++ b/apps/desktop/scripts/prepare-dsh.ts
-@@ -130,7 +130,11 @@ async function main(): Promise<void> {
+@@ -131,7 +131,11 @@ async function main(): Promise<void> {
        readFileSync(join(BUILD_ROOT, 'pnpm-lock.yaml'), 'utf8'),
        readDesktopCorePackageSet(BUILD_ROOT, release.version),
      )
@@ -41,7 +67,7 @@ index 7d290b945a..549e0c2c0c 100644
      const targetName = resolveDesktopBuildTarget()
      const target = { platform: process.platform, arch: desktopTargetPlatform(targetName).arch }
 diff --git a/apps/desktop/scripts/smoke-packaged-runtime.ts b/apps/desktop/scripts/smoke-packaged-runtime.ts
-index b91030008b..6427f25bcc 100644
+index 6c3c12c857..dbdb6097ae 100644
 --- a/apps/desktop/scripts/smoke-packaged-runtime.ts
 +++ b/apps/desktop/scripts/smoke-packaged-runtime.ts
 @@ -1,4 +1,5 @@
@@ -49,7 +75,7 @@ index b91030008b..6427f25bcc 100644
 +import { existsSync, readFileSync } from 'node:fs'
  import { join } from 'node:path'
  import { parseArgs } from 'node:util'
- import { resolveDesktopBuildTarget, resolveDesktopTargetBuildPaths } from './desktop-build-paths.mjs'
+ import { desktopArtifactOutput, resolveDesktopBuildTarget, resolveDesktopTargetBuildPaths } from './desktop-build-paths.mjs'
 @@ -19,4 +20,21 @@ const executable = windows ? join(application, 'DeepSeek Harness.exe') : join(ap
  const descriptor = await verifyDesktopRuntime(paths.dsh, readDesktopRuntime(paths.dsh).release.version,
    resolveDesktopPackageTarget(target))
@@ -93,13 +119,13 @@ index d406c27235..36bb70f4fb 100644
    if (!inside(appDir, sourceRoot)) {
      // Builder's source matcher slices the appDir prefix even for external FileSets.
 diff --git a/apps/desktop/src/main.ts b/apps/desktop/src/main.ts
-index 1202670a3e..6a3f01efe4 100644
+index 2afdfd7194..69d7baa0d9 100644
 --- a/apps/desktop/src/main.ts
 +++ b/apps/desktop/src/main.ts
 @@ -2,7 +2,9 @@ import type { ProductEventMap, ProductEvent } from '@deepseek-ai/dsh-client-prod
  import { WINDOWS_TITLEBAR_HEIGHT } from './windows-layout.ts'
  /** Electron shell: desktop project ownership, custom protocol, windows, and lifecycle. */
-
+ 
 +import { existsSync } from 'node:fs'
  import { readFile, writeFile } from 'node:fs/promises'
 +import { createRequire } from 'node:module'
@@ -114,8 +140,8 @@ index 1202670a3e..6a3f01efe4 100644
  import { DesktopProjectManager } from './project-manager.ts'
  import { DesktopHostFatalError, DesktopHostProcess, DesktopHostUncleanExitError } from './host-process.ts'
  import { DesktopPlatformView, PLATFORM_IPC, platformBounds } from './platform-view.ts'
-@@ -35,7 +38,7 @@ import { desktopUpdateReadyConfirmation, formatDesktopMessage, resolveDesktopLoc
- import { claimDesktopSingleInstance } from './single-instance.ts'
+@@ -36,7 +39,7 @@ import { claimDesktopSingleInstance } from './single-instance.ts'
+ import { desktopUpdateChannel } from './update-channel.ts'
  import { DesktopUpdateCoordinator } from './update-coordinator.ts'
  import { DesktopCommandManager } from './command-management.ts'
 -import { serveWebDocument, authenticateWebHost, forwardWebRequest } from './web-document.ts'
@@ -123,10 +149,10 @@ index 1202670a3e..6a3f01efe4 100644
  import { DesktopFatalRecovery } from './fatal-recovery.ts'
  import { pruneCrashReports, RendererConsoleTail, writeCrashReport, type CrashReportSource } from './crash-report.ts'
  import { openWelcomeWindow } from './welcome-window.ts'
-@@ -61,6 +64,70 @@ import { DesktopQuitConfirmation } from './quit-confirmation.ts'
+@@ -62,6 +65,70 @@ import { DesktopQuitConfirmation } from './quit-confirmation.ts'
  import { DesktopTray } from './tray.ts'
  import { DesktopBackgroundNotice } from './background-notice.ts'
-
+ 
 +// 让 host 子进程（以及跑在里面的插件）知道 shell 主 exe 在哪 —— 便携版没有独立的
 +// electron.exe，browser-electron 的窗口宿主只能用这个 exe 起第二个实例。
 +//
@@ -194,16 +220,16 @@ index 1202670a3e..6a3f01efe4 100644
  let focusPrimaryWindow = (): void => {}
  let stopForRecovery = async (): Promise<void> => {}
  let shuttingDown = false
-@@ -81,7 +148,7 @@ const rendererConsole = new RendererConsoleTail()
-
+@@ -82,7 +149,7 @@ const rendererConsole = new RendererConsoleTail()
+ 
  // Platform-conventional logs directory (macOS ~/Library/Logs/<name>, otherwise under userData);
  // set before ready so the first fatal report already resolves under it.
 -app.setAppLogsPath()
 +if (portableHome === undefined) app.setAppLogsPath()
-
+ 
  function currentDesktopLocale(): ReturnType<typeof resolveDesktopLocale> {
    return resolveDesktopLocale(windowsLanguage ?? app.getLocale())
-@@ -156,8 +223,17 @@ function runtimeResources(): RuntimeResources {
+@@ -157,8 +224,17 @@ function runtimeResources(): RuntimeResources {
    const pnpm = (development ? process.env.DSH_DESKTOP_PNPM_ENTRY : undefined)
      ?? (development ? join(app.getAppPath(), 'node_modules', 'pnpm', 'bin', 'pnpm.mjs')
        : join(process.resourcesPath, 'runtime', 'primary-runtime', 'dependencies', 'pnpm', 'bin', 'pnpm.mjs'))
@@ -221,10 +247,10 @@ index 1202670a3e..6a3f01efe4 100644
 +    ?? (development ? join(app.getAppPath(), '.desktop-build', 'development', 'project') : join(process.resourcesPath, 'dsh'))
    return { node, nodeBin, pnpm, dsh }
  }
-
-@@ -314,7 +390,11 @@ function createWindow(preload: string, show = false, primary = false): BrowserWi
+ 
+@@ -315,7 +391,11 @@ function createWindow(preload: string, show = false, primary = false): BrowserWi
  }
-
+ 
  async function main(): Promise<void> {
 -  const desktopSettings = readDesktopSettings(app.getPath('userData'))
 +  // alpha.2 起上游用 `updates.allowTestAuthPopupWindow`（默认 false）门控飞书登录弹窗 —— 默认值
@@ -235,7 +261,7 @@ index 1202670a3e..6a3f01efe4 100644
    void pruneCrashReports(app.getPath('logs'))
    const journalDirectory = process.env.DSH_DESKTOP_UPDATE_JOURNAL_DIR
    const updateJournal = journalDirectory === undefined ? undefined : new DesktopUpdateJournal(journalDirectory, app.getVersion())
-@@ -330,9 +410,9 @@ async function main(): Promise<void> {
+@@ -331,9 +411,9 @@ async function main(): Promise<void> {
    const loginShellRead = new AbortController()
    // The probe runs in its own process group, which outlives Desktop unless the read is aborted.
    app.on('will-quit', () => { loginShellRead.abort() })
@@ -247,7 +273,7 @@ index 1202670a3e..6a3f01efe4 100644
      for (const failure of result.failures) console.warn(`desktop login shell: ${failure.shell} failed (${failure.reason})`)
      return result.environment
    })
-@@ -450,11 +530,28 @@ async function main(): Promise<void> {
+@@ -451,11 +531,28 @@ async function main(): Promise<void> {
      return {
        start: async () => {
          const ready = await host.start()
@@ -279,10 +305,10 @@ index 1202670a3e..6a3f01efe4 100644
          analyticsEnabled = await welcomeBackend.analyticsEnabled().catch(() => false)
          if (!reportedLaunch) { reportedLaunch = true; void track('desktop_app_launch', {}) }
          stopAccount?.()
-@@ -709,7 +806,13 @@ async function main(): Promise<void> {
+@@ -712,7 +809,13 @@ async function main(): Promise<void> {
      return browserGuests.release(event.sender, lease)
    })
-
+ 
 -  session.defaultSession.webRequest.onBeforeSendHeaders({ urls: ['ws://127.0.0.1/*', 'wss://127.0.0.1/*'] }, (details, callback) => {
 +  // 渲染进程的事件流是自己发起的 WebSocket（不是走 Node 的转发），所以握手 cookie 得由壳注入。
 +  // 过滤名单必须覆盖**所有可能被选中的回环名**：兜底可能把 Host 定在 `localhost`（代理只放通
@@ -294,16 +320,16 @@ index 1202670a3e..6a3f01efe4 100644
      if (hostUrl === undefined || hostCookie === undefined || details.webContentsId !== mainWindow?.webContents.id) {
        callback({})
        return
-@@ -1229,7 +1332,7 @@ async function main(): Promise<void> {
+@@ -1232,7 +1335,7 @@ async function main(): Promise<void> {
      window.focus()
    }
-
+ 
 -  if (app.isPackaged || process.env.DSH_DESKTOP_DEV_APP === '1') app.setAsDefaultProtocolClient('dsh')
 +  if (portableHome === undefined && (app.isPackaged || process.env.DSH_DESKTOP_DEV_APP === '1')) app.setAsDefaultProtocolClient('dsh')
    app.on('open-url', (event, url) => {
      event.preventDefault()
      if (url === 'dsh://open' || url === 'dsh://open/') focusPrimaryWindow()
-@@ -1322,9 +1425,8 @@ async function main(): Promise<void> {
+@@ -1325,9 +1428,8 @@ async function main(): Promise<void> {
        refresh: async () => { await Promise.all([checkPolicyManually(), updateSchedule.check(true)]) },
        download: downloadUpdate, install: version => updates.install(version),
      })
@@ -315,10 +341,10 @@ index 1202670a3e..6a3f01efe4 100644
    }
    automaticCheck()
    await reconcileBackend().catch(() => undefined)
-@@ -1337,17 +1439,29 @@ async function main(): Promise<void> {
+@@ -1340,17 +1442,29 @@ async function main(): Promise<void> {
    publishUpdate(updateState)
  }
-
+ 
 -const ownsDesktopInstance = claimDesktopSingleInstance(app, () => { focusPrimaryWindow() })
 +// 窗口宿主模式：便携版里 browser-electron 用主 exe 起第二个实例来开浏览器窗口，
 +// 靠 `DSH_BROWSER_ELECTRON_HOST` 把宿主脚本的绝对路径传进来
@@ -327,7 +353,7 @@ index 1202670a3e..6a3f01efe4 100644
 +// 必须在 `claimDesktopSingleInstance` **之前**接管：先抢了单实例锁的话第二个实例会直接退出。
 +// 宿主只管开窗口，不碰 profile、也不开主窗口。
 +const browserHostScript = process.env.DSH_BROWSER_ELECTRON_HOST
-
+ 
 -if (ownsDesktopInstance) void app.whenReady().then(main).catch(async (error: unknown) => {
 -  const message = error instanceof Error ? error.message : String(error)
 -  console.error(error)
@@ -364,12 +390,12 @@ index cf03e38c36..878122bcd6 100644
 +++ b/apps/desktop/src/paths.ts
 @@ -1,6 +1,7 @@
  /** Filesystem ownership for the Electron-managed desktop installation. */
-
+ 
 -import { join } from 'node:path'
 +import { existsSync } from 'node:fs'
 +import { dirname, join, resolve } from 'node:path'
  import { resolveDshHome } from '@deepseek-ai/dsh-home-paths'
-
+ 
  /** Stable desktop installation paths under the shared Harness home. */
 @@ -20,3 +21,17 @@ export function resolveDesktopPaths(dshHome: string = resolveDshHome()): Desktop
      lock: join(dshHome, 'profiles', 'desktop', 'lock'),
@@ -388,6 +414,67 @@ index cf03e38c36..878122bcd6 100644
 +export function resolvePortableDshHome(executablePath: string): string | undefined {
 +  const portableHome = resolve(dirname(executablePath), '..', 'home')
 +  return existsSync(portableHome) ? portableHome : undefined
++}
+diff --git a/apps/desktop/src/portable-data.ts b/apps/desktop/src/portable-data.ts
+new file mode 100644
+index 0000000000..a4086fd882
+--- /dev/null
++++ b/apps/desktop/src/portable-data.ts
+@@ -0,0 +1,55 @@
++/** 便携版在获取单实例锁前确定所有可写数据目录。 */
++import { resolvePortableDshHome } from './paths.ts'
++import { mkdirSync, realpathSync } from 'node:fs'
++import { dirname, join } from 'node:path'
++
++/** Electron 启动阶段的目录设置接口。 */
++export interface PortableApplicationPaths {
++  setPath(name: 'appData' | 'userData' | 'sessionData' | 'temp' | 'crashDumps', path: string): void
++  setAppLogsPath(path: string): void
++  commandLine: { appendSwitch(name: string, value: string): void }
++}
++
++/**
++ * 初始化便携版数据归属；普通安装不改变系统路径。
++ * @param application - 尚未 ready 的 Electron 应用。
++ * @param executable - 主程序的绝对路径。
++ * @param environment - 主进程与子进程共享的环境。
++ * @returns 检测到的包内 Harness home；普通安装返回 undefined。
++ */
++export function configurePortableData(
++  application: PortableApplicationPaths, executable: string, environment: NodeJS.ProcessEnv,
++): string | undefined {
++  const detected = resolvePortableDshHome(executable)
++  if (detected === undefined) return undefined
++  // realpath 让目录别名与原路径使用同一个 Electron 单实例锁。
++  const home = realpathSync(detected)
++  const data = join(dirname(home), 'data')
++  const appData = join(data, 'app-data')
++  const temporary = join(data, 'temp')
++  const browserHost = (environment.DSH_BROWSER_ELECTRON_HOST ?? '') !== ''
++  const electronPaths = {
++    appData, temp: temporary, crashDumps: join(data, 'crash-dumps'),
++    ...browserHost ? {} : { userData: join(data, 'electron'), sessionData: join(data, 'electron') },
++  }
++  const logs = join(data, 'logs', browserHost ? 'browser' : 'desktop')
++  const overrides: Record<string, string> = {
++    DSH_HOME: home, DSH_AGENTS_HOME: join(home, '.agents'),
++    DSH_PORTABLE_DOCUMENTS_DIR: join(data, 'documents'),
++    DSH_TEMP_DIR: temporary,
++    // 沿用旧版包内浏览器目录，保留已有登录态；不再依赖 TEMP 重定向。
++    DSH_BROWSER_USER_DATA_DIR: join(temporary, 'dsh-browser-electron-host'),
++    DSH_DESKTOP_UPDATE_JOURNAL_DIR: join(data, 'update-journals'),
++  }
++  // 只设置 DSH 专属变量；外部工具继承原有用户目录、配置和临时目录。
++  for (const directory of [logs, ...Object.values(electronPaths), ...Object.values(overrides)]) {
++    mkdirSync(directory, { recursive: true })
++  }
++  Object.assign(environment, overrides)
++  for (const [name, path] of Object.entries(electronPaths)) {
++    application.setPath(name as Parameters<PortableApplicationPaths['setPath']>[0], path)
++  }
++  application.setAppLogsPath(logs)
++  application.commandLine.appendSwitch('log-file', join(logs, 'chromium.log'))
++  return home
 +}
 diff --git a/apps/desktop/src/settings.ts b/apps/desktop/src/settings.ts
 index a4bb67b3bd..8cd243b194 100644
@@ -427,7 +514,7 @@ index a74ea7c7ef..0a410e8163 100644
 @@ -35,16 +35,183 @@ export async function serveWebDocument(request: Request, root: string): Promise<
    })
  }
-
+ 
 +/**
 + * The Host's authentication exchange answered with something other than its 303 + cookie.
 + *
@@ -616,17 +703,17 @@ index 54ab46d85e..28512376f9 100644
 --- a/apps/desktop/src/welcome-backend.ts
 +++ b/apps/desktop/src/welcome-backend.ts
 @@ -3,6 +3,7 @@ import type { ProductEvent } from '@deepseek-ai/dsh-client-product-analytics/typ
-
+ 
  import { randomUUID } from 'node:crypto'
  import { desktopAccountBackend, type DesktopAccountBackend } from './account-backend.ts'
 +import { loopbackCandidates } from './web-document.ts'
-
+ 
  /** Metadata needed before the native entry or workspace becomes visible. */
  export interface WelcomeState {
 @@ -34,21 +35,58 @@ function record(value: unknown): value is Record<string, unknown> {
    return typeof value === 'object' && value !== null && !Array.isArray(value)
  }
-
+ 
 +/**
 + * Authenticate against whichever loopback host name this transport stack can actually reach.
 + *
@@ -706,7 +793,7 @@ index d9a8f3103b..d5ccc62e6a 100644
 @@ -16,7 +16,16 @@ import { writeCrashReport } from '../src/crash-report.ts'
  type InvokeEvent = { sender?: unknown; senderFrame: { url: string } }
  type InvokeHandler = (event: InvokeEvent, ...args: unknown[]) => unknown
-
+ 
 -vi.mock('../src/web-document.ts', () => ({ authenticateWebHost: async () => 'test-cookie', serveWebDocument: vi.fn(), forwardWebRequest: vi.fn() }))
 +vi.mock('../src/web-document.ts', async importOriginal => ({
 +  ...await importOriginal<typeof import('../src/web-document.ts')>(),
@@ -733,7 +820,7 @@ index d9a8f3103b..d5ccc62e6a 100644
 @@ -655,48 +664,22 @@ describe('desktop main startup', () => {
      expect(host.stop).not.toHaveBeenCalled()
    })
-
+ 
 -  it('shows one explained startup login before Host readiness and joins concurrent checks without reopening it', async () => {
 -    configureTestAuthPopup(true)
 +  // 上游 alpha.2 保留了「启动即弹登录」的测试，但按 allowTestAuthPopupWindow=true 才成立；
@@ -789,7 +876,7 @@ index d9a8f3103b..d5ccc62e6a 100644
 +    }))
 +    expect(testAuth.login).not.toHaveBeenCalled()
    })
-
+ 
    it.each(['returned', 'cancelled', 'failed'] as const)('requires explicit test login and handles %s without downloading', async (outcome) => {
 @@ -708,7 +691,7 @@ describe('desktop main startup', () => {
      await readyForUpdate()
@@ -822,386 +909,9 @@ index d9a8f3103b..d5ccc62e6a 100644
        primaryRuntime: join('desktop-test-resources', 'runtime', 'primary-runtime'),
        profile: 'desktop-test-profile',
      })
-diff --git a/apps/desktop/tests/web-document.spec.ts b/apps/desktop/tests/web-document.spec.ts
-index 0fd9b591b1..da9b3ab383 100644
---- a/apps/desktop/tests/web-document.spec.ts
-+++ b/apps/desktop/tests/web-document.spec.ts
-@@ -2,7 +2,7 @@ import { afterEach, expect, it, vi } from 'vitest'
- import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises'
- import { tmpdir } from 'node:os'
- import { join } from 'node:path'
--import { authenticateWebHost, forwardWebRequest, serveWebDocument } from '../src/web-document.ts'
-+import { authenticateLoopbackHost, authenticateWebHost, exchangeProbe, forwardWebRequest, jarProbe, serveWebDocument } from '../src/web-document.ts'
-
- const roots: string[] = []
- afterEach(async () => {
-@@ -35,6 +35,121 @@ it('requires the Host authentication exchange and retains only its cookie value'
-   await expect(authenticateWebHost('http://127.0.0.1:1234/')).rejects.toThrow('authentication failed')
- })
-
-+it('falls back to another loopback name when the announced one cannot be reached', async () => {
-+  const urls: string[] = []
-+  const fetch = vi.fn().mockImplementation(async (input: unknown) => {
-+    const url = String(input)
-+    urls.push(url)
-+    if (url.includes('127.0.0.1')) throw new TypeError('fetch failed')
-+    return new Response(null, { status: 303, headers: { 'set-cookie': 'session=owned' } })
-+  })
-+  vi.stubGlobal('fetch', fetch)
-+
-+  // Subsequent forwarding uses whichever name worked, so the Host name travels with the cookie.
-+  await expect(authenticateLoopbackHost('http://127.0.0.1:19387/?token=owned'))
-+    .resolves.toEqual({ url: 'http://localhost:19387/?token=owned', cookie: 'session=owned' })
-+  expect(urls).toEqual(['http://127.0.0.1:19387/?token=owned', 'http://localhost:19387/?token=owned'])
-+})
-+
-+it('keeps trying the other loopback name when an intermediary answers on the Host behalf', async () => {
-+  // 企业代理**代替** Host 回 403（不是拒绝连接）—— 只放通 `localhost` 的那类终端策略。
-+  // `Response.ok` 对 3xx/4xx 都是 false，所以「拿到了答复」不能当成「Host 答复了」。
-+  const urls: string[] = []
-+  const fetch = vi.fn().mockImplementation(async (input: unknown) => {
-+    const url = String(input)
-+    urls.push(url)
-+    if (url.includes('127.0.0.1')) return new Response('blocked by policy', { status: 403 })
-+    return new Response(null, { status: 303, headers: { 'set-cookie': 'session=owned' } })
-+  })
-+  vi.stubGlobal('fetch', fetch)
-+
-+  await expect(authenticateLoopbackHost('http://127.0.0.1:19387/?token=owned'))
-+    .resolves.toEqual({ url: 'http://localhost:19387/?token=owned', cookie: 'session=owned' })
-+  expect(urls).toEqual(['http://127.0.0.1:19387/?token=owned', 'http://localhost:19387/?token=owned'])
-+})
-+
-+it('reports what each loopback name answered when none of them works', async () => {
-+  const fetch = vi.fn().mockResolvedValue(new Response('unauthorized', { status: 401 }))
-+  vi.stubGlobal('fetch', fetch)
-+
-+  // 全试完仍不行时，报错必须自带证据（主机名 + 状态码）—— 只有一句「认证失败」无从下手。
-+  let failure: Error | undefined
-+  try {
-+    await authenticateLoopbackHost('http://127.0.0.1:19387/?token=owned')
-+  } catch (error: unknown) {
-+    failure = error as Error
-+  }
-+  expect(failure).toBeInstanceOf(Error)
-+  expect(failure?.message).toContain('127.0.0.1:19387 → ')
-+  expect(failure?.message).toContain('localhost:19387 → ')
-+  expect(failure?.message.match(/HTTP 401/gu)).toHaveLength(2)
-+  expect(fetch).toHaveBeenCalledTimes(2)
-+})
-+
-+it('rejects a loopback name only one transport stack can reach', async () => {
-+  // 2026-09-28 现场：Node 那条栈连得上 `127.0.0.1`（它不读企业代理），而 Chromium 那条
-+  // （渲染进程自己的 WebSocket、以及欢迎页）被代理回 403。只按 Node 选名字，界面就永远
-+  // 停在「重新连接中…」—— 文档转得动、事件流一条也建不起来。
-+  const calls: string[] = []
-+  const fetch = vi.fn().mockImplementation(async (input: unknown) => {
-+    calls.push(`node:${String(input)}`)
-+    return new Response(null, { status: 303, headers: { 'set-cookie': 'session=owned' } })
-+  })
-+  vi.stubGlobal('fetch', fetch)
-+  const chromium = vi.fn().mockImplementation(async (input: unknown) => {
-+    const url = String(input)
-+    calls.push(`net:${url}`)
-+    // 代理代替 Host 回 403：拿到答复 ≠ Host 答复了。
-+    return url.includes('127.0.0.1') ? new Response('blocked by policy', { status: 403 }) : new Response('app', { status: 200 })
-+  })
-+  const jars = vi.fn(async () => 'session=owned')
-+
-+  await expect(authenticateLoopbackHost('http://127.0.0.1:19387/?token=owned', [
-+    jarProbe('net.fetch', chromium, jars),
-+    exchangeProbe(),
-+  ])).resolves.toEqual({ url: 'http://localhost:19387/?token=owned', cookie: 'session=owned' })
-+
-+  // 被 Chromium 拒掉之后，同一个候选不再浪费一次 Node 请求；换到 `localhost` 两条栈都要点头。
-+  expect(calls).toEqual([
-+    'net:http://127.0.0.1:19387/?token=owned',
-+    'net:http://localhost:19387/?token=owned',
-+    'node:http://localhost:19387/?token=owned',
-+  ])
-+})
-+
-+it('refuses a name the Chromium stack answered without storing a cookie', async () => {
-+  // 名字通了但 jar 是空的 = 壳没有 cookie 可注入 WS 握手，渲染进程照样连不上。
-+  const fetch = vi.fn()
-+  vi.stubGlobal('fetch', fetch)
-+  const chromium = vi.fn(async () => new Response('app', { status: 200 }))
-+  const jars = vi.fn(async () => '')
-+
-+  await expect(authenticateLoopbackHost('http://127.0.0.1:19387/?token=owned', [
-+    jarProbe('net.fetch', chromium, jars),
-+    exchangeProbe(),
-+  ])).rejects.toThrow('the session stored no cookie for this host name')
-+  expect(chromium).toHaveBeenCalledTimes(2)
-+  expect(fetch).not.toHaveBeenCalled()
-+})
-+
-+it('names the transport stack that refused each loopback name', async () => {
-+  vi.stubGlobal('fetch', vi.fn(async () => new Response(null, { status: 303, headers: { 'set-cookie': 'session=owned' } })))
-+  const chromium = vi.fn(async () => new Response('blocked by policy', { status: 407 }))
-+
-+  let failure: Error | undefined
-+  try {
-+    await authenticateLoopbackHost('http://127.0.0.1:19387/?token=owned', [
-+      jarProbe('net.fetch', chromium, async () => 'session=owned'),
-+      exchangeProbe(),
-+    ])
-+  } catch (error: unknown) {
-+    failure = error as Error
-+  }
-+  // 「是哪条栈不同意」必须留在报错里 —— 两条栈的排查方向完全不同。
-+  expect(failure?.message).toContain('127.0.0.1:19387 → net.fetch: HTTP 407')
-+  expect(failure?.message).toContain('localhost:19387 → net.fetch: HTTP 407')
-+})
-+
- it('forwards upload bytes and cancellation with Host credentials while keeping the response streaming', async () => {
-   const body = new ReadableStream({ start(controller) { controller.enqueue(new TextEncoder().encode('stream')); controller.close() } })
-   const fetch = vi.fn().mockResolvedValue(new Response(body, { headers: { 'content-encoding': 'gzip', 'set-cookie': 'private' } }))
-diff --git a/apps/desktop/tests/welcome-host.spec.ts b/apps/desktop/tests/welcome-host.spec.ts
-index dea2905583..cb70d68123 100644
---- a/apps/desktop/tests/welcome-host.spec.ts
-+++ b/apps/desktop/tests/welcome-host.spec.ts
-@@ -93,7 +93,6 @@ describe('desktop welcome Web operations', () => {
-     await expect(backend.read()).rejects.toThrow('Web RPC failed')
-   })
-
--
-   it('submits native analytics through authenticated RPC with a bounded request', async () => {
-     const host = transport()
-     const backend = await connectDesktopWelcome(url, host.send)
-@@ -106,8 +105,53 @@ describe('desktop welcome Web operations', () => {
-     expect(JSON.parse(init!.body as string)).toMatchObject({ payload: { args: { event } } })
-   })
-
--  it('refuses an unauthenticated Web launch', async () => {
-+  it('keeps trying the next name when an intermediary answers on the Host behalf', async () => {
-+    // 代理代替 Host 回 403（`ok === false`）时**不能**当终局 —— 它只说明这个名字没通过。
-+    // 2026-09-28 真机照单：代理对 `127.0.0.1` 回 403、对 `localhost` 放行。
-+    const attempts: string[] = []
-+    const send = vi.fn<Parameters<typeof connectDesktopWelcome>[1]>(async (input) => {
-+      attempts.push(input)
-+      if (input.includes('127.0.0.1')) return new Response('blocked by policy', { status: 403 })
-+      return new Response('index')
-+    })
-+
-+    await expect(connectDesktopWelcome(url, send)).resolves.toBeDefined()
-+    expect(attempts).toEqual([url, 'http://localhost:19387/?token=fixture'])
-+  })
-+
-+  it('reports every host name it tried when none of them authenticates', async () => {
-     const send = vi.fn<Parameters<typeof connectDesktopWelcome>[1]>(async () => new Response(null, { status: 401 }))
--    await expect(connectDesktopWelcome(url, send)).rejects.toThrow('Web authentication failed')
-+    let failure: Error | undefined
-+    try {
-+      await connectDesktopWelcome(url, send)
-+    } catch (error: unknown) {
-+      failure = error as Error
-+    }
-+    expect(failure).toBeInstanceOf(Error)
-+    expect(failure?.message).toContain('Web authentication failed')
-+    expect(failure?.message).toContain('127.0.0.1:19387 → HTTP 401')
-+    expect(failure?.message).toContain('localhost:19387 → HTTP 401')
-+    expect(send).toHaveBeenCalledTimes(2)
-+  })
-+
-+  it('falls back to the next loopback name when this transport stack cannot reach the announced one', async () => {
-+    const rpc: string[] = []
-+    const send = vi.fn<Parameters<typeof connectDesktopWelcome>[1]>(async (input, init) => {
-+      // 「只放通 localhost」的终端策略：被拦的名字在传输层直接失败，而不是回一个错误码。
-+      if (input.includes('127.0.0.1')) throw new TypeError('fetch failed')
-+      if (init?.method !== 'POST') return new Response('index')
-+      rpc.push(input)
-+      const { rpcId } = JSON.parse(init.body as string) as { rpcId: string }
-+      return Response.json({
-+        type: 'server-response', rpcId,
-+        result: { ok: true, value: { namespaces: [{ ns: 'locale', value: { preference: 'zh' } }] } },
-+      })
-+    })
-+
-+    const backend = await connectDesktopWelcome(url, send)
-+
-+    expect(await backend.readLocalePreference()).toBe('zh')
-+    // 探测与后续请求必须落在同一个名字上，否则 RPC 会发给那个连不通的名字。
-+    expect(rpc).toEqual(['http://localhost:19387/api/settings/describe'])
-   })
- })
-diff --git a/apps/desktop/tests/welcome-startup.spec.ts b/apps/desktop/tests/welcome-startup.spec.ts
-index 7915248243..8b568d227f 100644
---- a/apps/desktop/tests/welcome-startup.spec.ts
-+++ b/apps/desktop/tests/welcome-startup.spec.ts
-@@ -1,4 +1,10 @@
--vi.mock('../src/web-document.ts', () => ({ authenticateWebHost: async () => 'test-cookie', serveWebDocument: vi.fn(), forwardWebRequest: vi.fn() }))
-+vi.mock('../src/web-document.ts', async importOriginal => ({
-+  ...await importOriginal<typeof import('../src/web-document.ts')>(),
-+  authenticateWebHost: async () => 'test-cookie',
-+  authenticateLoopbackHost: async (url: string) => ({ url, cookie: 'test-cookie' }),
-+  serveWebDocument: vi.fn(),
-+  forwardWebRequest: vi.fn(),
-+}))
- /** Welcome startup uses the Host before transitioning to the workspace. */
-
- import { afterEach, expect, it, vi } from 'vitest'
-@@ -101,7 +107,7 @@ vi.mock('electron', () => ({
- // The Windows tray relabels through Menu as well; keep the menu call counts below platform-neutral.
- vi.mock('../src/tray.ts', () => ({ DesktopTray: class { relabel() {} dispose() {} } }))
-
--vi.mock('../src/paths.ts', () => ({ resolveDesktopPaths: () => ({ profile: '/profile' }) }))
-+vi.mock('../src/paths.ts', () => ({ resolveDesktopPaths: () => ({ profile: '/profile' }), resolvePortableDshHome: () => undefined }))
- vi.mock('../src/settings.ts', () => ({ readDesktopSettings: () => ({ updates: { allowTestAuthPopupWindow: false } }) }))
- vi.mock('../src/login-shell-environment.ts', async importOriginal => ({
-   ...await importOriginal<typeof import('../src/login-shell-environment.ts')>(),
-diff --git a/packages/sandbox/sandbox-local/src/index.ts b/packages/sandbox/sandbox-local/src/index.ts
-index 45028746ff..c929f42495 100644
---- a/packages/sandbox/sandbox-local/src/index.ts
-+++ b/packages/sandbox/sandbox-local/src/index.ts
-@@ -148,6 +148,41 @@ interface AclTempCapability {
-   grant: AclWriteGrant
- }
-
-+/**
-+ * The node executable the windows-acl runner argv is prefixed with.
-+ *
-+ * Deliberately not a bare `process.execPath`: packaged desktop runs the host as
-+ * the Electron MAIN executable (`process.execPath` plus the injected
-+ * `ELECTRON_RUN_AS_NODE=1`). A spawner that scrubs the child environment — the
-+ * PTC runtime keeps only PATH/PATHEXT/SYSTEMROOT/WINDIR/TEMP/TMP — drops that
-+ * variable, so prefixing with `process.execPath` hands `runner.js` to Electron
-+ * as a GUI app. It then takes the single-instance path and exits 0 without ever
-+ * loading the script, so every confined PTC execution fails as
-+ * `worker-exit: Node process exited before completing (0)` with no output.
-+ *
-+ * The desktop package ships a real node for this purpose
-+ * (`resources/runtime/primary-runtime/dependencies/node/bin`), so use it
-+ * whenever we ARE the Electron runtime and it is present. Do not point at
-+ * `resources/runtime/bin/node.cmd`: that shim needs ELECTRON_RUN_AS_NODE and
-+ * DSH_DESKTOP_NODE_EXECUTABLE, both stripped from the PTC child env.
-+ * Dev, CLI and test runs keep `process.execPath` unchanged.
-+ */
-+function runnerExecutable(): string {
-+  if (process.versions.electron === undefined) return process.execPath
-+  const resources = (process as unknown as { resourcesPath?: string }).resourcesPath
-+  if (resources === undefined || resources.length === 0) return process.execPath
-+  const bundled = join(
-+    resources,
-+    'runtime',
-+    'primary-runtime',
-+    'dependencies',
-+    'node',
-+    'bin',
-+    process.platform === 'win32' ? 'node.exe' : 'node',
-+  )
-+  return existsSync(bundled) ? bundled : process.execPath
-+}
-+
- /**
-  * The runner chain per platform — selection is BY PLATFORM first, probes
-  * second: a platform's chain is probed in preference order only when it has
-@@ -566,13 +601,15 @@ export class LocalSandboxProvider extends SandboxProvider {
-    * Pin the source loader and TypeScript paths to this installation, independently
-    * of target cwd or environment overrides.
-    * The prefix stays `[node, runner, ...]` — a future native-exe runner keeps
--   * the same argv contract and only swaps these entries.
-+   * the same argv contract and only swaps these entries. The `node` slot comes
-+   * from {@link runnerExecutable}, which is why packaged desktop does not
-+   * launch the runner through the Electron main executable.
-    */
-   private windowsAclRunnerInvocation(): string[] {
-     const override = this.internals.windowsAclRunnerArgs
-     if (override !== undefined) return override
-     const builtEntry = this.internals.windowsAclRunnerEntry ?? fileURLToPath(import.meta.resolve('@deepseek-ai/dsh-sandbox-windows-acl/runner'))
--    if (existsSync(builtEntry)) return [process.execPath, builtEntry]
-+    if (existsSync(builtEntry)) return [runnerExecutable(), builtEntry]
-     const sourceEntry = fileURLToPath(import.meta.resolve('@deepseek-ai/dsh-sandbox-windows-acl/src/runner.ts'))
-     const sourceConfig = fileURLToPath(new URL('../../../../tsconfig.base.json', import.meta.url))
-     const registration = `import { register } from ${JSON.stringify(import.meta.resolve('tsx/esm/api'))}; register({ tsconfig: ${JSON.stringify(sourceConfig)} });`
-diff --git a/apps/desktop/README.md b/apps/desktop/README.md
-index 60f14b908f..fbcc12270c 100644
---- a/apps/desktop/README.md
-+++ b/apps/desktop/README.md
-@@ -2,6 +2,8 @@
-
- English | [中文](README.zh.md)
-
-+Portable bundles use `<root>/app/<exe>` beside `<root>/home`. The bundle directory owns each instance and isolates DSH-owned data without changing inherited user or third-party tool environment settings: sessions, configuration, credentials, plugins and dependency runtimes live under `home`, and shared agent configuration under `home/.agents`. Electron user and session data, logs, crash reports, temporary files, update caches and journals live under `data`. External tools retain their original user directories, configuration and caches. Different bundle directories run concurrently; launching the same directory focuses its owner, with directory aliases resolved to the real path. Both the executable and launcher follow this rule. Portable mode neither registers the system `dsh://` protocol nor reads the system login shell to override bundle paths. Explicit workspace paths and external application installation directories remain accessible. Existing system Electron data is not imported automatically; see the [portable directory upgrade guide](../../docs/upgrade-guide/v0.2.1-alpha.2/portable-data/guide.md).
-+
- Desktop analytics follows the [product collection policy](../../packages/client/product-analytics/README.md), including its live application setting. Web usage is excluded. Update installation waits for its local analytics intake before locking API admission and stopping the Host. Intake has a one-second deadline; failure does not prevent installation, and collector delivery is not awaited.
-
- The desktop application is an Electron shell around the complete dsh Web application. An Electron RunAsNode child starts the shared profile runner, and Electron immediately loads the packaged Web entry at `dsh-app://app/`. Its shared loading page waits for Host boot injections, then starts the client without navigating to another document. Electron forwards application HTTP requests to the authenticated Web Host, dropping connection-level response headers (`transfer-encoding`, `connection`, `keep-alive`) that describe the Node fetch rather than the resource, and marking plugin bundle responses `no-store` because their per-launch revisions would only accumulate in Chromium's disk cache; WebSocket streams connect to that Host with credentials attached only for the owned application window. Node IPC carries boot injections, readiness, and shutdown. Desktop listens on an OS-assigned port by default, so it cannot collide with Web’s `3080` or a reserved port; a `webserver.config.port` patch can override it.
-diff --git a/apps/desktop/README.zh.md b/apps/desktop/README.zh.md
-index eb1cbe5b78..daddef95c4 100644
---- a/apps/desktop/README.zh.md
-+++ b/apps/desktop/README.zh.md
-@@ -2,6 +2,8 @@
-
- [English](README.md) | 中文
-
-+便携包采用 `<根目录>/app/<exe>` 与 `<根目录>/home` 布局。启动时由包目录决定实例归属，仅隔离 DSH 自有数据，保留继承的系统用户及第三方工具环境：会话、配置、凭据、插件与依赖运行时位于 `home`，共享智能体配置位于 `home/.agents`；Electron 用户数据及会话缓存、日志、崩溃报告、临时目录、更新缓存与日志位于 `data`；外部工具继续使用原用户目录、配置与缓存。不同包目录可并行运行，同目录重复启动聚焦原实例；目录别名按真实路径识别。exe 与启动脚本使用同一规则，便携模式不注册系统 `dsh://` 协议，也不读取系统登录 shell 来覆盖包内路径。用户明确指定的工作区与外部程序安装目录仍按实际路径访问。旧版的系统 Electron 数据不会自动导入，迁移说明见[便携目录升级指南](../../docs/upgrade-guide/v0.2.1-alpha.2/portable-data/guide.zh.md)。
-+
- 桌面埋点遵循[产品采集策略](../../packages/client/product-analytics/README.zh.md)及其动态应用配置，不包含 Web 使用情况。安装更新会等待该操作的本地埋点接收请求结束，再锁定 API 准入并停止 Host。接收请求的时限为一秒，失败不会阻止安装，也不等待收集端完成发送。
-
- 桌面应用是完整 dsh Web 应用外的一层 Electron 壳。Electron RunAsNode 子进程启动共享 profile runner，Electron 立即从 `dsh-app://app/` 加载打包内的 Web 入口。共享加载页等待 Host 启动注入，然后在同一文档中启动客户端。Electron 将应用 HTTP 请求转发给已认证的 Web Host，转发时丢弃描述 Node fetch 连接而非资源本身的响应头（`transfer-encoding`、`connection`、`keep-alive`），并把插件 bundle 响应标记为 `no-store`，因为其每次启动都变化的 revision 只会在 Chromium 磁盘缓存中累积；WebSocket 流连接到该 Host，仅为归属的应用窗口附加凭据。Node IPC 承载启动注入、就绪与关闭。Desktop 默认监听系统分配的端口，因此不会与 Web 的 `3080` 或系统保留端口冲突；可通过 `webserver.config.port` patch 覆盖。
-diff --git a/apps/desktop/src/portable-data.ts b/apps/desktop/src/portable-data.ts
-new file mode 100644
---- /dev/null
-+++ b/apps/desktop/src/portable-data.ts
-@@ -0,0 +1,55 @@
-+/** 便携版在获取单实例锁前确定所有可写数据目录。 */
-+import { resolvePortableDshHome } from './paths.ts'
-+import { mkdirSync, realpathSync } from 'node:fs'
-+import { dirname, join } from 'node:path'
-+
-+/** Electron 启动阶段的目录设置接口。 */
-+export interface PortableApplicationPaths {
-+  setPath(name: 'appData' | 'userData' | 'sessionData' | 'temp' | 'crashDumps', path: string): void
-+  setAppLogsPath(path: string): void
-+  commandLine: { appendSwitch(name: string, value: string): void }
-+}
-+
-+/**
-+ * 初始化便携版数据归属；普通安装不改变系统路径。
-+ * @param application - 尚未 ready 的 Electron 应用。
-+ * @param executable - 主程序的绝对路径。
-+ * @param environment - 主进程与子进程共享的环境。
-+ * @returns 检测到的包内 Harness home；普通安装返回 undefined。
-+ */
-+export function configurePortableData(
-+  application: PortableApplicationPaths, executable: string, environment: NodeJS.ProcessEnv,
-+): string | undefined {
-+  const detected = resolvePortableDshHome(executable)
-+  if (detected === undefined) return undefined
-+  // realpath 让目录别名与原路径使用同一个 Electron 单实例锁。
-+  const home = realpathSync(detected)
-+  const data = join(dirname(home), 'data')
-+  const appData = join(data, 'app-data')
-+  const temporary = join(data, 'temp')
-+  const browserHost = (environment.DSH_BROWSER_ELECTRON_HOST ?? '') !== ''
-+  const electronPaths = {
-+    appData, temp: temporary, crashDumps: join(data, 'crash-dumps'),
-+    ...browserHost ? {} : { userData: join(data, 'electron'), sessionData: join(data, 'electron') },
-+  }
-+  const logs = join(data, 'logs', browserHost ? 'browser' : 'desktop')
-+  const overrides: Record<string, string> = {
-+    DSH_HOME: home, DSH_AGENTS_HOME: join(home, '.agents'),
-+    DSH_PORTABLE_DOCUMENTS_DIR: join(data, 'documents'),
-+    DSH_TEMP_DIR: temporary,
-+    // 沿用旧版包内浏览器目录，保留已有登录态；不再依赖 TEMP 重定向。
-+    DSH_BROWSER_USER_DATA_DIR: join(temporary, 'dsh-browser-electron-host'),
-+    DSH_DESKTOP_UPDATE_JOURNAL_DIR: join(data, 'update-journals'),
-+  }
-+  // 只设置 DSH 专属变量；外部工具继承原有用户目录、配置和临时目录。
-+  for (const directory of [logs, ...Object.values(electronPaths), ...Object.values(overrides)]) {
-+    mkdirSync(directory, { recursive: true })
-+  }
-+  Object.assign(environment, overrides)
-+  for (const [name, path] of Object.entries(electronPaths)) {
-+    application.setPath(name as Parameters<PortableApplicationPaths['setPath']>[0], path)
-+  }
-+  application.setAppLogsPath(logs)
-+  application.commandLine.appendSwitch('log-file', join(logs, 'chromium.log'))
-+  return home
-+}
 diff --git a/apps/desktop/tests/portable-data.spec.ts b/apps/desktop/tests/portable-data.spec.ts
 new file mode 100644
+index 0000000000..b274ad5a35
 --- /dev/null
 +++ b/apps/desktop/tests/portable-data.spec.ts
 @@ -0,0 +1,152 @@
@@ -1357,8 +1067,262 @@ new file mode 100644
 +    expect(a.output).not.toBe(b.output)
 +  })
 +})
+diff --git a/apps/desktop/tests/web-document.spec.ts b/apps/desktop/tests/web-document.spec.ts
+index 0fd9b591b1..da9b3ab383 100644
+--- a/apps/desktop/tests/web-document.spec.ts
++++ b/apps/desktop/tests/web-document.spec.ts
+@@ -2,7 +2,7 @@ import { afterEach, expect, it, vi } from 'vitest'
+ import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises'
+ import { tmpdir } from 'node:os'
+ import { join } from 'node:path'
+-import { authenticateWebHost, forwardWebRequest, serveWebDocument } from '../src/web-document.ts'
++import { authenticateLoopbackHost, authenticateWebHost, exchangeProbe, forwardWebRequest, jarProbe, serveWebDocument } from '../src/web-document.ts'
+ 
+ const roots: string[] = []
+ afterEach(async () => {
+@@ -35,6 +35,121 @@ it('requires the Host authentication exchange and retains only its cookie value'
+   await expect(authenticateWebHost('http://127.0.0.1:1234/')).rejects.toThrow('authentication failed')
+ })
+ 
++it('falls back to another loopback name when the announced one cannot be reached', async () => {
++  const urls: string[] = []
++  const fetch = vi.fn().mockImplementation(async (input: unknown) => {
++    const url = String(input)
++    urls.push(url)
++    if (url.includes('127.0.0.1')) throw new TypeError('fetch failed')
++    return new Response(null, { status: 303, headers: { 'set-cookie': 'session=owned' } })
++  })
++  vi.stubGlobal('fetch', fetch)
++
++  // Subsequent forwarding uses whichever name worked, so the Host name travels with the cookie.
++  await expect(authenticateLoopbackHost('http://127.0.0.1:19387/?token=owned'))
++    .resolves.toEqual({ url: 'http://localhost:19387/?token=owned', cookie: 'session=owned' })
++  expect(urls).toEqual(['http://127.0.0.1:19387/?token=owned', 'http://localhost:19387/?token=owned'])
++})
++
++it('keeps trying the other loopback name when an intermediary answers on the Host behalf', async () => {
++  // 企业代理**代替** Host 回 403（不是拒绝连接）—— 只放通 `localhost` 的那类终端策略。
++  // `Response.ok` 对 3xx/4xx 都是 false，所以「拿到了答复」不能当成「Host 答复了」。
++  const urls: string[] = []
++  const fetch = vi.fn().mockImplementation(async (input: unknown) => {
++    const url = String(input)
++    urls.push(url)
++    if (url.includes('127.0.0.1')) return new Response('blocked by policy', { status: 403 })
++    return new Response(null, { status: 303, headers: { 'set-cookie': 'session=owned' } })
++  })
++  vi.stubGlobal('fetch', fetch)
++
++  await expect(authenticateLoopbackHost('http://127.0.0.1:19387/?token=owned'))
++    .resolves.toEqual({ url: 'http://localhost:19387/?token=owned', cookie: 'session=owned' })
++  expect(urls).toEqual(['http://127.0.0.1:19387/?token=owned', 'http://localhost:19387/?token=owned'])
++})
++
++it('reports what each loopback name answered when none of them works', async () => {
++  const fetch = vi.fn().mockResolvedValue(new Response('unauthorized', { status: 401 }))
++  vi.stubGlobal('fetch', fetch)
++
++  // 全试完仍不行时，报错必须自带证据（主机名 + 状态码）—— 只有一句「认证失败」无从下手。
++  let failure: Error | undefined
++  try {
++    await authenticateLoopbackHost('http://127.0.0.1:19387/?token=owned')
++  } catch (error: unknown) {
++    failure = error as Error
++  }
++  expect(failure).toBeInstanceOf(Error)
++  expect(failure?.message).toContain('127.0.0.1:19387 → ')
++  expect(failure?.message).toContain('localhost:19387 → ')
++  expect(failure?.message.match(/HTTP 401/gu)).toHaveLength(2)
++  expect(fetch).toHaveBeenCalledTimes(2)
++})
++
++it('rejects a loopback name only one transport stack can reach', async () => {
++  // 2026-09-28 现场：Node 那条栈连得上 `127.0.0.1`（它不读企业代理），而 Chromium 那条
++  // （渲染进程自己的 WebSocket、以及欢迎页）被代理回 403。只按 Node 选名字，界面就永远
++  // 停在「重新连接中…」—— 文档转得动、事件流一条也建不起来。
++  const calls: string[] = []
++  const fetch = vi.fn().mockImplementation(async (input: unknown) => {
++    calls.push(`node:${String(input)}`)
++    return new Response(null, { status: 303, headers: { 'set-cookie': 'session=owned' } })
++  })
++  vi.stubGlobal('fetch', fetch)
++  const chromium = vi.fn().mockImplementation(async (input: unknown) => {
++    const url = String(input)
++    calls.push(`net:${url}`)
++    // 代理代替 Host 回 403：拿到答复 ≠ Host 答复了。
++    return url.includes('127.0.0.1') ? new Response('blocked by policy', { status: 403 }) : new Response('app', { status: 200 })
++  })
++  const jars = vi.fn(async () => 'session=owned')
++
++  await expect(authenticateLoopbackHost('http://127.0.0.1:19387/?token=owned', [
++    jarProbe('net.fetch', chromium, jars),
++    exchangeProbe(),
++  ])).resolves.toEqual({ url: 'http://localhost:19387/?token=owned', cookie: 'session=owned' })
++
++  // 被 Chromium 拒掉之后，同一个候选不再浪费一次 Node 请求；换到 `localhost` 两条栈都要点头。
++  expect(calls).toEqual([
++    'net:http://127.0.0.1:19387/?token=owned',
++    'net:http://localhost:19387/?token=owned',
++    'node:http://localhost:19387/?token=owned',
++  ])
++})
++
++it('refuses a name the Chromium stack answered without storing a cookie', async () => {
++  // 名字通了但 jar 是空的 = 壳没有 cookie 可注入 WS 握手，渲染进程照样连不上。
++  const fetch = vi.fn()
++  vi.stubGlobal('fetch', fetch)
++  const chromium = vi.fn(async () => new Response('app', { status: 200 }))
++  const jars = vi.fn(async () => '')
++
++  await expect(authenticateLoopbackHost('http://127.0.0.1:19387/?token=owned', [
++    jarProbe('net.fetch', chromium, jars),
++    exchangeProbe(),
++  ])).rejects.toThrow('the session stored no cookie for this host name')
++  expect(chromium).toHaveBeenCalledTimes(2)
++  expect(fetch).not.toHaveBeenCalled()
++})
++
++it('names the transport stack that refused each loopback name', async () => {
++  vi.stubGlobal('fetch', vi.fn(async () => new Response(null, { status: 303, headers: { 'set-cookie': 'session=owned' } })))
++  const chromium = vi.fn(async () => new Response('blocked by policy', { status: 407 }))
++
++  let failure: Error | undefined
++  try {
++    await authenticateLoopbackHost('http://127.0.0.1:19387/?token=owned', [
++      jarProbe('net.fetch', chromium, async () => 'session=owned'),
++      exchangeProbe(),
++    ])
++  } catch (error: unknown) {
++    failure = error as Error
++  }
++  // 「是哪条栈不同意」必须留在报错里 —— 两条栈的排查方向完全不同。
++  expect(failure?.message).toContain('127.0.0.1:19387 → net.fetch: HTTP 407')
++  expect(failure?.message).toContain('localhost:19387 → net.fetch: HTTP 407')
++})
++
+ it('forwards upload bytes and cancellation with Host credentials while keeping the response streaming', async () => {
+   const body = new ReadableStream({ start(controller) { controller.enqueue(new TextEncoder().encode('stream')); controller.close() } })
+   const fetch = vi.fn().mockResolvedValue(new Response(body, { headers: { 'content-encoding': 'gzip', 'set-cookie': 'private' } }))
+diff --git a/apps/desktop/tests/welcome-host.spec.ts b/apps/desktop/tests/welcome-host.spec.ts
+index dea2905583..cb70d68123 100644
+--- a/apps/desktop/tests/welcome-host.spec.ts
++++ b/apps/desktop/tests/welcome-host.spec.ts
+@@ -93,7 +93,6 @@ describe('desktop welcome Web operations', () => {
+     await expect(backend.read()).rejects.toThrow('Web RPC failed')
+   })
+ 
+-
+   it('submits native analytics through authenticated RPC with a bounded request', async () => {
+     const host = transport()
+     const backend = await connectDesktopWelcome(url, host.send)
+@@ -106,8 +105,53 @@ describe('desktop welcome Web operations', () => {
+     expect(JSON.parse(init!.body as string)).toMatchObject({ payload: { args: { event } } })
+   })
+ 
+-  it('refuses an unauthenticated Web launch', async () => {
++  it('keeps trying the next name when an intermediary answers on the Host behalf', async () => {
++    // 代理代替 Host 回 403（`ok === false`）时**不能**当终局 —— 它只说明这个名字没通过。
++    // 2026-09-28 真机照单：代理对 `127.0.0.1` 回 403、对 `localhost` 放行。
++    const attempts: string[] = []
++    const send = vi.fn<Parameters<typeof connectDesktopWelcome>[1]>(async (input) => {
++      attempts.push(input)
++      if (input.includes('127.0.0.1')) return new Response('blocked by policy', { status: 403 })
++      return new Response('index')
++    })
++
++    await expect(connectDesktopWelcome(url, send)).resolves.toBeDefined()
++    expect(attempts).toEqual([url, 'http://localhost:19387/?token=fixture'])
++  })
++
++  it('reports every host name it tried when none of them authenticates', async () => {
+     const send = vi.fn<Parameters<typeof connectDesktopWelcome>[1]>(async () => new Response(null, { status: 401 }))
+-    await expect(connectDesktopWelcome(url, send)).rejects.toThrow('Web authentication failed')
++    let failure: Error | undefined
++    try {
++      await connectDesktopWelcome(url, send)
++    } catch (error: unknown) {
++      failure = error as Error
++    }
++    expect(failure).toBeInstanceOf(Error)
++    expect(failure?.message).toContain('Web authentication failed')
++    expect(failure?.message).toContain('127.0.0.1:19387 → HTTP 401')
++    expect(failure?.message).toContain('localhost:19387 → HTTP 401')
++    expect(send).toHaveBeenCalledTimes(2)
++  })
++
++  it('falls back to the next loopback name when this transport stack cannot reach the announced one', async () => {
++    const rpc: string[] = []
++    const send = vi.fn<Parameters<typeof connectDesktopWelcome>[1]>(async (input, init) => {
++      // 「只放通 localhost」的终端策略：被拦的名字在传输层直接失败，而不是回一个错误码。
++      if (input.includes('127.0.0.1')) throw new TypeError('fetch failed')
++      if (init?.method !== 'POST') return new Response('index')
++      rpc.push(input)
++      const { rpcId } = JSON.parse(init.body as string) as { rpcId: string }
++      return Response.json({
++        type: 'server-response', rpcId,
++        result: { ok: true, value: { namespaces: [{ ns: 'locale', value: { preference: 'zh' } }] } },
++      })
++    })
++
++    const backend = await connectDesktopWelcome(url, send)
++
++    expect(await backend.readLocalePreference()).toBe('zh')
++    // 探测与后续请求必须落在同一个名字上，否则 RPC 会发给那个连不通的名字。
++    expect(rpc).toEqual(['http://localhost:19387/api/settings/describe'])
+   })
+ })
+diff --git a/apps/desktop/tests/welcome-startup.spec.ts b/apps/desktop/tests/welcome-startup.spec.ts
+index 7915248243..8b568d227f 100644
+--- a/apps/desktop/tests/welcome-startup.spec.ts
++++ b/apps/desktop/tests/welcome-startup.spec.ts
+@@ -1,4 +1,10 @@
+-vi.mock('../src/web-document.ts', () => ({ authenticateWebHost: async () => 'test-cookie', serveWebDocument: vi.fn(), forwardWebRequest: vi.fn() }))
++vi.mock('../src/web-document.ts', async importOriginal => ({
++  ...await importOriginal<typeof import('../src/web-document.ts')>(),
++  authenticateWebHost: async () => 'test-cookie',
++  authenticateLoopbackHost: async (url: string) => ({ url, cookie: 'test-cookie' }),
++  serveWebDocument: vi.fn(),
++  forwardWebRequest: vi.fn(),
++}))
+ /** Welcome startup uses the Host before transitioning to the workspace. */
+ 
+ import { afterEach, expect, it, vi } from 'vitest'
+@@ -101,7 +107,7 @@ vi.mock('electron', () => ({
+ // The Windows tray relabels through Menu as well; keep the menu call counts below platform-neutral.
+ vi.mock('../src/tray.ts', () => ({ DesktopTray: class { relabel() {} dispose() {} } }))
+ 
+-vi.mock('../src/paths.ts', () => ({ resolveDesktopPaths: () => ({ profile: '/profile' }) }))
++vi.mock('../src/paths.ts', () => ({ resolveDesktopPaths: () => ({ profile: '/profile' }), resolvePortableDshHome: () => undefined }))
+ vi.mock('../src/settings.ts', () => ({ readDesktopSettings: () => ({ updates: { allowTestAuthPopupWindow: false } }) }))
+ vi.mock('../src/login-shell-environment.ts', async importOriginal => ({
+   ...await importOriginal<typeof import('../src/login-shell-environment.ts')>(),
+diff --git a/docs/upgrade-guide/v0.2.1-alpha.2/portable-data/guide.i18n.yaml b/docs/upgrade-guide/v0.2.1-alpha.2/portable-data/guide.i18n.yaml
+new file mode 100644
+index 0000000000..cb57abea66
+--- /dev/null
++++ b/docs/upgrade-guide/v0.2.1-alpha.2/portable-data/guide.i18n.yaml
+@@ -0,0 +1,19 @@
++# Bilingual-pair consistency record for guide.md (docs/i18n/README.md): per heading
++# section, a hash of its English and Chinese blocks outside code blocks and generated regions.
++# After editing either side, bring the other along and re-record with:
++#   pnpm run verify-translation-pairing --write docs/upgrade-guide/v0.2.1-alpha.2/portable-data/guide.md
++/:
++  en: cb3f91d54eee30e5
++  zh: cb3f91d54eee30e5
++/kind-upgrade-guide-description-portable-electron-and-global-data-directories-become-owned-by-each-bundle-directory:
++  en: c3da1b009121f70c
++  zh: 07c2c68bd7c8f815
++/portable-data-isolation:
++  en: 45d3336d55963a1d
++  zh: 2cfb61f3f31c9c1b
++/portable-data-isolation/change:
++  en: fe4d80df751e95b8
++  zh: c9b34995048a0969
++/portable-data-isolation/migration:
++  en: 8567c493d69f34be
++  zh: 278c7efc5f04fc84
 diff --git a/docs/upgrade-guide/v0.2.1-alpha.2/portable-data/guide.md b/docs/upgrade-guide/v0.2.1-alpha.2/portable-data/guide.md
 new file mode 100644
+index 0000000000..7752feafab
 --- /dev/null
 +++ b/docs/upgrade-guide/v0.2.1-alpha.2/portable-data/guide.md
 @@ -0,0 +1,20 @@
@@ -1384,6 +1348,7 @@ new file mode 100644
 +4. Launch bundles from two different directories, create separate sessions and change configuration in each. Restart and verify that sessions, configuration and `data/electron` remain separate. Launching the same directory again should focus the running window.
 diff --git a/docs/upgrade-guide/v0.2.1-alpha.2/portable-data/guide.zh.md b/docs/upgrade-guide/v0.2.1-alpha.2/portable-data/guide.zh.md
 new file mode 100644
+index 0000000000..03218a6383
 --- /dev/null
 +++ b/docs/upgrade-guide/v0.2.1-alpha.2/portable-data/guide.zh.md
 @@ -0,0 +1,20 @@
@@ -1407,12 +1372,53 @@ new file mode 100644
 +2. 首次启动会创建包内 `data`。旧系统 Electron 目录不会被修改或自动复制；旧快捷键、桌面偏好及网页登录态不会自动出现。需要旧偏好时，在实例退出后将明确属于该实例的 `keybindings.json` 与 `desktop/settings.json` 复制到包内 `data/electron` 的对应位置；来源归属不明确时不要混合导入整个系统目录。
 +3. 如需原共享智能体配置，将所需文件复制到 `home/.agents`。外部工具继续使用原用户配置，无需迁移 npm 或 Python 配置。
 +4. 启动两个不同目录的便携包，分别建立会话和修改配置。重启后核对各自会话、配置与 `data/electron` 均保持独立。同目录再次启动应聚焦已运行的窗口。
+diff --git a/packages/api/workspace-controller/README.i18n.yaml b/packages/api/workspace-controller/README.i18n.yaml
+index e3cb08a719..652890de9b 100644
+--- a/packages/api/workspace-controller/README.i18n.yaml
++++ b/packages/api/workspace-controller/README.i18n.yaml
+@@ -18,8 +18,8 @@
+   en: 8276c5edb7d0db7d
+   zh: cda0c91f8c3776e6
+ /workspace-controller/use-this-package/first-use-workspace:
+-  en: 61032e060e7213f0
+-  zh: 437eb982a8738539
++  en: 0c6f6053b6d95703
++  zh: faf44626103fd3de
+ /workspace-controller/model-experience:
+   en: 4f399d6a27daf683
+   zh: 13811489fe636127
+diff --git a/packages/api/workspace-controller/README.md b/packages/api/workspace-controller/README.md
+index 27c26c7d9b..5c9f929d93 100644
+--- a/packages/api/workspace-controller/README.md
++++ b/packages/api/workspace-controller/README.md
+@@ -40,6 +40,8 @@ The [Workspace registry](../../workspace/workspace/README.md#first-use-workspace
+ | Configuration | Default | Purpose |
+ | --- | --- | --- |
+ | `documentsDirectory` | System Documents directory | Fully qualified Host directory override |
++
++Portable desktop supplies its package-local default through `DSH_PORTABLE_DOCUMENTS_DIR`; explicit `documentsDirectory` takes precedence. Existing workspace registrations are not migrated when this default changes.
+ | `documentsLookupTimeoutMs` | `10000` | Positive maximum duration of OS directory lookup, in milliseconds |
+ 
+ Documents lookup holds the registry mutation queue, so other Workspace mutations, including registration of a picked directory, can wait up to `documentsLookupTimeoutMs`. Cancellation can stop the lookup; after resolution succeeds, it does not roll back creation or registration.
+diff --git a/packages/api/workspace-controller/README.zh.md b/packages/api/workspace-controller/README.zh.md
+index 4772d0c9b1..e5a7189faf 100644
+--- a/packages/api/workspace-controller/README.zh.md
++++ b/packages/api/workspace-controller/README.zh.md
+@@ -40,6 +40,8 @@ Client 入口提供 `ClientWorkspaceModel` 和 `createWorkspaceStateStream()`。
+ | 配置 | 默认值 | 用途 |
+ | --- | --- | --- |
+ | `documentsDirectory` | 系统 Documents 目录 | 完全限定的 Host 目录覆盖值 |
++
++便携桌面通过 `DSH_PORTABLE_DOCUMENTS_DIR` 提供包内默认目录；显式 `documentsDirectory` 优先。已有工作区注册不会因默认值变化而迁移。
+ | `documentsLookupTimeoutMs` | `10000` | 操作系统目录查询的正数最大时长，单位为毫秒 |
+ 
+ Documents 查询占用注册表变更队列，因此其他 Workspace 变更（包括登记已选目录）最多可能等待 `documentsLookupTimeoutMs`。取消可以停止查询；解析成功后，取消不会回滚创建或登记。
 diff --git a/packages/api/workspace-controller/src/default-directory.ts b/packages/api/workspace-controller/src/default-directory.ts
 index b15fea8b94..b17e86b6cc 100644
 --- a/packages/api/workspace-controller/src/default-directory.ts
 +++ b/packages/api/workspace-controller/src/default-directory.ts
 @@ -7,6 +7,7 @@ import { DEFAULT_WORKSPACE_DIRECTORY } from './default-workspace.ts'
-
+ 
  /** Platform observations replaceable in directory-resolution tests. */
  interface DocumentsDirectoryInternals {
 +  readonly environment?: NodeJS.ProcessEnv
@@ -1435,7 +1441,7 @@ index c382f410ac..e462edd384 100644
 +++ b/packages/api/workspace-controller/tests/default-directory.host.spec.ts
 @@ -3,6 +3,16 @@ import type { NativeCommandRunner } from '@deepseek-ai/dsh-native-command'
  import { defaultWorkspaceDirectory, validateDocumentsDirectory } from '../src/default-directory.ts'
-
+ 
  describe('system Documents directory', () => {
 +  it('便携版首次目录使用包内位置，明确配置优先且不查询系统目录', async () => {
 +    const run = vi.fn<NativeCommandRunner>()
@@ -1450,71 +1456,70 @@ index c382f410ac..e462edd384 100644
    it.each([
      ['darwin', '/Users/a/文档/\n', '/Users/a/文档/deepseek-harness/default-workspace', 'osascript'],
      ['win32', 'D:\\Redirected Documents\r\n', 'D:\\Redirected Documents\\deepseek-harness\\default-workspace', 'powershell.exe'],
-diff --git a/packages/api/workspace-controller/README.md b/packages/api/workspace-controller/README.md
-index b24053384f..0813b7dc5e 100644
---- a/packages/api/workspace-controller/README.md
-+++ b/packages/api/workspace-controller/README.md
-@@ -38,6 +38,8 @@ The [Workspace registry](../../workspace/workspace/README.md#first-use-workspace
- | Configuration | Default | Purpose |
- | --- | --- | --- |
- | `documentsDirectory` | System Documents directory | Fully qualified Host directory override |
+diff --git a/packages/sandbox/sandbox-local/src/index.ts b/packages/sandbox/sandbox-local/src/index.ts
+index 45028746ff..c929f42495 100644
+--- a/packages/sandbox/sandbox-local/src/index.ts
++++ b/packages/sandbox/sandbox-local/src/index.ts
+@@ -148,6 +148,41 @@ interface AclTempCapability {
+   grant: AclWriteGrant
+ }
+ 
++/**
++ * The node executable the windows-acl runner argv is prefixed with.
++ *
++ * Deliberately not a bare `process.execPath`: packaged desktop runs the host as
++ * the Electron MAIN executable (`process.execPath` plus the injected
++ * `ELECTRON_RUN_AS_NODE=1`). A spawner that scrubs the child environment — the
++ * PTC runtime keeps only PATH/PATHEXT/SYSTEMROOT/WINDIR/TEMP/TMP — drops that
++ * variable, so prefixing with `process.execPath` hands `runner.js` to Electron
++ * as a GUI app. It then takes the single-instance path and exits 0 without ever
++ * loading the script, so every confined PTC execution fails as
++ * `worker-exit: Node process exited before completing (0)` with no output.
++ *
++ * The desktop package ships a real node for this purpose
++ * (`resources/runtime/primary-runtime/dependencies/node/bin`), so use it
++ * whenever we ARE the Electron runtime and it is present. Do not point at
++ * `resources/runtime/bin/node.cmd`: that shim needs ELECTRON_RUN_AS_NODE and
++ * DSH_DESKTOP_NODE_EXECUTABLE, both stripped from the PTC child env.
++ * Dev, CLI and test runs keep `process.execPath` unchanged.
++ */
++function runnerExecutable(): string {
++  if (process.versions.electron === undefined) return process.execPath
++  const resources = (process as unknown as { resourcesPath?: string }).resourcesPath
++  if (resources === undefined || resources.length === 0) return process.execPath
++  const bundled = join(
++    resources,
++    'runtime',
++    'primary-runtime',
++    'dependencies',
++    'node',
++    'bin',
++    process.platform === 'win32' ? 'node.exe' : 'node',
++  )
++  return existsSync(bundled) ? bundled : process.execPath
++}
 +
-+Portable desktop supplies its package-local default through `DSH_PORTABLE_DOCUMENTS_DIR`; explicit `documentsDirectory` takes precedence. Existing workspace registrations are not migrated when this default changes.
- | `documentsLookupTimeoutMs` | `10000` | Positive maximum duration of OS directory lookup, in milliseconds |
-
- Documents lookup holds the registry mutation queue, so other Workspace mutations, including registration of a picked directory, can wait up to `documentsLookupTimeoutMs`. Cancellation can stop the lookup; after resolution succeeds, it does not roll back creation or registration.
-diff --git a/packages/api/workspace-controller/README.zh.md b/packages/api/workspace-controller/README.zh.md
-index dc240950cc..56caf00762 100644
---- a/packages/api/workspace-controller/README.zh.md
-+++ b/packages/api/workspace-controller/README.zh.md
-@@ -38,6 +38,8 @@ Client 入口提供 `ClientWorkspaceModel` 和 `createWorkspaceStateStream()`。
- | 配置 | 默认值 | 用途 |
- | --- | --- | --- |
- | `documentsDirectory` | 系统 Documents 目录 | 完全限定的 Host 目录覆盖值 |
-+
-+便携桌面通过 `DSH_PORTABLE_DOCUMENTS_DIR` 提供包内默认目录；显式 `documentsDirectory` 优先。已有工作区注册不会因默认值变化而迁移。
- | `documentsLookupTimeoutMs` | `10000` | 操作系统目录查询的正数最大时长，单位为毫秒 |
-
- Documents 查询占用注册表变更队列，因此其他 Workspace 变更（包括登记已选目录）最多可能等待 `documentsLookupTimeoutMs`。取消可以停止查询；解析成功后，取消不会回滚创建或登记。
-diff --git a/packages/api/workspace-controller/README.i18n.yaml b/packages/api/workspace-controller/README.i18n.yaml
-index d804399b83..9b998ed83b 100644
---- a/packages/api/workspace-controller/README.i18n.yaml
-+++ b/packages/api/workspace-controller/README.i18n.yaml
-@@ -18,8 +18,8 @@
-   en: aa0d93826ab685fe
-   zh: 144e48d49020f5a4
- /workspace-controller/use-this-package/first-use-workspace:
--  en: 61032e060e7213f0
--  zh: 437eb982a8738539
-+  en: 0c6f6053b6d95703
-+  zh: faf44626103fd3de
- /workspace-controller/model-experience:
-   en: 4f399d6a27daf683
-   zh: 13811489fe636127
-diff --git a/docs/upgrade-guide/v0.2.1-alpha.2/portable-data/guide.i18n.yaml b/docs/upgrade-guide/v0.2.1-alpha.2/portable-data/guide.i18n.yaml
-new file mode 100644
---- /dev/null
-+++ b/docs/upgrade-guide/v0.2.1-alpha.2/portable-data/guide.i18n.yaml
-@@ -0,0 +1,19 @@
-+# Bilingual-pair consistency record for guide.md (docs/i18n/README.md): per heading
-+# section, a hash of its English and Chinese blocks outside code blocks and generated regions.
-+# After editing either side, bring the other along and re-record with:
-+#   pnpm run verify-translation-pairing --write docs/upgrade-guide/v0.2.1-alpha.2/portable-data/guide.md
-+/:
-+  en: cb3f91d54eee30e5
-+  zh: cb3f91d54eee30e5
-+/kind-upgrade-guide-description-portable-electron-and-global-data-directories-become-owned-by-each-bundle-directory:
-+  en: c3da1b009121f70c
-+  zh: 07c2c68bd7c8f815
-+/portable-data-isolation:
-+  en: 45d3336d55963a1d
-+  zh: 2cfb61f3f31c9c1b
-+/portable-data-isolation/change:
-+  en: fe4d80df751e95b8
-+  zh: c9b34995048a0969
-+/portable-data-isolation/migration:
-+  en: 8567c493d69f34be
-+  zh: 278c7efc5f04fc84
+ /**
+  * The runner chain per platform — selection is BY PLATFORM first, probes
+  * second: a platform's chain is probed in preference order only when it has
+@@ -566,13 +601,15 @@ export class LocalSandboxProvider extends SandboxProvider {
+    * Pin the source loader and TypeScript paths to this installation, independently
+    * of target cwd or environment overrides.
+    * The prefix stays `[node, runner, ...]` — a future native-exe runner keeps
+-   * the same argv contract and only swaps these entries.
++   * the same argv contract and only swaps these entries. The `node` slot comes
++   * from {@link runnerExecutable}, which is why packaged desktop does not
++   * launch the runner through the Electron main executable.
+    */
+   private windowsAclRunnerInvocation(): string[] {
+     const override = this.internals.windowsAclRunnerArgs
+     if (override !== undefined) return override
+     const builtEntry = this.internals.windowsAclRunnerEntry ?? fileURLToPath(import.meta.resolve('@deepseek-ai/dsh-sandbox-windows-acl/runner'))
+-    if (existsSync(builtEntry)) return [process.execPath, builtEntry]
++    if (existsSync(builtEntry)) return [runnerExecutable(), builtEntry]
+     const sourceEntry = fileURLToPath(import.meta.resolve('@deepseek-ai/dsh-sandbox-windows-acl/src/runner.ts'))
+     const sourceConfig = fileURLToPath(new URL('../../../../tsconfig.base.json', import.meta.url))
+     const registration = `import { register } from ${JSON.stringify(import.meta.resolve('tsx/esm/api'))}; register({ tsconfig: ${JSON.stringify(sourceConfig)} });`
 diff --git a/packages/spill/spill-local/README.i18n.yaml b/packages/spill/spill-local/README.i18n.yaml
 index 62cd34b4ae..9c068a87fd 100644
 --- a/packages/spill/spill-local/README.i18n.yaml
@@ -1600,33 +1605,33 @@ index 5ebb404f0b..4a58178a5c 100644
 --- a/packages/spill/spill-local/README.md
 +++ b/packages/spill/spill-local/README.md
 @@ -29,6 +29,8 @@ Mount this backend in a composition that spills text to the local filesystem. It
-
+ 
  ### Minimal configuration
-
+ 
 +With nonempty `DSH_TEMP_DIR`, default creation and discovery use that DSH-owned directory; `root` still overrides the active storage root. The variable does not change external tools' temporary directories.
 +
  Loading the plugin with no config is safe: files land in a lazily-created private (0700) per-process directory under the OS temp directory. Set `root` when the files must live under a known location.
-
+ 
  ```yaml
 diff --git a/packages/spill/spill-local/README.zh.md b/packages/spill/spill-local/README.zh.md
 index aba434f495..d97799403d 100644
 --- a/packages/spill/spill-local/README.zh.md
 +++ b/packages/spill/spill-local/README.zh.md
 @@ -29,6 +29,8 @@ kind: "package-reference"
-
+ 
  ### 最小配置
-
+ 
 +`DSH_TEMP_DIR` 非空时，默认目录创建和历史目录扫描使用该 DSH 专属目录；`root` 仍优先决定当前存储根。此变量不改变外部工具的临时目录。
 +
  不带配置加载插件是安全的：文件会落在操作系统临时目录下延迟创建的私有（0700）每进程目录中。当文件必须位于已知位置时，设置 `root`。
-
+ 
  ```yaml
 diff --git a/packages/spill/spill-local/src/index.ts b/packages/spill/spill-local/src/index.ts
 index feb9f32fb3..2b2a5ebcc2 100644
 --- a/packages/spill/spill-local/src/index.ts
 +++ b/packages/spill/spill-local/src/index.ts
 @@ -11,13 +11,12 @@
-
+ 
  import { Context } from '@deepseek-ai/cordis'
  import { resolve } from 'node:path'
 -import { tmpdir } from 'node:os'
@@ -1637,7 +1642,7 @@ index feb9f32fb3..2b2a5ebcc2 100644
  import type { SweepRoot, WarnFn } from './cleanup.ts'
 -import { privateRoot, saveTextFile } from './store.ts'
 +import { defaultRootsBase, privateRoot, saveTextFile } from './store.ts'
-
+ 
  export { discoverDefaultRoots, sweepSpillRoots } from './cleanup.ts'
  export type { SweepOptions, SweepRoot, WarnFn } from './cleanup.ts'
 @@ -143,7 +142,7 @@ export class LocalSpillStore extends SpillStore {
@@ -1647,7 +1652,7 @@ index feb9f32fb3..2b2a5ebcc2 100644
 -    return tmpdir()
 +    return defaultRootsBase()
    }
-
+ 
    async saveText(input: SaveTextSpill): Promise<SpillRef> {
 diff --git a/packages/spill/spill-local/src/store.ts b/packages/spill/spill-local/src/store.ts
 index ba518cf035..bfa2ee9d9d 100644
@@ -1661,7 +1666,7 @@ index ba518cf035..bfa2ee9d9d 100644
 +  defaultRoot ??= mkdtempSync(join(defaultRootsBase(), DEFAULT_ROOT_PREFIX))
    return defaultRoot
  }
-
+ 
 +/** DSH 专属临时根；普通运行方式保留系统默认值。 */
 +export function defaultRootsBase(): string {
 +  return process.env.DSH_TEMP_DIR || tmpdir()
@@ -1758,26 +1763,26 @@ index 5a7124b17b..b30e7c5a28 100644
 --- a/packages/subprocess/subprocess-local/README.md
 +++ b/packages/subprocess/subprocess-local/README.md
 @@ -44,6 +44,8 @@ Windows ordinary subprocesses start the private Job runner with `windowsHide` an
-
+ 
  ### Collecting output
-
+ 
 +With nonempty `DSH_TEMP_DIR`, default spill files use that DSH-owned directory and its per-process directories are retained on exit. External tools retain their original environment.
 +
  Collect mode keeps the last `maxBytes` of a stream in memory — errors and final results cluster at the end — and, when a `spill` cap is configured, appends the complete stream to a private file under a per-process directory in the OS temp dir (a `0700` directory, `0600` random-named files). A stream larger than the spill cap discards its incomplete spill and returns only the marked truncated tail. Spilling is best-effort: when the spill file cannot be opened or appended (the per-process directory removed by a temporary-file cleaner, `EACCES`, `EMFILE`, `ENOSPC`), the collector discards the spill, logs one `error` through the plugin logger, and keeps collecting the in-memory tail, so the result is truncated with no spill path. Reads are offset-based and non-consuming, so background and batch readers coexist before and after exit.
-
+ 
  The `./output` export shares this collector and retained-spill storage with process adapters. `snapshot()` returns the retained raw bytes and total byte count, allowing remote adapters to preserve offsets without forwarding the complete stream.
 diff --git a/packages/subprocess/subprocess-local/README.zh.md b/packages/subprocess/subprocess-local/README.zh.md
 index a498b00c6c..f7b24224ab 100644
 --- a/packages/subprocess/subprocess-local/README.zh.md
 +++ b/packages/subprocess/subprocess-local/README.zh.md
 @@ -44,6 +44,8 @@ Windows 普通子进程通过 `windowsHide` 启动私有 Job runner，并为原
-
+ 
  ### 收集输出
-
+ 
 +`DSH_TEMP_DIR` 非空时，默认 spill 文件使用该 DSH 专属目录，退出时保留其每进程目录。外部工具保留原环境。
 +
  收集模式在内存中保留一条流的最后 `maxBytes`——错误与最终结果通常聚集在末尾——并在配置了 `spill` 上限时把完整流追加到 OS 临时目录下每进程目录中的私有文件（`0700` 目录、`0600` 随机命名文件）。某条流大于 spill 上限时，会丢弃不完整的 spill，只返回带截断标记的尾部。spill 是尽力而为：当 spill 文件无法打开或追加（每进程目录被临时文件清理工具删除、`EACCES`、`EMFILE`、`ENOSPC`）时，收集器丢弃该 spill，通过插件 logger 记录一条 `error`，并继续收集内存尾部，因此结果带截断标记且没有 spill 路径。读取基于偏移量且从不消费，因此后台读取与批量读取在退出前后都可以共存。
-
+ 
  `./output` 导出向进程适配器共享该收集器与保留 spill 的存储。`snapshot()` 返回保留的原始字节及总字节数，使远程适配器能够保留偏移量，而无需转发完整的流。
 diff --git a/packages/subprocess/subprocess-local/src/output.ts b/packages/subprocess/subprocess-local/src/output.ts
 index 837d9e1e60..ea1c0c4f17 100644
@@ -1791,8 +1796,8 @@ index 837d9e1e60..ea1c0c4f17 100644
 +  defaultSpillDir ??= mkdtempSync(join(process.env.DSH_TEMP_DIR || tmpdir(), 'dsh-subprocess-'))
    return defaultSpillDir
  }
-
-@@ -52,5 +52,7 @@ function privateSpillDir(): string {
+ 
+@@ -52,6 +52,8 @@ function privateSpillDir(): string {
  /* v8 ignore next 4 -- exit listeners run after the coverage dump; removal is verified by the CI /tmp residue measurement. */
  process.once('exit', () => {
    if (defaultSpillDir === undefined) return
@@ -1800,3 +1805,4 @@ index 837d9e1e60..ea1c0c4f17 100644
 +  if (process.env.DSH_TEMP_DIR) return
    try { rmdirSync(defaultSpillDir) } catch { /* best-effort: ENOENT/ENOTEMPTY/EBUSY/EPERM must not change the exit code. */ }
  })
+ 

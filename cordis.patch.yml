@@ -65,7 +65,8 @@
 
 # 下面这条是**顶层** entry（不在 `insert:` 里），语义是「覆盖已存在的某行的 config」
 # —— `ptc-runtime` 行由 dsh 自己的 base bundle 定义
-# （`packages/bundle/base/cordis.patch.yml` 的 `- id: ptc-runtime`），所有 surface 都有。
+# （`packages/bundle/base/cordis.patch.yml` 的 `- id: ptc-runtime`），所有 surface 都有，
+# 且那一行**没有 config**，所以这里只需写 `launch` 一个键，其余走 schema 默认值。
 #
 # 为什么需要它：PTC 子进程（`run_code` 的实际执行体）默认用 `process.execPath` 启动，
 # 而打包态那是 Electron 主 exe，靠 `ELECTRON_RUN_AS_NODE=1` 才进 node 模式；
@@ -79,6 +80,20 @@
 # 也就是说这一条不改变任何 CLI / TUI / headless 场景的行为，也不装新插件，只是给桌面端
 # 留一个可注入的入口。
 #
+# 键名史（这条覆盖**静默失效过一整个大版本**，教训在）：
+#   0.1.6 时代上游的 config 键就是顶层 `nodeExecutable`，我们照它写；
+#   上游 2026-09-12（`7c9bb5914c refactor(ptc): align runtime packages and services
+#   with PTC naming`，随 0.2.1 发货）把它改成了 `launch.executable`，顶层键**不再被读取**
+#   —— schemastery 的 object 是非 strict 的，多写的键会被原样带进 config 对象然后被忽略，
+#   **不报错**。于是 0.2.1-alpha.1 升级（2026-10-04）之后这条覆盖一直是死的，
+#   而当时的自检只验证「补丁文本能 compose、表达式能求值」，验不出「服务读不读这个键」。
+#   0.2.1-alpha.3 适配时改回新键名，并把 verify-ptc 的判据从「读回补丁文本」
+#   升级成「读回服务实际解析到的 launch.executable」。
+#
+# `kind: node-script`（而不是 `embedded`）：bootstrap 不写 `bootstrapPath`，
+# 由 `bootstrapArgs()` 把本包的 `process.js` 映射进执行世界——这正是上游
+# 「不写 launch」时的默认行为，我们只钉住 executable 一个量。
+#
 # 历史：这条原本写在 harness 的 `apps/desktop-host/config/desktop.cordis.patch.yml` 里，
 # 由 `runProfile({ patchFiles: [...] })` 挂载。0.1.6-alpha.2 把那个文件连同 `config/`
 # 目录整个删掉、`patchFiles` 变成 `[]`，桌面补丁挂载点没了 —— 索性收进这份随包出货的
@@ -86,4 +101,6 @@
 # 少维护一个每次上游改桌面壳都会失配的补丁目标。
 - id: ptc-runtime
   config:
-    nodeExecutable: !!js process.env.DSH_PTC_NODE ?? process.execPath
+    launch:
+      kind: node-script
+      executable: !!js process.env.DSH_PTC_NODE ?? process.execPath
