@@ -63,18 +63,18 @@ describe('每次发布的完整便携包', () => {
     mkdirSync(runtime, { recursive: true })
     mkdirSync(join(data.root, 'home'), { recursive: true })
     const manifest = join(data.root, 'release-manifest.json')
-    writeFileSync(manifest, JSON.stringify({ pluginVersion: '错误版本', dshVersion: '0.2.1-alpha.2' }))
+    writeFileSync(manifest, JSON.stringify({ pluginVersion: '错误版本', dshVersion: '0.2.1-alpha.3' }))
     const bytes = Buffer.from('原始内容')
     writeFileSync(join(runtime, 'entry.js'), '损坏内容')
     writeFileSync(join(runtime, 'desktop-runtime.json'), JSON.stringify({
-      platform: 'win32', arch: 'x64', release: { version: '0.2.1-alpha.2' },
+      platform: 'win32', arch: 'x64', release: { version: '0.2.1-alpha.3' },
       files: [{ path: 'entry.js', bytes: bytes.length, sha256: createHash('sha256').update(bytes).digest('hex') }],
     }))
     const run = () => spawnSync(process.execPath, [verifyReleaseScript, '--dir', data.root], { encoding: 'utf8' })
     const version = run()
     expect(version.status).toBe(1)
     expect(version.stderr).toContain('插件版本与发布源码不一致')
-    writeFileSync(manifest, JSON.stringify({ pluginVersion: pkg.version, dshVersion: '0.2.1-alpha.2' }))
+    writeFileSync(manifest, JSON.stringify({ pluginVersion: pkg.version, dshVersion: '0.2.1-alpha.3' }))
     const corrupt = run()
     expect(corrupt.status).toBe(1)
     expect(corrupt.stderr).toContain('运行时完整性失败')
@@ -98,7 +98,7 @@ describe('每次发布的完整便携包', () => {
     const startup = join(runtime, 'node_modules', '@deepseek-ai', 'dsh-web-app', 'lib')
     mkdirSync(startup, { recursive: true })
     writeFileSync(join(startup, 'startup.js'), 'const WEB_STARTUP_SERVICE = "webStartup";\n')
-    writeFileSync(descriptor, JSON.stringify({ release: { version: '0.2.1-alpha.2' } }))
+    writeFileSync(descriptor, JSON.stringify({ release: { version: '0.2.1-alpha.3' } }))
     writeFileSync(join(app, 'DeepSeek Harness.exe'), '测试本体')
     writeFileSync(join(app, 'debug.log'), '运行时日志不出货')
     const out = join(data.root, 'full.zip')
@@ -112,10 +112,12 @@ describe('每次发布的完整便携包', () => {
     expect(inspected.status, inspected.stderr).toBe(0)
     const zip = JSON.parse(inspected.stdout)
     expect(zip.bad).toBeNull()
-    expect(zip.manifest).toEqual({ pluginVersion: pkg.version, dshVersion: '0.2.1-alpha.2' })
+    expect(zip.manifest).toEqual({ pluginVersion: pkg.version, dshVersion: '0.2.1-alpha.3' })
     expect(zip.profile.dsh.profile.bundles).toEqual(['@deepseek-ai/dsh-base', '@deepseek-ai/dsh-web-app',
       'dsh-webops-plugin', 'dsh-context', 'dsh-better-sidebar'])
-    expect(zip.profile.dependencies['dsh-better-sidebar']).toBe('0.25.0')
+    expect(zip.profile.dependencies['dsh-better-sidebar']).toBe(
+      JSON.parse(readFileSync(new URL('../vendor/plugins/manifest.json', import.meta.url), 'utf8'))
+        .plugins.find((plugin: { name: string }) => plugin.name === 'dsh-better-sidebar').version)
     const adapted = spawnSync('python', ['-c',
       'import sys,zipfile; z=zipfile.ZipFile(sys.argv[1]); print(z.read("home/profiles/desktop/node_modules/dsh-better-sidebar/lib/index.js").decode())', out], { encoding: 'utf8' })
     expect(adapted.status, adapted.stderr).toBe(0)
