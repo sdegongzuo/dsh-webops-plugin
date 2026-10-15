@@ -24,7 +24,7 @@ import { BROWSER_NS, en, zh } from './locales.ts'
 /** 需要浏览器服务、slot 注册表与文案。 */
 export const inject = ['slots', 'locale']
 
-/** 本插件认领的 15 个公开网页工具，与服务端能力清单保持一致。 */
+/** 本插件认领的 16 个公开网页工具，与服务端能力清单保持一致（含加载入口 `webpage_tools`）。 */
 export const BROWSER_TOOLS = [
   'webpage_open',
   'webpage_navigate',
@@ -41,6 +41,7 @@ export const BROWSER_TOOLS = [
   'webpage_execute',
   'webpage_find',
   'webpage_locate',
+  'webpage_tools',
 ] as const
 
 /**

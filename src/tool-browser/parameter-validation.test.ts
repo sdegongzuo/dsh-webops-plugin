@@ -11,8 +11,11 @@ function mount() {
   const browser = new Proxy({}, { get: (_target, key) => key === 'onLeaseRelease'
     ? () => () => {}
     : () => { dispatched.push(String(key)); throw sentinel } })
+  // 逐步披露要接宿主生命周期：桩给最小的事件口（`on`）与探测口（`get`），
+  // 这里没有 agent 注册服务，所以 `attachExisting()` 不会装任何屏蔽。
   apply({ browser, tools: { register: (tool: ToolDefinition) => tools.set(tool.name, tool), get: () => undefined },
-    systemPrompt: { section: () => {} }, effect: () => {} } as unknown as Context)
+    systemPrompt: { section: () => {} }, effect: () => {}, on: () => () => {}, get: () => undefined,
+    logger: { warn: () => {} } } as unknown as Context)
   const execute = (name: string, args: unknown) => tools.get(name)!.execute(args, { agent: { id: '验收对话' } } as unknown as ToolRunContext)
   return { tools, dispatched, sentinel, execute }
 }

@@ -14,6 +14,7 @@ import {
 } from '../config.ts'
 import { defineTool, callerOf, observeCall } from '../tool-runtime.ts'
 import { type SnapshotCache, rememberSnapshot } from '../snapshot-cache.ts'
+import type { ToolDisclosure } from '../disclosure.ts'
 import { MAX_SNAPSHOT_LINES, DEFAULT_SNAPSHOT_LIMITS } from '../../browser-cdp/snapshot.ts'
 import { formatSnapshotOutput, SNAPSHOT_OUTPUT_SCHEMA, toSnapshotOutput } from '../snapshot-output.ts'
 export { formatSnapshotOutput, SNAPSHOT_OUTPUT_SCHEMA, toSnapshotOutput, rememberBrowserSnapshot, type SnapshotOutput } from '../snapshot-output.ts'
@@ -96,9 +97,13 @@ const ATTACHMENT_SCHEMA = {
 
 /**
  * 注册 `webpage_open`。
+ *
+ * 打开**成功**才把该对话提升到基础组（逐步披露）：失败不提升，模型看到的仍是初始四项。
+ *
  * @param ctx - 上下文；其 `browser` 服务执行打开动作。
+ * @param disclosure - 逐步披露控制器；缺省时不接线（单测与未启用披露的场景）。
  */
-export function registerOpen(ctx: Context): void {
+export function registerOpen(ctx: Context, disclosure?: ToolDisclosure): void {
   ctx.tools.register(defineTool({
     name: 'webpage_open',
     description:
@@ -120,6 +125,8 @@ export function registerOpen(ctx: Context): void {
         callerOf(exec),
         exec.signal,
       )
+      // 只有真的拿到会话才展开基础组：打开失败时模型仍应停在初始四项。
+      disclosure?.markOpened(exec.agent)
       return toSessionOutput(session)
     },
     presentCall: args => observeCall(
