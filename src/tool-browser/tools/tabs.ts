@@ -6,6 +6,7 @@ import { UNTRUSTED_PAGE_CONTENT_NOTICE, BROWSER_OBSERVE_TIMEOUT_MS } from '../co
 import type { SnapshotCache } from '../snapshot-cache.ts'
 import { defineTool, callerOf, observeCall } from '../tool-runtime.ts'
 import type { BrowserTabsRequest } from '../../browser/index.ts'
+import type { ToolDisclosure } from '../disclosure.ts'
 
 /** `webpage_tabs` 的输出。 */
 interface TabsOutput {
@@ -115,10 +116,13 @@ const TABS_OUTPUT_SCHEMA = {
  * 所有权边界与 P0 一致 —— 清单里只有**本插件自己开**的标签页；用户的标签页
  * 既不出现也不会被关掉。
  *
+ * 领取（claim）**成功**才把该对话提升到基础组（逐步披露）：claim 失败不提升。
+ *
  * @param ctx - 上下文；其 `browser` 服务执行标签页操作。
  * @param cache - find 的 snapshot 缓存；close 成功即删对应会话的大纲。
+ * @param disclosure - 逐步披露控制器；缺省时不接线。
  */
-export function registerTabs(ctx: Context, cache: SnapshotCache): void {
+export function registerTabs(ctx: Context, cache: SnapshotCache, disclosure?: ToolDisclosure): void {
   ctx.tools.register(defineTool({
     name: 'webpage_tabs',
     description:
@@ -170,6 +174,8 @@ export function registerTabs(ctx: Context, cache: SnapshotCache): void {
           ?? (result.sessionId !== undefined ? [result.sessionId] : [])
         for (const id of affected) cache.delete(id)
       }
+      // 领到标签等价于「进入网页任务」：基础组（含 snapshot）随之展开。
+      if (result.action === 'claim') disclosure?.markOpened(exec.agent)
       return {
         action: result.action,
         ...result.sessionId !== undefined ? { session_id: result.sessionId } : {},

@@ -109,4 +109,6 @@ export const BROWSER_TOOL_CAPABILITIES: Readonly<Record<string, 'read' | 'mutate
   // `webpage_execute` 是逃生舱：允许列表里有 `Page.navigate`（会改页面 / 作废 ref 纪元），
   // 按最坏情况归为 mutate。
   webpage_execute: 'mutate',
+  // 加载入口只改「本对话可见哪些工具」，不发页面命令、不给 ref，归 read。
+  webpage_tools: 'read',
 })

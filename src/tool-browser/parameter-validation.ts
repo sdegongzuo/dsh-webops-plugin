@@ -162,6 +162,11 @@ function semanticParameterErrors(toolName: string, args: Record<string, unknown>
       if (typeof args.code !== 'string' || args.code.trim().length === 0) errors.push('code 必须是非空 async 函数体，例如 return { title: document.title };')
       range('timeout_ms', 1, MAX_WAIT_TIME_MS)
       break
+    case 'webpage_tools':
+      if (!Array.isArray(args['tools']) || (args['tools'] as unknown[]).length === 0) {
+        errors.push('tools 必须是至少一个工具名的数组，例如 ["webpage_find"]')
+      }
+      break
     case 'webpage_find':
       nonEmpty('session_id', 'query')
       range('limit', 1, MAX_FIND_LIMIT)

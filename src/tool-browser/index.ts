@@ -10,7 +10,9 @@ import { registerTabs } from './tools/tabs.ts'
 import { registerMutations } from './tools/mutations.ts'
 import { registerConsole, registerNetwork, registerExecute } from './tools/diagnostics.ts'
 import { registerFind, registerLocate } from './tools/discovery.ts'
+import { registerToolLoader } from './tools/loader.ts'
 import { registerSystemPrompt } from './system-prompt.ts'
+import { mountToolDisclosure, webpageToolName } from './disclosure.ts'
 import { noteLoaded } from '../debug.ts'
 
 export {
@@ -71,13 +73,20 @@ export function apply(ctx: Context, config: Config = {}): void {
     yield stopLeaseWatch
   }, 'webpage-tools.lease-watch()')
 
+  // 逐步披露：状态属于对话。先建控制器（装屏蔽要用「已注册的网页工具名」），
+  // 注册完工具后再给已存在的对话补装。
+  const registeredTools = (Object.keys(enabled) as (keyof typeof enabled)[])
+    .filter(key => enabled[key])
+    .map(webpageToolName)
+  const disclosure = mountToolDisclosure(ctx, registeredTools)
+
   registerSystemPrompt(ctx)
 
-  if (enabled.open) registerOpen(ctx)
+  if (enabled.open) registerOpen(ctx, disclosure)
   if (enabled.navigate) registerNavigate(ctx, snapshotCache)
   if (enabled.snapshot) registerSnapshot(ctx, snapshotCache)
   if (enabled.screenshot) registerScreenshot(ctx, snapshotCache)
-  if (enabled.tabs) registerTabs(ctx, snapshotCache)
+  if (enabled.tabs) registerTabs(ctx, snapshotCache, disclosure)
   if (enabled.click || enabled.fill || enabled.press || enabled.scroll || enabled.wait) {
     registerMutations(ctx, snapshotCache, { click: enabled.click, fill: enabled.fill, press: enabled.press, scroll: enabled.scroll, wait: enabled.wait })
   }
@@ -86,6 +95,10 @@ export function apply(ctx: Context, config: Config = {}): void {
   if (enabled.execute) registerExecute(ctx, snapshotCache)
   if (enabled.find) registerFind(ctx, snapshotCache)
   if (enabled.locate) registerLocate(ctx, snapshotCache)
+  // 加载入口始终注册：初始阶段就可见，是展开按需工具的唯一通道。
+  registerToolLoader(ctx, disclosure)
+  // 网页工具全部注册完之后，才能给插件加载前就存在的对话装屏蔽。
+  disclosure.attachExisting()
 
   // 全部注册完再报，这样这一行同时证明 browser 能力与 systemPrompt / attachments
   // 都已就绪 —— 任一个 inject 没解析成功，本函数根本不会被执行。
