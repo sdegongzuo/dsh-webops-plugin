@@ -59,6 +59,7 @@ import { fileURLToPath } from 'node:url'
 import { buildRoot } from './local-env.mjs'
 import { readRuntimeDescriptor } from './desktop-runtime.mjs'
 import { desktopReleaseVersion } from './desktop-release-version.mjs'
+import { slimApp } from './slim-portable-app.mjs'
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const DIST = join(ROOT, 'dist')
@@ -583,6 +584,14 @@ if (leftover.length > 0) {
   process.exit(1)
 }
 
+// 1.2) 瘦身（与 package-release-portable 同一套 `slimApp`）：删旧布局重复 pnpm、
+//      语言包只留中英文。slimApp 的中止条件（白名单缺失 / 两份 pnpm 不逐字节相同）
+//      会在这里直接抛错终止打包——瘦不了就宁可不发货，不做静默行为回退。
+// 2026-10-16 实测 alpha.3 包：55 个语言包 48MB 原始 / 15.5MB 压缩全在包里，
+// 就是因为只有 release 路径接了瘦身、desktop 路径漏了。
+const slimResult = slimApp(join(STAGE, 'app'))
+console.log(`  - 瘦身：locales 删 ${slimResult.locales.removed} 个（${(slimResult.locales.bytes / 1048576).toFixed(1)}MB），旧布局 pnpm ${slimResult.legacyPnpm.removed ? `已删（${(slimResult.legacyPnpm.bytes / 1048576).toFixed(1)}MB）` : '无（上游已修复或基包不同）'}`)
+
 // 2) profile：官方模板 + 本插件
 //    dependencies 必须是**精确版本**（project-manager.ts:160-162 会校验），
 //    bundles 必须以前两个内置 bundle 开头（project-manager.ts:169）。
@@ -785,10 +794,13 @@ writeFileSync(
 
 // 6) 打包
 //
-// 压缩级别用 Fastest：app/ 里绝大多数是已经压过的二进制（Electron 运行时、asar、
-// .node、图片），Optimal 换来的体积收益是个位数 MB，代价却是几分钟的 CPU ——
-// 实测这一整步（物化 profile + 打 zip）在 CI 上要 294s，压缩占了绝大部分。
-// 产物仍是标准 zip（Compress-Archive 只换 deflate 级别），不影响用户侧解压。
+// 压缩级别曾用 Fastest（2026-09 实测，基包较小时 Optimal 收益是个位数 MB、代价是
+// 几分钟 CPU，CI 上这一步要 294s，压缩占绝大部分）。
+// 2026-10-16 起改为 Optimal（.NET 的 Optimal = deflate level 6，非最高档 9）：
+// 基包膨胀到 426.7MB 后重新抽样实测（.probe-ziplevel9.py，alpha.3 包）：Fastest 全包
+// 426.7MB，level 9 外推约 360MB，level 6 与 9 相差通常 <3% —— 折中档，约省 60MB。
+// 产物仍是标准 zip，不影响用户侧解压。两条压缩路径必须同级别：
+// Compress-Archive 的 Optimal 对应 zip-stage.py 的 --level 6，退化产物才等价。
 //
 // 为什么先写临时名再改名（2026-09-17 踩坑后改）：
 //   · `Compress-Archive` 的失败是 **PowerShell 的非终止错误**，进程退出码仍是 0；
@@ -809,7 +821,7 @@ const archived = spawnSync(
     '-NoProfile',
     '-NonInteractive',
     '-Command',
-    `$ErrorActionPreference='Stop'; Compress-Archive -Path '${join(STAGE, '*')}' -DestinationPath '${partial}' -CompressionLevel Fastest`,
+    `$ErrorActionPreference='Stop'; Compress-Archive -Path '${join(STAGE, '*')}' -DestinationPath '${partial}' -CompressionLevel Optimal`,
   ],
   { encoding: 'utf8' },
 )
@@ -822,7 +834,7 @@ if (archived.status !== 0 || !existsSync(partial)) {
   console.warn((archived.stderr ?? '').trim() || (archived.stdout ?? '').trim() || '(无输出)')
   const fallback = spawnSync(
     'python',
-    [join(ROOT, 'scripts', 'zip-stage.py'), '--stage', STAGE, '--out', partial],
+    [join(ROOT, 'scripts', 'zip-stage.py'), '--stage', STAGE, '--out', partial, '--level', '6'],
     { encoding: 'utf8' },
   )
   console.log((fallback.stdout ?? '').trim())

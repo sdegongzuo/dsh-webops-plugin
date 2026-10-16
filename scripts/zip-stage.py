@@ -26,7 +26,7 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument('--stage', default='.desktop-stage')
     ap.add_argument('--out', required=True)
-    ap.add_argument('--level', type=int, default=1, help='deflate 级别，1=Fastest（与脚本一致）')
+    ap.add_argument('--level', type=int, default=6, help='deflate 级别，6=Optimal（与 Compress-Archive 对应，2026-10-16 起便携包统一）；1=Fastest（旧默认）')
     ap.add_argument('--no-overwrite', action='store_true', help='仅创建新 ZIP；已有输出及竞争创建均拒绝，不执行删除')
     args = ap.parse_args()
 

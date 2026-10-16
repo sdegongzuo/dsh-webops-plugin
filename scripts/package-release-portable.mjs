@@ -48,6 +48,8 @@ try {
   }
   // 复制之前过滤运行时日志，不复制后删除；不读取任何用户 home。
   cpSync(app, join(stage, 'app'), { recursive: true, filter: path => path !== join(app, 'debug.log') })
+  // 瘦身只动暂存副本：删旧布局重复 pnpm、语言包只留中英文；有任何一处与预期不符就中止打包。
+  run(process.execPath, [join(ROOT, 'scripts/slim-portable-app.mjs'), '--app', join(stage, 'app')])
   const vendor = JSON.parse(readFileSync(join(ROOT, 'vendor/plugins/manifest.json'), 'utf8'))
   writeFileSync(join(profile, 'package.json'), JSON.stringify({
     name: '@deepseek-ai/dsh-desktop-runtime', private: true, version: '0.0.0',
@@ -67,7 +69,9 @@ try {
   ].join('\r\n'))
   writeFileSync(join(stage, 'release-manifest.json'), JSON.stringify({ pluginVersion: version, dshVersion: runtime.release.version }, null, 2) + '\n')
   mkdirSync(dirname(out), { recursive: true })
-  run('python', [join(ROOT, 'scripts/zip-stage.py'), '--stage', stage, '--out', out, '--level', '1', '--no-overwrite'])
+  // 与 package-desktop-portable 同级别：deflate level 6（Compress-Archive 的 Optimal），
+  // 两条打包路径产出的同版本包压缩率一致；level 1=Fastest 已废弃（2026-10-16，alpha.3 实测省 ~60MB）。
+  run('python', [join(ROOT, 'scripts/zip-stage.py'), '--stage', stage, '--out', out, '--level', '6', '--no-overwrite'])
   console.log(JSON.stringify({ out, stage, pluginVersion: version, dshVersion: runtime.release.version }))
 } catch (error) {
   console.error(`package-release-portable: ${error.message}`)
