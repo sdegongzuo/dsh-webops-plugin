@@ -1676,35 +1676,10 @@ index ba518cf035..bfa2ee9d9d 100644
  /* jscpd:ignore-start */
  /**
 diff --git a/packages/subprocess/subprocess-local/README.i18n.yaml b/packages/subprocess/subprocess-local/README.i18n.yaml
-index 186563a7fa..b3ef950090 100644
+index 98a5c40de8..dbd6f2b4be 100644
 --- a/packages/subprocess/subprocess-local/README.i18n.yaml
 +++ b/packages/subprocess/subprocess-local/README.i18n.yaml
-@@ -3,8 +3,11 @@
- # After editing either side, bring the other along and re-record with:
- #   pnpm run verify-translation-pairing --write packages/subprocess/subprocess-local/README.md
- /:
--  en: 6569fcd132144a11
--  zh: 2f632189747feb07
-+  en: cb3f91d54eee30e5
-+  zh: cb3f91d54eee30e5
-+/description-the-local-host-provider-for-the-subprocess-service-run-os-owned-managed-ranges-and-real-terminal-sessions-on-the-host-machine-with-explicit-weaker-fallbacks-kind-package-reference:
-+  en: 57c10cc8d12725bf
-+  zh: 21622d49a4c14301
- /deepseek-ai-dsh-subprocess-local:
-   en: 5b4986ccda3a5135
-   zh: 3aac611780972806
-@@ -12,8 +15,8 @@
-   en: ea90a41d1f8feca7
-   zh: a44f4b25ba0bdd48
- /deepseek-ai-dsh-subprocess-local/table-of-contents:
--  en: d152484eb41ac6b4
--  zh: 09388d293f9be9cb
-+  en: eb6ed279e78f8b65
-+  zh: 5583226de8ecca29
- /deepseek-ai-dsh-subprocess-local/use-this-package:
-   en: a26b360a0d1b847a
-   zh: c0e1139451e51fc8
-@@ -24,8 +27,8 @@
+@@ -24,8 +24,8 @@
    en: b770dddf2a9c3d1e
    zh: f5cb27e63a589a1b
  /deepseek-ai-dsh-subprocess-local/use-this-package/collecting-output:
@@ -1715,51 +1690,8 @@ index 186563a7fa..b3ef950090 100644
  /deepseek-ai-dsh-subprocess-local/use-this-package/control-transport:
    en: 7f14cd108b614c98
    zh: da54e49e2b1896d2
-@@ -39,14 +42,14 @@
-   en: 1e1ce532b004c92b
-   zh: ca7274b7a9207a5d
- /deepseek-ai-dsh-subprocess-local/understand-the-implementation:
--  en: 531a48766c666ea0
--  zh: b40df533a2fd7244
-+  en: 189086c903c2a15a
-+  zh: 60ff0055c7f1bd78
- /deepseek-ai-dsh-subprocess-local/understand-the-implementation/design-concept:
-   en: c1f9a5ee756547b9
-   zh: d47d9f6175f5cbc9
- /deepseek-ai-dsh-subprocess-local/understand-the-implementation/source-map:
--  en: 3d5fd99e4ad1f7af
--  zh: 241490c1052f415c
-+  en: 0308eeaf67974d34
-+  zh: 5146b1598c2711e0
- /deepseek-ai-dsh-subprocess-local/understand-the-implementation/main-flow:
-   en: 6b6e17fa0d1b39b7
-   zh: 0b40691719ce658f
-@@ -54,8 +57,8 @@
-   en: 8a1c2f5be5ac659c
-   zh: 5c108bd23a7eee85
- /deepseek-ai-dsh-subprocess-local/further-exploration:
--  en: b15c86ee670899d9
--  zh: a18f23e9f3e36727
-+  en: 041c35b27485bbb4
-+  zh: 9936f2d00d59e635
- /deepseek-ai-dsh-subprocess-local/model-experience:
-   en: a39b4c2a8755aff2
-   zh: 1c13e5e0f7db3dab
-@@ -63,8 +66,8 @@
-   en: e290ccc9b3c92c08
-   zh: d75d48f485447a74
- /deepseek-ai-dsh-subprocess-local/known-limitations-and-deferred-work:
--  en: aca923fe6b461acb
--  zh: ee19a96907134d85
-+  en: cb18d19cd13f4a7c
-+  zh: 1edf6ba1eec82f7c
- /deepseek-ai-dsh-subprocess-local/known-limitations-and-deferred-work/dev-note:
--  en: e67f633dc6fe7773
--  zh: 3bb0c20c93f16f98
-+  en: 34651d247c0d1bba
-+  zh: b8b78bf26d28e4d6
 diff --git a/packages/subprocess/subprocess-local/README.md b/packages/subprocess/subprocess-local/README.md
-index 5a7124b17b..b30e7c5a28 100644
+index 05a6c3e41c..40f2c79f2d 100644
 --- a/packages/subprocess/subprocess-local/README.md
 +++ b/packages/subprocess/subprocess-local/README.md
 @@ -44,6 +44,8 @@ Windows ordinary subprocesses start the private Job runner with `windowsHide` an
@@ -1772,7 +1704,7 @@ index 5a7124b17b..b30e7c5a28 100644
  
  The `./output` export shares this collector and retained-spill storage with process adapters. `snapshot()` returns the retained raw bytes and total byte count, allowing remote adapters to preserve offsets without forwarding the complete stream.
 diff --git a/packages/subprocess/subprocess-local/README.zh.md b/packages/subprocess/subprocess-local/README.zh.md
-index a498b00c6c..f7b24224ab 100644
+index e8589765c0..042414aeaa 100644
 --- a/packages/subprocess/subprocess-local/README.zh.md
 +++ b/packages/subprocess/subprocess-local/README.zh.md
 @@ -44,6 +44,8 @@ Windows 普通子进程通过 `windowsHide` 启动私有 Job runner，并为原

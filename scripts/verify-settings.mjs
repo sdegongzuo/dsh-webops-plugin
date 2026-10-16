@@ -201,6 +201,10 @@ export function apply(ctx, config) {
       try {
         const value = await fn()
         if (value !== undefined) return [value, undefined]
+        // 空列表不是异常，但也要记下来：否则超时时报的是**早先某一次**抛错的
+        // 陈旧消息（比如适配器还没注册上的「no adapter registered」），
+        // 而真正原因——凭据缺失导致 listModels 返回空——反而看不见。
+        lastError = 'listModels returned an empty list'
       } catch (error) { lastError = String(error?.message ?? error) }
       if (Date.now() > deadline) return [undefined, lastError]
       await new Promise(resolve => setTimeout(resolve, 300))
@@ -292,6 +296,15 @@ writeFileSync(join(profileDir, 'package.json'), `${JSON.stringify({
 }, null, 2)}\n`)
 
 process.env.DSH_HOME = home
+// 上游 alpha.3 起 `PiAiAdapter.listModels` 对「命名凭据解析不到」的路由返回**空列表**
+// （"offers no models until the key is stored"——密钥存储前不提供模型）。本自检验的是
+// 出厂**配置管线**（路由/模型/默认选择能不能一路落到运行中的条目），不是凭据层；
+// 没有这个 fixture，18 个模型会被凭据检查全部藏掉，断言红得莫名其妙。取自 patch 里
+// 声明的 apiKeyEnv 名，fixture 值只为过 resolveApiKey 的格式校验，不发任何 HTTP。
+const apiKeyRef = patchText.match(/^\s*apiKeyEnv:\s*(\S+)\s*$/mu)?.[1]
+if (apiKeyRef !== undefined && process.env[apiKeyRef] === undefined) {
+  process.env[apiKeyRef] = 'verify-settings-fixture-key'
+}
 
 const host = startPackagedDesktopHost({
   runtimeDir,
