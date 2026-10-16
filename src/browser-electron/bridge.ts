@@ -101,13 +101,13 @@ export const DEFAULT_BRIDGE_HANDSHAKE_TIMEOUT_MS = 20_000
 const LEGACY_ANNOUNCED_HOST = '127.0.0.1'
 
 /**
- * 打包应用模式下第二个实例的 `--user-data-dir`。
+ * 浏览器宿主独立于主应用的 `--user-data-dir`。
  *
  * 必须和主应用**分开**：共享同一份 userData 会让第二个实例撞上 profile 锁（或污染主应用的
- * 本地状态）。便携版使用包内专属目录；其他运行方式沿用系统临时目录。
+ * 本地状态）。便携版与开发态均由 `DSH_BROWSER_USER_DATA_DIR` 指定；其他运行方式保留旧的系统临时目录回退。
  */
 function hostUserDataDir(): string {
-  return process.env.DSH_BROWSER_USER_DATA_DIR || join(tmpdir(), 'dsh-browser-electron-host')
+  return process.env.DSH_BROWSER_USER_DATA_DIR?.trim() || join(tmpdir(), 'dsh-browser-electron-host')
 }
 
 /**
@@ -126,14 +126,17 @@ export function resolveHostLaunch(options: BridgeOptions): {
   const environment: NodeJS.ProcessEnv = { ...process.env }
   // 宿主必须是**真的 Electron 应用**：带这个变量它会退化成纯 Node，`app` 就不存在了。
   delete environment['ELECTRON_RUN_AS_NODE']
+  const userDataDir = hostUserDataDir()
+  const userDataSource = process.env.DSH_BROWSER_USER_DATA_DIR?.trim() ? 'DSH_BROWSER_USER_DATA_DIR 环境变量' : '系统临时目录兼容回退'
+  noteLoaded('browser-electron', `浏览器数据目录=${userDataDir} 来源=${userDataSource} 共享范围=本实例全部网页标签与对话`)
 
   if (options.appMode === true) {
     // 打包应用的 app 路径固定在 asar 里，argv 里的脚本会被忽略 —— 只能靠环境变量
     // 告诉 shell 去 require 哪个脚本；argv 留给 userData 开关。
     environment[APP_HOST_ENV] = options.hostScript
-    return { args: [`--user-data-dir=${hostUserDataDir()}`], environment }
+    return { args: [`--user-data-dir=${userDataDir}`], environment }
   }
-  return { args: [options.hostScript], environment }
+  return { args: [`--user-data-dir=${userDataDir}`, options.hostScript], environment }
 }
 
 /** 一条在途命令。 */
@@ -381,6 +384,7 @@ export class ElectronWindowBridge implements TabHostChannel {
   private readonly keepAlive: boolean
   private nextId = 1
   private closed = false
+  private disposal: Promise<void> | undefined
 
   /**
    * @param child - 已 spawn 的 Electron 进程。
@@ -772,15 +776,39 @@ export class ElectronWindowBridge implements TabHostChannel {
   }
 
   /** 关掉所有窗口并退出宿主进程。 */
-  async dispose(): Promise<void> {
-    if (this.closed) return
-    try {
-      await this.request({ op: 'dispose' })
-    } catch {
-      // 宿主可能在响应之前就退了；下面的 kill 兜底。
+  dispose(): Promise<void> {
+    if (this.disposal !== undefined) return this.disposal
+    this.disposal = this.disposeHost()
+    return this.disposal
+  }
+
+  private async disposeHost(): Promise<void> {
+    let acknowledged = false
+    if (!this.closed) {
+      try {
+        await this.request({ op: 'dispose' })
+        acknowledged = true
+      } catch {
+        // 宿主可能在响应之前就退了；仍等待真实进程退出，超时才强制结束。
+      }
+    }
+    const exited = await waitForChildExit(this.child, 10_000)
+    if (!exited) {
+      this.child.kill()
+      await waitForChildExit(this.child, 1_000)
+      this.handleClosed()
+      throw new BridgeError(
+        `窗口宿主未在 10000ms 内正常退出${acknowledged ? '（已收到 dispose 确认）' : ''}，已尝试强制结束`,
+        'BRIDGE_SHUTDOWN_TIMEOUT',
+      )
     }
     this.handleClosed()
-    this.child.kill()
+    if (this.child.exitCode !== 0 || this.child.signalCode !== null) {
+      throw new BridgeError(
+        `窗口宿主退出状态异常：exitCode=${String(this.child.exitCode)} signal=${String(this.child.signalCode)}`,
+        'BRIDGE_SHUTDOWN_FAILED',
+      )
+    }
   }
 
   /** 发一条命令并等它的响应。 */
@@ -976,6 +1004,21 @@ export class ElectronWindowBridge implements TabHostChannel {
       // 已经断了。
     }
   }
+}
+
+/** 等待 Electron 宿主实际退出；socket 关闭只代表通道结束，不代表磁盘 flush 已完成。 */
+function waitForChildExit(child: ChildProcess, timeoutMs: number): Promise<boolean> {
+  if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve(true)
+  return new Promise(resolveExit => {
+    const finish = (exited: boolean) => {
+      clearTimeout(timer)
+      child.off('exit', onExit)
+      resolveExit(exited)
+    }
+    const onExit = () => { finish(true) }
+    const timer = setTimeout(() => { finish(false) }, timeoutMs)
+    child.once('exit', onExit)
+  })
 }
 
 /** 启动诊断保留的 stdout / stderr 尾部上限（字符）。两部分各算一份。 */

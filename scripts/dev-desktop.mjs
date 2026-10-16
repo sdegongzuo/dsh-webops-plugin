@@ -138,6 +138,10 @@ async function main() {
   // 宿主注入的 ELECTRON_RUN_AS_NODE 会让 electron.exe 退化成纯 Node，窗口起不来。
   delete environment.ELECTRON_RUN_AS_NODE
   environment.DSH_HOME = home
+  // 与便携 app 模式共用 DSH_BROWSER_USER_DATA_DIR 契约，但按当前 DSH_HOME 隔离。
+  // 开发态旧的系统 temp profile 没有所属 home 的标记，不自动让多个 profile 共用它。
+  const configuredBrowserData = environment.DSH_BROWSER_USER_DATA_DIR?.trim()
+  environment.DSH_BROWSER_USER_DATA_DIR = configuredBrowserData || join(home, 'data', 'browser')
   environment.DSH_DESKTOP_DSH_DIR = PROJECT_DIR
   const temporary = join(DEVELOPMENT_ROOT, 'temp')
   mkdirSync(temporary, { recursive: true })
@@ -198,6 +202,7 @@ async function main() {
   environment.DSH_BROWSER_CDP_ENDPOINT ??= 'http://127.0.0.1:9333'
 
   console.log(`dev-desktop: DSH_HOME=${environment.DSH_HOME}`)
+  console.log(`dev-desktop: 浏览器 userData=${environment.DSH_BROWSER_USER_DATA_DIR}（来源=${configuredBrowserData ? '环境变量' : '当前 DSH_HOME'}；此实例标签和对话共享）`)
   console.log(`dev-desktop: 调试端口 main=${PORTS.main} renderer=${PORTS.renderer} host=${PORTS.host}`)
   console.log(`dev-desktop: 浏览器 provider=${environment.DSH_BROWSER_PROVIDER}`
     + `（electron = 桌面端自己的窗口；换 cdp 需另起真 Chrome）`)

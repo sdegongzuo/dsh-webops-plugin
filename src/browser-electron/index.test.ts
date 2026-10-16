@@ -7,6 +7,7 @@
  */
 
 import { describe, expect, it, vi } from 'vitest'
+import { EventEmitter } from 'node:events'
 import Module from 'node:module'
 import { readdirSync, readFileSync } from 'node:fs'
 import { createRequire } from 'node:module'
@@ -354,9 +355,17 @@ describe('ElectronWindowTransport', () => {
       return { server, client }
     }
 
-    /** 只会 kill 的假子进程：构造桥够用。 */
+    /** 假子进程遵循 ChildProcess 的退出状态与事件契约。 */
     function fakeChild(): ChildProcess {
-      return { kill: () => {}, once: () => {} } as unknown as ChildProcess
+      const child = Object.assign(new EventEmitter(), {
+        exitCode: null as number | null, signalCode: null as NodeJS.Signals | null,
+        kill: () => {
+          child.exitCode = 0
+          child.emit('exit', 0, null)
+          return true
+        },
+      })
+      return child as unknown as ChildProcess
     }
 
     async function teardown(client: NetSocket, server: ReturnType<typeof createServer>): Promise<void> {
@@ -383,6 +392,77 @@ describe('ElectronWindowTransport', () => {
         message: expect.stringContaining('unknown op list'),
       }))
       await teardown(client, server)
+    })
+
+    it('dispose 收到确认后等待 Electron 真实退出，不立即 kill 子进程', async () => {
+      let serverSocket!: NetSocket
+      const { server, client } = await socketPair(socket => { serverSocket = socket })
+      const child = Object.assign(new EventEmitter(), {
+        kill: vi.fn(() => true), exitCode: null as number | null, signalCode: null as NodeJS.Signals | null,
+      })
+      const bridge = ElectronWindowBridge.forTesting(child as unknown as ChildProcess, client, { electronPath: 'x', hostScript: 'y' })
+      const received = new Promise<void>(resolve => {
+        serverSocket.setEncoding('utf8')
+        serverSocket.on('data', chunk => {
+          const request = JSON.parse(String(chunk).trim()) as { id: number }
+          serverSocket.write(`${JSON.stringify({ type: 'disposed', id: request.id })}\n`)
+          resolve()
+        })
+      })
+
+      let finished = false
+      const disposing = bridge.dispose().then(() => { finished = true })
+      await received
+      await Promise.resolve()
+      expect(child.kill).not.toHaveBeenCalled()
+      expect(finished).toBe(false)
+      child.exitCode = 0
+      child.emit('exit', 0, null)
+      await disposing
+      expect(finished).toBe(true)
+      await teardown(client, server)
+    })
+
+    it('宿主确认后超过退出时限会 kill 并向调用方报错', async () => {
+      let serverSocket!: NetSocket
+      const { server, client } = await socketPair(socket => { serverSocket = socket })
+      const child = Object.assign(new EventEmitter(), {
+        kill: vi.fn(() => true), exitCode: null as number | null, signalCode: null as NodeJS.Signals | null,
+      })
+      child.kill.mockImplementation(() => {
+        child.signalCode = 'SIGTERM'
+        child.emit('exit', null, 'SIGTERM')
+        return true
+      })
+      const bridge = ElectronWindowBridge.forTesting(child as unknown as ChildProcess, client, { electronPath: 'x', hostScript: 'y' })
+      let markExitWait!: () => void
+      const exitWaitRegistered = new Promise<void>(resolve => { markExitWait = resolve })
+      const realOnce = child.once.bind(child)
+      vi.spyOn(child, 'once').mockImplementation(((event, listener) => {
+        if (event === 'exit') markExitWait()
+        return realOnce(event, listener)
+      }) as typeof child.once)
+      const received = new Promise<void>(resolve => {
+        serverSocket.setEncoding('utf8')
+        serverSocket.on('data', chunk => {
+          const request = JSON.parse(String(chunk).trim()) as { id: number }
+          serverSocket.write(`${JSON.stringify({ type: 'disposed', id: request.id })}\n`)
+          resolve()
+        })
+      })
+
+      vi.useFakeTimers()
+      try {
+        const disposing = expect(bridge.dispose()).rejects.toThrow(expect.objectContaining({ code: 'BRIDGE_SHUTDOWN_TIMEOUT' }))
+        await received
+        await exitWaitRegistered
+        await vi.advanceTimersByTimeAsync(10_000)
+        await disposing
+        expect(child.kill).toHaveBeenCalledOnce()
+      } finally {
+        vi.useRealTimers()
+        await teardown(client, server)
+      }
     })
 
     it('不带 id 的宿主状态告警既不炸桥也不污染在途命令', async () => {
@@ -975,11 +1055,15 @@ describe('resolveConfig', () => {
 describe('resolveHostLaunch（宿主启动参数）', () => {
   const base = { electronPath: '/electron.exe', hostScript: '/plugin/lib/browser-electron/host.cjs' }
 
-  it('脚本模式：argv 直接带脚本路径，不设宿主变量', () => {
-    const { args, environment } = resolveHostLaunch(base)
-
-    expect(args).toEqual(['/plugin/lib/browser-electron/host.cjs'])
-    expect(environment.DSH_BROWSER_ELECTRON_HOST).toBeUndefined()
+  it('脚本模式：argv 带脚本与显式持久 userData，不设宿主变量', () => {
+    vi.stubEnv('DSH_BROWSER_USER_DATA_DIR', 'D:/开发profile/data/browser')
+    try {
+      const { args, environment } = resolveHostLaunch(base)
+      expect(args).toEqual(['--user-data-dir=D:/开发profile/data/browser', '/plugin/lib/browser-electron/host.cjs'])
+      expect(environment.DSH_BROWSER_ELECTRON_HOST).toBeUndefined()
+    } finally {
+      vi.unstubAllEnvs()
+    }
   })
 
   it('便携浏览器使用专属 profile，不改变外部工具临时目录', () => {
@@ -1004,6 +1088,17 @@ describe('resolveHostLaunch（宿主启动参数）', () => {
     expect(environment.DSH_BROWSER_ELECTRON_HOST).toBe('/plugin/lib/browser-electron/host.cjs')
     expect(args).toHaveLength(1)
     expect(args[0]).toMatch(/^--user-data-dir=/u)
+  })
+
+  it('空 userData 环境值回退到兼容路径', () => {
+    vi.stubEnv('DSH_BROWSER_USER_DATA_DIR', '   ')
+    try {
+      const { args } = resolveHostLaunch(base)
+      expect(args[0]).toMatch(/^--user-data-dir=/u)
+      expect(args[0]).not.toBe('--user-data-dir=   ')
+    } finally {
+      vi.unstubAllEnvs()
+    }
   })
 
   it('两种模式都摘掉 ELECTRON_RUN_AS_NODE（否则宿主退化成纯 Node，开不了窗口）', () => {

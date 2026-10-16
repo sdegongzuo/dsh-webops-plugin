@@ -460,8 +460,8 @@ index 0000000000..a4086fd882
 +    DSH_HOME: home, DSH_AGENTS_HOME: join(home, '.agents'),
 +    DSH_PORTABLE_DOCUMENTS_DIR: join(data, 'documents'),
 +    DSH_TEMP_DIR: temporary,
-+    // 沿用旧版包内浏览器目录，保留已有登录态；不再依赖 TEMP 重定向。
-+    DSH_BROWSER_USER_DATA_DIR: join(temporary, 'dsh-browser-electron-host'),
++    // 所有新 profile 固定放在 data/browser，不依赖系统 TEMP。
++    DSH_BROWSER_USER_DATA_DIR: join(data, 'browser'),
 +    DSH_DESKTOP_UPDATE_JOURNAL_DIR: join(data, 'update-journals'),
 +  }
 +  // 只设置 DSH 专属变量；外部工具继承原有用户目录、配置和临时目录。
@@ -964,7 +964,7 @@ index 0000000000..b274ad5a35
 +    expect(a.environment.DSH_HOME).toBe(join(first.root, 'home'))
 +    expect(b.environment.DSH_HOME).toBe(join(second.root, 'home'))
 +    expect(a.environment.DSH_AGENTS_HOME).toBe(join(first.root, 'home', '.agents'))
-+    expect(a.environment.DSH_BROWSER_USER_DATA_DIR).toBe(join(first.root, 'data', 'temp', 'dsh-browser-electron-host'))
++    expect(a.environment.DSH_BROWSER_USER_DATA_DIR).toBe(join(first.root, 'data', 'browser'))
 +    expect(readFileSync(join(first.root, 'home', '会话哨兵.txt'), 'utf8')).toBe('A 的记录')
 +    for (const name of ['appData', 'userData', 'sessionData', 'temp', 'crashDumps', 'logs']) {
 +      expect(a.app.paths.get(name)?.startsWith(first.root)).toBe(true)

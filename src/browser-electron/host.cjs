@@ -106,11 +106,35 @@
  * @module dsh-webops-plugin/browser-electron/host
  */
 
-const { app, BaseWindow, BrowserWindow, WebContentsView, ipcMain, Menu, nativeImage } = require('electron')
+const { app, BaseWindow, BrowserWindow, WebContentsView, ipcMain, Menu, nativeImage, session } = require('electron')
 const { createActionOverlay } = require('./action-overlay.cjs')
 const { WindowInputQueue, WRITE_AGENT, WRITE_BG_READ, WRITE_HUMAN } = require('./window-input-queue.cjs')
 const net = require('node:net')
 const path = require('node:path')
+
+// Electron 默认会在退出时落盘，但关闭宿主后父进程可能立刻重启它。先显式完成
+// Chromium 的会话存储写入，再允许 app.quit() 继续，避免近期 Cookie/Storage 丢失。
+let persistenceFlushStarted = false
+let persistenceFlushComplete = false
+app.on('before-quit', event => {
+  if (persistenceFlushComplete) return
+  event.preventDefault()
+  if (persistenceFlushStarted) return
+  persistenceFlushStarted = true
+  void (async () => {
+    try {
+      const defaultSession = session.defaultSession
+      defaultSession.flushStorageData()
+      await defaultSession.cookies.flushStore()
+    } catch (error) {
+      process.exitCode = 1
+      process.stderr.write(`浏览器会话数据显式落盘失败：${error instanceof Error ? error.message : String(error)}\n`)
+    } finally {
+      persistenceFlushComplete = true
+      app.quit()
+    }
+  })()
+})
 
 /**
  * 后台页面暂时在活动页面下面参与合成；不切换活动标签、不抢焦点。

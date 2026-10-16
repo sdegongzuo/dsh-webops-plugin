@@ -1,6 +1,17 @@
 /** 固定基包的最小桌面升级：所有替换先验证唯一目标，源码取已登记补丁。 */
 import ts from 'typescript'
 
+/** alpha3 便携入口只替换唯一的浏览器 profile 路径，其他隔离接线原样保留。 */
+export function replaceBrowserProfilePath(main) {
+  const before = 'DSH_BROWSER_USER_DATA_DIR: join(temporary, "dsh-browser-electron-host"),'
+  const after = 'DSH_BROWSER_USER_DATA_DIR: join(data, "browser"),'
+  if (main.split(before).length !== 2) throw Error('alpha3 app.asar 中旧浏览器 userData 配置不是唯一锚点，拒绝修改')
+  if (main.split('DSH_BROWSER_USER_DATA_DIR:').length !== 2) throw Error('alpha3 app.asar 中存在额外 userData 配置，拒绝修改')
+  const updated = main.replace(before, after)
+  if (updated.includes('dsh-browser-electron-host') || updated.split(after).length !== 2) throw Error('候选桌面主进程路径替换校验失败')
+  return updated
+}
+
 export function portableSource(patch) {
   const header = 'diff --git a/apps/desktop/src/portable-data.ts b/apps/desktop/src/portable-data.ts'
   const start = patch.indexOf(header)

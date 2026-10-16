@@ -2,7 +2,7 @@
 import { readFileSync } from 'node:fs'
 import { describe, expect, it } from 'vitest'
 // @ts-expect-error 独立 Node 脚本没有声明文件。
-import { portableSource, overlayPortableMain, portableWorkspaceModule } from '../scripts/release-app-isolation.mjs'
+import { portableSource, overlayPortableMain, portableWorkspaceModule, replaceBrowserProfilePath } from '../scripts/release-app-isolation.mjs'
 
 const patch = readFileSync(new URL('../docs/harness-desktop-build.patch', import.meta.url), 'utf8')
 describe('发布基包的目录隔离升级', () => {
@@ -24,5 +24,13 @@ describe('发布基包的目录隔离升级', () => {
     expect(evaluate('指定目录', { environment: { DSH_PORTABLE_DOCUMENTS_DIR: '包内目录' } })).toBe('指定目录')
     expect(evaluate(undefined, { environment: { DSH_PORTABLE_DOCUMENTS_DIR: '包内目录' } })).toBe('包内目录')
     expect(() => portableWorkspaceModule(updated, patch)).toThrow('替换目标必须唯一')
+  })
+  it('alpha3 候选只改唯一 browser profile 锚点，重复或已修改输入拒绝', () => {
+    const old = 'const overrides = { DSH_BROWSER_USER_DATA_DIR: join(temporary, "dsh-browser-electron-host"), DSH_HOME: home };'
+    expect(replaceBrowserProfilePath(old)).toBe('const overrides = { DSH_BROWSER_USER_DATA_DIR: join(data, "browser"), DSH_HOME: home };')
+    expect(() => replaceBrowserProfilePath(`${old} ${old}`)).toThrow('不是唯一锚点')
+    expect(() => replaceBrowserProfilePath(old.replace('DSH_BROWSER_USER_DATA_DIR:', 'DSH_BROWSER_USER_DATA_DIR: DSH_BROWSER_USER_DATA_DIR:')))
+      .toThrow('存在额外 userData 配置')
+    expect(() => replaceBrowserProfilePath(replaceBrowserProfilePath(old))).toThrow('不是唯一锚点')
   })
 })

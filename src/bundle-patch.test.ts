@@ -298,12 +298,12 @@ describe('便携数据归属（双击 exe 与启动脚本使用同一包目录�
 
   it('便携包只接管 DSH 自有的目录，系统工具环境与显式工作区保持原值', () => {
     const home = nodePath.resolve('测试包甲', 'home'), data = nodePath.join(nodePath.dirname(home), 'data')
-    const environment = { DSH_HOME: '全局home', USERPROFILE: '全局用户', TEMP: '全局临时', DSH_WORKSPACE_DIR: '用户工作区' }
+    const environment: NodeJS.ProcessEnv = { DSH_HOME: '全局home', USERPROFILE: '全局用户', TEMP: '全局临时', DSH_WORKSPACE_DIR: '用户工作区' }
     const result = initialize(home, environment)
     expect(result.home).toBe(home)
     expect(environment).toMatchObject({ DSH_HOME: home, DSH_AGENTS_HOME: nodePath.join(home, '.agents'),
       DSH_PORTABLE_DOCUMENTS_DIR: nodePath.join(data, 'documents'), DSH_TEMP_DIR: nodePath.join(data, 'temp'),
-      DSH_BROWSER_USER_DATA_DIR: nodePath.join(data, 'temp', 'dsh-browser-electron-host'),
+      DSH_BROWSER_USER_DATA_DIR: nodePath.join(data, 'browser'),
       DSH_DESKTOP_UPDATE_JOURNAL_DIR: nodePath.join(data, 'update-journals') })
     // 外部工具继承系统用户目录、配置和临时目录：不改写系统或第三方变量。
     expect(environment).toMatchObject({ USERPROFILE: '全局用户', TEMP: '全局临时', DSH_WORKSPACE_DIR: '用户工作区' })
@@ -311,9 +311,12 @@ describe('便携数据归属（双击 exe 与启动脚本使用同一包目录�
       userData: nodePath.join(data, 'electron'), sessionData: nodePath.join(data, 'electron'),
       temp: nodePath.join(data, 'temp'), crashDumps: nodePath.join(data, 'crash-dumps'),
       logs: nodePath.join(data, 'logs', 'desktop'), 'log-file': nodePath.join(data, 'logs', 'desktop', 'chromium.log') })
-    const other = initialize(nodePath.resolve('测试包乙', 'home'), {})
+    const otherEnvironment: NodeJS.ProcessEnv = {}
+    const other = initialize(nodePath.resolve('测试包乙', 'home'), otherEnvironment)
     expect(other.paths['userData']).not.toBe(result.paths['userData'])
+    expect(otherEnvironment['DSH_BROWSER_USER_DATA_DIR']).not.toBe(environment['DSH_BROWSER_USER_DATA_DIR'])
   })
+
 
   it('普通安装保留现有环境且不设置 Electron 路径', () => {
     const environment = { DSH_HOME: '用户home', TEMP: '用户临时', USERPROFILE: '用户目录' }
