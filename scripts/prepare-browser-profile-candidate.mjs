@@ -1,5 +1,5 @@
 /**
- * 从本机 alpha3 flat 桌面基包创建一个保留原包的 browser profile 候选壳。
+ * 从本机 flat 桌面基包创建一个保留原包的 browser profile 候选壳（不限 DSH 版本，判据见下）。
  * 仅改 app.asar 内唯一的浏览器 userData 路径；所有阶段与输出写入调用者给定的 D 盘新目录。
  * 不删除、不覆盖基包、候选包或阶段证据。
  *
@@ -29,8 +29,13 @@ try {
   const app = required('--app'), stageRoot = required('--stage-root'), out = required('--out')
   if (existsSync(out)) throw Error(`候选输出已存在，拒绝覆盖：${out}`)
   const runtime = readRuntimeDescriptor(app)
-  if (runtime.layout !== 'flat' || runtime.descriptor.release.version !== '0.2.1-alpha.3') {
-    throw Error(`只接受当前本机 0.2.1-alpha.3 flat 基包；实际为 ${runtime.descriptor.release.version} (${runtime.layout})`)
+  // 这里刻意**不锁 DSH 版本号**。2026-10-16 适配 alpha.4 时 HARNESS_REF 与 peer 都跟了，
+  // 唯独漏了原先钉在这里的 `!== '0.2.1-alpha.3'`，alpha.4 基包被这一句直接挡在门外 ——
+  // 版本号是会随每次上游升级过期的清单，跟它不如跟机制。
+  // 真正的判据在 `replaceBrowserProfilePath()` 里：它断言旧浏览器 userData 锚点唯一存在，
+  // 锚点不在就抛错，上游怎么改版本都跟得上。布局则是真约束（本仓出货永远是 flat）。
+  if (runtime.layout !== 'flat') {
+    throw Error(`只接受 flat 布局基包；实际为 ${runtime.layout}`)
   }
 
   const archivePath = join(app, 'resources', 'app.asar')

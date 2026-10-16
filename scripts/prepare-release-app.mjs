@@ -23,7 +23,19 @@ try {
   if (existsSync(out)) throw Error(`输出已存在，拒绝覆盖：${out}`)
   const archivePath = join(app, 'resources', 'app.asar')
   const runtime = readRuntimeDescriptor(app)
-  if (runtime.layout !== 'flat' || runtime.descriptor.release.version !== '0.2.1-alpha.2') throw Error('仅接受固定 0.2.1-alpha.2 flat 基包')
+  // ⚠️ 这里的版本门槛**必须留着**（与 `prepare-browser-profile-candidate.mjs` 的做法相反，
+  // 那边是删掉版本锁、只留锚点判据）。理由不是保守，是机制：本脚本那五处 `replace()` 的
+  // 锚点是 **alpha.2 时代旧的** main.js 形状。alpha.3 起上游自己带上了便携数据接线，本仓
+  // 出货的基包（release-desktop 从打过补丁的源码构建）main 已经是升级后的版本，再喂进来
+  // 就是**二次升级** —— 而 `overlayPortableMain` 那几处 replace 有可能仍然命中（import 行
+  // 之类的锚点上游未必动过），于是插进第二份 `configurePortableData`、node --check 照样过，
+  // 静默产出一个坏候选包。所以必须在这之前拦住。
+  // 遇到 alpha.3+ 也不是「改个版本号让它过」，而是该停止使用本脚本 —— release.yml 自
+  // 0.2.20 起已不再调用它（基包换成 desktop-* 源码构建产物，不需要再升级 main）。
+  if (runtime.layout !== 'flat') throw Error(`仅接受 flat 布局基包；实际为 ${runtime.layout}`)
+  if (runtime.descriptor.release.version !== '0.2.1-alpha.2') {
+    throw Error(`本脚本只服务 alpha.2 及更早基包，实际为 ${runtime.descriptor.release.version}：alpha.3 起出货基包已内置便携数据接线，直接用基包即可，不要再走本脚本升级`)
+  }
   const patch = readFileSync(join(root, 'docs', 'harness-desktop-build.patch'), 'utf8')
   const source = portableSource(patch)
   const original = extractFile(archivePath, 'lib/main.js').toString('utf8')

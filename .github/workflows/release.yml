@@ -42,9 +42,18 @@ env:
   # 用同一个 ref，也让本 workflow 的构建对着我们实际随包出货的那个 harness 版本。
   HARNESS_REF: ${{ inputs.harness_ref || '86a402200d95fecef4529d969836f1fe13c6cb0d' }}
   TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
-  BASE_DESKTOP_TAG: v0.2.16
-  BASE_DESKTOP_ASSET: dsh-webops-desktop-v0.2.16-win-x64-portable.zip
-  BASE_DESKTOP_SHA256: 23d2be61276514b5c6d0e488abeb69478e0b2c712040f7d32963a4c5ba1a8f43
+  # ⚠️ 基包三项必须**一起换**，且与 dsh peer 版本同源：
+  #   · 只换 tag → 下完撞 BASE_DESKTOP_SHA256 校验；
+  #   · 只换附件名 → 撞 `package-release-portable.mjs` 的 peer 门槛（那条是**精确字符串**
+  #     相等：基包内 DSH 是 X，插件三个 dsh peer 就必须一字不差是 `^X`，不是 semver 匹配）；
+  #   · 只升 peer 不换基包 → 同上，v0.2.20 就是这样红的（peer 已 ^0.2.1-alpha.4，基包还是
+  #     alpha.2 的 v0.2.16，报 `DSH 0.2.1-alpha.2 不在插件声明的 peerDependencies 中`）。
+  # 基包取 `desktop-v<DSH 版本>` 的整包附件：它由 release-desktop 从打过
+  # docs/harness-desktop-build.patch 的 harness 源码构建，main 已含便携数据接线，
+  # 因此**不需要**再跑 prepare-release-app.mjs（0.2.17~0.2.19 需要，是因那时基包是上游原样包）。
+  BASE_DESKTOP_TAG: desktop-v0.2.1-alpha.4
+  BASE_DESKTOP_ASSET: dsh-webops-desktop-v0.2.1-alpha.4-win-x64-portable.zip
+  BASE_DESKTOP_SHA256: 304633763b3ca58c27cad724f5b4bedc3c5d66981a4067958125948093a6ab7d
 
 jobs:
   portable-win-x64:
@@ -160,10 +169,13 @@ jobs:
           if ((Get-FileHash $baseZip -Algorithm SHA256).Hash.ToLower() -ne $env:BASE_DESKTOP_SHA256) { throw 'DSH 基包哈希不一致，拒绝发布' }
           python scripts/unzip-portable.py --zip $baseZip --dir $baseRoot --only-prefix app/
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          $releaseApp = Join-Path $env:RUNNER_TEMP 'webops-release-app'
-          $appStage = Join-Path $env:RUNNER_TEMP 'webops-release-app-stage'
-          node scripts/prepare-release-app.mjs --app (Join-Path $baseRoot 'app') --stage-root $appStage --out $releaseApp
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          # 解出来的 app 直接用，不再跑 prepare-release-app.mjs：desktop-* 基包是
+          # release-desktop 从打过 harness-desktop-build.patch 的源码构建的，便携数据接线
+          # 与工作区默认目录已经在里面了。0.2.17~0.2.19 需要那一步，是因为当时基包
+          # （v0.2.16，DSH 0.2.1-alpha.2）是上游原样包；现在再升级一遍是**二次升级** ——
+          # 那五处 replace 锚点仍可能命中，插进第二份 configurePortableData，而
+          # node --check 照样过，静默产出坏包。该脚本自己也已加版本护栏并给出这条指引。
+          $releaseApp = Join-Path $baseRoot 'app'
           $version = $env:PLUGIN_VERSION
           $portableZip = Join-Path dist "dsh-webops-desktop-v$version-win-x64-portable.zip"
           $stageRoot = Join-Path $env:RUNNER_TEMP 'webops-full-stage'
