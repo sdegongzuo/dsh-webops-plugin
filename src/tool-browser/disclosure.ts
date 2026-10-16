@@ -6,11 +6,19 @@
  * 2. 只屏蔽**本插件自己注册**的网页工具，不动其他插件，也不用 allow 列表。
  * 3. 屏蔽变更在工具返回前完成 —— 下一次模型请求必须看到新工具集合。
  *
+ * 重启 / 重载 / fork 后的恢复走宿主的会话投影（`disclosure-projection.ts`）：
+ * 内存状态机仍是当前生效的权威，投影只是首次触达时的播种源。
+ *
  * 对话身份按结构化取值，不 import `@deepseek-ai/dsh-agent`：该包是上游运行时类型，
  * 本仓只依赖它的字段语义（与 `tool-runtime.ts` 的 `callerOf` 同一口径）。
  */
 
 import type { Context } from '@deepseek-ai/cordis'
+import {
+  registerDisclosureProjection,
+  restoreDisclosureState,
+  type SessionProjectionRegistryLike,
+} from './disclosure-projection.ts'
 
 /** 加载入口工具名：初始就可见，用来展开其余按需工具。 */
 export const WEBPAGE_LOADER_TOOL = 'webpage_tools'
@@ -37,6 +45,8 @@ export function webpageToolName(key: string): string {
 export interface DisclosureAgent {
   readonly id?: unknown
   readonly ctx?: Context
+  /** 宿主 Session；恢复持久化披露状态用（宿主 agent 上确有这个字段）。 */
+  readonly session?: unknown
 }
 
 /** 一次加载的结果：本次真正新增的、以及此前已可见的。 */
@@ -119,10 +129,32 @@ export function mountToolDisclosure(ctx: Context, registered: readonly string[])
   /** 当前生效的屏蔽 disposer；变更时先释放旧的，再装新的。 */
   const masks = new Map<object, () => void>()
 
+  // 持久化恢复：注册表缺位（部署未组装投影）时只丢恢复能力，内存状态机照常工作。
+  const registry: SessionProjectionRegistryLike | undefined = ctx.get('sessionProjections')
+  let disposeProjection: (() => void) | undefined
+  if (registry !== undefined) {
+    try {
+      disposeProjection = registerDisclosureProjection(registry)
+    } catch (error: unknown) {
+      // 注册冲突（同名不同版本）等：留痕并退化为纯内存披露，不阻断插件。
+      const reason = error instanceof Error ? error.message : String(error)
+      ctx.logger?.warn?.(`webpage-tools: disclosure projection not registered: ${reason}`)
+    }
+  }
+
   const stateOf = (agent: object): AgentState => {
     const existing = states.get(agent)
     if (existing !== undefined) return existing
-    const fresh: AgentState = { coreOpened: false, loaded: new Set<string>() }
+    // 首次触达即从投影播种：重启 / 重载 / fork 的对话从这里拿回已展开的状态。
+    // 播种只发生一次（之后由本插件的 markOpened / load 直接推进内存状态），
+    // 因此不存在「投影后来居上」把已展开状态覆盖回去的路径。
+    const restored = restoreDisclosureState(registry, (agent as DisclosureAgent).session, message => {
+      ctx.logger?.warn?.(message)
+    })
+    const fresh: AgentState = {
+      coreOpened: restored?.coreOpened ?? false,
+      loaded: new Set(restored?.loaded ?? []),
+    }
     states.set(agent, fresh)
     return fresh
   }
@@ -165,11 +197,13 @@ export function mountToolDisclosure(ctx: Context, registered: readonly string[])
 
   ctx.on('agent/created', payload => { install(payload.agent); return undefined })
   ctx.on('agent/disposed', payload => { drop(payload.agent); return undefined })
-  // 插件卸载：释放全部屏蔽与状态。
+  // 插件卸载：释放全部屏蔽、内存状态与投影注册（注册表活在根 ctx，不随我们消亡）。
   ctx.effect(() => () => {
     for (const mask of [...masks.values()]) mask()
     masks.clear()
     states.clear()
+    disposeProjection?.()
+    disposeProjection = undefined
   }, 'webpage-tools.disclosure')
 
   return {

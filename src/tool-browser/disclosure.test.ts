@@ -11,12 +11,67 @@ import type { Context } from '@deepseek-ai/cordis'
 import type { ToolDefinition, ToolRunContext } from '@deepseek-ai/dsh-tools'
 import { apply, type Config } from './index.ts'
 import { WEBPAGE_LOADABLE_TOOLS } from './disclosure.ts'
+import {
+  DISCLOSURE_PROJECTION_KEY,
+  type SessionProjectionRegistryLike,
+} from './disclosure-projection.ts'
 
 const SESSION = { id: 's1', url: 'https://example.com/', title: 'Example', epoch: 4 }
 
 interface Agent {
   readonly id: string
   readonly ctx: unknown
+  /** 宿主 Session：投影按它隔离；每个对话一个独立对象。 */
+  readonly session: unknown
+}
+
+/**
+ * 宿主投影注册表的测试替身：按「注册定义 + 每会话事件日志」重放 fold。
+ *
+ * 它不用第二套语义 —— `stateOf` 走的是本插件注册时交上去的 `init` / `apply`，
+ * 因此这条链路同时验了「注册表面可用」与「播种读的是投影」。
+ */
+class FakeProjections implements SessionProjectionRegistryLike {
+  readonly definitions = new Map<string, Parameters<SessionProjectionRegistryLike['register']>[0]>()
+  readonly disposals: string[] = []
+  /** 每个会话已提交的事件日志（重启前发生的事都在这里）。 */
+  readonly logs = new Map<unknown, { type: string; data: unknown }[]>()
+  /** 注入故障：让 `stateOf` 抛错。 */
+  failRead = false
+
+  register(definition: Parameters<SessionProjectionRegistryLike['register']>[0]): () => void {
+    this.definitions.set(definition.key, definition)
+    return () => {
+      this.disposals.push(definition.key)
+      this.definitions.delete(definition.key)
+    }
+  }
+
+  /** 提交一条会话事件（宿主在工具结果入日志时做等价的事）。 */
+  commit(session: unknown, event: { type: string; data: unknown }): void {
+    const log = this.logs.get(session) ?? []
+    log.push(event)
+    this.logs.set(session, log)
+  }
+
+  stateOf(session: unknown, key: string): unknown {
+    if (this.failRead) throw new Error('投影缓存行损坏（桩）')
+    const definition = this.definitions.get(key)
+    if (definition === undefined) return undefined
+    let state = definition.init({}, 0)
+    for (const event of this.logs.get(session) ?? []) state = definition.apply(state, event)
+    return state
+  }
+}
+
+/** 宿主 `tool/call` 事件（字段与上游一致）。 */
+function toolCall(callId: string, name: string, args: unknown): { type: 'tool/call'; data: unknown } {
+  return { type: 'tool/call', data: { turn: 1, step: 1, callId, name, arguments: JSON.stringify(args) } }
+}
+
+/** 宿主 `tool/result` 事件。 */
+function toolResult(callId: string, isError = false): { type: 'tool/result'; data: unknown } {
+  return { type: 'tool/result', data: { turn: 1, step: 1, message: { toolCallId: callId, isError } } }
 }
 
 interface TestBed {
@@ -30,6 +85,8 @@ interface TestBed {
   /** 让 `restrict` 抛错，验证失败不静默也不阻断。 */
   failRestrict: boolean
   createAgent(id: string): Agent
+  /** 重启 / fork：复用旧 session 对象新建 agent，恢复只能来自投影。 */
+  createRestoredAgent(id: string, session: unknown): Agent
   emit(event: string, payload: unknown): void
   visible(agent: Agent): string[]
   prompt(agent: Agent): string
@@ -38,22 +95,32 @@ interface TestBed {
   failOpen: boolean
   /** `apply()` 之前就已存在的对话（不派发 agent/created）。 */
   existing: Agent[]
+  /** 宿主投影注册表替身；`null` 表示部署未组装投影服务。 */
+  projections: FakeProjections | null
+  /** 跑一遍插件卸载的清理（屏蔽、内存状态、投影注册）。 */
+  unload(): void
 }
 
-function mount(config: Config = {}, preExisting: readonly string[] = []): TestBed {
+function mount(
+  config: Config = {},
+  preExisting: readonly string[] = [],
+  projections: FakeProjections | null = new FakeProjections(),
+): TestBed {
   const tools = new Map<string, ToolDefinition>()
   const hidden = new Map<object, Set<string>>()
   const restrictCalls: { agent: string; deny: string[] }[] = []
   const disposals: string[] = []
   const warnings: string[] = []
   const listeners = new Map<string, ((payload: unknown) => unknown)[]>()
+  const cleanups: (() => void)[] = []
   const agents: Agent[] = []
   let sections: { text: unknown }[] = []
   /** 造一个对话：scoped `restrict` 只作用于它自己的 hidden。 */
-  const record = (id: string): Agent => {
+  const record = (id: string, session: unknown = { id }): Agent => {
     const set = new Set<string>()
     const agent: Agent = {
       id,
+      session,
       ctx: {
         tools: {
           restrict: ({ deny }: { deny?: readonly string[] }) => {
@@ -81,8 +148,19 @@ function mount(config: Config = {}, preExisting: readonly string[] = []): TestBe
     failOpen: false,
     failRestrict: false,
     existing: [],
+    projections,
     createAgent(id: string): Agent {
       const agent = record(id)
+      agents.push(agent)
+      bed.emit('agent/created', { agent })
+      return agent
+    },
+    /**
+     * 重启 / fork 后的对话：复用**上一代进程的同一个 session 对象**（日志里
+     * 已有历史事件），agent 与 scoped ctx 都是新建的 —— 恢复只能来自投影。
+     */
+    createRestoredAgent(id: string, session: unknown): Agent {
+      const agent = record(id, session)
       agents.push(agent)
       bed.emit('agent/created', { agent })
       return agent
@@ -103,6 +181,9 @@ function mount(config: Config = {}, preExisting: readonly string[] = []): TestBe
       if (definition === undefined) throw new Error(`${toolName} 未注册`)
       const exec = { signal: new AbortController().signal, agent, token: Symbol(toolName) } as unknown as ToolRunContext
       return definition.execute(args, exec)
+    },
+    unload(): void {
+      for (const cleanup of cleanups.splice(0)) cleanup()
     },
   }
   const ctx = {
@@ -133,14 +214,31 @@ function mount(config: Config = {}, preExisting: readonly string[] = []): TestBe
       }),
     },
     attachments: { saveImage: () => Promise.resolve({}) },
-    effect: () => () => undefined,
+    // 兼容 cordis effect 的两种形态：纯工厂（返回 disposer）与 generator
+    // （yield 出一串 disposer）。这里不跑 generator 本体，只在卸载时驱动它。
+    effect: (factory: () => unknown) => {
+      const produced = factory()
+      const cleanup = typeof produced === 'function'
+        ? produced as () => void
+        : () => {
+          if (produced !== null && typeof produced === 'object' && Symbol.iterator in produced) {
+            for (const dispose of produced as Iterable<(() => void) | undefined>) dispose?.()
+          }
+        }
+      cleanups.push(cleanup)
+      return cleanup
+    },
     on: (event: string, listener: (payload: unknown) => unknown) => {
       const list = listeners.get(event) ?? []
       list.push(listener)
       listeners.set(event, list)
       return () => undefined
     },
-    get: (key: string) => key === 'agents' ? { list: () => agents } : undefined,
+    get: (key: string) => {
+      if (key === 'agents') return { list: () => agents }
+      if (key === 'sessionProjections') return projections ?? undefined
+      return undefined
+    },
     logger: { warn: (message: string) => { warnings.push(message) } },
   } as unknown as Context
   sections = []
@@ -303,5 +401,88 @@ describe('逐步披露：工具按对话分阶段可见', () => {
     const bed = mount()
     const parameters = bed.tools.get('webpage_tools')?.parameters as { properties: { tools: { items?: { enum?: string[] } } } }
     expect(parameters.properties.tools.items?.enum).toEqual([...WEBPAGE_LOADABLE_TOOLS])
+  })
+})
+
+describe('逐步披露：投影恢复（重启 / fork / 重载）', () => {
+  it('注册了投影：key 与版本随插件装载落到宿主注册表', () => {
+    const bed = mount()
+    expect(bed.projections?.definitions.has(DISCLOSURE_PROJECTION_KEY)).toBe(true)
+  })
+
+  it('重启后恢复：新对话从投影拿回已展开的状态，不用重新加载', () => {
+    const projections = new FakeProjections()
+    const bed = mount({}, [], projections)
+    // 上一代进程里发生过的事：open 成功 + 加载过 find。
+    const session = { id: 'restarted' }
+    projections.commit(session, toolCall('c1', 'webpage_open', { url: 'https://example.com/' }))
+    projections.commit(session, toolResult('c1'))
+    projections.commit(session, toolCall('c2', 'webpage_tools', { tools: ['webpage_find'] }))
+    projections.commit(session, toolResult('c2'))
+    // 重启后的新对话：同样一个 session 对象，agent 是新建的。
+    const agent = bed.createRestoredAgent('restarted', session)
+    expect(bed.visible(agent)).toContain('webpage_snapshot')
+    expect(bed.visible(agent)).toContain('webpage_find')
+    expect(bed.visible(agent)).not.toContain('webpage_console')
+  })
+
+  it('fork 出的对话只拿到继承前缀里的提升：加载过 find 但没 open 就没有基础组', () => {
+    const projections = new FakeProjections()
+    const bed = mount({}, [], projections)
+    const session = { id: 'forked' }
+    projections.commit(session, toolCall('c1', 'webpage_tools', { tools: ['webpage_find'] }))
+    projections.commit(session, toolResult('c1'))
+    const agent = bed.createRestoredAgent('forked', session)
+    expect(bed.visible(agent)).toContain('webpage_find')
+    expect(bed.visible(agent)).not.toContain('webpage_snapshot')
+  })
+
+  it('失败调用不进投影：重启后不会恢复未成功的提升', () => {
+    const projections = new FakeProjections()
+    const bed = mount({}, [], projections)
+    const session = { id: 'failed' }
+    projections.commit(session, toolCall('c1', 'webpage_open', { url: 'https://example.com/' }))
+    projections.commit(session, toolResult('c1', true))
+    const agent = bed.createRestoredAgent('failed', session)
+    expect(bed.visible(agent)).toEqual(INITIAL_STAGE)
+  })
+
+  it('播种只发生一次：投影后来的事件不覆盖内存里已展开的状态', async () => {
+    const projections = new FakeProjections()
+    const bed = mount({}, [], projections)
+    const alice = bed.createAgent('alice')
+    await bed.run(alice, 'webpage_tools', { tools: ['webpage_console'] })
+    // 播种之后再往日志里补事件（真实里对应别的进程/回放路径），不得回缩或改判。
+    projections.commit(alice.session, toolCall('c9', 'webpage_open', { url: 'https://example.com/' }))
+    projections.commit(alice.session, toolResult('c9'))
+    expect(bed.visible(alice)).not.toContain('webpage_snapshot')
+    expect(bed.visible(alice)).toContain('webpage_console')
+  })
+
+  it('投影缺位时退化为纯内存披露：open 仍然展开，不报错', async () => {
+    const bed = mount({}, [], null)
+    expect(bed.projections).toBeNull()
+    const alice = bed.createAgent('alice')
+    await bed.run(alice, 'webpage_open', { url: 'https://example.com/' })
+    expect(bed.visible(alice)).toContain('webpage_snapshot')
+  })
+
+  it('投影读失败留痕并退化，不把异常抛给 agent 创建流程', () => {
+    const projections = new FakeProjections()
+    projections.failRead = true
+    const bed = mount({}, [], projections)
+    const alice = bed.createAgent('alice')
+    expect(bed.warnings.some(message => message.includes('disclosure restore failed'))).toBe(true)
+    expect(bed.visible(alice)).toEqual(INITIAL_STAGE)
+  })
+
+  it('插件卸载释放投影注册、屏蔽与内存状态', () => {
+    const bed = mount()
+    const alice = bed.createAgent('alice')
+    bed.unload()
+    expect(bed.projections?.disposals).toContain(DISCLOSURE_PROJECTION_KEY)
+    expect(bed.projections?.definitions.has(DISCLOSURE_PROJECTION_KEY)).toBe(false)
+    expect(bed.disposals).toEqual(['alice'])
+    expect(bed.hidden.get(alice)?.size).toBe(0)
   })
 })
