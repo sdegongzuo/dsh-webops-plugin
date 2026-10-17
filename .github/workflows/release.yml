@@ -51,9 +51,9 @@ env:
   # 基包取 `desktop-v<DSH 版本>` 的整包附件：它由 release-desktop 从打过
   # docs/harness-desktop-build.patch 的 harness 源码构建，main 已含便携数据接线，
   # 因此**不需要**再跑 prepare-release-app.mjs（0.2.17~0.2.19 需要，是因那时基包是上游原样包）。
-  BASE_DESKTOP_TAG: desktop-v0.2.1-alpha.4
-  BASE_DESKTOP_ASSET: dsh-webops-desktop-v0.2.1-alpha.4-win-x64-portable.zip
-  BASE_DESKTOP_SHA256: 304633763b3ca58c27cad724f5b4bedc3c5d66981a4067958125948093a6ab7d
+  BASE_DESKTOP_TAG: desktop-v0.2.1-rc.2
+  BASE_DESKTOP_ASSET: dsh-webops-desktop-v0.2.1-rc.2-win-x64-portable.zip
+  BASE_DESKTOP_SHA256: 709577497d7e3448718a346419cbf01874ae79fb5e58e8d7fc1e8763181ec520
 
 jobs:
   portable-win-x64:
