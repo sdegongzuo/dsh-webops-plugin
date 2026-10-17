@@ -417,7 +417,7 @@ index cf03e38c36..878122bcd6 100644
 +}
 diff --git a/apps/desktop/src/portable-data.ts b/apps/desktop/src/portable-data.ts
 new file mode 100644
-index 0000000000..a4086fd882
+index 0000000000..e768e62373
 --- /dev/null
 +++ b/apps/desktop/src/portable-data.ts
 @@ -0,0 +1,55 @@
@@ -911,7 +911,7 @@ index d9a8f3103b..d5ccc62e6a 100644
      })
 diff --git a/apps/desktop/tests/portable-data.spec.ts b/apps/desktop/tests/portable-data.spec.ts
 new file mode 100644
-index 0000000000..b274ad5a35
+index 0000000000..28d562118c
 --- /dev/null
 +++ b/apps/desktop/tests/portable-data.spec.ts
 @@ -0,0 +1,152 @@

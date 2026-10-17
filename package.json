@@ -86,14 +86,23 @@
     "portable:set-app": "node scripts/portable-dev.mjs set-app",
     "portable:verify": "node scripts/portable-dev.mjs verify",
     "portable:launch": "node scripts/portable-dev.mjs launch",
-    "portable:clean": "node scripts/portable-dev.mjs clean"
+    "portable:clean": "node scripts/portable-dev.mjs clean",
+    "mi:env": "node scripts/local-multi-instance.mjs env",
+    "mi:artifact": "node scripts/local-multi-instance.mjs artifact",
+    "mi:assemble": "node scripts/local-multi-instance.mjs assemble",
+    "mi:launch": "node scripts/local-multi-instance.mjs launch",
+    "mi:endpoint": "node scripts/local-multi-instance.mjs endpoint",
+    "mi:chat": "node scripts/local-multi-instance.mjs chat",
+    "mi:status": "node scripts/local-multi-instance.mjs status",
+    "mi:stop": "node scripts/local-multi-instance.mjs stop",
+    "mi:list": "node scripts/local-multi-instance.mjs list"
   },
   "peerDependencies": {
-    "@deepseek-ai/cordis": "^4.0.5-alpha.2",
-    "@deepseek-ai/dsh-attachment": "^0.2.1-alpha.4",
-    "@deepseek-ai/dsh-system-prompt": "^0.2.1-alpha.4",
-    "@deepseek-ai/dsh-tools": "^0.2.1-alpha.4",
-    "@deepseek-ai/schemastery": "^3.18.5-alpha.2"
+    "@deepseek-ai/cordis": "^4.0.5",
+    "@deepseek-ai/dsh-attachment": "^0.2.1-rc.2",
+    "@deepseek-ai/dsh-system-prompt": "^0.2.1-rc.2",
+    "@deepseek-ai/dsh-tools": "^0.2.1-rc.2",
+    "@deepseek-ai/schemastery": "^3.18.5"
   },
   "devDependencies": {
     "@deepseek-ai/cordis": "link:../deepseek-harness/vendor/cordis",
