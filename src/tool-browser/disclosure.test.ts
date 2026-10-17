@@ -89,6 +89,8 @@ interface TestBed {
   createRestoredAgent(id: string, session: unknown): Agent
   emit(event: string, payload: unknown): void
   visible(agent: Agent): string[]
+  /** 宿主内置工具在该对话里还剩哪些可见 —— 屏蔽是否真的落到宿主工具上。 */
+  hostVisible(agent: Agent): string[]
   prompt(agent: Agent): string
   run(agent: Agent, toolName: string, args: Record<string, unknown>): Promise<unknown>
   /** 让 `webpage_open` 失败，用来验证「失败不提升」。 */
@@ -105,8 +107,12 @@ function mount(
   config: Config = {},
   preExisting: readonly string[] = [],
   projections: FakeProjections | null = new FakeProjections(),
+  /** 模拟宿主已注册的内置工具（真实宿主有 `web_fetch`）；空数组表示宿主没这个工具。 */
+  hostTools: readonly string[] = ['web_fetch'],
 ): TestBed {
   const tools = new Map<string, ToolDefinition>()
+  /** 宿主内置工具名：不在 `tools` 里，但在同一条可见性继承面上。 */
+  const builtin = new Set<string>(hostTools)
   const hidden = new Map<object, Set<string>>()
   const restrictCalls: { agent: string; deny: string[] }[] = []
   const disposals: string[] = []
@@ -126,6 +132,9 @@ function mount(
           restrict: ({ deny }: { deny?: readonly string[] }) => {
             if (bed.failRestrict) throw new Error('restrict 不可用（桩）')
             const names = [...deny ?? []]
+            // 真实宿主的行为：`restrict` 只认继承面上的工具名，混进未知名整次调用失败。
+            const unknown = names.filter(name => !tools.has(name) && !builtin.has(name))
+            if (unknown.length > 0) throw new Error(`unknown tool: ${unknown.join(', ')}`)
             restrictCalls.push({ agent: id, deny: names })
             for (const name of names) set.add(name)
             return () => {
@@ -172,6 +181,10 @@ function mount(
       const set = hidden.get(agent) ?? new Set<string>()
       return [...tools.keys()].filter(name => !set.has(name)).sort()
     },
+    hostVisible(agent: Agent): string[] {
+      const set = hidden.get(agent) ?? new Set<string>()
+      return [...builtin].filter(name => !set.has(name)).sort()
+    },
     prompt(agent: Agent): string {
       const section = sections[0]
       return (section?.text as (context: { scope: unknown }) => string)({ scope: agent })
@@ -194,7 +207,9 @@ function mount(
       },
       get: (name: string, scope?: unknown) => {
         const set = scope === undefined ? undefined : hidden.get(scope as object)
-        return set !== undefined && set.has(name) ? undefined : tools.get(name)
+        if (set !== undefined && set.has(name)) return undefined
+        // 宿主内置工具也在继承面上，只是定义不归本插件管：判据只需「能不能解析到」。
+        return tools.get(name) ?? (builtin.has(name) ? { name } as ToolDefinition : undefined)
       },
     },
     systemPrompt: {
@@ -260,8 +275,42 @@ describe('逐步披露：工具按对话分阶段可见', () => {
     const bed = mount()
     const alice = bed.createAgent('alice')
     expect(bed.visible(alice)).toEqual(INITIAL_STAGE)
-    expect(bed.restrictCalls).toHaveLength(1)
+    // 两次：网页工具披露一次、宿主内置抓取工具一次（后者不随阶段变化）。
+    expect(bed.restrictCalls).toHaveLength(2)
     expect(bed.restrictCalls[0]?.deny).not.toContain('webpage_tools')
+  })
+
+  it('宿主内置的 web_fetch 一起被屏蔽，网页工具清单不受影响', () => {
+    const bed = mount()
+    const alice = bed.createAgent('alice')
+    expect(bed.hostVisible(alice)).toEqual([])
+    expect(bed.restrictCalls.filter(call => call.deny.includes('web_fetch'))).toHaveLength(1)
+    expect(bed.visible(alice)).toEqual(INITIAL_STAGE)
+  })
+
+  it('配置 hideHostWebFetch=false 时保留宿主 web_fetch', () => {
+    const bed = mount({ hideHostWebFetch: false })
+    const alice = bed.createAgent('alice')
+    expect(bed.hostVisible(alice)).toEqual(['web_fetch'])
+    expect(bed.restrictCalls.some(call => call.deny.includes('web_fetch'))).toBe(false)
+  })
+
+  it('宿主没有 web_fetch 时留痕，且不牵连网页工具的屏蔽', () => {
+    const bed = mount({}, [], new FakeProjections(), [])
+    const alice = bed.createAgent('alice')
+    expect(bed.warnings.some(message => message.includes('host tool mask failed'))).toBe(true)
+    // 反向验证：未知名若混进网页工具那次 restrict，整批屏蔽会被打掉（16 项全可见）。
+    expect(bed.visible(alice)).toEqual(INITIAL_STAGE)
+    expect(bed.restrictCalls.every(call => !call.deny.includes('web_fetch'))).toBe(true)
+  })
+
+  it('提示只在 web_fetch 真的看不见时说它不可用', () => {
+    const bed = mount()
+    const alice = bed.createAgent('alice')
+    expect(bed.prompt(alice)).toContain('web_fetch is unavailable here')
+    bed.failRestrict = true
+    const bob = bed.createAgent('bob')
+    expect(bed.prompt(bob)).not.toContain('web_fetch is unavailable')
   })
 
   it('open 成功展开基础组；只装一次屏蔽，旧屏蔽先释放', async () => {
@@ -272,7 +321,8 @@ describe('逐步披露：工具按对话分阶段可见', () => {
       'webpage_click', 'webpage_execute', 'webpage_fill', 'webpage_navigate', 'webpage_open',
       'webpage_press', 'webpage_snapshot', 'webpage_tabs', 'webpage_tools', 'webpage_wait',
     ])
-    expect(bed.restrictCalls).toHaveLength(2)
+    // 创建时 2 次（网页 + 宿主），open 成功重算网页那次（先释放旧的）。
+    expect(bed.restrictCalls).toHaveLength(3)
     expect(bed.disposals).toEqual(['alice'])
   })
 
@@ -282,7 +332,7 @@ describe('逐步披露：工具按对话分阶段可见', () => {
     const alice = bed.createAgent('alice')
     await expect(bed.run(alice, 'webpage_open', { url: 'https://example.com/' })).rejects.toThrow()
     expect(bed.visible(alice)).toEqual(INITIAL_STAGE)
-    expect(bed.restrictCalls).toHaveLength(1)
+    expect(bed.restrictCalls).toHaveLength(2)
   })
 
   it('claim 成功才提升，list 不算进入网页任务', async () => {
@@ -357,23 +407,26 @@ describe('逐步披露：工具按对话分阶段可见', () => {
     await bed.run(alice, 'webpage_tools', { tools: ['webpage_console'] })
     expect(bed.visible(alice)).toContain('webpage_console')
     expect(bed.visible(bob)).toEqual(INITIAL_STAGE)
-    expect(bed.restrictCalls.map(call => call.agent)).toEqual(['alice', 'bob', 'alice'])
+    expect(bed.restrictCalls.map(call => call.agent)).toEqual(['alice', 'alice', 'bob', 'bob', 'alice'])
   })
 
   it('对话销毁释放屏蔽，不留下别人的限制', () => {
     const bed = mount()
     const alice = bed.createAgent('alice')
     bed.emit('agent/disposed', { agent: alice })
-    expect(bed.disposals).toEqual(['alice'])
+    // 网页披露一层、宿主内置一层，两层都要释放。
+    expect(bed.disposals).toEqual(['alice', 'alice'])
     expect(bed.hidden.get(alice)?.size).toBe(0)
+    expect(bed.hostVisible(alice)).toEqual(['web_fetch'])
   })
 
   it('插件加载前就存在的对话由 attachExisting 接管（热加载也只看到初始组）', () => {
     const bed = mount({}, ['older'])
     const older = bed.existing[0]
     expect(older).toBeDefined()
-    expect(bed.restrictCalls.map(call => call.agent)).toEqual(['older'])
+    expect(bed.restrictCalls.map(call => call.agent)).toEqual(['older', 'older'])
     expect(bed.visible(older!)).toEqual(INITIAL_STAGE)
+    expect(bed.hostVisible(older!)).toEqual([])
   })
 
   it('装不上屏蔽时不静默：留痕并退化为全可见，不阻断插件', () => {
@@ -482,7 +535,8 @@ describe('逐步披露：投影恢复（重启 / fork / 重载）', () => {
     bed.unload()
     expect(bed.projections?.disposals).toContain(DISCLOSURE_PROJECTION_KEY)
     expect(bed.projections?.definitions.has(DISCLOSURE_PROJECTION_KEY)).toBe(false)
-    expect(bed.disposals).toEqual(['alice'])
+    expect(bed.disposals).toEqual(['alice', 'alice'])
     expect(bed.hidden.get(alice)?.size).toBe(0)
+    expect(bed.hostVisible(alice)).toEqual(['web_fetch'])
   })
 })

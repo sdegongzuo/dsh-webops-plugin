@@ -3,7 +3,8 @@
  *
  * 三条不变式（定案见 docs/工具逐步披露设计.md）：
  * 1. 状态属于**对话**（宿主 agent scope），不属于窗口或插件全局；同一对话只展开、不回缩。
- * 2. 只屏蔽**本插件自己注册**的网页工具，不动其他插件，也不用 allow 列表。
+ * 2. 本插件自己注册的网页工具按阶段屏蔽；**另外**屏蔽与它们重复的宿主内置抓取工具
+ *    （见 `HOST_WEB_FETCH_TOOLS`），不碰其他插件，也不用 allow 列表。
  * 3. 屏蔽变更在工具返回前完成 —— 下一次模型请求必须看到新工具集合。
  *
  * 重启 / 重载 / fork 后的恢复走宿主的会话投影（`disclosure-projection.ts`）：
@@ -31,6 +32,19 @@ export const WEBPAGE_BASE_KEYS = ['navigate', 'snapshot', 'click', 'fill', 'pres
 
 /** 只能逐项加载的工具：搜索、滚动、定位、视觉、控制台、网络。 */
 export const WEBPAGE_LOADABLE_KEYS = ['find', 'scroll', 'locate', 'screenshot', 'console', 'network'] as const
+
+/**
+ * 与网页工具重复的**宿主内置**工具：装了网页能力的对话里一律屏蔽。
+ *
+ * `web_fetch` 是宿主自带的「给个 URL 换回正文」，和 `webpage_navigate` + `webpage_snapshot`
+ * 干的是同一件事。两个都在清单里时模型会先试那个便宜的，等于绕开了标签归属、
+ * 租约和不可信内容边界 —— 抓回来的正文没有 ref，下一步还是得开网页。
+ *
+ * **必须单独一次 `restrict`**：`restrict` 只认继承面上的工具名，名单里有一个
+ * 宿主不认的名字整次调用就失败；和网页工具的屏蔽混在一次调用里，
+ * 宿主版本没有 `web_fetch` 时会连带把网页工具的屏蔽一起打掉（退化成 16 项全可见）。
+ */
+export const HOST_WEB_FETCH_TOOLS: readonly string[] = ['web_fetch']
 
 /** 加载入口接受的工具名（顺序即文档顺序）。 */
 export const WEBPAGE_LOADABLE_TOOLS: readonly string[] =
@@ -119,15 +133,24 @@ export interface ToolDisclosure {
  *
  * 屏蔽用 `agent.ctx.tools.restrict({ deny })` —— 它只过滤该 scope **继承**的工具，
  * 本插件自己注册在 host 层的网页工具都在继承面上，因此可被屏蔽，而其他插件不受影响。
+ * 宿主内置工具（如 `web_fetch`）也在继承面上，但走**独立的一次**调用，理由见常量注释。
  *
  * @param ctx - 插件上下文。
  * @param registered - 本次实际注册的网页工具名（配置关掉的不要传）。
+ * @param options.hideHostTools - 要屏蔽的宿主内置工具名；不给就只管网页工具。
  * @returns 供 open / claim / 加载入口调用的披露控制器。
  */
-export function mountToolDisclosure(ctx: Context, registered: readonly string[]): ToolDisclosure {
+export function mountToolDisclosure(
+  ctx: Context,
+  registered: readonly string[],
+  options: { readonly hideHostTools?: readonly string[] } = {},
+): ToolDisclosure {
   const states = new Map<object, AgentState>()
   /** 当前生效的屏蔽 disposer；变更时先释放旧的，再装新的。 */
   const masks = new Map<object, () => void>()
+  /** 宿主内置工具的屏蔽：与披露阶段无关，每个对话只装一次、只随对话消亡释放。 */
+  const hostMasks = new Map<object, () => void>()
+  const hostDenied = [...options.hideHostTools ?? []]
 
   // 持久化恢复：注册表缺位（部署未组装投影）时只丢恢复能力，内存状态机照常工作。
   const registry: SessionProjectionRegistryLike | undefined = ctx.get('sessionProjections')
@@ -180,10 +203,29 @@ export function mountToolDisclosure(ctx: Context, registered: readonly string[])
     }
   }
 
+  /**
+   * 装宿主内置工具的屏蔽。它不随披露阶段变化，因此只在对话出现时装一次；
+   * 失败只影响这一个名字（宿主没有它），绝不能影响网页工具的屏蔽。
+   */
+  const applyHostMask = (agent: object): void => {
+    if (hostDenied.length === 0) return
+    hostMasks.get(agent)?.()
+    hostMasks.delete(agent)
+    const scopeCtx = (agent as DisclosureAgent).ctx
+    if (scopeCtx === undefined) return
+    try {
+      hostMasks.set(agent, scopeCtx.tools.restrict({ deny: hostDenied }))
+    } catch (error: unknown) {
+      const reason = error instanceof Error ? error.message : String(error)
+      ctx.logger?.warn?.(`webpage-tools: host tool mask failed for one conversation: ${reason}`)
+    }
+  }
+
   const install = (agent: unknown): void => {
     const target = agentOf(agent)
     if (target === undefined) return
     applyMask(target)
+    applyHostMask(target)
   }
 
   const drop = (agent: unknown): void => {
@@ -193,6 +235,9 @@ export function mountToolDisclosure(ctx: Context, registered: readonly string[])
     const mask = masks.get(target)
     masks.delete(target)
     mask?.()
+    const hostMask = hostMasks.get(target)
+    hostMasks.delete(target)
+    hostMask?.()
   }
 
   ctx.on('agent/created', payload => { install(payload.agent); return undefined })
@@ -201,6 +246,8 @@ export function mountToolDisclosure(ctx: Context, registered: readonly string[])
   ctx.effect(() => () => {
     for (const mask of [...masks.values()]) mask()
     masks.clear()
+    for (const mask of [...hostMasks.values()]) mask()
+    hostMasks.clear()
     states.clear()
     disposeProjection?.()
     disposeProjection = undefined

@@ -57,6 +57,13 @@ export interface Config {
   find?: boolean
   /** 注册 `webpage_locate`。默认 true。 */
   locate?: boolean
+  /**
+   * 屏蔽宿主内置的 `web_fetch`（按对话，只在装了网页工具时生效）。默认 true。
+   *
+   * 它抓正文，`webpage_navigate` + `webpage_snapshot` 也抓正文，两个都在清单里时
+   * 模型会先试便宜的那个，绕开标签归属与不可信内容边界。置 false 可保留宿主原行为。
+   */
+  hideHostWebFetch?: boolean
 }
 
 export const Config: z<Config> = z.object({
@@ -75,6 +82,7 @@ export const Config: z<Config> = z.object({
   execute: z.boolean().default(true),
   find: z.boolean().default(true),
   locate: z.boolean().default(true),
+  hideHostWebFetch: z.boolean().default(true),
 })
 
 /**

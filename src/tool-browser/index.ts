@@ -12,7 +12,7 @@ import { registerConsole, registerNetwork, registerExecute } from './tools/diagn
 import { registerFind, registerLocate } from './tools/discovery.ts'
 import { registerToolLoader } from './tools/loader.ts'
 import { registerSystemPrompt } from './system-prompt.ts'
-import { mountToolDisclosure, webpageToolName } from './disclosure.ts'
+import { HOST_WEB_FETCH_TOOLS, mountToolDisclosure, webpageToolName } from './disclosure.ts'
 import { noteLoaded } from '../debug.ts'
 
 export {
@@ -78,7 +78,11 @@ export function apply(ctx: Context, config: Config = {}): void {
   const registeredTools = (Object.keys(enabled) as (keyof typeof enabled)[])
     .filter(key => enabled[key])
     .map(webpageToolName)
-  const disclosure = mountToolDisclosure(ctx, registeredTools)
+  // 宿主内置抓取工具与网页工具重复：本插件真提供了网页能力时才屏蔽（全关时不夺走唯一抓手）。
+  const hideHostTools = registeredTools.length > 0 && config.hideHostWebFetch !== false
+    ? HOST_WEB_FETCH_TOOLS
+    : []
+  const disclosure = mountToolDisclosure(ctx, registeredTools, { hideHostTools })
 
   registerSystemPrompt(ctx)
 
