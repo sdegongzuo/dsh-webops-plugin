@@ -130,13 +130,15 @@ describe('每次发布的完整便携包', () => {
     expect(zip.profile.dependencies['dsh-better-sidebar']).toBe(
       JSON.parse(readFileSync(new URL('../vendor/plugins/manifest.json', import.meta.url), 'utf8'))
         .plugins.find((plugin: { name: string }) => plugin.name === 'dsh-better-sidebar').version)
-    const adapted = spawnSync('python', ['-c',
+    const shipped = spawnSync('python', ['-c',
       'import sys,zipfile; z=zipfile.ZipFile(sys.argv[1]); print(z.read("home/profiles/desktop/node_modules/dsh-better-sidebar/lib/index.js").decode())', out], { encoding: 'utf8' })
-    expect(adapted.status, adapted.stderr).toBe(0)
-    expect(adapted.stdout).toContain('ctx.get("connection")')
-    expect(adapted.stdout).toContain('ctx.get("webRuntime")?.trustedHosts ?? []')
-    expect(adapted.stdout).not.toContain('ctx.webRuntime.trustedHosts')
-    expect(zip.names).toContain('home/profiles/desktop/node_modules/dsh-better-sidebar/dsh-host-compatibility.json')
+    expect(shipped.status, shipped.stderr).toBe(0)
+    // 0.28.0 起上游原生 inject「connection」并直接用 ctx.connection.requestRejection，
+    // 无需宿主兼容补丁，官方模块原样出货、不落兼容回执。
+    expect(shipped.stdout).toContain('"connection",')
+    expect(shipped.stdout).toContain('const fence = (req) => ctx.connection.requestRejection(req) === void 0;')
+    expect(shipped.stdout).not.toContain('ctx.get("webRuntime")?.trustedHosts ?? []')
+    expect(zip.names).not.toContain('home/profiles/desktop/node_modules/dsh-better-sidebar/dsh-host-compatibility.json')
     for (const name of ['dsh-webops-plugin', 'dsh-context', 'dsh-better-sidebar']) {
       expect(zip.names).toContain(`home/profiles/desktop/node_modules/${name}/package.json`)
     }

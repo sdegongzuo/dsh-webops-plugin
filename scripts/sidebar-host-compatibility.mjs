@@ -2,6 +2,10 @@
  * 按上游 PR #905 适配侧边栏 0.25.0 / 0.26.0 / 0.26.1；官方 tgz 保持原样。
  * 上游 PR #905 尚未合入这两个正式版本，升新版本后先核对 lib/index.js 的
  * inject 与 fence 形状仍匹配 adaptSidebarHostSource 判据，再登记进下方集合。
+ *
+ * 0.28.0 起上游原生 inject「connection」，栅栏直接用
+ * `(req) => ctx.connection.requestRejection(req) === void 0`，与宿主提供的
+ * connection.requestRejection（401/403/undefined）一致，无需补丁、不进下方集合。
  */
 import { createHash } from 'node:crypto'
 import { existsSync, readFileSync, writeFileSync } from 'node:fs'

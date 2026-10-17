@@ -3,23 +3,22 @@
   "plugins": [
     {
       "name": "dsh-context",
-      "version": "0.72.0",
+      "version": "0.73.0",
       "client": true,
-      "tarball": "dsh-context-0.72.0.tgz",
-      "integrity": "sha512-supPJgAYJ6wLZkaZRhAbWolPPZU33Scdw/wtWarj6k81wZPQwVDO82VGz+MAO2XQWNPU4apds1ccaxY99nvW6A==",
-      "source": "https://registry.npmjs.org/dsh-context/-/dsh-context-0.72.0.tgz",
+      "tarball": "dsh-context-0.73.0.tgz",
+      "integrity": "sha512-kDgiLcq2ZzVQOTGw08M1e4k3ALOSch88nTV7w4wWNYYGtZDAbl7nm+FLjPpQ5YlKOS7hGeFw6o9xJIKY6sFWsg==",
+      "source": "https://registry.npmjs.org/dsh-context/-/dsh-context-0.73.0.tgz",
       "repo": "https://github.com/bowenliang123/dsh-context",
       "portableNote": "Context 上下文面板与 /context 命令（透视上下文组成、演进、压缩与剪枝），侧栏一级入口可见",
       "runtimeDependencies": ["zod"]
     },
     {
       "name": "dsh-better-sidebar",
-      "version": "0.26.1",
+      "version": "0.28.0",
       "client": true,
-      "tarball": "dsh-better-sidebar-0.26.1.tgz",
-      "integrity": "sha512-0/BXLEAqFJnd3SI/aryQVFHayrjE+RHcFgWIy57GrCYUeppEFTujfQOkO4U9V4QRd3qTVHFE7DZzNzUyU+kscw==",
-      "source": "https://registry.npmjs.org/dsh-better-sidebar/-/dsh-better-sidebar-0.26.1.tgz",
-      "hostCompatibility": "connection-fence-pr905-v1",
+      "tarball": "dsh-better-sidebar-0.28.0.tgz",
+      "integrity": "sha512-x7+/YmH/HrSlXWOBZkhL7qQqcDgZEnDcWrhR5GlizzUZjz+w84FbQ6jo8trJC9tyaQxMaNvXVnXwDxn4I330Ew==",
+      "source": "https://registry.npmjs.org/dsh-better-sidebar/-/dsh-better-sidebar-0.28.0.tgz",
       "repo": "https://github.com/omdsh-dev/DSH-better-sidebar",
       "portableNote": "开放侧边栏底座：文件树/编辑器、文件变动(Git diff)、任务管理、侧边对话；自带 dsh.bundle.patch（单条 insert + 防双挂载守卫），进 bundles 后由 profile boot 自动合并，无需手写 cordis.patch.yml 挂载行",
       "runtimeDependencies": ["ws", "yaml"]
@@ -32,7 +31,7 @@
       "tarball": "zod-4.6.5.tgz",
       "integrity": "sha512-v5l/aFXZQeai4awLbOpSoHecE9UiMrnfx75tEXLjNonXVARxQ5mOeipTjROUchszUNCqnE+hqAMujRsRHsut2Q==",
       "source": "https://registry.npmjs.org/zod/-/zod-4.6.5.tgz",
-      "satisfies": "dsh-context@0.72.0 dependencies.zod ^4.4.3"
+      "satisfies": "dsh-context@0.73.0 dependencies.zod ^4.4.3"
     },
     {
       "name": "ws",
@@ -40,7 +39,7 @@
       "tarball": "ws-8.22.0.tgz",
       "integrity": "sha512-Ydggc987+RO0AnWtZ/7Wq9FtNvcrL1b/RO0ud9mWjUPgDrsAAwQSF51sm2hm1XofbU/4jkpGEsLFsZZxU+1DOg==",
       "source": "https://registry.npmjs.org/ws/-/ws-8.22.0.tgz",
-      "satisfies": "dsh-better-sidebar@0.26.1 dependencies.ws ^8.18.0"
+      "satisfies": "dsh-better-sidebar@0.28.0 dependencies.ws ^8.18.0"
     },
     {
       "name": "yaml",
@@ -48,7 +47,7 @@
       "tarball": "yaml-2.9.1.tgz",
       "integrity": "sha512-3NxN8+78OdzbT7C/WjGsyfPAtJaN3FNDsWxv7Y7mcDsT/oOmgW8BpyQQFFBnvZE3j9Y2Sdz1ULFLezL7Eb2yFw==",
       "source": "https://registry.npmjs.org/yaml/-/yaml-2.9.1.tgz",
-      "satisfies": "dsh-better-sidebar@0.26.1 dependencies.yaml ^2.9.1"
+      "satisfies": "dsh-better-sidebar@0.28.0 dependencies.yaml ^2.9.1"
     }
   ]
 }
