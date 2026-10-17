@@ -8,3 +8,10 @@ export function slimApp(app: string): {
   locales: { removed: number; bytes: number; missing: never[] }
   legacyPnpm: { removed: boolean; reason: string; bytes: number }
 }
+
+/** 只读核验并生成复制过滤器，输入目录始终保留。 */
+export function planSlimAppCopy(app: string): {
+  excluded: string[]
+  skippedBytes: number
+  filter: (path: string) => boolean
+}

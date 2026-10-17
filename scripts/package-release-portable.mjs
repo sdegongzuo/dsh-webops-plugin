@@ -4,6 +4,7 @@ import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, 
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { readRuntimeDescriptor } from './desktop-runtime.mjs'
+import { planSlimAppCopy } from './slim-portable-app.mjs'
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const args = process.argv.slice(2)
@@ -47,9 +48,9 @@ try {
     throw Error(`DSH ${runtime.release.version} 不在插件声明的 peerDependencies 中`)
   }
   // 复制之前过滤运行时日志，不复制后删除；不读取任何用户 home。
-  cpSync(app, join(stage, 'app'), { recursive: true, filter: path => path !== join(app, 'debug.log') })
-  // 瘦身只动暂存副本：删旧布局重复 pnpm、语言包只留中英文；有任何一处与预期不符就中止打包。
-  run(process.execPath, [join(ROOT, 'scripts/slim-portable-app.mjs'), '--app', join(stage, 'app')])
+  const copyPlan = planSlimAppCopy(app)
+  cpSync(app, join(stage, 'app'), { recursive: true, filter: path => path !== join(app, 'debug.log') && copyPlan.filter(path) })
+  console.log(`只读核验后复制：排除${copyPlan.excluded.length}项、${copyPlan.skippedBytes}字节；输入和暂存均不执行删除`)
   const vendor = JSON.parse(readFileSync(join(ROOT, 'vendor/plugins/manifest.json'), 'utf8'))
   writeFileSync(join(profile, 'package.json'), JSON.stringify({
     name: '@deepseek-ai/dsh-desktop-runtime', private: true, version: '0.0.0',

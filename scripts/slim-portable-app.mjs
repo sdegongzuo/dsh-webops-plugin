@@ -24,7 +24,7 @@
  */
 import { createHash } from 'node:crypto'
 import { existsSync, readFileSync, readdirSync, rmSync, statSync } from 'node:fs'
-import { join } from 'node:path'
+import { join, relative, sep } from 'node:path'
 import { pathToFileURL } from 'node:url'
 
 const allowed = ['--app']
@@ -76,7 +76,7 @@ function md5Of(file) {
   return createHash('md5').update(readFileSync(file)).digest('hex')
 }
 
-function slimLocales(app) {
+function slimLocales(app, excluded) {
   const dir = join(app, 'locales')
   if (!existsSync(dir)) return { removed: 0, bytes: 0, missing: [] }
   const missing = KEEP_LOCALES.filter(name => !existsSync(join(dir, name)))
@@ -90,13 +90,14 @@ function slimLocales(app) {
     const full = join(dir, name)
     if (!statSync(full).isFile()) continue
     bytes += statSync(full).size
-    rmSync(full)
+    if (excluded) excluded.add(full)
+    else rmSync(full)
     removed += 1
   }
   return { removed, bytes, missing: [] }
 }
 
-function slimLegacyPnpm(app) {
+function slimLegacyPnpm(app, excluded) {
   const legacy = join(app, LEGACY_PNPM)
   if (!existsSync(legacy)) return { removed: false, reason: '无旧布局 pnpm（上游已修复或基包不同）', bytes: 0 }
   const canonical = join(app, CANONICAL_PNPM)
@@ -120,7 +121,8 @@ function slimLegacyPnpm(app) {
   }
   const bytes = dirSize(legacy)
   const count = legacyFiles.size
-  rmSync(legacy, { recursive: true, force: true })
+  if (excluded) excluded.add(legacy)
+  else rmSync(legacy, { recursive: true, force: true })
   return { removed: true, reason: `旧布局 pnpm 与现行布局逐字节相同（${String(count)} 个文件 md5 全同），已删`, bytes }
 }
 
@@ -131,6 +133,19 @@ function slimLegacyPnpm(app) {
 export function slimApp(app) {
   if (!existsSync(app) || !statSync(app).isDirectory()) throw Error(`app 目录不存在：${app}`)
   return { locales: slimLocales(app), legacyPnpm: slimLegacyPnpm(app) }
+}
+
+/** 只读核验复制排除项；返回cpSync过滤器，不删除、覆盖或移动输入文件。 */
+export function planSlimAppCopy(app) {
+  if (!existsSync(app) || !statSync(app).isDirectory()) throw Error(`app 目录不存在：${app}`)
+  const excluded = new Set()
+  const locales = slimLocales(app, excluded)
+  const legacyPnpm = slimLegacyPnpm(app, excluded)
+  return {
+    excluded: [...excluded].map(path => relative(app, path)),
+    skippedBytes: locales.bytes + legacyPnpm.bytes,
+    filter: path => ![...excluded].some(exclude => path === exclude || path.startsWith(exclude + sep)),
+  }
 }
 
 function main() {
