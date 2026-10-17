@@ -14,11 +14,11 @@
     },
     {
       "name": "dsh-better-sidebar",
-      "version": "0.26.0",
+      "version": "0.26.1",
       "client": true,
-      "tarball": "dsh-better-sidebar-0.26.0.tgz",
-      "integrity": "sha512-tjWdPvvOgSeHvtPex/5c8pwBUa9zbKTemkGdnbbRgx6Y3oTXxBLqZ/2HJk29wrYKnth8bW3RiLxyFK1M2oa5SA==",
-      "source": "https://registry.npmjs.org/dsh-better-sidebar/-/dsh-better-sidebar-0.26.0.tgz",
+      "tarball": "dsh-better-sidebar-0.26.1.tgz",
+      "integrity": "sha512-0/BXLEAqFJnd3SI/aryQVFHayrjE+RHcFgWIy57GrCYUeppEFTujfQOkO4U9V4QRd3qTVHFE7DZzNzUyU+kscw==",
+      "source": "https://registry.npmjs.org/dsh-better-sidebar/-/dsh-better-sidebar-0.26.1.tgz",
       "hostCompatibility": "connection-fence-pr905-v1",
       "repo": "https://github.com/omdsh-dev/DSH-better-sidebar",
       "portableNote": "开放侧边栏底座：文件树/编辑器、文件变动(Git diff)、任务管理、侧边对话；自带 dsh.bundle.patch（单条 insert + 防双挂载守卫），进 bundles 后由 profile boot 自动合并，无需手写 cordis.patch.yml 挂载行",
@@ -40,7 +40,7 @@
       "tarball": "ws-8.22.0.tgz",
       "integrity": "sha512-Ydggc987+RO0AnWtZ/7Wq9FtNvcrL1b/RO0ud9mWjUPgDrsAAwQSF51sm2hm1XofbU/4jkpGEsLFsZZxU+1DOg==",
       "source": "https://registry.npmjs.org/ws/-/ws-8.22.0.tgz",
-      "satisfies": "dsh-better-sidebar@0.26.0 dependencies.ws ^8.18.0"
+      "satisfies": "dsh-better-sidebar@0.26.1 dependencies.ws ^8.18.0"
     },
     {
       "name": "yaml",
@@ -48,7 +48,7 @@
       "tarball": "yaml-2.9.1.tgz",
       "integrity": "sha512-3NxN8+78OdzbT7C/WjGsyfPAtJaN3FNDsWxv7Y7mcDsT/oOmgW8BpyQQFFBnvZE3j9Y2Sdz1ULFLezL7Eb2yFw==",
       "source": "https://registry.npmjs.org/yaml/-/yaml-2.9.1.tgz",
-      "satisfies": "dsh-better-sidebar@0.26.0 dependencies.yaml ^2.9.1"
+      "satisfies": "dsh-better-sidebar@0.26.1 dependencies.yaml ^2.9.1"
     }
   ]
 }

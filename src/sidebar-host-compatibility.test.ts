@@ -27,6 +27,7 @@ function officialSource(tarball: string): string {
 const sources = {
   '0.25.0': officialSource('dsh-better-sidebar-0.25.0.tgz'),
   '0.26.0': officialSource('dsh-better-sidebar-0.26.0.tgz'),
+  '0.26.1': officialSource('dsh-better-sidebar-0.26.1.tgz'),
 }
 const sha = (text: string) => createHash('sha256').update(text).digest('hex')
 
@@ -41,7 +42,7 @@ function fixture(version: keyof typeof sources, official = sources[version]) {
   return { plugin }
 }
 
-describe.each(['0.25.0', '0.26.0'] as const)('侧边栏宿主服务迁移（正式产物 %s）', version => {
+describe.each(['0.25.0', '0.26.0', '0.26.1'] as const)('侧边栏宿主服务迁移（正式产物 %s）', version => {
   const official = sources[version]
 
   it('正式产物旧必需服务确实缺失，适配后全部服务可满足且信任来源随服务迁移', () => {
@@ -110,7 +111,7 @@ function fence(version: keyof typeof sources, get: (key: string) => unknown) {
 }
 const remote = { method: 'POST', url: '/sidebar/api/fs.read', headers: { host: 'example.com', origin: 'https://example.com' } }
 
-describe.each(['0.25.0', '0.26.0'] as const)('PR905 的实际栅栏行为（正式产物 %s）', version => {
+describe.each(['0.25.0', '0.26.0', '0.26.1'] as const)('PR905 的实际栅栏行为（正式产物 %s）', version => {
   it.each([undefined, 401, 403])('宿主 verdict=%s：401 放行，403 拒绝，并传入原请求头', verdict => {
     let received
     const fn = fence(version, key => key === 'connection' ? { requestRejection: (req: unknown) => { received = req; return verdict } } : undefined)

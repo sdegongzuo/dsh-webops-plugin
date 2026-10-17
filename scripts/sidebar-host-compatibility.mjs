@@ -1,5 +1,5 @@
 /**
- * 按上游 PR #905 适配侧边栏 0.25.0 / 0.26.0；官方 tgz 保持原样。
+ * 按上游 PR #905 适配侧边栏 0.25.0 / 0.26.0 / 0.26.1；官方 tgz 保持原样。
  * 上游 PR #905 尚未合入这两个正式版本，升新版本后先核对 lib/index.js 的
  * inject 与 fence 形状仍匹配 adaptSidebarHostSource 判据，再登记进下方集合。
  */
@@ -21,7 +21,7 @@ const NEW_FENCE = `const fence = (req) => {
 export const SIDEBAR_COMPATIBILITY_PATCH = 'connection-fence-pr905-v1'
 const UPSTREAM_COMMIT = '8f521f4f2aed9e64b1637c512bde9833f22e6219'
 /** 官方 tgz 中 inject/fence 消费点形状与 0.25.0 一致、可直接适配的版本。 */
-export const SIDEBAR_COMPATIBLE_VERSIONS = ['0.25.0', '0.26.0']
+export const SIDEBAR_COMPATIBLE_VERSIONS = ['0.25.0', '0.26.0', '0.26.1']
 
 /** 保留插件原栅栏，以宿主 connection 补充；接受上一版本的已知补丁。 */
 export function adaptSidebarHostSource(source) {
