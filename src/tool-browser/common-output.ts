@@ -225,7 +225,8 @@ export function formatReboundRefs(refs: { ref: string; role: string; name: strin
 }
 
 /** mutation 结果的文本渲染：模型最需要知道的是「页面是否被导航、ref 是否还活着」。 */
-export function formatMutationOutput(value: MutationOutput, snapshotAttached = false): string {
+export function formatMutationOutput(value: MutationOutput, snapshotAttached = false, fullSnapshotAttached = snapshotAttached): string {
+  const snapshotName = fullSnapshotAttached ? 'full snapshot' : 'regional snapshot'
   // 点弹窗链接后**必须**明确点名新标签页：真机报告里模型点开 t2 之后 6 分钟毫不知情，
   // 一直对着旧页面做判断，最后在窗口最小化时发 activate → 撞出整窗空白。
   // 放在最前面（紧跟标题行）是因为它是本次调用里唯一「模型不查就永远不知道」的事实。
@@ -253,7 +254,7 @@ export function formatMutationOutput(value: MutationOutput, snapshotAttached = f
       : '\nNAVIGATION DETECTED: every ref from earlier snapshots is now invalid — run webpage_snapshot again before any ref-based call. '
         + 'The next call is webpage_snapshot, NOT webpage_find: the cached outline was dropped with the navigation, so find has nothing to search.'
     : snapshotAttached
-      ? '\nThe attached full snapshot contains new refs for this page; use them directly.'
+      ? `\nThe attached ${snapshotName} contains current refs; use them directly.`
       : value.observation_error !== undefined
         ? '\nCurrent page state is not observed; refs may be stale.'
       : '\nRefs from the latest snapshot are still valid unless the page changed on its own.'
@@ -271,6 +272,7 @@ export function formatMutationOutput(value: MutationOutput, snapshotAttached = f
   const waitSignals = value.signals === undefined
     ? ''
     : `\nSignals: readyState=${value.signals.readyState}, dom=${value.signals.dom}, network=${value.signals.network}.`
+      + ' 页面安静不证明业务完成；不要仅为再次确认安静重复stable等待。检查附观察中的本轮结果，缺少尾部时读取已知结果区域。'
   const observationError = value.observation_error === undefined
     ? ''
     : `\nACTION DISPATCHED; POST-ACTION OBSERVATION FAILED (${value.observation_error.code}): `
@@ -280,12 +282,12 @@ export function formatMutationOutput(value: MutationOutput, snapshotAttached = f
     : value.satisfied
       ? `\nThe awaited condition became true before the timeout.${waitSignals}`
         + (snapshotAttached
-          ? ' A full snapshot is attached with current refs; continue using them directly.'
+          ? ` A ${snapshotName} is attached with current refs; continue using them directly.`
           : !value.navigated && (value.page_changed?.navigated ?? 0) === 0
           ? ' If needed, read updated text with webpage_snapshot(region_viewport=true) for a visible fragment, or region_ref covering the CURRENT reply; verify its tail before claiming a complete answer.'
           : '')
       : `\nThe awaited condition did NOT become true before the timeout; decide whether to continue waiting or give up.${waitSignals}`
-        + (snapshotAttached ? ' A full snapshot is attached with the current page and usable refs.' : '')
+        + (snapshotAttached ? ` A ${snapshotName} is attached with the current page and usable refs.` : '')
         // 项 2（2026-10-07）：ref 等待超时时，把元素此刻的三态之一讲破 ——
         // 「被隐藏」与「页面没移除它」是两回事，别把隐藏当成提交失败。
         + (value.ref_state === 'hidden'
@@ -305,7 +307,7 @@ export function formatMutationOutput(value: MutationOutput, snapshotAttached = f
   const where = value.title.length > 0 ? `${value.url} — ${value.title}` : value.url
   // 紧挨着 `navigation` 那一段：两句话说的是同一件事的两个侧面（「我这次动作换页了没」与
   // 「页面在我之外换过没」），分开放进 notes 会让模型只读到其中一句（§6.3 的去重意图）。
-  const pageChanged = value.page_changed === undefined ? '' : `\n${formatPageChanged(value.page_changed, snapshotAttached)}`
+  const pageChanged = value.page_changed === undefined ? '' : `\n${formatPageChanged(value.page_changed, fullSnapshotAttached)}`
   return [
     `${value.action} done on session_id=${value.session_id} (now at ${where}, ref epoch ${value.epoch}).`,
     opened,

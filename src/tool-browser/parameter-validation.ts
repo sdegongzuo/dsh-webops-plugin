@@ -107,9 +107,16 @@ function semanticParameterErrors(toolName: string, args: Record<string, unknown>
       nonEmpty('session_id', 'ref')
       if (toolName === 'webpage_click' || toolName === 'webpage_press') {
         nonEmpty('wait_text')
+        nonEmpty('region_ref', 'observe_ref')
+        onlyOne(['region_ref', 'observe_ref'])
+        if (args.region_ref !== undefined && args.observe !== true && args.wait_text === undefined) errors.push('region_ref 必须与 observe=true 或 wait_text 同用')
+        if (args.observe_ref !== undefined && args.observe !== true && args.wait_text === undefined) errors.push('observe_ref 必须与 observe=true 或 wait_text 同用')
         range('timeout_ms', 1, MAX_WAIT_TIME_MS)
-        if (args.timeout_ms !== undefined && args.wait_text === undefined) errors.push('timeout_ms 必须与 wait_text 一起提供')
-        if (args.wait_text !== undefined && args.observe === false) errors.push('wait_text 需要观察，不能与 observe=false 同用')
+        // timeout_ms 有两种合法用法：wait_text 的完成等待期限，或 observe=true 的「动作后等待页面安静」期限。
+        // 既不等完成也不观察时单独的 timeout_ms 没有意义，也不静默忽略。
+        if (args.timeout_ms !== undefined && args.wait_text === undefined && args.observe !== true) {
+          errors.push('timeout_ms 仅在 wait_text（完成等待）或 observe=true（动作后等待页面安静）时允许')
+        }
       }
       if (toolName === 'webpage_press') {
         const key = args.key
@@ -128,7 +135,8 @@ function semanticParameterErrors(toolName: string, args: Record<string, unknown>
       if (args.delta_x === undefined && args.delta_y === undefined) errors.push('必须提供 delta_x 或 delta_y')
       break
     case 'webpage_wait': {
-      nonEmpty('session_id', 'text', 'ref')
+      nonEmpty('session_id', 'text', 'ref', 'region_ref', 'observe_ref')
+      onlyOne(['region_ref', 'observe_ref'])
       const conditions = ['time_ms', 'text', 'ref', 'until'].filter(field => args[field] !== undefined)
       if (conditions.length !== 1) errors.push('time_ms、text、ref、until 必须且只能提供一个')
       range('time_ms', 1, MAX_WAIT_TIME_MS)
@@ -170,6 +178,15 @@ function semanticParameterErrors(toolName: string, args: Record<string, unknown>
     case 'webpage_find':
       nonEmpty('session_id', 'query')
       range('limit', 1, MAX_FIND_LIMIT)
+      if (args.read !== undefined && args.read !== null && typeof args.read === 'object') {
+        if (args.full_text !== true) errors.push('read 续读仅在 full_text=true 时允许')
+        const read = args.read as Record<string, unknown>
+        for (const field of ['observation_id', 'line', 'offset']) {
+          if (typeof read[field] !== 'number' || !Number.isSafeInteger(read[field]) || (read[field] as number) < (field === 'observation_id' ? 1 : 0)) {
+            errors.push(`read.${field} 必须是合法非负整数，observation_id必须大于0`)
+          }
+        }
+      }
       if (args.regex === true && typeof args.query === 'string') {
         try { new RegExp(args.query, 'i') } catch (error) { errors.push(`query 不是有效正则：${(error as Error).message}`) }
       }

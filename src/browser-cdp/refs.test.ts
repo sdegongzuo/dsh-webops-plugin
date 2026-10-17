@@ -7,6 +7,18 @@ function target(role: string, name: string, backendNodeId: number): { role: stri
 }
 
 describe('RefRegistry', () => {
+  it('只有当前纪元的全页publish满足完整观察，区域adopt不能代替首次或导航后观察', () => {
+    const registry = new RefRegistry()
+    expect(registry.hasFullObservation).toBe(false)
+    registry.adopt([target('button', 'Save', 11)])
+    expect(registry.hasFullObservation).toBe(false)
+    registry.publish([target('button', 'Save', 11)], false)
+    expect(registry.hasFullObservation).toBe(true)
+    registry.adopt([target('button', 'Save', 11)])
+    expect(registry.hasFullObservation).toBe(true)
+    registry.invalidate()
+    expect(registry.hasFullObservation).toBe(false)
+  })
   it('publishes a fresh epoch per snapshot and resolves its refs', () => {
     const registry = new RefRegistry()
     const publication = registry.publish([target('button', 'Save', 11)], false)

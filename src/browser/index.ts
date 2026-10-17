@@ -441,15 +441,18 @@ export class BrowserRuntime extends Service {
     caller: BrowserCaller | undefined,
     signal?: AbortSignal,
   ): Promise<BrowserMutationResult> {
+    if ((request.kind === 'wait' || request.kind === 'click' || request.kind === 'press') && request.observeRef !== undefined) {
+      if (request.observeRef.trim().length === 0 || (request.kind !== 'wait' && request.observe !== true && request.waitText === undefined)) {
+        throw new BrowserError('observe_ref requires a non-empty ref and post-action observation', 'BROWSER_INVALID_PARAMS')
+      }
+    }
     if (request.kind === 'click' || request.kind === 'press') {
       if (request.waitText !== undefined && request.waitText.trim().length === 0) {
         throw new BrowserError('wait_text must contain non-whitespace text', 'BROWSER_INVALID_PARAMS')
       }
-      if (request.timeoutMs !== undefined && request.waitText === undefined) {
-        throw new BrowserError('timeout_ms requires wait_text', 'BROWSER_INVALID_PARAMS')
-      }
-      if (request.waitText !== undefined && request.observe === false) {
-        throw new BrowserError('observe=false cannot be combined with wait_text', 'BROWSER_INVALID_PARAMS')
+      // timeout_ms：wait_text 的完成等待期限，或 observe=true 的「动作后等待页面安静」期限。
+      if (request.timeoutMs !== undefined && request.waitText === undefined && request.observe !== true) {
+        throw new BrowserError('timeout_ms requires wait_text or observe=true', 'BROWSER_INVALID_PARAMS')
       }
       if (request.timeoutMs !== undefined
         && (!Number.isInteger(request.timeoutMs) || request.timeoutMs < 1 || request.timeoutMs > 30_000)) {
@@ -459,13 +462,20 @@ export class BrowserRuntime extends Service {
     return this.withLease(request.sessionId, caller, async (provider, ownerId) => {
       const result = await provider.mutate(request, signal)
       let filtered = this.filterOpenedTabs(provider, ownerId, result)
-      if ((request.kind === 'click' || request.kind === 'press') && request.waitText !== undefined) {
+      // 动作后的等待条件：已知本轮完成原文时等文本；只给 observe=true+timeout_ms 时等页面安静（至多 timeout_ms）。
+      const followUpWait: Extract<BrowserMutationRequest, { kind: 'wait' }> | undefined =
+        request.kind === 'click' || request.kind === 'press'
+          ? request.waitText !== undefined
+            ? { kind: 'wait', sessionId: request.sessionId, text: request.waitText,
+              ...(request.timeoutMs !== undefined ? { timeoutMs: request.timeoutMs } : {}) }
+            : request.observe === true && request.timeoutMs !== undefined
+              ? { kind: 'wait', sessionId: request.sessionId, until: 'stable', timeoutMs: request.timeoutMs }
+              : undefined
+          : undefined
+      if (followUpWait !== undefined) {
         let waited: BrowserMutationResult
         try {
-          waited = await provider.mutate({
-            kind: 'wait', sessionId: request.sessionId, text: request.waitText,
-            ...(request.timeoutMs !== undefined ? { timeoutMs: request.timeoutMs } : {}),
-          }, signal)
+          waited = await provider.mutate(followUpWait, signal)
         } catch (error) {
           return {
             ...filtered,
@@ -487,6 +497,7 @@ export class BrowserRuntime extends Service {
           navigated: filtered.navigated || waitResult.navigated,
           ...(pageChanged !== undefined ? { pageChanged } : {}),
           ...(waitResult.satisfied !== undefined ? { satisfied: waitResult.satisfied } : {}),
+          ...waitResult.signals !== undefined ? { signals: waitResult.signals } : {},
           ...(openedTabs.size > 0 ? { openedTabs: [...openedTabs.values()] } : {}),
         })
       }
@@ -495,7 +506,12 @@ export class BrowserRuntime extends Service {
           && (request.observe === true || request.waitText !== undefined))
       if (!shouldSnapshot) return filtered
       try {
-        const snapshot = await provider.observe({ kind: 'snapshot', sessionId: request.sessionId }, signal)
+        const observeRef = request.kind === 'wait' || request.kind === 'click' || request.kind === 'press' ? request.observeRef : undefined
+        const requiresFull = filtered.navigated || (filtered.pageChanged?.navigated ?? 0) > 0
+          || provider.needsReobserve?.(request.sessionId) === true || provider.hasFullObservation?.(request.sessionId) !== true
+        const snapshot = await provider.observe({ kind: 'snapshot', sessionId: request.sessionId,
+          ...observeRef !== undefined && !requiresFull ? { region: { ref: observeRef }, guardGlobal: true } : {},
+        }, signal)
         if (snapshot.kind !== 'snapshot') {
           throw new BrowserError(`mutation received a "${snapshot.kind}" observation`, 'BROWSER_PROTOCOL_ERROR')
         }

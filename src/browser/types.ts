@@ -35,6 +35,8 @@ export type BrowserErrorCode =
   | 'BROWSER_SNAPSHOT_REQUIRED'
   /** ref 属于已作废的纪元。可恢复：重新 snapshot，不要重试同一个 ref。 */
   | 'BROWSER_STALE_REF'
+  /** 缓存观察已更新，旧正文续读位置不可再用；重新find即可，不强制重拍页面。 */
+  | 'BROWSER_OBSERVATION_CHANGED'
   /** 目标 URL 被地址策略拒绝（非 HTTP(S)、含内嵌凭据、超长）。 */
   | 'BROWSER_URL_BLOCKED'
   /** 调试端口连不上（Chrome 没开、端口不对、被防火墙拦）。 */
@@ -214,6 +216,7 @@ const BROWSER_ERROR_RECOVERY: Readonly<Partial<Record<BrowserErrorCode, string>>
   BROWSER_TARGET_NOT_FOUND: 'the session is gone; open the page again with webpage_open.',
   BROWSER_SNAPSHOT_REQUIRED: 'take a webpage_snapshot first, then act on the fresh refs.',
   BROWSER_STALE_REF: 'this ref is obsolete — take a fresh webpage_snapshot and use the new refs; do not retry this ref.',
+  BROWSER_OBSERVATION_CHANGED: 'discard the old read cursor and find the target in the current cached scope; do not re-snapshot only to resume old text.',
   BROWSER_URL_BLOCKED: 'use an http(s) URL without embedded credentials.',
   BROWSER_ENDPOINT_UNREACHABLE: 'check that the browser is running and its debugging port is reachable.',
   BROWSER_NAVIGATION_FAILED: 'check the URL; if the page is slow, retry once or report the site as unreachable.',
@@ -374,6 +377,11 @@ export interface BrowserPageChanged {
 export interface BrowserTextRead {
   readonly line: number
   readonly text: string
+  /** 本次观察内的正文组身份，只用于避免同一正文块重复返回。 */
+  readonly blockId?: string
+  /** 超过内部缓存上限时仍显式报告源长度与截断。 */
+  readonly sourceLength?: number
+  readonly sourceTruncated?: boolean
 }
 
 /**
@@ -383,6 +391,8 @@ export interface BrowserTextRead {
  * 导航或人工接管直接作废。用旧 ref 必须报 `BROWSER_STALE_REF`，绝不能静默命中别的元素。
  */
 export interface BrowserSnapshot {
+  /** 实际观察范围；内部强制回退全页时为full。 */
+  readonly scope?: string
   readonly kind: 'snapshot'
   readonly sessionId: string
   /** 本次观察的 ref 纪元。 */
@@ -485,6 +495,8 @@ export interface BrowserScreenshot {
 export type BrowserObserveRequest =
   | {
     readonly kind: 'snapshot'
+    /** 动作后局部观察检查新浮层，必要时回退全页。显式区域读取默认不启用。 */
+    readonly guardGlobal?: boolean
     readonly sessionId: string
     /**
      * 大纲的行数上限（1-{@link MAX_SNAPSHOT_LINES}）。省略 = provider 默认（800）。
@@ -522,11 +534,13 @@ export type BrowserMutationRequest =
     readonly kind: 'click'
     readonly sessionId: string
     readonly ref: string
-    /** 动作完成后附带一份全页快照。 */
+    /** 动作完成后附带一份快照；已知结果区时用 observeRef 只读该区域，否则为全页。wait_text 存在时观察总会附加。 */
     readonly observe?: boolean
+    /** 仅动作后附观察的区域；导航/交还/新浮层时回退全页。 */
+    readonly observeRef?: string
     /** 等待页面正文出现指定文本；超时后仍附带快照。 */
     readonly waitText?: string
-    /** waitText 的超时预算；省略时使用默认等待时长。 */
+    /** 等待期限：wait_text 的完成等待，或 observe=true 的页面安静等待（至多该毫秒）。省略时用默认等待时长。 */
     readonly timeoutMs?: number
   }
   | { readonly kind: 'fill'; readonly sessionId: string; readonly ref: string; readonly value: string }
@@ -535,11 +549,12 @@ export type BrowserMutationRequest =
     readonly sessionId: string
     readonly ref: string
     readonly key: string
-    /** 动作完成后附带一份全页快照。 */
+    /** 动作完成后附带一份快照；已知结果区时用 observeRef 只读该区域，否则为全页。wait_text 存在时观察总会附加。 */
     readonly observe?: boolean
+    readonly observeRef?: string
     /** 等待页面正文出现指定文本；超时后仍附带快照。 */
     readonly waitText?: string
-    /** waitText 的超时预算；省略时使用默认等待时长。 */
+    /** 等待期限：wait_text 的完成等待，或 observe=true 的页面安静等待（至多该毫秒）。省略时用默认等待时长。 */
     readonly timeoutMs?: number
   }
   | {
@@ -558,6 +573,7 @@ export type BrowserMutationRequest =
   | {
     readonly kind: 'wait'
     readonly sessionId: string
+    readonly observeRef?: string
     /** 纯等待。 */
     readonly timeMs?: number
     /** 等页面文本包含该串。 */
@@ -1057,6 +1073,8 @@ export interface BrowserProvider {
   invalidateSession?(sessionId: string): void
   /** 会话在交还 agent 后是否仍需全页观察；全页 snapshot 后清除。 */
   needsReobserve?(sessionId: string): boolean
+  /** 当前引用纪元是否由完整观察建立；局部附观察不能替代首次/导航后的完整观察。 */
+  hasFullObservation?(sessionId: string): boolean
   /** 归还一个会话：关闭它的标签页并释放连接。 */
   close(sessionId: string): Promise<void>
   /** 释放 provider 持有的全部资源（连接、标签页、进程）。可省略。 */

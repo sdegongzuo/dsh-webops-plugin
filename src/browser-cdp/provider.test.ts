@@ -839,6 +839,21 @@ describe('CdpBrowserProvider', () => {
     expect(region.outline).not.toContain('OVERLAY')
   })
 
+  it('动作后区域观察发现无dialog角色的新浮层时回退全页，仍返回浮层与当前引用', async () => {
+    await provider.open({})
+    const full = await provider.observe({ kind: 'snapshot', sessionId: 'tab-1' })
+    if (full.kind !== 'snapshot') throw new Error('expected snapshot')
+    const ref = full.refs.find(target => target.anchor !== true)!.ref
+    chrome.overlay = { role: 'div', name: '新确认浮层', hint: '#confirm' }
+    const guarded = await provider.observe({ kind: 'snapshot', sessionId: 'tab-1', region: { ref }, guardGlobal: true })
+    if (guarded.kind !== 'snapshot') throw new Error('expected snapshot')
+    expect(guarded.scope).toBe('full')
+    expect(guarded.outline).toContain('OVERLAY')
+    expect(guarded.outline).toContain('新确认浮层')
+    expect(guarded.epoch).toBeGreaterThan(full.epoch)
+    expect(guarded.outsideRegion).toBeUndefined()
+  })
+
   it('region.ref snapshot adopts into the current epoch so earlier refs stay usable', async () => {
     await provider.open({})
     const full = await provider.observe({ kind: 'snapshot', sessionId: 'tab-1' })
@@ -936,8 +951,11 @@ describe('CdpBrowserProvider', () => {
     expect(regional.epoch).toBe(full.epoch)
     expect(regional.outline).toContain('Email')
     expect(regional.outline).not.toContain('Submit')
+    expect(regional.refs.some(entry => entry.name === 'Submit')).toBe(false)
     expect(regional.outsideRegion).toBe(2)
-    const shot = await provider.observe({ kind: 'screenshot', sessionId: 'tab-1', ref: full.refs.find(target => target.anchor !== true)?.ref as string })
+    const outside = full.refs.find(target => target.name === 'Submit')
+    if (outside === undefined) throw new Error('缺少全页中的区域外控件')
+    const shot = await provider.observe({ kind: 'screenshot', sessionId: 'tab-1', ref: outside.ref })
     expect(shot.kind).toBe('screenshot')
   })
 

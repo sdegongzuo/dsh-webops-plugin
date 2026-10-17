@@ -636,13 +636,27 @@ describe('buildOutline：正文读取（项 3 · 2026-10-07）', () => {
     node({ nodeId: '4', role: { value: 'statictext' }, name: { value: LONG_PARAGRAPH }, backendDOMNodeId: 4 }),
   ]
 
-  it('keeps the unclipped paragraph tail on the outline line without printing it', () => {
+  it('正文预览在原字符预算内保留首尾，完整原文仍独立保存', () => {
     const outline = buildOutline(READ_PAGE)
-    // 打印行仍然裁到 120：大纲不加价。
-    expect(outline.lines.some(line => line.text.includes('TAIL_MARKER_9F2'))).toBe(false)
+    const preview = outline.lines.find(line => line.text.startsWith('text '))?.text
+    expect(preview).toContain('This is a very long paragraph')
+    expect(preview).toContain('…')
+    expect(preview).toContain('TAIL_MARKER_9F2.')
+    expect(preview?.length).toBeLessThanOrEqual(DEFAULT_SNAPSHOT_LIMITS.maxTextLength + 'text ""'.length)
     // 底稿行带着未裁切全文（换行/缩进原样），尾部标记能被 full_text 读取拿到。
     const full = outline.unfoldedLines.find(line => line.full?.includes('TAIL_MARKER_9F2'))
     expect(full?.full).toBe(LONG_PARAGRAPH)
+  })
+
+  it('首尾预览不输出半个代理对，极小预算仍有界', () => {
+    const raw = '😀'.repeat(30)
+    for (const maxTextLength of [2, 3, 8, 10, 13]) {
+      const outline = buildOutline([node({ nodeId: '1', role: { value: 'statictext' }, name: { value: raw } })], { ...DEFAULT_SNAPSHOT_LIMITS, maxTextLength })
+      const preview = outline.lines[0]!.text.slice(6, -1)
+      expect(preview.length).toBeLessThanOrEqual(maxTextLength)
+      if (maxTextLength >= 3) expect(preview).not.toMatch(/[\uD800-\uDFFF]/u)
+      expect(outline.unfoldedLines[0]?.full).toBe(raw)
+    }
   })
 
   it('concatenates sibling statictext runs verbatim: runs already carry the whitespace', () => {
@@ -733,15 +747,17 @@ describe('buildOutline：正文读取（项 3 · 2026-10-07）', () => {
     expect(block).toBe(original)
   })
 
-  it('caps oversized text with an explicit truncation account, not a silent cut', () => {
+  it('内部正文缓存有界，源长度单独记录，原文不混入人工截断标记', () => {
     const tree: AxNode[] = [
       node({ nodeId: '1', role: { value: 'RootWebArea' }, childIds: ['2'], backendDOMNodeId: 1 }),
       node({ nodeId: '2', role: { value: 'generic' }, childIds: ['3'], backendDOMNodeId: 2 }),
-      node({ nodeId: '3', role: { value: 'statictext' }, name: { value: 'y'.repeat(5000) }, backendDOMNodeId: 3 }),
+      node({ nodeId: '3', role: { value: 'statictext' }, name: { value: 'y'.repeat(49992) + 'TAIL-739' }, backendDOMNodeId: 3 }),
     ]
     const outline = buildOutline(tree)
     const full = outline.unfoldedLines.find(line => line.full !== undefined)?.full ?? ''
-    expect(full.length).toBeLessThanOrEqual(4100)
-    expect(full).toContain('more chars')
+    expect(full.length).toBe(40000)
+    expect(outline.unfoldedLines.find(line => line.full !== undefined)?.fullLength).toBe(50000)
+    expect(full).not.toContain('truncated')
+    expect(outline.lines[0]?.text).not.toContain('TAIL-739')
   })
 })

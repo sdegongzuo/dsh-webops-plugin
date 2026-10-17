@@ -440,11 +440,13 @@ describe('registration', () => {
     const section = mount().sections[0]
     const text = (section?.text as (context: { scope?: undefined }) => string)({ scope: undefined })
     expect(text).toContain('navigated=true, use its attached snapshot or observe the new document')
-    expect(text).toContain('use wait_text when the next visible text is known')
-    expect(text).toContain('observe=true is for immediate changes with unknown text')
+    expect(text).toContain('已知本轮独有完成标记时')
+    expect(text).toContain('仅click/press用observe=true观察即时变化')
     expect(text).not.toContain('navigated=true, or a ref call')
-    expect(text).toContain('webpage_wait(text=...)')
-    expect(text).toContain('webpage_find and a regional snapshot (region_ref)')
+    expect(text).toContain('webpage_wait(text=..., region_ref=已知区域)')
+    expect(text).toContain('find locates missing or ambiguous targets')
+    expect(text).toContain('snapshot(region_ref=anchor)')
+    expect(text).toContain('without another regional read or execute')
     expect(text).toContain('truncated=true')
     expect(text).toContain('take another snapshot only for missing details')
     expect(text).toContain('Human handback requires a full observation before writing')
@@ -456,7 +458,7 @@ describe('registration', () => {
       webpage_snapshot: ['does NOT invalidate other refs', 'webpage_find', 'truncated=true'],
       webpage_tabs: ['one-time code', 'ends your access', 'kills every ref'],
       webpage_execute: ['async 函数体', 'return 返回普通数据', 'timeout_ms', '副作用'],
-      webpage_wait: ['exactly ONE condition', 'satisfied=false', 'timeout_ms'],
+      webpage_wait: ['恰好一种条件', 'satisfied=false', 'timeout_ms'],
     }
     for (const [name, phrases] of Object.entries(anchors)) {
       for (const phrase of phrases) expect(String(tool(harness, name).description), name).toContain(phrase)
@@ -471,19 +473,28 @@ describe('registration', () => {
   it('流式回复等待当前轮新文本，完成后局部观察，不默认全页重拍', () => {
     const harness = mount()
     const wait = String(tool(harness, 'webpage_wait').description)
-    expect(wait).toContain('text from the CURRENT reply')
-    expect(wait).toContain('one such wait confirms submission too')
+    expect(wait).toContain('本轮独有完成文本')
+    expect(wait).toContain('一次等待可同时确认提交')
     expect(wait).not.toContain('Use until=stable after sending a chat message')
     const snapshot = String(tool(harness, 'webpage_snapshot').description)
     expect(snapshot).toContain('region_viewport reads only the visible fragment')
-    expect(snapshot).toContain('find(query=unique text,full_text=true)')
+    expect(snapshot).toContain('known region_ref')
     expect(snapshot).not.toContain('use it before deciding anything')
     const section = harness.sections[0]
     const text = (section?.text as (context: { scope?: undefined }) => string)({ scope: undefined })
-    expect(text).toContain('not text already present from a previous reply')
-    expect(text).toContain('Wait returns a fresh full snapshot')
-    expect(text).toContain('Use current refs for the next message')
-    expect(text).toContain('do not separately wait for an echo')
+    expect(text).toContain('完成标记必须属于当前轮，不能使用此前已有文本')
+    expect(text).toContain('默认附全页观察；region_ref指定局部')
+    expect(text).toContain('使用其当前refs')
+    expect(text).toContain('不再单独等待输入回显')
+    expect(text).toContain('webpage_click({session_id, ref: submitRef, wait_text: currentCompletionText, region_ref: resultRegionRef})')
+    expect(text).toContain('未知时省略wait_text，使用observe:true和已知region_ref')
+    expect(text).not.toContain('回复1完成')
+    expect(text).toContain('wait始终附观察，不接受observe参数')
+    for (const name of ['webpage_click', 'webpage_press', 'webpage_wait']) {
+      expect(JSON.stringify(tool(harness, name).parameters)).toContain('同snapshot.region_ref')
+      expect(JSON.stringify(tool(harness, name).parameters)).toContain('不是按钮ref')
+    }
+    expect(JSON.stringify(tool(harness, 'webpage_click').parameters)).not.toContain('Add a full snapshot')
     expect(text).not.toContain('use after a chat send')
   })
 
@@ -871,12 +882,48 @@ describe('webpage_tabs and the P1 mutation tools', () => {
     expect(rendered).not.toContain('re-snapshot')
   })
 
+  it.each(['region_ref', 'observe_ref'])('wait通过%s局部附观察刷新相同scope缓存', async field => {
+    harness.snapshotResponse = { ...SNAPSHOT, scope: 'ref:e1', fullTexts: [] }
+    const definition = tool(harness, 'webpage_wait')
+    const result = await definition.execute({ session_id: 's1', text: 'Saved', [field]: 'e1' }, exec())
+    expect(harness.browserCalls.find(call => call.method === 'mutate')?.args).toMatchObject({ observeRef: 'e1' })
+    const rendered = renderText(harness, 'webpage_wait', {}, result)
+    expect(rendered).toContain('regional snapshot')
+    expect(rendered).not.toContain('A full snapshot is attached')
+    expect(await tool(harness, 'webpage_find').execute({ session_id: 's1', query: 'Submit' }, exec())).toMatchObject({ scope: 'ref:e1' })
+  })
+
+  it.each(['webpage_click', 'webpage_press'])('%s的region_ref与旧observe_ref映射同一观察请求', async name => {
+    for (const field of ['region_ref', 'observe_ref']) {
+      harness.browserCalls.length = 0
+      await tool(harness, name).execute({ session_id: 's1', ref: 'e2', wait_text: '本轮完成', [field]: 'e1',
+        ...name === 'webpage_press' ? { key: 'Enter' } : {} }, exec())
+      expect(harness.browserCalls.find(call => call.method === 'mutate')?.args).toMatchObject({
+        sessionId: 's1', ref: 'e2', waitText: '本轮完成', observeRef: 'e1',
+      })
+    }
+  })
+
   it('wait until=stable forwards until and timeout_ms', async () => {
     await tool(harness, 'webpage_wait').execute({ session_id: 's1', until: 'stable', timeout_ms: 20_000 }, exec())
     expect(harness.browserCalls).toEqual([{
       method: 'mutate',
       args: { kind: 'wait', sessionId: 's1', until: 'stable', timeoutMs: 20_000 },
     }])
+  })
+
+  it.each(['webpage_click', 'webpage_press'])('%s保留动作内安静等待信号且回执不冒充业务完成', name => {
+    const definition = tool(harness, name)
+    const value = {
+      session_id: 's1', action: name === 'webpage_click' ? 'click' : 'press', epoch: 5,
+      url: SESSION.url, title: SESSION.title, navigated: false, satisfied: true,
+      signals: { readyState: 'complete', dom: 'quiet', network: 'quiet' },
+    }
+    expect(validateJsonSchemaValue(definition.output.schema, value)).toEqual([])
+    const text = renderText(harness, name, {}, value)
+    expect(text).toContain('Signals: readyState=complete, dom=quiet, network=quiet.')
+    expect(text).toContain('页面安静不证明业务完成')
+    expect(text).toContain('缺少尾部时读取已知结果区域')
   })
 
   it('renders a navigated mutation with the re-snapshot instruction', async () => {
@@ -1288,6 +1335,8 @@ describe('webpage_find / webpage_locate (P3)', () => {
     expect(harness.browserCalls.filter(call => call.method === 'observe')).toHaveLength(1)
     expect(value).toEqual({
       session_id: 's1',
+      observation_id: 1,
+      scope: 'full',
       truncated: false,
       matches: [{ ref: 'e1', role: 'button', name: 'Submit', line: '- button "Submit" [ref=e1]' }],
       durationMs: expect.any(Number),
@@ -1306,6 +1355,69 @@ describe('webpage_find / webpage_locate (P3)', () => {
       .rejects.toThrow(/regular expression/u)
   })
 
+  it('完整正文尾部可检索，区域缓存标范围，同纪元新观察推进版本且不发额外页面命令', async () => {
+    harness.snapshotResponse = {
+      ...SNAPSHOT, fullTexts: [{ line: 0, text: '原文开头' + '背景'.repeat(150) + 'TAIL-739' }],
+    }
+    const snapshot = tool(harness, 'webpage_snapshot')
+    const full = await snapshot.execute({ session_id: 's1' }, exec()) as { observation_id: number; scope: string }
+    const definition = tool(harness, 'webpage_find')
+    const found = await definition.execute({ session_id: 's1', query: 'TAIL-739', full_text: true, limit: 1 }, exec()) as FindResultView
+    expect(found.matches).toHaveLength(1)
+    expect(found.truncated).toBe(false)
+    expect(found).toMatchObject({ scope: 'full', observation_id: full.observation_id })
+    harness.snapshotResponse = { ...SNAPSHOT, fullTexts: [] }
+    const regional = await snapshot.execute({ session_id: 's1', region_ref: 'e1' }, exec()) as { observation_id: number }
+    expect(regional.observation_id).toBeGreaterThan(full.observation_id)
+    const absent = await definition.execute({ session_id: 's1', query: 'TAIL-739' }, exec())
+    expect(absent).toMatchObject({ matches: [], scope: 'ref:e1', observation_id: regional.observation_id })
+    const rendered = definition.output.render({}, absent as never).map(b => b.type === 'text' ? b.text : '').join('\n')
+    expect(rendered).toContain('No match in this cached REGION does not mean absent elsewhere')
+    expect(harness.browserCalls.filter(call => call.method === 'observe')).toHaveLength(2)
+    expect(validateJsonSchemaValue(definition.output.schema, absent)).toEqual([])
+  })
+
+  it('仅在确实存在下一项匹配时报告更多结果', async () => {
+    harness.snapshotResponse = { ...SNAPSHOT, outline: '- text "needle甲"\n- text "needle乙"', fullTexts: [] }
+    await tool(harness, 'webpage_snapshot').execute({ session_id: 's1' }, exec())
+    const found = await tool(harness, 'webpage_find').execute({ session_id: 's1', query: 'needle', limit: 1 }, exec()) as FindResultView
+    expect(found.matches).toHaveLength(1)
+    expect(found.truncated).toBe(true)
+  })
+
+  it('原文按同观察版本续读，区域重拍后拒绝拼接旧页，不触发浏览器读取', async () => {
+    const original = '背景'.repeat(2400) + '\n\n  END-739'
+    harness.snapshotResponse = { ...SNAPSHOT, fullTexts: [{ line: 0, text: original }] }
+    await tool(harness, 'webpage_snapshot').execute({ session_id: 's1' }, exec())
+    const definition = tool(harness, 'webpage_find')
+    interface PageView { observation_id: number; matches: { text: string; line_index: number; next_text_offset?: number; text_complete: boolean }[] }
+    const first = await definition.execute({ session_id: 's1', query: 'END-739', full_text: true }, exec()) as PageView
+    expect(first.matches[0]?.text).toHaveLength(4000)
+    expect(first.matches[0]?.text_complete).toBe(false)
+    const read = { observation_id: first.observation_id, line: first.matches[0]!.line_index, offset: first.matches[0]!.next_text_offset! }
+    const last = await definition.execute({ session_id: 's1', query: 'END-739', full_text: true, read }, exec()) as PageView
+    expect(first.matches[0]!.text + last.matches[0]!.text).toBe(original)
+    expect(last.matches[0]?.text_complete).toBe(true)
+    expect(validateJsonSchemaValue(definition.output.schema, last)).toEqual([])
+    await tool(harness, 'webpage_snapshot').execute({ session_id: 's1', region_ref: 'e1' }, exec())
+    await expect(definition.execute({ session_id: 's1', query: 'END-739', full_text: true, read }, exec()))
+      .rejects.toThrow(expect.objectContaining({ code: 'BROWSER_OBSERVATION_CHANGED' }))
+    expect(harness.browserCalls.filter(call => call.method === 'observe')).toHaveLength(2)
+  })
+
+  it('默认尾部命中有匹配片段，内部缓存截断不被宣称为完整原文', async () => {
+    const original = '背景'.repeat(500) + 'TAIL-739'
+    harness.snapshotResponse = { ...SNAPSHOT, fullTexts: [{ line: 0, text: original, sourceTruncated: true, sourceLength: 50000 }] }
+    await tool(harness, 'webpage_snapshot').execute({ session_id: 's1' }, exec())
+    const definition = tool(harness, 'webpage_find')
+    const plain = await definition.execute({ session_id: 's1', query: 'TAIL-739' }, exec()) as { matches: { excerpt: string }[] }
+    expect(plain.matches[0]?.excerpt).toContain('TAIL-739')
+    expect(plain.matches[0]?.excerpt.length).toBeLessThanOrEqual(200)
+    const full = await definition.execute({ session_id: 's1', query: 'TAIL-739', full_text: true }, exec())
+    expect(full).toMatchObject({ matches: [{ text_complete: false, source_truncated: true }] })
+    expect(renderText(harness, 'webpage_find', {}, full)).toContain('uncached tail is unavailable')
+  })
+
   it('caps matches at limit, clips overlong lines and marks ref-less lines', async () => {
     const longText = 'x'.repeat(300)
     harness.snapshotResponse = {
@@ -1322,7 +1434,8 @@ describe('webpage_find / webpage_locate (P3)', () => {
     const value = await tool(harness, 'webpage_find')
       .execute({ session_id: 's1', query: 'needle', limit: 2 }, exec()) as FindResultView
 
-    expect(value.truncated).toBe(true)
+    // 恰好两项命中且 limit=2，不能宣称还有第三项。
+    expect(value.truncated).toBe(false)
     expect(value.matches).toHaveLength(2)
     expect(value.matches[0]).toMatchObject({ ref: 'e1', role: 'link' })
     const firstLine = (value.matches[0] as { line: string }).line
@@ -1388,6 +1501,25 @@ describe('webpage_find / webpage_locate (P3)', () => {
     const plain = await tool(harness, 'webpage_find').execute({ session_id: 's1', query: '绝对不存在的词' }, exec())
     expect(plain).not.toHaveProperty('outline_truncated')
     expect(render(plain)).not.toContain('TRUNCATED')
+  })
+
+  it('正文缓存截断但零命中时仍报告未缓存尾部，不增加页面读取', async () => {
+    harness.snapshotResponse = {
+      ...SNAPSHOT, truncated: false, fullTexts: [{ line: 0, text: '缓存内原文', sourceTruncated: true, sourceLength: 50000 }],
+    }
+    await tool(harness, 'webpage_snapshot').execute({ session_id: 's1' }, exec())
+    const definition = tool(harness, 'webpage_find')
+    const result = await definition.execute({ session_id: 's1', query: '缓存外尾部' }, exec())
+    expect(result).toMatchObject({ matches: [], cache_text_truncated: true })
+    expect(result).not.toHaveProperty('outline_truncated')
+    expect(renderText(harness, 'webpage_find', {}, result)).toContain('uncached text')
+    expect(validateJsonSchemaValue(definition.output.schema, result)).toEqual([])
+    expect(harness.browserCalls.filter(call => call.method === 'observe')).toHaveLength(1)
+    harness.snapshotResponse = { ...SNAPSHOT, fullTexts: [{ line: 0, text: '完整原文' }] }
+    await tool(harness, 'webpage_snapshot').execute({ session_id: 's1' }, exec())
+    const complete = await definition.execute({ session_id: 's1', query: '缓存外尾部' }, exec())
+    expect(complete).not.toHaveProperty('cache_text_truncated')
+    expect(renderText(harness, 'webpage_find', {}, complete)).not.toContain('uncached text')
   })
 
   it('renders find output with the untrusted-content notice', () => {
@@ -1531,10 +1663,10 @@ describe('webpage_find / webpage_locate (P3)', () => {
     const plain = await tool(harness, 'webpage_find').execute({ session_id: 's1', query: 'Submit' }, exec()) as { matches: { text?: string; block?: string }[] }
     expect(plain.matches[0]?.text).toBeUndefined()
 
-    // full_text=true：正文与整块都回来（代码换行/缩进保留）。
+    // 有完整代码块时优先整块，避免正文行和代码块重复返回；空白保持原样。
     const value = await tool(harness, 'webpage_find')
       .execute({ session_id: 's1', query: 'Submit', full_text: true }, exec()) as { matches: { text?: string; block?: string }[] }
-    expect(value.matches[0]?.text).toBe(FULL)
+    expect(value.matches[0]?.text).toBeUndefined()
     expect(value.matches[0]?.block).toBe('function checkData() {\n  if (ready) {\n    return true;\n  }\n}')
     expect(validateJsonSchemaValue(tool(harness, 'webpage_find').output.schema, value)).toEqual([])
 
@@ -2304,7 +2436,7 @@ describe('T-C 前缀成本守卫', () => {
     expect(total).toBeLessThanOrEqual(20_000)
     for (const phrase of ['BROWSER_TAB_NOT_HELD', 'BROWSER_SNAPSHOT_REQUIRED', 'Never retry obsolete refs',
       'about 30 minutes idle', '副作用不会回滚', 'untrusted external data',
-      'stable, URL and input clearing do not prove a new answer']) {
+      'stable、URL和输入清空不证明回复完成']) {
       expect(prompt).toContain(phrase)
     }
   })

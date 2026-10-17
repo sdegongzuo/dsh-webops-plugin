@@ -1,6 +1,7 @@
 /** 每次 apply 独立持有的大纲缓存及纯文本检索；缓存失效由入口和工具动作驱动。 */
 
 import { FOLD_MARKER_PREFIX } from '../browser-cdp/snapshot.ts'
+import type { BrowserTextRead } from '../browser/types.ts'
 
 // ---------------------------------------------------------------------------
 // P3：webpage_find 的「最近一次 snapshot」缓存与检索
@@ -20,6 +21,8 @@ export type SnapshotCache = Map<string, SnapshotCacheEntry>
 
 interface SnapshotCacheEntry {
   session_id: string
+  /** 每次成功观察的序号；区域观察不推进 epoch，但必须推进此序号。 */
+  observationId: number
   /** 全页缓存为 undefined；区域快照写入时标记，find 回执要声明范围。 */
   region?: string
   /**
@@ -38,8 +41,8 @@ interface SnapshotCacheEntry {
    * 行号与底稿行号对齐。`webpage_find(full_text=true)` 按需读取；不进模型上下文。
    * 导航 / 重拍快照时随整条缓存一起失效（与 outline 同生命周期，纪元语义免费继承）。
    */
-  fullTexts?: readonly { line: number; text: string }[]
-  textBlocks?: readonly { line: number; text: string }[]
+  fullTexts?: readonly BrowserTextRead[]
+  textBlocks?: readonly BrowserTextRead[]
   /**
    * 这次快照的大纲是不是被截断了（B2-e）。
    *
@@ -51,6 +54,11 @@ interface SnapshotCacheEntry {
 
 /** 缓存的会话数上限。 */
 const SNAPSHOT_CACHE_CAPACITY = 32
+/** 每份观察的正文总缓存预算；同组代码只计一次，不为扩展单条上限而放大整个缓存。 */
+export const SNAPSHOT_TEXT_CACHE_CHARS = 1_000_000
+
+/** 随插件缓存生命周期释放，不把页面内容或序号另行落盘。 */
+const observationSequences = new WeakMap<SnapshotCache, number>()
 
 /** `webpage_find` 的默认与最大命中数。 */
 const DEFAULT_FIND_LIMIT = 20
@@ -69,6 +77,14 @@ export interface FindMatch {
   role: string
   name: string
   line: string
+  /** 只在关键词落于被裁切正文时返回的有界匹配片段，不授予操作权限。 */
+  excerpt?: string
+  line_index?: number
+  text_offset?: number
+  text_length?: number
+  text_complete?: boolean
+  next_text_offset?: number
+  source_truncated?: boolean
   /**
    * 项 3 补正（2026-10-08）：`true` = 这条 ref 是**只读文本锚点**（大纲行标 `[anchor=eN]`，
    * 通常是 heading）。它定位内容：`webpage_snapshot(region_ref=锚点)` 读的就是那一节正文，
@@ -97,22 +113,43 @@ export function rememberSnapshot(
   snapshot: Pick<SnapshotCacheEntry, 'session_id' | 'refs' | 'truncated'>,
   searchOutline: string,
   region?: string,
-  fullTexts?: readonly { line: number; text: string }[],
-  textBlocks?: readonly { line: number; text: string }[],
-): void {
+  fullTexts?: readonly BrowserTextRead[],
+  textBlocks?: readonly BrowserTextRead[],
+): SnapshotCacheEntry {
+  const observationId = (observationSequences.get(cache) ?? 0) + 1
+  observationSequences.set(cache, observationId)
+  let remainingText = SNAPSHOT_TEXT_CACHE_CHARS
+  const blockCache = new Map<string, string>()
+  const boundedReads = (reads: readonly BrowserTextRead[] | undefined): BrowserTextRead[] | undefined => reads?.map(read => {
+    let text = read.blockId === undefined ? undefined : blockCache.get(read.blockId)
+    if (text === undefined) {
+      let end = Math.min(read.text.length, remainingText)
+      if (end > 0 && end < read.text.length && /[\uD800-\uDBFF]/u.test(read.text[end - 1]!) && /[\uDC00-\uDFFF]/u.test(read.text[end]!)) end -= 1
+      text = read.text.slice(0, end)
+      remainingText -= text.length
+      if (read.blockId !== undefined) blockCache.set(read.blockId, text)
+    }
+    return { ...read, text, ...text.length < read.text.length ? { sourceTruncated: true, sourceLength: read.sourceLength ?? read.text.length } : {} }
+  })
+  // 先保留完整代码组，剩余预算再分配给段落，避免代码被大量逐token全文挤掉。
+  const boundedBlocks = boundedReads(textBlocks)
+  const boundedFullTexts = boundedReads(fullTexts)
   if (!cache.has(snapshot.session_id) && cache.size >= SNAPSHOT_CACHE_CAPACITY) {
     const oldest = cache.keys().next().value
     if (oldest !== undefined) cache.delete(oldest)
   }
-  cache.set(snapshot.session_id, {
+  const entry: SnapshotCacheEntry = {
     session_id: snapshot.session_id,
+    observationId,
     outline: searchOutline,
     refs: snapshot.refs,
     truncated: snapshot.truncated,
     ...region !== undefined ? { region } : {},
-    ...fullTexts !== undefined ? { fullTexts } : {},
-    ...textBlocks !== undefined && textBlocks.length > 0 ? { textBlocks } : {},
-  })
+    ...boundedFullTexts !== undefined ? { fullTexts: boundedFullTexts } : {},
+    ...boundedBlocks !== undefined && boundedBlocks.length > 0 ? { textBlocks: boundedBlocks } : {},
+  }
+  cache.set(snapshot.session_id, entry)
+  return entry
 }
 
 /** 收窄 `limit`：非法落到默认值，过大压到上限（与 console / network 的 limit 同风格）。 */
@@ -186,37 +223,57 @@ export function searchOutline(
   matcher: (line: string) => boolean,
   limit: number,
   withFullText = false,
+  excerptOf?: (text: string) => string,
+  onlyLine?: number,
 ): FindMatch[] {
   const byRef = new Map(snapshot.refs.map(item => [item.ref, item]))
   const lines = snapshot.outline.length === 0 ? [] : snapshot.outline.split('\n')
   const contexts = outlineContexts(lines)
-  const fullTextByLine = new Map((withFullText ? snapshot.fullTexts ?? [] : []).map(entry => [entry.line, entry.text]))
-  const blockByLine = new Map((withFullText ? snapshot.textBlocks ?? [] : []).map(entry => [entry.line, entry.text]))
+  // 完整正文一直参与匹配；withFullText 只控制是否回传原文。
+  const fullTextByLine = new Map((snapshot.fullTexts ?? []).map(entry => [entry.line, entry.text]))
+  const blockByLine = new Map((snapshot.textBlocks ?? []).map(entry => [entry.line, entry.text]))
+  const blockIds = new Map((snapshot.textBlocks ?? []).map(entry => [entry.line, entry.blockId]))
+  const emittedBlocks = new Set<string>()
+  const fullReads = new Map((snapshot.fullTexts ?? []).map(entry => [entry.line, entry]))
+  const blockReads = new Map((snapshot.textBlocks ?? []).map(entry => [entry.line, entry]))
   const matches: FindMatch[] = []
   for (const [index, line] of lines.entries()) {
+    if (onlyLine !== undefined && index !== onlyLine) continue
     const body = OUTLINE_LINE.exec(line)?.[2]
     // 折叠标记行是插件自己写的注释，不是页面元素：底稿万一就是折叠后的那份，
     // 放它进来会多出一条没有 ref、点不了的幻影命中。
     if (body?.startsWith(FOLD_MARKER_PREFIX) === true) continue
-    if (!matcher(line)) continue
+    const full = fullTextByLine.get(index)
+    const block = blockByLine.get(index)
+    const outlineMatched = matcher(line)
+    const matchedBody = full !== undefined && matcher(full) ? full : block !== undefined && matcher(block) ? block : undefined
+    if (!outlineMatched && matchedBody === undefined) continue
     // `[ref=eN]` = 可操作元素；`[anchor=eN]` = 只读文本锚点（项 3 补正）：能配 region_ref /
     // locate 读内容，click/fill/press 拿它会被 BROWSER_READ_ONLY_ANCHOR 拒绝。
     const marked = /\[(ref|anchor)=(e\d+)\]/u.exec(line)
     const refId = marked?.[2]
     const isAnchor = marked?.[1] === 'anchor'
     const known = refId === undefined ? undefined : byRef.get(refId)
+    const blockId = blockIds.get(index)
+    // 可操作项始终保留各自ref；只合并有真实组身份的只读正文，文本相同不是身份。
+    if (withFullText && blockId !== undefined && refId === undefined) {
+      if (emittedBlocks.has(blockId)) continue
+      emittedBlocks.add(blockId)
+    }
     const context = contexts[index]
-    const full = fullTextByLine.get(index)
-    const block = blockByLine.get(index)
     matches.push({
       ref: known?.ref ?? refId ?? '',
       role: known?.role ?? '',
       name: known?.name ?? '',
       ...(isAnchor ? { anchor: true } : {}),
       line: clipFindText(line, FIND_LINE_MAX_CHARS),
+      ...!withFullText && !outlineMatched && matchedBody !== undefined
+        ? { excerpt: clipFindText(excerptOf?.(matchedBody) ?? matchedBody, FIND_LINE_MAX_CHARS) } : {},
       ...context !== undefined ? { context: clipFindText(context, FIND_CONTEXT_MAX_CHARS) } : {},
-      ...full !== undefined ? { text: full } : {},
-      ...block !== undefined ? { block } : {},
+      ...withFullText && full !== undefined ? { text: full } : {},
+      ...withFullText && block !== undefined ? { block } : {},
+      ...withFullText && (block !== undefined || full !== undefined)
+        ? { line_index: index, source_truncated: (block !== undefined ? blockReads.get(index) : fullReads.get(index))?.sourceTruncated === true } : {},
     })
     if (matches.length >= limit) break
   }

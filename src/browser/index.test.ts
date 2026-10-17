@@ -639,6 +639,32 @@ describe('BrowserRuntime tab ownership', () => {
     await browser.dispose()
   })
 
+  it('已完整观察时wait可附局部快照，保留租约并启用区域外浮层检查', async () => {
+    const { browser, provider } = await mountWithProvider()
+    const session = await browser.open({}, ALICE)
+    Object.assign(provider, { hasFullObservation: () => true })
+    const original = provider.observe.bind(provider)
+    let received: unknown
+    provider.observe = async request => { received = request; return original(request) }
+    await browser.mutate({ kind: 'wait', sessionId: session.id, text: '完成', observeRef: 'e1' }, ALICE)
+    expect(received).toMatchObject({ kind: 'snapshot', region: { ref: 'e1' }, guardGlobal: true })
+    await browser.dispose()
+  })
+
+  it.each(['first', 'handback', 'navigation'] as const)('%s等待必须返回全页，不能以局部观察绕过完整门禁', async mode => {
+    const { browser, provider } = await mountWithProvider()
+    const session = await browser.open({}, ALICE)
+    Object.assign(provider, { hasFullObservation: () => mode !== 'first', needsReobserve: () => mode === 'handback' })
+    const mutate = provider.mutate.bind(provider)
+    provider.mutate = async request => ({ ...await mutate(request), navigated: mode === 'navigation' })
+    const observe = provider.observe.bind(provider)
+    let received: unknown
+    provider.observe = async request => { received = request; return observe(request) }
+    await browser.mutate({ kind: 'wait', sessionId: session.id, text: '完成', observeRef: 'e1' }, ALICE)
+    expect(received).toEqual({ kind: 'snapshot', sessionId: session.id })
+    await browser.dispose()
+  })
+
   it('click wait_text reuses the same lease and queue, then returns one current snapshot', async () => {
     const { browser, provider, adopt } = await mountWithAdoptingProvider()
     const session = await browser.open({}, ALICE)
@@ -747,6 +773,26 @@ describe('BrowserRuntime tab ownership', () => {
     expect(result.snapshot).toMatchObject({ kind: 'snapshot', sessionId: session.id })
     expect(result.epoch).toBe(result.snapshot?.epoch)
     expect(provider.calls.filter(call => call === `mutate:${session.id}`)).toHaveLength(1)
+    expect(provider.calls.filter(call => call === `observe:${session.id}`)).toHaveLength(1)
+    await browser.dispose()
+  })
+
+  it('observe=true 配 timeout_ms 时先等页面安静（until=stable）再观察，仍然只派发一次点击', async () => {
+    const { browser, provider } = await mountWithProvider()
+    const session = await browser.open({}, ALICE)
+    let mutations = 0
+    provider.mutate = async request => {
+      mutations += 1
+      return request.kind === 'wait'
+        ? { kind: 'mutation', sessionId: session.id, action: 'wait', epoch: 6, url: SESSION.url, title: SESSION.title, navigated: false, satisfied: true,
+          signals: { readyState: 'complete', dom: 'quiet', network: 'quiet' } }
+        : { kind: 'mutation', sessionId: session.id, action: 'click', epoch: 4, url: SESSION.url, title: SESSION.title, navigated: false }
+    }
+    const result = await browser.mutate({ kind: 'click', sessionId: session.id, ref: 'e1', observe: true, timeoutMs: 200 }, ALICE)
+    expect(mutations).toBe(2)
+    expect(result).toMatchObject({ action: 'click', satisfied: true, epoch: result.snapshot?.epoch })
+    expect(result.signals).toEqual({ readyState: 'complete', dom: 'quiet', network: 'quiet' })
+    expect(result.snapshot).toMatchObject({ kind: 'snapshot', sessionId: session.id })
     expect(provider.calls.filter(call => call === `observe:${session.id}`)).toHaveLength(1)
     await browser.dispose()
   })

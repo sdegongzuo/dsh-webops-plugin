@@ -30,6 +30,7 @@ import { Context } from '@deepseek-ai/cordis'
 import { LocalAttachmentStore } from '@deepseek-ai/dsh-attachment-local'
 import { CdpBrowserProvider } from './provider.ts'
 import { validateEndpoint } from './url-policy.ts'
+import { DEFAULT_SNAPSHOT_LIMITS } from './snapshot.ts'
 
 const { buildRoot } = await import(new URL('../../scripts/local-env.mjs', import.meta.url).href) as {
   buildRoot(): string
@@ -169,6 +170,9 @@ describe.runIf(PROBE.run)(`live Chrome at ${ENDPOINT}`, () => {
     const region = await provider.observe({ kind: 'snapshot', sessionId: session.id, region: { ref } })
     if (region.kind !== 'snapshot') throw new Error('expected snapshot')
     expect(region.outline).not.toContain('FIRST_ONLY')
+    const preview = /text "([^"\n]*SECOND_SECTION_TAIL)"/u.exec(region.outline)?.[1]
+    expect(preview).toContain('…')
+    expect(preview?.length).toBeLessThanOrEqual(DEFAULT_SNAPSHOT_LIMITS.maxTextLength)
     expect(region.fullTexts?.some(text => text.text === SECTION_TAIL)).toBe(true)
     expect(region.textBlocks?.some(text => text.text === SECTION_CODE)).toBe(true)
     await expect(provider.mutate({ kind: 'click', sessionId: session.id, ref }))

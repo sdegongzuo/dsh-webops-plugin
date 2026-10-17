@@ -47,9 +47,15 @@ describe('网页工具统一参数边界', () => {
     ['webpage_wait', { session_id: 's1', text: 'x', time_ms: 1 }, '只能'],
     ['webpage_wait', { session_id: 's1', text: 'x', ref_state: 'hidden' }, 'ref_state'],
     ['webpage_wait', { session_id: 's1', text: 'x', timeout_ms: 0 }, 'timeout_ms'],
-    ['webpage_click', { session_id: 's1', ref: 'e1', timeout_ms: 200 }, 'wait_text'],
-    ['webpage_press', { session_id: 's1', ref: 'e1', key: 'Enter', wait_text: 'Saved', observe: false }, 'observe=false'],
+    ['webpage_click', { session_id: 's1', ref: 'e1', timeout_ms: 200 }, 'timeout_ms'],
+    ['webpage_press', { session_id: 's1', ref: 'e1', key: 'Enter', timeout_ms: 200, observe: false }, 'timeout_ms'],
     ['webpage_click', { session_id: 's1', ref: 'e1', wait_text: '   ' }, 'wait_text'],
+    ['webpage_click', { session_id: 's1', ref: 'e1', observe_ref: 'e1' }, 'observe_ref'],
+    ['webpage_wait', { session_id: 's1', text: 'x', observe_ref: ' ' }, 'observe_ref'],
+    ['webpage_click', { session_id: 's1', ref: 'e1', region_ref: 'e2' }, 'region_ref'],
+    ['webpage_wait', { session_id: 's1', text: 'x', region_ref: ' ' }, 'region_ref'],
+    ['webpage_wait', { session_id: 's1', text: 'x', region_ref: 'e2', observe_ref: 'e2' }, '互斥'],
+    ['webpage_click', { session_id: 's1', ref: 'e1', observe: true, region_ref: 'e2', observe_ref: 'e3' }, '互斥'],
     ['webpage_snapshot', { session_id: 's1', max_lines: 1.5 }, 'max_lines'],
     ['webpage_snapshot', { session_id: 's1', region_box: { x: 0, y: 0, width: 10, height: 10, extra: 1 } }, 'region_box.extra'],
     ['webpage_scroll', { session_id: 's1', delta_y: Infinity }, 'delta_y'],
@@ -59,6 +65,9 @@ describe('网页工具统一参数边界', () => {
     ['webpage_press', { session_id: 's1', ref: 'e1', key: '\x7f' }, 'ASCII'],
     ['webpage_click', { session_id: ' ', ref: 'e1' }, 'session_id'],
     ['webpage_find', { session_id: 's1', query: '[', regex: true }, '正则'],
+    ['webpage_find', { session_id: 's1', query: 'x', read: { observation_id: 1, line: 0, offset: 0 } }, 'full_text'],
+    ['webpage_find', { session_id: 's1', query: 'x', full_text: true, read: { observation_id: 1, line: 0, offset: -1 } }, 'read.offset'],
+    ['webpage_find', { session_id: 's1', query: 'x', full_text: true, read: { observation_id: 1, line: 0, offset: 0, unexpected: true } }, 'read.unexpected'],
   ] as const)('%s 拒绝非法契约并指出字段 %s', async (name, args, hint) => {
     const h = mount()
     await expect(h.execute(name, args)).rejects.toThrow('BROWSER_INVALID_PARAMS')
@@ -70,6 +79,14 @@ describe('网页工具统一参数边界', () => {
     ['webpage_fill', { session_id: 's1', ref: 'e1', value: '' }],
     ['webpage_press', { session_id: 's1', ref: 'e1', key: ' ' }],
     ['webpage_press', { session_id: 's1', ref: 'e1', key: 'Space' }],
+    ['webpage_click', { session_id: 's1', ref: 'e1', observe: true, region_ref: 'e2' }],
+    ['webpage_press', { session_id: 's1', ref: 'e1', key: 'Enter', wait_text: '完成', region_ref: 'e2' }],
+    // observe=false 与 wait_text 不再拒绝：完成等待总会附观察，observe 字段被忽略而不是报错。
+    ['webpage_press', { session_id: 's1', ref: 'e1', key: 'Enter', wait_text: 'Saved', observe: false }],
+    // 只给 observe=true+timeout_ms：动作后等页面安静至多该毫秒，再观察。
+    ['webpage_click', { session_id: 's1', ref: 'e1', observe: true, timeout_ms: 200 }],
+    ['webpage_press', { session_id: 's1', ref: 'e1', key: 'Enter', observe: true, timeout_ms: 200 }],
+    ['webpage_wait', { session_id: 's1', text: '完成', region_ref: 'e2' }],
     ['webpage_snapshot', { session_id: 's1', region_ref: 'e1', region_viewport: false }],
     ['webpage_screenshot', { session_id: 's1', ref: 'e1', full_page: false }],
     ['webpage_console', { session_id: 's1', text: '' }],

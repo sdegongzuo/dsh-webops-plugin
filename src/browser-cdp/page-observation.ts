@@ -52,6 +52,7 @@ export class PageObservation {
     signal?: AbortSignal,
     maxLines?: number,
     region?: Extract<BrowserObserveRequest, { kind: 'snapshot' }>['region'],
+    guardGlobal = false,
   ): Promise<BrowserSnapshot> {
     const options = { signal, timeoutMs: this.config.commandTimeoutMs }
     const regionKinds = [
@@ -65,12 +66,14 @@ export class PageObservation {
         'BROWSER_PROTOCOL_ERROR',
       )
     }
-    const regional = regionKinds === 1
+    let regional = regionKinds === 1
     let nodes: readonly AxNode[]
     let outsideRegion: number | undefined
+    let globalNodes: readonly AxNode[] | undefined
     if (region?.ref !== undefined) {
       const target = session.refs.resolve(region.ref)
       const full = await session.connection.send<AxTreeResult>('Accessibility.getFullAXTree', {}, options)
+      globalNodes = full.nodes ?? []
       if (target.anchor === true) {
         // heading 本身的 partial AX 不含后续兄弟正文；按真实 DOM 章节范围筛完整 AX。
         const objectId = await this.nodes.resolveObjectId(session, region.ref, signal)
@@ -91,6 +94,7 @@ export class PageObservation {
       outsideRegion = Math.max(0, fullRows - partRows)
     } else if (region?.viewport === true || region?.box !== undefined) {
       const full = await session.connection.send<AxTreeResult>('Accessibility.getFullAXTree', {}, options)
+      globalNodes = full.nodes ?? []
       const keep = await this.backendIdsInRegion(session, region, signal)
       nodes = filterAxTreeByBackendIds(full.nodes ?? [], keep)
       const limits = resolveSnapshotLimits(this.config.snapshotLimits, maxLines)
@@ -101,9 +105,15 @@ export class PageObservation {
       const tree = await session.connection.send<AxTreeResult>('Accessibility.getFullAXTree', {}, options)
       nodes = tree.nodes ?? []
     }
+    const guardedOverlay = regional && guardGlobal ? await this.detectOverlay(session, signal) : undefined
+    if (regional && guardGlobal && (guardedOverlay !== undefined || globalNodes?.some(node => ['dialog', 'alertdialog', 'alert'].includes(String(node.role?.value).toLowerCase())))) {
+      nodes = globalNodes ?? nodes
+      regional = false
+      outsideRegion = undefined
+    }
     const outline = buildOutline(nodes, resolveSnapshotLimits(this.config.snapshotLimits, maxLines))
     // 全页快照才查浮层：区域快照本来就是「只看这一块」，中心被别的块盖住不算异常。
-    const overlay = regional ? undefined : await this.detectOverlay(session, signal)
+    const overlay = regional ? undefined : guardedOverlay ?? await this.detectOverlay(session, signal)
     // 地址与 `loaderId` 必须**随这一份 ref 表一起落地**、不能延后再读（粗门比的就是「发布那一刻的地址」，
     // 晚一步会把人工之间的导航记成快照状态，方案 §5.1.1）。「一起」不是「同一瞬间」：粗门是启发式不是事务。
     const meta = await this.navigation.readPageMeta(session.connection, signal)
@@ -122,8 +132,13 @@ export class PageObservation {
       session.url = meta.url
       session.title = meta.title
     }
+    const observedRefs = new Set(publication.refs.map(ref => ref.ref))
+    const liveRefs = session.refs.list().filter(ref => observedRefs.has(ref.ref))
     return {
       kind: 'snapshot',
+      scope: !regional ? 'full' : region?.ref !== undefined ? `ref:${region.ref}`
+        : region?.viewport === true ? 'viewport'
+          : `box:${region!.box!.x},${region!.box!.y},${region!.box!.width},${region!.box!.height}`,
       sessionId: session.targetId,
       epoch: publication.epoch,
       url: session.url,
@@ -139,17 +154,18 @@ export class PageObservation {
       // 不能 join 成字符串；不进模型上下文，只有 find 按需读取。
       // 空数组也声明正文已采集但无附加全文条目，不能误报缺少快照。
       fullTexts: outline.unfoldedLines
-        .map((line, index) => ({ line: index, text: line.full ?? '' }))
+        .map((line, index) => ({ line: index, text: line.full ?? '', ...line.fullLength !== undefined ? { sourceLength: line.fullLength, sourceTruncated: line.fullLength > (line.full?.length ?? 0) } : {} }))
         .filter(entry => entry.text !== ''),
       ...outline.unfoldedLines.some(line => line.block !== undefined)
         ? {
           textBlocks: outline.unfoldedLines
-            .map((line, index) => ({ line: index, text: line.block ?? '' }))
+            .map((line, index) => ({ line: index, text: line.block ?? '', ...line.blockId !== undefined ? { blockId: line.blockId } : {}, ...line.blockLength !== undefined ? { sourceLength: line.blockLength, sourceTruncated: line.blockLength > (line.block?.length ?? 0) } : {} }))
             .filter(entry => entry.text !== ''),
         }
         : {},
-      refs: session.refs.list(),
-      truncated: publication.truncated,
+      // 回执只计本次观察发布的引用；区域外旧引用仍保留在 registry，可正常解析。
+      refs: liveRefs,
+      truncated: regional ? outline.truncated || liveRefs.length < observedRefs.size : publication.truncated,
       outlineLines: outline.lines.length,
       ...outline.truncated ? { droppedElements: outline.droppedElements } : {},
       ...outline.foldedRepeats > 0 ? { foldedRepeats: outline.foldedRepeats } : {},

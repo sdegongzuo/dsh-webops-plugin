@@ -594,8 +594,8 @@ export class CdpBrowserProvider implements BrowserProvider {
     if (request.kind === 'snapshot') {
       const controlGeneration = session.controlGeneration
       const shouldClearReobserve = session.needsReobserve && session.holder === 'agent'
-      const result = await this.observation.snapshot(session, signal, request.maxLines, request.region)
-      if (request.region === undefined && shouldClearReobserve
+      const result = await this.observation.snapshot(session, signal, request.maxLines, request.region, request.guardGlobal)
+      if ((request.region === undefined || result.scope === 'full') && shouldClearReobserve
         && session.holder === 'agent' && session.controlGeneration === controlGeneration) {
         session.needsReobserve = false
       }
@@ -607,6 +607,10 @@ export class CdpBrowserProvider implements BrowserProvider {
   /** 交还后的重观察状态仅按会话查询；租约 owner 过滤由 BrowserRuntime 执行。 */
   needsReobserve(sessionId: string): boolean {
     return this.sessions.get(sessionId)?.needsReobserve === true
+  }
+
+  hasFullObservation(sessionId: string): boolean {
+    return this.sessions.get(sessionId)?.refs.hasFullObservation === true
   }
 
   refRecoveryState(sessionId: string): number | undefined {

@@ -14,14 +14,19 @@ import {
   SESSION_ID_PARAMETER,
 } from '../common-output.ts'
 import { BrowserError } from '../../browser/index.ts'
+import { pageFindText } from '../find-read.ts'
 
 /** `webpage_find` 的输出。 */
 interface FindOutput {
   session_id: string
+  observation_id: number
+  scope: string
   matches: FindMatch[]
   truncated: boolean
   /** 缓存里那份大纲本身是被截断的（B2-e）：0 命中不等于「页面上没有」。 */
   outline_truncated?: boolean
+  /** 正文缓存有未采集/未保留尾部；即使零命中也必须说明。 */
+  cache_text_truncated?: boolean
   /** 请求了正文读取（项 3）：渲染时把 text/block 带出来。 */
   full_text?: boolean
 }
@@ -46,13 +51,12 @@ interface LocateOutput {
 
 /** find 结果的文本渲染：命中行是不可信数据，逐条列出并附上不可信提示。 */
 function formatFindOutput(value: FindOutput): string {
-  // 0 命中 + 大纲被截断：最可能的原因是「它在被截掉的那半截里」，而不是「页面上没有」。
-  // find 搜的是**已发出**的大纲（不是完整 ref 表），所以这条提示必须出现。
+  // 检索覆盖缓存正文；大纲截断仍代表观察不完整，不能猜测零命中的具体原因。
   const rows = value.matches.length === 0
     ? [value.outline_truncated === true
-      ? '(no outline line matches) — the cached outline was TRUNCATED, so the line you want is probably in '
-        + 'the part that was cut: re-run webpage_snapshot with a larger max_lines and find again.'
-      : '(no outline line matches)']
+      ? '(no cached text matches) — the cached outline was TRUNCATED; this does not prove absence. '
+        + 'Read a known relevant region_ref, or increase max_lines if the required area was omitted.'
+      : '(no cached text matches)']
     : value.matches.map((match) => {
       const tag = match.ref.length > 0 ? `[${match.ref}] ${match.role} "${match.name}" — ` : ''
       // 只读锚点要当场讲破用法与边界：能读不能点（项 3 补正）。
@@ -62,16 +66,28 @@ function formatFindOutput(value: FindOutput): string {
         : ''
       const context = match.context === undefined ? '' : `  ← context: ${match.context}`
       const body = [`- ${tag}${match.line}${context}${anchorNote}`]
+      if (match.excerpt !== undefined) body.push(`  matching excerpt: ${match.excerpt}`)
       // 项 3：full_text=true 时正文按需带出；text 是未裁切整行，block 是整块（代码）。
-      if (match.text !== undefined && match.text !== match.line) body.push(`  text: ${match.text}`)
-      if (match.block !== undefined) body.push(`  block:\n${match.block}`)
+      const original = match.block ?? match.text
+      if (original !== undefined) body.push(`  original_text_json: ${JSON.stringify(original)}`)
+      if (match.text_complete !== undefined) body.push(`  original_complete=${String(match.text_complete)}; line_index=${String(match.line_index)}; text_offset=${String(match.text_offset)}; cached_chars=${String(match.text_length)}`)
+      if (match.next_text_offset !== undefined) body.push(`  Continue with full_text=true and read={observation_id:${value.observation_id},line:${String(match.line_index)},offset:${match.next_text_offset}}; keep the query.`)
+      if (match.source_truncated) body.push('  The source exceeds the internal text cache. Its uncached tail is unavailable here; inspect a smaller source region before claiming complete text.')
       return body.join('\n')
     })
   const lines = [
-    `session_id=${value.session_id} — ${value.matches.length} match(es) in the cached outline of the last webpage_snapshot`,
+    `session_id=${value.session_id} — ${value.matches.length} match(es) in the latest cached outline and text`,
+    ...(value.scope !== undefined && value.observation_id !== undefined
+      ? [`scope=${value.scope}; observation_id=${value.observation_id}. Searches cached text at observation time, not the live page.`]
+      : []),
     ...rows,
   ]
-  if (value.truncated) lines.push('More matches may exist; raise limit or narrow the query.')
+  if (value.matches.length === 0 && value.scope !== undefined && value.scope !== 'full') {
+    lines.push('No match in this cached REGION does not mean absent elsewhere. Read another known region_ref, or take a full snapshot if its location is unknown.')
+  }
+  if (value.truncated) lines.push('More matches exist; raise limit or narrow the query.')
+  if (value.cache_text_truncated) lines.push('cache_text_truncated=true; some source text exceeds the cache budget. A zero match does not prove absence in uncached text. Read a smaller source region, or use a bounded live read when the source cannot be split.')
+  if (value.full_text && value.matches.some(match => match.text !== undefined || match.block !== undefined)) lines.push('Decode original_text_json escapes and preserve all whitespace; outline whitespace is flattened. When original_complete=true and sufficient, use it directly without execute.')
   lines.push('', UNTRUSTED_PAGE_CONTENT_NOTICE)
   return lines.join('\n')
 }
@@ -109,9 +125,16 @@ const FIND_MATCH_SCHEMA = {
     role: { type: 'string', required: true },
     name: { type: 'string', required: true },
     line: { type: 'string', required: true },
+    excerpt: { type: 'string' },
     context: { type: 'string' },
     text: { type: 'string' },
     block: { type: 'string' },
+    line_index: { type: 'integer' },
+    text_offset: { type: 'integer' },
+    text_length: { type: 'integer' },
+    text_complete: { type: 'boolean' },
+    next_text_offset: { type: 'integer' },
+    source_truncated: { type: 'boolean' },
     // 项 3 补正（2026-10-08）：true = 这条 ref 是只读文本锚点（heading 等），
     // 配 webpage_snapshot(region_ref=...) / webpage_locate 读内容，click/fill/press 拒绝。
     anchor: { type: 'boolean' },
@@ -124,10 +147,13 @@ const FIND_OUTPUT_SCHEMA = {
   additionalProperties: false,
   properties: {
     session_id: { type: 'string', required: true },
+    observation_id: { type: 'integer', required: true },
+    scope: { type: 'string', required: true },
     matches: { type: 'array', required: true, items: FIND_MATCH_SCHEMA },
     truncated: { type: 'boolean', required: true },
     // B2-e：缓存的那份大纲本身被截断过（`truncated` 是「命中数到了 limit」，两回事）。
     outline_truncated: { type: 'boolean' },
+    cache_text_truncated: { type: 'boolean' },
     full_text: { type: 'boolean' },
   },
 } as const
@@ -159,22 +185,32 @@ export function registerFind(ctx: Context, cache: SnapshotCache): void {
   ctx.tools.register(defineTool({
     name: 'webpage_find',
     description:
-      'Search the LAST snapshot cache, including folded rows: substring or JS regex. Returns refs/heading context; full_text adds original text/code whitespace. Heading anchor=true selects its own region_ref section, including duplicate headings; anchors grant no writes. No cache: BROWSER_SNAPSHOT_REQUIRED. No page commands.',
+      '搜索最近快照的大纲与缓存正文（含折叠项），先snapshot。返回refs、上下文、scope/observation_id；full_text保留原文空白，超长按read续读。heading anchor=true只读，用region_ref读对应章节（含同名标题）。无缓存：BROWSER_SNAPSHOT_REQUIRED。不发页面命令。',
     parameters: {
       session_id: SESSION_ID_PARAMETER,
       query: {
         type: 'string',
         required: true,
-        description: 'Substring to search for; a JavaScript regular expression when regex=true.',
+        description: '子串；regex=true时为JavaScript正则。',
       },
       regex: {
         type: 'boolean',
-        description: 'Treat query as a regular expression. Default false.',
+        description: '正则模式，默认false。',
       },
-      limit: { type: 'integer', description: 'Maximum matches to return (1-100). Default 20.' },
+      limit: { type: 'integer', description: '命中数1–100，默认20。' },
       full_text: {
         type: 'boolean',
-        description: 'Also return the unclipped text cached at snapshot time (text, and block for code-block lines). Default false.',
+        description: '返回缓存原文：text或完整代码block，每项最多4000字符；默认false。',
+      },
+      read: {
+        type: 'object',
+        additionalProperties: false,
+        description: '仅full_text=true续读：复制observation_id、line_index为line、next_text_offset为offset。缓存已变则拒绝。',
+        properties: {
+          observation_id: { type: 'integer', required: true },
+          line: { type: 'integer', required: true },
+          offset: { type: 'integer', required: true },
+        },
       },
     },
     output: {
@@ -190,13 +226,21 @@ export function registerFind(ctx: Context, cache: SnapshotCache): void {
       if (cached === undefined) {
         throw new BrowserError(
           `no snapshot is cached for session "${args.session_id}"; run webpage_snapshot first, `
-          + 'then webpage_find searches its outline. The cache is dropped by navigation and by every full '
-          + 'webpage_snapshot — after either of those, find cannot answer until you snapshot again',
+          + 'then webpage_find searches its cached text. The cache is dropped by navigation or release; '
+          + 'a successful snapshot establishes a new cache, and a regional snapshot replaces its search scope',
           'BROWSER_SNAPSHOT_REQUIRED',
         )
       }
+      if (args.read !== undefined && args.read.observation_id !== cached.observationId) {
+        throw new BrowserError('Cached observation changed; discard the old continuation and find the text again in the current scope. A new snapshot is not required.', 'BROWSER_OBSERVATION_CHANGED')
+      }
       // regex 解析失败属于参数错误（模型换个写法重试），不是浏览器错误。
       let matcher: (line: string) => boolean
+      let excerptOf: (text: string) => string
+      const around = (text: string, index: number): string => {
+        const start = Math.max(0, index - 60)
+        return `${start > 0 ? '…' : ''}${text.slice(start, start + 190)}`
+      }
       if (args.regex === true) {
         let pattern: RegExp
         try {
@@ -205,15 +249,22 @@ export function registerFind(ctx: Context, cache: SnapshotCache): void {
           throw new Error(`query is not a valid regular expression: ${(error as Error).message}`)
         }
         matcher = line => pattern.test(line)
+        excerptOf = text => around(text, pattern.exec(text)?.index ?? 0)
       } else {
         // 空白归一化匹配（\s 含 NBSP U+00A0）：网页标题里的空格常是不可断行空格，
         // 而模型从渲染文本里抄 query 时拿到的是普通空格——两侧都归一，避免漏匹配。
         const needle = normalizeWhitespace(args.query).toLowerCase()
         matcher = line => normalizeWhitespace(line).toLowerCase().includes(needle)
+        excerptOf = text => {
+          const normalized = normalizeWhitespace(text)
+          return around(normalized, normalized.toLowerCase().indexOf(needle))
+        }
       }
       const limit = normalizeFindLimit(args.limit)
       const fullText = args.full_text === true
-      const matches = searchOutline(cached, matcher, limit, fullText)
+      const candidates = searchOutline(cached, matcher, limit + 1, fullText, excerptOf, args.read?.line)
+      if (args.read !== undefined && candidates.length === 0) throw new BrowserError('read.line does not match this query in the cached observation; find the target again.', 'BROWSER_INVALID_PARAMS')
+      const matches = fullText ? pageFindText(candidates.slice(0, limit), args.read?.offset) : candidates.slice(0, limit)
       if (fullText && cached.fullTexts === undefined) {
         // 缺数据必须明说（项 7 的口径）：这份缓存来自不带正文的旧快照，模型不能猜。
         // 与「0 命中」分开：命中照常返回，只是没有附加正文。
@@ -228,10 +279,13 @@ export function registerFind(ctx: Context, cache: SnapshotCache): void {
       }
       return {
         session_id: args.session_id,
+        observation_id: cached.observationId,
+        scope: cached.region ?? 'full',
         matches,
-        truncated: matches.length >= limit,
+        truncated: candidates.length > limit,
         // 0 命中时「没找到」与「在被截断的那半截里」必须分得开（B2-e）。
         ...cached.truncated ? { outline_truncated: true } : {},
+        ...(cached.fullTexts?.some(read => read.sourceTruncated === true) === true || cached.textBlocks?.some(read => read.sourceTruncated === true) === true) ? { cache_text_truncated: true } : {},
         ...fullText ? { full_text: true } : {},
       }
     },

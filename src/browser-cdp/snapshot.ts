@@ -226,6 +226,10 @@ export interface OutlineLine {
    * statictext 合起来才是完整代码（换行与缩进保留）。 ≥2 个同级 statictext 才产出。
    */
   readonly block?: string
+  /** 本次AX树中的正文组身份；同文不同组不能按字符串合并。 */
+  readonly blockId?: string
+  readonly fullLength?: number
+  readonly blockLength?: number
 }
 
 /** 大纲构建结果。 */
@@ -294,16 +298,33 @@ function clip(raw: string, maxLength: number): string {
   return text.length <= maxLength ? text : `${text.slice(0, maxLength - 1)}…`
 }
 
+/** 只读正文在原预算内保留首尾；省略号明确中间缺失，原文缓存不经过此函数。 */
+function previewText(raw: string, maxLength: number): string {
+  // 超过单项原文缓存上限时仍只显示前缀，不把缓存外尾部拼成可续读的正文。
+  if (raw.length > MAX_TEXT_READ_CHARS) return clip(raw, maxLength)
+  const text = raw.replace(/\s+/gu, ' ').trim()
+  if (text.length <= maxLength) return text
+  if (maxLength < 3) return clip(raw, maxLength)
+  const headLength = Math.floor((maxLength - 1) * 2 / 3)
+  const tailLength = maxLength - 1 - headLength
+  // UTF-16预算仍不增加；切口落在emoji代理对中间时舍去半个字符。
+  const head = text.slice(0, headLength).replace(/[\uD800-\uDBFF]$/u, '')
+  const tail = text.slice(-tailLength).replace(/^[\uDC00-\uDFFF]/u, '')
+  return `${head}…${tail}`
+}
+
 /**
  * 正文读取（项 3）单条文本的硬上限。原始名称不进模型上下文、只经 find(full_text) 按需读取，
  * 但一个 10MB 的 text 节点照样能把缓存撑爆 —— 截断要带账目（少了多少字符），不静默丢尾。
  */
-const MAX_TEXT_READ_CHARS = 4000
+const MAX_TEXT_READ_CHARS = 40000
 
-/** 正文读取的截断标记：显式声明被截掉多少，模型不会把截断当成完整结尾。 */
+/** 内部缓存上限；源长度/截断另传元数据，原文中不插入人工截断标记。 */
 function capTextRead(raw: string): string {
   if (raw.length <= MAX_TEXT_READ_CHARS) return raw
-  return `${raw.slice(0, MAX_TEXT_READ_CHARS - 1)}… [truncated, ${String(raw.length - (MAX_TEXT_READ_CHARS - 1))} more chars]`
+  const end = /[\uD800-\uDBFF]/u.test(raw[MAX_TEXT_READ_CHARS - 1]!) && /[\uDC00-\uDFFF]/u.test(raw[MAX_TEXT_READ_CHARS]!)
+    ? MAX_TEXT_READ_CHARS - 1 : MAX_TEXT_READ_CHARS
+  return raw.slice(0, end)
 }
 
 /** 读取 `{ type, value }` 包装里的可展示文本。 */
@@ -450,7 +471,8 @@ export function buildOutline(
     const anchorRow = !actionable && role === 'heading' && typeof node.backendDOMNodeId === 'number'
 
     let childDepth = depth
-    const text = transparent ? undefined : renderLine(node, role, name, limits.maxTextLength, actionable)
+    const text = transparent ? undefined : renderLine(node, role,
+      role === 'statictext' ? previewText(raw, limits.maxTextLength) : name, limits.maxTextLength, actionable)
     if (text !== undefined) {
       const targetRow = (actionable || anchorRow) && typeof node.backendDOMNodeId === 'number'
         ? rows.push({
@@ -668,6 +690,8 @@ export function buildOutline(
   // 换行，代码格式与字符串语义都被改掉（证据 MDN-code-format-mismatch.json）。
   // 代码按最近 code 祖先分组，跨越高亮 token 的透明包装；普通正文按实际 AX 父节点。
   const staticByParent = new Map<string, string[]>()
+  const blockTexts = new Map<string, string>()
+  const blockLengths = new Map<string, number>()
   for (const candidate of candidates) {
     if (candidate.role !== 'statictext' || candidate.parentAxId === undefined) continue
     const list = staticByParent.get(candidate.parentAxId)
@@ -679,8 +703,12 @@ export function buildOutline(
     if (self === undefined || self.role !== 'statictext' || self.parentAxId === undefined) return undefined
     const siblings = staticByParent.get(self.parentAxId)
     if (siblings === undefined || siblings.length < 2) return undefined
+    const existing = blockTexts.get(self.parentAxId)
+    if (existing !== undefined) return (blockLengths.get(self.parentAxId) ?? 0) > self.raw.length ? existing : undefined
     // 首尾缩进与换行也属于代码原文，不裁掉它们。
     const block = siblings.join('')
+    blockTexts.set(self.parentAxId, capTextRead(block))
+    blockLengths.set(self.parentAxId, block.length)
     return block.length > self.raw.length ? capTextRead(block) : undefined
   }
 
@@ -694,7 +722,10 @@ export function buildOutline(
       text: candidate.text,
       ...candidate.targetRow !== undefined ? { targetRow: candidate.targetRow } : {},
       ...full !== undefined ? { full } : {},
+      ...full !== undefined ? { fullLength: candidate.raw.length } : {},
       ...block !== undefined ? { block } : {},
+      ...block !== undefined && candidate.parentAxId !== undefined ? { blockId: candidate.parentAxId } : {},
+      ...block !== undefined && candidate.parentAxId !== undefined ? { blockLength: blockLengths.get(candidate.parentAxId)! } : {},
     }
     const foldedAway = hiddenRows.has(index)
     if (foldedAway || redundantRows.has(index)) {

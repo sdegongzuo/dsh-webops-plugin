@@ -180,6 +180,11 @@ export class RefRegistry {
   get observed(): boolean {
     return this.targets !== undefined
   }
+  private fullObservedEpoch: number | undefined
+
+  get hasFullObservation(): boolean {
+    return this.fullObservedEpoch === this.epoch
+  }
 
   /**
    * 当前纪元的发布时刻地址；从未观察、或那次 `publish` 没读到地址时为 `undefined`。
@@ -236,6 +241,7 @@ export class RefRegistry {
     // 粗门既比不出东西、又挡住 `restore()` 回填（判据是「没有地址才填」）。
     this.epochUrl = url === undefined || url === '' ? undefined : url
     this.epoch += 1
+    this.fullObservedEpoch = this.epoch
     this.trimLive()
     // `publish()` 的号是**发新的**（跨重启复用走 `pendingRebind`，那是另一个语义：
     // 上一进程的 `backendNodeId` 属于一个已经死掉的进程，拿它比对没有意义）。

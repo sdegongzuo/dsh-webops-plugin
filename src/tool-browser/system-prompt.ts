@@ -23,8 +23,13 @@ export function registerSystemPrompt(ctx: Context): void {
       const ownerId = (scope as { readonly id?: unknown } | undefined)?.id
       const handbackTabs = typeof ownerId === 'string' ? ctx.browser.reobserveRequired(ownerId) : []
       return [
-        'Use browser tools to read and operate controlled tabs.',
+        'Use browser tools to read and operate controlled tabs. Fill user-specified text exactly, without shortening or paraphrasing.',
         UNTRUSTED_PAGE_CONTENT_NOTICE,
+        // 判据与工具清单同源：web_fetch 真的看不见（被本插件屏蔽掉）才说这句，
+        // 屏蔽没装上时这句话也不该出现，否则模型会对着一个还能用的工具被要求别用。
+        ...!visible('web_fetch') && visible('webpage_open')
+          ? ['web_fetch is unavailable here: to read a page, use webpage_open (or webpage_navigate) and then webpage_snapshot.']
+          : [],
         // 初始阶段：模型还没拿到基础组，必须知道下一步怎么拿到，而不是只看到四项就去猜工具名。
         ...visible('webpage_snapshot')
           ? []
@@ -32,14 +37,14 @@ export function registerSystemPrompt(ctx: Context): void {
             + 'After a successful webpage_open (or claiming an idle tab) the basic operation tools — navigate, snapshot, click, fill, press, wait — appear automatically. '
             + 'Load the rest by name with webpage_tools(tools=["webpage_find"]): find, scroll, locate, screenshot, console, network; once loaded they stay for the rest of this conversation.'],
         ...visible('webpage_open')
-          ? ['webpage_open returns a session_id; pass it to every later call.']
+          ? ['webpage_open returns a session_id; pass it to calls that read or operate that tab. webpage_tools only loads tools for this conversation: pass tools only, without session_id.']
           : [],
         ...visible('webpage_snapshot')
           ? ['webpage_snapshot gives a compact accessibility outline and refs such as [ref=e12]. Navigation and full snapshots invalidate refs; regional snapshots (region_ref / region_viewport / region_box) preserve other refs.',
-            'Observe with webpage_snapshot before ref-based actions. BROWSER_STALE_REF and the handback gate BROWSER_SNAPSHOT_REQUIRED may include a fresh full snapshot: the original action was NOT dispatched. Use the included new refs directly after checking the current page; take another snapshot only for missing details. Without an attached snapshot, take a full webpage_snapshot. Never retry obsolete refs. If an action reports navigated=true, use its attached snapshot or observe the new document before further ref use.']
+            'Observe with a full webpage_snapshot before the first find or ref-based action. Find searches the latest cached scope, not the live page; zero regional hits do not mean absent elsewhere. BROWSER_STALE_REF and the handback gate BROWSER_SNAPSHOT_REQUIRED may include a fresh full snapshot: the original action was NOT dispatched. Use the included new refs directly after checking the current page; take another snapshot only for missing details. Without an attached snapshot, take a full webpage_snapshot. Never retry obsolete refs. If an action reports navigated=true, use its attached snapshot or observe the new document before further ref use.']
           : [],
         ...visible('webpage_click') || visible('webpage_press')
-          ? ['For click/press, use wait_text when the next visible text is known: wait and receive new refs in ONE call. observe=true is for immediate changes with unknown text. Use attached refs directly; do not add snapshot/wait unless the needed result is missing. Do not repeat a dispatched action after an observation error.']
+          ? ['已知结果区域时，click/press的附观察也指定region_ref（与snapshot同名），填结果区标题anchor或容器ref，只读相关区域。已知本轮独有完成标记时，把提交、等待和局部观察合为一次调用：webpage_click({session_id, ref: submitRef, wait_text: currentCompletionText, region_ref: resultRegionRef})；Enter提交则用webpage_press并加key:"Enter"。变量来自当前会话及已观察页面；currentCompletionText是本轮真实完成原文，未知时省略wait_text，使用observe:true和已知region_ref（可加timeout_ms等页面安静，避免另发一次等待），不猜标记。observe_ref是兼容旧名，与region_ref互斥。Use attached refs directly; read again only for missing details. Do not repeat a dispatched action after an observation error.']
           : [],
         ...visible('webpage_scroll') || visible('webpage_locate')
           ? ['Scroll without ref targets the viewport centre. webpage_locate measures without scrolling by default; use it to verify movement.']
@@ -65,13 +70,13 @@ export function registerSystemPrompt(ctx: Context): void {
           ? ['Search boxes with autocomplete: after webpage_fill, press Enter on the SAME ref (webpage_press) instead of clicking the submit button — a click can let the suggestion list overwrite the value you just filled.']
           : [],
         ...visible('webpage_find') || visible('webpage_snapshot')
-          ? ['Long pages: after the first full webpage_snapshot, use webpage_find and a regional snapshot (region_ref) instead of re-snapshotting the whole page. Heading matches carry READ-ONLY anchors: snapshot(region_ref=anchor) reads that section, including the second of same-titled sections. The outline is compressed; recover verbatim code/paragraphs with webpage_find(full_text=true) AFTER the regional read. Keep the returned block unchanged, including whitespace and tail; do not guess DOM selectors or Copy-button order. Raise max_lines only when truncated=true.']
+          ? ['Long pages: use known refs directly; find locates missing or ambiguous targets in the latest cache. Heading matches carry READ-ONLY anchors: snapshot(region_ref=anchor) reads that section, including duplicate headings. Find matches cached full text too; full_text=true returns original code/paragraphs. Keep returned whitespace and tail unchanged. When sufficient, continue without another regional read or execute. Raise max_lines only when truncated=true.']
           : [],
         ...visible('webpage_wait') || visible('webpage_click') || visible('webpage_press')
-          ? ['Waiting for generated text: prefer click/press(wait_text=...) when submitting, otherwise use webpage_wait(text=...) for a completion marker unique to the CURRENT reply, not text already present from a previous reply. When that marker also proves submission, wait once; do not separately wait for an echo. Wait returns a fresh full snapshot with the current refs, including after navigation or normal timeout; use those refs in later calls. If the outline is complete, continue without another snapshot. If truncated or exact long text is needed, use webpage_find(full_text=true) or a regional snapshot to recover it. If the marker is unknown, inspect the reply area once; if still unknown, report that completion is unverified instead of repeated waits or resending. stable, URL and input clearing do not prove a new answer. Use current refs for the next message; inspect again when the input has changed.']
+          ? ['等待生成内容：完成标记必须属于当前轮，不能使用此前已有文本；一次完成等待可同时证明提交，不再单独等待输入回显。已提交时用webpage_wait(text=..., region_ref=已知区域)，wait始终附观察，不接受observe参数。标记未知时，仅click/press用observe=true观察即时变化，或局部读取回复区一次；仍未知则报告完成未验证，不反复等待或重发。stable、URL和输入清空不证明回复完成。默认附全页观察；region_ref指定局部，首次、导航、交还或新浮层仍回退全页。正常超时也附观察，使用其当前refs；内容足够就继续，截断或需要精确长原文才find(full_text=true)或区域读取。']
           : [],
         ...visible('webpage_click')
-          ? ['When a click neither navigates nor opens a tab: read the receipt first (it names the target with the next step). A click whose point is covered by another element is REJECTED before dispatch with BROWSER_TARGET_OCCLUDED — close the overlay or act on the element on top, re-snapshot, then click again; do not retry and do not start guessing from console/network. On a hidden (background, reloaded) tab the plugin brings the tab to the foreground before dispatching real mouse/keyboard input; if the page stays hidden after activation the action is rejected with BROWSER_TAB_NOT_VISIBLE and NOTHING is dispatched — show the window / activate the tab, then retry once.']
+          ? ['When a click neither navigates nor opens a tab, read its target and next step in the receipt. BROWSER_TARGET_OCCLUDED rejects input before dispatch: close the overlay or act on top, observe, then click; do not guess from console/network. Hidden tabs are activated before real input; if still hidden, BROWSER_TAB_NOT_VISIBLE rejects without dispatch. Show/activate the window, then retry once. Never bypass rejected real input with DOM clicks or synthetic input in execute.']
           : [],
         ...visible('webpage_snapshot')
           ? ['Looking for a dialog or overlay: never lower max_lines below its default; when the outline reports truncated=true, raise it — overlays without role=dialog sort at the END of the outline and get cut first.']

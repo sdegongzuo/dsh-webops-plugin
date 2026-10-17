@@ -56,6 +56,14 @@ const MUTATION_OUTPUT_SCHEMA = {
     // scroll 才有：滚轮已投递、浏览器没回话。
     unconfirmed: { type: 'boolean' },
     satisfied: { type: 'boolean' },
+    signals: {
+      type: 'object', additionalProperties: false,
+      properties: {
+        readyState: { type: 'string', required: true },
+        dom: { type: 'string', required: true },
+        network: { type: 'string', required: true },
+      },
+    },
     snapshot: SNAPSHOT_OUTPUT_SCHEMA,
     action_dispatched: { type: 'boolean' },
     observation_error: {
@@ -73,32 +81,32 @@ const WAIT_OUTPUT_SCHEMA = {
     ...MUTATION_OUTPUT_SCHEMA.properties,
     satisfied: { type: 'boolean', required: true },
     ref_state: { type: 'string' },
-    signals: {
-      type: 'object',
-      additionalProperties: false,
-      properties: {
-        readyState: { type: 'string', required: true },
-        dom: { type: 'string', required: true },
-        network: { type: 'string', required: true },
-      },
-    },
     snapshot: { ...SNAPSHOT_OUTPUT_SCHEMA, required: true },
   },
 } as const
 
 const POST_ACTION_PARAMETERS = {
-  observe: { type: 'boolean', description: 'Add a full snapshot.' },
-  wait_text: { type: 'string', description: 'Visible body text marker.' },
-  timeout_ms: { type: 'integer', description: '1-30000ms; default 10000.' },
+  observe: { type: 'boolean', description: '布尔值true/false，不加引号。附观察；配timeout_ms等页面安静，不证明完成。region_ref限区域；wait_text时忽略。' },
+  wait_text: { type: 'string', description: '本轮独有完成原文；动作后等待并附观察，可配region_ref。' },
+  timeout_ms: { type: 'integer', description: '整数毫秒，如30000，不加引号；1–30000，默认10000。必须配wait_text或observe=true。' },
+  region_ref: { type: 'string', description: '结果区标题anchor/容器ref，同snapshot.region_ref，不是按钮ref；动作配observe或wait_text。导航/交还/新浮层回退全页。' },
+  observe_ref: { type: 'string', description: '旧名；优先region_ref，二者互斥。' },
 } as const
 
-function postActionOptions(args: Record<string, unknown>): Pick<Extract<BrowserMutationRequest, { kind: 'click' | 'press' }>, 'observe' | 'waitText' | 'timeoutMs'> {
+/** 两个公开参数名只映射一次；互斥与类型在统一参数边界验证。 */
+function observationRegion(args: Record<string, unknown>): { observeRef?: string } {
+  const ref = args['region_ref'] ?? args['observe_ref']
+  return typeof ref === 'string' ? { observeRef: ref } : {}
+}
+
+function postActionOptions(args: Record<string, unknown>): Pick<Extract<BrowserMutationRequest, { kind: 'click' | 'press' }>, 'observe' | 'waitText' | 'timeoutMs' | 'observeRef'> {
   const waitText = args['wait_text']
   const timeoutMs = args['timeout_ms']
   return {
     ...(typeof args['observe'] === 'boolean' ? { observe: args['observe'] } : {}),
     ...(typeof waitText === 'string' ? { waitText } : {}),
     ...(typeof timeoutMs === 'number' ? { timeoutMs } : {}),
+    ...observationRegion(args),
   }
 }
 
@@ -128,10 +136,11 @@ function registerMutationTool(
       render: (_args, value) => {
         const mutation = value as MutationOutput & { snapshot?: SnapshotOutput }
         const hasSnapshot = mutation.snapshot !== undefined
-        const text = formatMutationOutput(mutation, hasSnapshot)
+        const full = hasSnapshot && (mutation.snapshot?.scope === undefined || mutation.snapshot.scope === 'full')
+        const text = formatMutationOutput(mutation, hasSnapshot, full)
         return [{ type: 'text', text: mutation.snapshot === undefined
           ? text
-          : `${text}\n\n${spec.action === 'wait' ? 'Observation after wait' : 'Observation after action'}:\n${formatSnapshotOutput(mutation.snapshot, true)}` }]
+          : `${text}\n\n${spec.action === 'wait' ? 'Observation after wait' : 'Observation after action'}:\n${formatSnapshotOutput(mutation.snapshot, full)}` }]
       },
     },
     timeoutMs: spec.timeoutMs,
@@ -182,7 +191,7 @@ export function registerMutations(
   // "from the latest webpage_snapshot" 是纯浪费（每个工具的 ref 参数描述里已经写了），
   // 而这段 ×4 是每一步都付的前缀成本（方案 §2.T-C2）。
   const STALE_NOTICE =
-    'BROWSER_STALE_REF: use the attached fresh snapshot when present; otherwise take a full snapshot. Never retry old refs.'
+    'BROWSER_STALE_REF: attached fresh snapshot first, else full snapshot; never retry old refs.'
 
   if (enabled.click) registerMutationTool(ctx, cache, {
     name: 'webpage_click',
@@ -194,7 +203,7 @@ export function registerMutations(
       // 模型 6 分钟里毫不知情 —— 于是 provider 侧按会话差集把新标签页写进回执的
       // `opened_tabs`，这里只需告诉模型「看到这个字段就换到那个 session_id 去干活」。
       + 'Popup links return opened_tabs with new session_id(s) in the same window; switch to the content tab. '
-      + 'Use observe=true for new controls; wait_text waits and returns new refs. '
+      + '即时观察用observe；完成等待用wait_text，结果区用region_ref。 '
       + STALE_NOTICE,
     parameters: {
       session_id: SESSION_ID_PARAMETER,
@@ -215,7 +224,7 @@ export function registerMutations(
     parameters: {
       session_id: SESSION_ID_PARAMETER,
       ref: { type: 'string', required: true, description: 'Element ref of the field.' },
-      value: { type: 'string', required: true, description: 'Text to put into the field (replaces the current value).' },
+      value: { type: 'string', required: true, description: '必填：替换字段的完整目标字符串；清空也必须显式传value:""。' },
     },
     timeoutMs: BROWSER_OBSERVE_TIMEOUT_MS,
     build: (args, sessionId) => ({ kind: 'fill', sessionId, ref: args['ref'] as string, value: args['value'] as string }),
@@ -227,7 +236,7 @@ export function registerMutations(
     action: 'press',
     description:
       'Focus a ref and press a named key or one ASCII character. Use webpage_fill for CJK/composed text. Enter may submit; navigated=true invalidates earlier refs. '
-      + 'Use observe=true for new controls; wait_text waits and returns new refs. '
+      + '即时观察用observe；完成等待用wait_text，结果区用region_ref。 '
       + STALE_NOTICE,
     parameters: {
       session_id: SESSION_ID_PARAMETER,
@@ -272,22 +281,25 @@ export function registerMutations(
     name: 'webpage_wait',
     action: 'wait',
     description:
-      'Wait for exactly ONE condition: time_ms, text, ref, or until="stable" (document complete + DOM/network quiet, not reply completion). Prefer completion text from the CURRENT reply; one such wait confirms submission too. time_ms is a fixed delay and cannot combine with timeout_ms. For text/ref/stable, timeout_ms is the shared 1-30000 ms deadline (default 10000); normal timeout returns satisfied=false. On success or normal timeout, returns a full snapshot with usable refs. '
+      '等待恰好一种条件：time_ms、text、ref或until="stable"（文档与DOM/network安静，不证明回复完成）。优先本轮独有完成文本，一次等待可同时确认提交。time_ms固定延时，不与timeout_ms同用；其他条件共享1–30000ms期限，默认10000。成功或正常超时附观察与可用refs，超时satisfied=false；region_ref只观察结果区域，导航/交还/新浮层回退全页。 '
       + STALE_NOTICE,
     parameters: {
       session_id: SESSION_ID_PARAMETER,
       // 「exactly one」只在顶层描述里说一次。四个参数各写一遍是纯重复（方案 §2.T-C2）。
-      time_ms: { type: 'integer', description: 'Plain wait duration in milliseconds (1-30000).' },
-      text: { type: 'string', description: 'Wait until the page text contains this string.' },
+      time_ms: { type: 'integer', description: '固定等待毫秒，1–30000。' },
+      text: { type: 'string', description: '等待页面包含本轮独有完成原文。' },
       ref: { type: 'string', description: 'Element to wait for; see ref_state.' },
       ref_state: { type: 'string', enum: ['removed', 'hidden'], description: 'Only with ref: removed (default) = detached; hidden = attached but invisible.' },
       until: { type: 'string', enum: ['stable'], description: 'Page quietness; timeout_ms sets the shared wait deadline.' },
       timeout_ms: { type: 'integer', description: 'Shared deadline for text/ref/stable (1-30000 ms; default 10000). Cannot combine with time_ms.' },
+      region_ref: POST_ACTION_PARAMETERS.region_ref,
+      observe_ref: POST_ACTION_PARAMETERS.observe_ref,
     },
     timeoutMs: BROWSER_WAIT_TIMEOUT_MS,
     build: (args, sessionId) => ({
       kind: 'wait',
       sessionId,
+      ...observationRegion(args),
       ...typeof args['time_ms'] === 'number' ? { timeMs: args['time_ms'] } : {},
       ...typeof args['text'] === 'string' && args['text'] !== '' ? { text: args['text'] } : {},
       ...typeof args['ref'] === 'string' ? { ref: args['ref'] } : {},

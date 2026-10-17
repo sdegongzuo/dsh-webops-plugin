@@ -6,6 +6,8 @@ import { MAX_SNAPSHOT_LINES, DEFAULT_SNAPSHOT_LIMITS } from '../browser-cdp/snap
 import type { BrowserSnapshot } from '../browser/index.ts'
 /** `webpage_snapshot` 的输出。 */
 export interface SnapshotOutput extends SessionOutput {
+  observation_id?: number
+  scope?: string
   outline: string
   truncated: boolean
   /** 被截断时：实际输出的大纲行数。 */
@@ -16,7 +18,7 @@ export interface SnapshotOutput extends SessionOutput {
   folded_repeats?: number
   /** 因与祖先链上的某行同名而被跳过的行数（同一条链上同一个名字只印一次）。 */
   deduped_lines?: number
-  /** 区域快照：区域外还有几个可操作元素。 */
+  /** 区域外的可引用大纲条目数，包含控件与只读锚点。 */
   outside_region?: number
   refs: { ref: string; role: string; name: string; anchor?: boolean }[]
   /** P3：有人正开着 DevTools 操作这个页面（结果可能随时失效，但 ref 纪元不受影响）。 */
@@ -37,6 +39,7 @@ export function formatSnapshotOutput(snapshot: SnapshotOutput, currentFullSnapsh
       ? `title: ${snapshot.title}`
       : 'title: (empty — the document sets no <title>, or it is still loading)',
     `session_id=${snapshot.session_id} (ref epoch ${snapshot.epoch}, ${controls} actionable controls, ${anchors} read-only anchors)`,
+    ...(snapshot.scope !== undefined ? [`scope=${snapshot.scope}; observation_id=${String(snapshot.observation_id)}`] : []),
   ].join('\n')
   // 两条告警都放在**大纲正文之前**：这份回执的正文可能几千行（实测中位 5516 字符，上限 33285），
   // 塞进末尾的 notes 等于没报 —— 模型读到那段时早就不看后面了。
@@ -66,8 +69,8 @@ export function formatSnapshotOutput(snapshot: SnapshotOutput, currentFullSnapsh
   }
   if (snapshot.outside_region !== undefined) {
     notes.unshift(
-      `${String(snapshot.outside_region)} actionable element(s) sit outside this region. `
-      + 'This outline is not the whole page — take a full webpage_snapshot if you need those refs.',
+      `${String(snapshot.outside_region)} referenceable outline item(s), including controls and read-only anchors, sit outside this region. `
+      + 'Other known region_refs remain usable; take a full snapshot only when the needed location is unknown.',
     )
   }
   if (snapshot.folded_repeats !== undefined) {
@@ -90,7 +93,7 @@ export function formatSnapshotOutput(snapshot: SnapshotOutput, currentFullSnapsh
     // 零 ref 不是错误，是能力边界：必须告诉模型「这页上没东西可操作」以及还能干什么，
     // 否则它只看到一堆没有 ref 的文本，会反复 snapshot 或直接放弃（报告 S4/S5）。
     notes.unshift(
-      'This page has NO actionable elements (no links, buttons, inputs or other controls in the outline), '
+      `${snapshot.scope !== undefined && snapshot.scope !== 'full' ? 'This region' : 'This page'} has NO actionable elements (no links, buttons, inputs or other controls in the outline), `
       + 'so there is nothing to click, fill or press here — ref-based tools have nothing to act on. '
       + 'You can still scroll without a ref, navigate elsewhere, or use webpage_execute.',
     )
@@ -107,7 +110,7 @@ export function formatSnapshotOutput(snapshot: SnapshotOutput, currentFullSnapsh
     // 而全页重拍既贵又会把 find 的缓存换掉。默认行数也要说清，免得它一上来就抬 max_lines。
     notes.push(
       `${String(controls)} actionable element(s) carry refs. For a control you already know: `
-      + 'webpage_find it, then take a regional snapshot (region_ref) for a closer look. '
+      + 'use its current ref directly. Use find or a regional snapshot only for missing details or ambiguous targets. '
       + `Default max_lines is ${String(DEFAULT_SNAPSHOT_LIMITS.maxLines)} — raise it only when the result says truncated.`,
     )
   }
@@ -120,6 +123,7 @@ export const SNAPSHOT_OUTPUT_SCHEMA = {
   type: 'object', additionalProperties: false,
   properties: {
     ...SESSION_OUTPUT_SCHEMA.properties,
+    observation_id: { type: 'integer' }, scope: { type: 'string' },
     outline: { type: 'string', required: true }, truncated: { type: 'boolean', required: true },
     outline_lines: { type: 'integer' }, dropped_elements: { type: 'integer' },
     folded_repeats: { type: 'integer' }, deduped_lines: { type: 'integer' }, outside_region: { type: 'integer' },
@@ -146,8 +150,8 @@ export function toSnapshotOutput(observation: BrowserSnapshot): SnapshotOutput {
 }
 
 /** wait 的全页快照与显式 snapshot 使用同一 find 缓存写入路径。 */
-export function rememberBrowserSnapshot(cache: SnapshotCache, observation: BrowserSnapshot): SnapshotOutput {
+export function rememberBrowserSnapshot(cache: SnapshotCache, observation: BrowserSnapshot, scope = observation.scope ?? 'full'): SnapshotOutput {
   const output = toSnapshotOutput(observation)
-  rememberSnapshot(cache, output, observation.fullOutline ?? observation.outline, undefined, observation.fullTexts, observation.textBlocks)
-  return output
+  const cached = rememberSnapshot(cache, output, observation.fullOutline ?? observation.outline, scope === 'full' ? undefined : scope, observation.fullTexts, observation.textBlocks)
+  return { ...output, observation_id: cached.observationId, scope }
 }

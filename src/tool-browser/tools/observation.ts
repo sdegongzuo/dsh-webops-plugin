@@ -13,10 +13,10 @@ import {
   BROWSER_OBSERVE_TIMEOUT_MS,
 } from '../config.ts'
 import { defineTool, callerOf, observeCall } from '../tool-runtime.ts'
-import { type SnapshotCache, rememberSnapshot } from '../snapshot-cache.ts'
+import { type SnapshotCache } from '../snapshot-cache.ts'
 import type { ToolDisclosure } from '../disclosure.ts'
 import { MAX_SNAPSHOT_LINES, DEFAULT_SNAPSHOT_LIMITS } from '../../browser-cdp/snapshot.ts'
-import { formatSnapshotOutput, SNAPSHOT_OUTPUT_SCHEMA, toSnapshotOutput } from '../snapshot-output.ts'
+import { formatSnapshotOutput, SNAPSHOT_OUTPUT_SCHEMA, rememberBrowserSnapshot } from '../snapshot-output.ts'
 export { formatSnapshotOutput, SNAPSHOT_OUTPUT_SCHEMA, toSnapshotOutput, rememberBrowserSnapshot, type SnapshotOutput } from '../snapshot-output.ts'
 
 /** `webpage_screenshot` 的输出。 */
@@ -189,7 +189,7 @@ export function registerSnapshot(ctx: Context, cache: SnapshotCache): void {
   ctx.tools.register(defineTool({
     name: 'webpage_snapshot',
     description:
-      'Compact AX outline, not verbatim source. Full snapshot invalidates refs; regional does NOT invalidate other refs. Give at most one region_*. Read CURRENT replies with region_ref; region_viewport reads only the visible fragment. Read-only anchors select sections. For exact text: webpage_find heading, snapshot(region_ref=anchor), then find(query=unique text,full_text=true); preserve whitespace and verify the tail. If truncated=true, raise max_lines.',
+      'Compact AX outline, not verbatim source. Full snapshot invalidates refs; regional does NOT invalidate other refs. Give at most one region_*. Read CURRENT replies with a known region_ref; region_viewport reads only the visible fragment. Read-only anchors select sections. Use known refs directly. For exact cached text use webpage_find(full_text=true), preserving whitespace and tail; skip extra reads when complete. If truncated=true, raise max_lines.',
     parameters: {
       session_id: SESSION_ID_PARAMETER,
       max_lines: {
@@ -234,16 +234,15 @@ export function registerSnapshot(ctx: Context, cache: SnapshotCache): void {
         // 能力缝隙按 `kind` 分派，这里不可能拿到别的观察类型；真拿到就是缝隙有 bug。
         throw new Error(`webpage_snapshot received a "${observation.kind}" observation`)
       }
-      const output = toSnapshotOutput(observation)
       // 落缓存给 webpage_find 用：它只查这份大纲，不再发任何 CDP 命令。
       // 底稿 = 打印行 ∪ 被折叠的实例行 —— 折叠标记承诺「用 find 拿全部实例的 ref」，缓存里少了实例，
       // 这句承诺就是假的（provider 不提供 fullOutline 时退回模型看到的那份，至少不更差）。
-      const regional = region !== undefined
       // find 的契约是 LAST snapshot；区域新回复不能继续读旧全页缓存。
-      rememberSnapshot(cache, output, observation.fullOutline ?? observation.outline,
-        regional ? (region.ref !== undefined ? 'ref' : region.viewport === true ? 'viewport' : 'box') : undefined,
-        observation.fullTexts, observation.textBlocks)
-      return output
+      const scope = region === undefined ? 'full'
+        : region.ref !== undefined ? `ref:${region.ref}`
+          : region.viewport === true ? 'viewport'
+            : `box:${region.box!.x},${region.box!.y},${region.box!.width},${region.box!.height}`
+      return rememberBrowserSnapshot(cache, observation, scope)
     },
     presentCall: args => observeCall(`Snapshot ${args.session_id}`, 'read', args.session_id),
   }, cache))
