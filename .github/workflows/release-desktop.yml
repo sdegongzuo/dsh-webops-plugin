@@ -340,7 +340,12 @@ jobs:
         # 代价：一次 host face 的 tsdown（~25s）；`tsc -b` 是增量的，正式那一轮几乎不多花时间。
         #
         # 本机同款验证：`pnpm harness:build`（它内部也做了这一步）。
-        if: steps.base-cache.outputs.cache-hit != 'true'
+        # ⚠️ 不随本体缓存跳过：`verify-portable` 用 tsx 直接跑 harness 源码
+        # （`apps/desktop/src/paths.ts` → `import { resolveDshHome } from '@deepseek-ai/dsh-home-paths'`），
+        # 而全新 checkout 里 `packages/*/lib/index.js`（tsdown 产物、被根 `.gitignore` 的 `lib/` 排除）
+        # 还不存在。缓存只存 `.desktop-base` 的 win-unpacked 产物、**不含 harness 的 workspace lib**，
+        # 所以命中缓存时这一步同样要跑——否则 `verify-portable` 报
+        # `ERR_MODULE_NOT_FOUND: …/dsh-home-paths/lib/index.js`（同版本第二次发版必踩）。
         shell: pwsh
         run: |
           Set-Location $env:HARNESS_ROOT
