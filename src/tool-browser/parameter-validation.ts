@@ -6,6 +6,38 @@ import { MAX_P2_LIMIT, MAX_WAIT_TIME_MS } from '../browser-cdp/provider-config.t
 import { MAX_SNAPSHOT_LINES } from '../browser-cdp/snapshot.ts'
 import { MAX_FIND_LIMIT } from './snapshot-cache.ts'
 
+/**
+ * 布尔字段被写成字符串（`"observe":"true"`）是稳定复现的模型误区：2026-10-18 的 S15 同壳
+ * 对照里，候选侧唯一一次派发前拒绝就是它（`"observe" must be a boolean`），整次调用作废、
+ * 只能重来。schema 严格类型本身没错，但为一个引号丢掉一次完整调用代价明显更高，所以只对这
+ * **一种形状**做窄归一化：字符串 `true`/`false`（去空白、不区分大小写）换成布尔值，其他
+ * 字符串（`"yes"`、`"1"`）照旧按类型错误拒绝，不猜语义。
+ *
+ * 必须**返回副本**、绝不就地改写入参：打包态的宿主传进来的 args 是冻结对象，就地赋值直接抛
+ * `Cannot assign to read only property 'observe'`（2026-10-18 实测，对照组一例就是这么炸的：
+ * `region_ref` + `observe:"true"`），把一次可救的参数误区变成一次真正的工具错误。
+ * 调用方必须拿返回值去执行，否则会出现「校验通过、执行仍读到字符串」的分叉。
+ */
+const BOOLEAN_TEXT: ReadonlyMap<string, boolean> = new Map([['true', true], ['false', false]])
+
+export function normalizeToolArguments(schema: Record<string, unknown>, args: unknown): unknown {
+  const properties = schema['properties']
+  if (args === null || typeof args !== 'object' || Array.isArray(args)) return args
+  if (properties === null || typeof properties !== 'object') return args
+  const record = args as Record<string, unknown>
+  let copy: Record<string, unknown> | undefined
+  for (const [key, property] of Object.entries(properties as Record<string, unknown>)) {
+    const value = record[key]
+    if (typeof value !== 'string') continue
+    if ((property as Record<string, unknown> | null)?.['type'] !== 'boolean') continue
+    const coerced = BOOLEAN_TEXT.get(value.trim().toLowerCase())
+    if (coerced === undefined) continue
+    copy ??= { ...record }
+    copy[key] = coerced
+  }
+  return copy ?? args
+}
+
 /** 在网页工具执行和任何浏览器服务调用前验证参数。 */
 export function validateToolArguments(toolName: string, schema: Record<string, unknown>, args: unknown): void {
   const properties = schema['properties']

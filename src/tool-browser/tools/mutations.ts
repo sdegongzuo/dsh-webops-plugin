@@ -86,10 +86,10 @@ const WAIT_OUTPUT_SCHEMA = {
 } as const
 
 const POST_ACTION_PARAMETERS = {
-  observe: { type: 'boolean', description: '布尔值true/false，不加引号。附观察；配timeout_ms等页面安静，不证明完成。region_ref限区域；wait_text时忽略。' },
+  observe: { type: 'boolean', description: '布尔值true/false，不加引号。附观察，默认只回被操作元素所在区块（全页用snapshot）；配timeout_ms只等安静，不证明完成。region_ref改区域；wait_text时忽略。' },
   wait_text: { type: 'string', description: '本轮独有完成原文；动作后等待并附观察，可配region_ref。' },
   timeout_ms: { type: 'integer', description: '整数毫秒，如30000，不加引号；1–30000，默认10000。必须配wait_text或observe=true。' },
-  region_ref: { type: 'string', description: '结果区标题anchor/容器ref，同snapshot.region_ref，不是按钮ref；动作配observe或wait_text。导航/交还/新浮层回退全页。' },
+  region_ref: { type: 'string', description: '同snapshot.region_ref，不是按钮ref；默认已取被操作元素所在区块，要换才传。导航/交还/新浮层回退全页。' },
   observe_ref: { type: 'string', description: '旧名；优先region_ref，二者互斥。' },
 } as const
 

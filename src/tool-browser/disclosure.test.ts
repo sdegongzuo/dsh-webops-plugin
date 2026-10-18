@@ -383,6 +383,18 @@ describe('逐步披露：工具按对话分阶段可见', () => {
     await expect(bed.run(alice, 'webpage_tools', { tools: [] })).rejects.toThrow(/BROWSER_INVALID_PARAMS/)
   })
 
+  it('照其他工具的样子带上 session_id 不被拒绝，仍然只展开请求到的工具', async () => {
+    const bed = mount()
+    const alice = bed.createAgent('alice')
+    const value = await bed.run(alice, 'webpage_tools', { tools: ['webpage_find'], session_id: 's1' }) as { loaded: string[] }
+    expect(value.loaded).toEqual(['webpage_find'])
+    expect(bed.visible(alice)).toContain('webpage_find')
+    // 只放宽这一个字段：其他未知字段照样整次拒绝。
+    await expect(bed.run(alice, 'webpage_tools', { tools: ['webpage_locate'], tab: 't1' }))
+      .rejects.toThrow(/BROWSER_INVALID_PARAMS/)
+    expect(bed.visible(alice)).not.toContain('webpage_locate')
+  })
+
   it('配置关掉的工具不谎报成已加载', async () => {
     const bed = mount({ find: false })
     const alice = bed.createAgent('alice')

@@ -85,6 +85,13 @@ export function registerToolLoader(ctx: Context, disclosure: ToolDisclosure): vo
         description: 'Tool names to load, e.g. ["webpage_find"]. Unknown names are rejected.',
         items: { type: 'string', enum: [...WEBPAGE_LOADABLE_TOOLS] },
       },
+      // 其余网页工具都按标签收 session_id，模型会顺手一起传（打包态重复出现）。
+      // 加载作用于整个对话而非单个标签，这里接受并忽略，避免为一个多余字段丢掉整次调用。
+      // 描述压到最短：前端 schema 有 14000/9000 字符成本守卫，不为容忍字段加价。
+      session_id: {
+        type: 'string',
+        description: '可选，忽略。',
+      },
     },
     output: {
       schema: LOADER_OUTPUT_SCHEMA,

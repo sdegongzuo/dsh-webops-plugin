@@ -509,8 +509,17 @@ export class BrowserRuntime extends Service {
         const observeRef = request.kind === 'wait' || request.kind === 'click' || request.kind === 'press' ? request.observeRef : undefined
         const requiresFull = filtered.navigated || (filtered.pageChanged?.navigated ?? 0) > 0
           || provider.needsReobserve?.(request.sessionId) === true || provider.hasFullObservation?.(request.sessionId) !== true
+        // 动作后的默认落点是**被操作元素所在的区块**（2026-10-18）：点击能改变的范围几乎总是
+        // 它所在的那一块，而整页重拍正是 S15 单请求峰值 +9.80% 的来源（两条件的区域观察次数
+        // 都是 1，峰值升高只来自「动作驱动的全页」）。显式 region_ref 仍然最优先，其次是这个
+        // 默认区块；两者都不可用时才全页 —— 区块能不能定位由 provider 判断，它拿不到就自己
+        // 回退全页（`region.enclosing` 的降级语义见 PageObservation.snapshot）。
+        const actionRef = request.kind === 'click' || request.kind === 'press' ? request.ref : undefined
+        const region = observeRef !== undefined
+          ? { ref: observeRef }
+          : actionRef !== undefined ? { enclosing: actionRef } : undefined
         const snapshot = await provider.observe({ kind: 'snapshot', sessionId: request.sessionId,
-          ...observeRef !== undefined && !requiresFull ? { region: { ref: observeRef }, guardGlobal: true } : {},
+          ...region !== undefined && !requiresFull ? { region, guardGlobal: true } : {},
         }, signal)
         if (snapshot.kind !== 'snapshot') {
           throw new BrowserError(`mutation received a "${snapshot.kind}" observation`, 'BROWSER_PROTOCOL_ERROR')

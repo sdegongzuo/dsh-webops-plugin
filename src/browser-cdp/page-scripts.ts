@@ -70,6 +70,46 @@ export const HIT_TEST_FUNCTION = 'function (point) {'
   + ' }'
 
 /**
+ * 动作后默认观察（2026-10-18）：把**被操作的元素**换算成它所在的「内容区块」。
+ *
+ * 为什么需要它：`click{observe:true}` 过去一律重拍全页，而模型要知道的往往只是「我这一下
+ * 改变了哪一块」。S15 同壳对照实测：候选条件 4 次全页观察把单请求峰值顶高 9.80%，而两条件
+ * 的区域观察次数都是 1 —— 峰值升高完全来自「动作驱动的那几次全页」。所以默认落点是区块，
+ * 不是整页；区块不可用时调用方回退全页（判据见 `PageObservation`）。
+ *
+ * **返回元素而不是 backendNodeId**：页面脚本拿不到 CDP 的节点号，只能把节点本身交回去
+ * （`returnByValue: false` → `result.objectId`），再由调用方 `DOM.describeNode` 换号。
+ *
+ * 选区块的次序（自内向外，命中即停）：
+ * 1. 语义地标 / 块级容器：`section`、`article`、`main`、`nav`、`form`、`li`、`tr`、`td` …；
+ * 2. 带块级 role 的元素（`listitem`、`row`、`tabpanel`、`dialog` …）—— 大量 SPA 只用 div + role；
+ * 3. 都没有就是 `body` / `html`：**返回 null**，绝不把整页当区块（那等于没优化，还会让
+ *    调用方误以为「已按区块观察」，从而不再做全页兜底）。
+ *
+ * 上限 40 层只是防御环状 / 病态 DOM；真实页面到 body 通常不超过 15 层。
+ */
+export const ENCLOSING_BLOCK_FUNCTION = 'function () {'
+  + ' const blockTags = "section,article,main,nav,aside,header,footer,form,fieldset,figure,dialog,li,tr,td,details";'
+  + ' const blockRoles = ["article","region","group","listitem","row","rowgroup","tabpanel","dialog",'
+  + '   "main","navigation","complementary","form","search","list","grid","tree","menu"];'
+  + ' const asBlock = (el) => {'
+  + '   if (!el || el.nodeType !== 1) return null;'
+  + '   const tag = String(el.tagName || "").toUpperCase();'
+  + '   if (tag === "BODY" || tag === "HTML") return null;'
+  + '   const role = String(el.getAttribute("role") || "").toLowerCase();'
+  + '   if (blockRoles.indexOf(role) >= 0) return el;'
+  + '   try { if (el.matches(blockTags)) return el; } catch (e) { return null; }'
+  + '   return null;'
+  + ' };'
+  + ' let node = this;'
+  + ' for (let hops = 0; node && node.nodeType === 1 && hops < 40; node = node.parentElement, hops++) {'
+  + '   const enclosingBlock = asBlock(node);'
+  + '   if (enclosingBlock !== null) return enclosingBlock;'
+  + ' }'
+  + ' return null;'
+  + ' }'
+
+/**
  * 视口中心浮层探测（B2-d）。
  *
  * 从 `elementFromPoint` 命中的那个元素往上走，找第一个「定位在浮层里」的祖先：

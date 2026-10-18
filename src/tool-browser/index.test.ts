@@ -483,7 +483,7 @@ describe('registration', () => {
     const section = harness.sections[0]
     const text = (section?.text as (context: { scope?: undefined }) => string)({ scope: undefined })
     expect(text).toContain('完成标记必须属于当前轮，不能使用此前已有文本')
-    expect(text).toContain('默认附全页观察；region_ref指定局部')
+    expect(text).toContain('默认附观察只回被操作元素所在区块')
     expect(text).toContain('使用其当前refs')
     expect(text).toContain('不再单独等待输入回显')
     expect(text).toContain('webpage_click({session_id, ref: submitRef, wait_text: currentCompletionText, region_ref: resultRegionRef})')

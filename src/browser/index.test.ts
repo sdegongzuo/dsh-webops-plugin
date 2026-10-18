@@ -651,6 +651,32 @@ describe('BrowserRuntime tab ownership', () => {
     await browser.dispose()
   })
 
+  it('click 附观察时默认落在被操作元素所在区块，显式区域仍然优先，首次观察仍全页', async () => {
+    const { browser, provider } = await mountWithProvider()
+    const session = await browser.open({}, ALICE)
+    const original = provider.observe.bind(provider)
+    const received: unknown[] = []
+    provider.observe = async request => { received.push(request); return original(request) }
+
+    // ① 纪元还不是「完整观察过」：区块观察不能替代首次全页（否则模型连页面上有什么都不知道）。
+    await browser.mutate({ kind: 'click', sessionId: session.id, ref: 'e7', observe: true }, ALICE)
+    expect(received[0]).toEqual({ kind: 'snapshot', sessionId: session.id })
+
+    Object.assign(provider, { hasFullObservation: () => true })
+    // ② 已完整观察过：默认落点是被操作元素所在区块。
+    await browser.mutate({ kind: 'click', sessionId: session.id, ref: 'e7', observe: true }, ALICE)
+    expect(received[1]).toMatchObject({ kind: 'snapshot', region: { enclosing: 'e7' }, guardGlobal: true })
+
+    // ③ 模型点名的区域比默认区块权威。
+    await browser.mutate({ kind: 'click', sessionId: session.id, ref: 'e7', observe: true, observeRef: 'e9' }, ALICE)
+    expect(received[2]).toMatchObject({ kind: 'snapshot', region: { ref: 'e9' }, guardGlobal: true })
+
+    // ④ wait 没有「被操作元素」，不凭空造一个区块。
+    await browser.mutate({ kind: 'wait', sessionId: session.id, timeMs: 1 }, ALICE)
+    expect(received[3]).toEqual({ kind: 'snapshot', sessionId: session.id })
+    await browser.dispose()
+  })
+
   it.each(['first', 'handback', 'navigation'] as const)('%s等待必须返回全页，不能以局部观察绕过完整门禁', async mode => {
     const { browser, provider } = await mountWithProvider()
     const session = await browser.open({}, ALICE)

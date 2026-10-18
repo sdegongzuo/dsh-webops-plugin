@@ -68,6 +68,8 @@ describe('网页工具统一参数边界', () => {
     ['webpage_find', { session_id: 's1', query: 'x', read: { observation_id: 1, line: 0, offset: 0 } }, 'full_text'],
     ['webpage_find', { session_id: 's1', query: 'x', full_text: true, read: { observation_id: 1, line: 0, offset: -1 } }, 'read.offset'],
     ['webpage_find', { session_id: 's1', query: 'x', full_text: true, read: { observation_id: 1, line: 0, offset: 0, unexpected: true } }, 'read.unexpected'],
+    // 布尔字段写成字符串只归一化 true/false；其他写法仍然按类型错误拒绝（不猜语义）。
+    ['webpage_click', { session_id: 's1', ref: 'e1', observe: 'yes', timeout_ms: 200 }, 'boolean'],
   ] as const)('%s 拒绝非法契约并指出字段 %s', async (name, args, hint) => {
     const h = mount()
     await expect(h.execute(name, args)).rejects.toThrow('BROWSER_INVALID_PARAMS')
@@ -92,9 +94,23 @@ describe('网页工具统一参数边界', () => {
     ['webpage_console', { session_id: 's1', text: '' }],
     ['webpage_network', { session_id: 's1', action: 'list', url: '' }],
     ['webpage_scroll', { session_id: 's1', delta_y: 0.5 }],
+    // 字符串布尔归一化（返回副本）：`timeout_ms` 与 `region_ref` 两个语义门都要求
+    // observe===true，能被放行就证明下游读到的是布尔值，而不是「校验通过、执行还拿到字符串」。
+    ['webpage_click', { session_id: 's1', ref: 'e1', observe: 'true', timeout_ms: 200 }],
+    ['webpage_click', { session_id: 's1', ref: 'e1', observe: ' TRUE ', region_ref: 'e2' }],
   ] as const)('%s 合法边界保持可派发，服务异常不改写为参数错误', async (name, args) => {
     const h = mount()
     await expect(h.execute(name, args)).rejects.toBe(h.sentinel)
     expect(h.dispatched).toHaveLength(1)
+  })
+
+  // 打包态宿主递进来的 args 是冻结对象：2026-10-18 首轮实跑就是在这里炸的
+  // （`Cannot assign to read only property 'observe'`），所以归一化必须走副本。
+  it('冻结入参里的字符串布尔仍能归一化，且原对象不被改写', async () => {
+    const h = mount()
+    const frozen = Object.freeze({ session_id: 's1', ref: 'e1', observe: 'true', region_ref: 'e2', timeout_ms: 200 })
+    await expect(h.execute('webpage_click', frozen)).rejects.toBe(h.sentinel)
+    expect(h.dispatched).toHaveLength(1)
+    expect(frozen.observe).toBe('true')
   })
 })

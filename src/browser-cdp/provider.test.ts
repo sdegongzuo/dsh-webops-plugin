@@ -197,6 +197,14 @@ class FakeChrome {
   ]
   layoutMetricsOverride: unknown
   /**
+   * 动作后默认区域观察（2026-10-18）：假页面里「被操作元素所在区块」的 backendNodeId。
+   * `null` = 页面脚本返回 null（元素已脱离文档 / 没有块级祖先）；`undefined` = 不挂这条脚本，
+   * `callFunctionOn` 走兜底分支（既不返回 objectId，provider 就回退全页）。
+   */
+  enclosingBackendNodeId: number | null | undefined = undefined
+  /** 设了就用它回答 `DOMSnapshot.captureSnapshot`：区块子树要找真实父子关系。 */
+  domTree: { backendNodeId: number[]; parentIndex: number[]; nodeName?: number[] } | undefined
+  /**
    * 窗口输入权（并发网页操作方案 §4）：transport 有没有这个能力面。缺省**不挂** ——
    * 外部 Chrome 就是这个形状（没有共享窗口概念，不宣称窗口级隔离保护），既有用例
    * 正是在验「没有输入权保护时照旧派发」。要测临界区的用例自己显式打开。
@@ -295,6 +303,13 @@ class FakeChrome {
       }
       case 'Runtime.callFunctionOn': {
         const fn = String(params['functionDeclaration'])
+        // 动作后默认区域观察：页面脚本交回「被操作元素所在的区块」这个**节点**。
+        // 判据 `enclosingBlock` 是该脚本独有的局部变量名；放最前面，避免被下面的兜底吃掉。
+        if (fn.includes('enclosingBlock')) {
+          return this.enclosingBackendNodeId === undefined || this.enclosingBackendNodeId === null
+            ? { result: { value: null } }
+            : { result: { objectId: 'obj-enclosing', subtype: 'node' } }
+        }
         // wait(ref_state='hidden') 的等待条件：成功 = 元素还连着文档且已不可见。
         // 脚本里含 `checkVisibility`（与其它 wait 探测共用串没有），先于 isConnected 分支判。
         if (fn.includes('checkVisibility') && fn.includes('isConnected') && fn.includes('return false')) {
@@ -404,6 +419,7 @@ class FakeChrome {
           },
         }
       case 'DOMSnapshot.captureSnapshot':
+        if (this.domTree !== undefined) return { documents: [{ nodes: this.domTree }] }
         return {
           documents: [{
             nodes: { backendNodeId: this.layoutBoxes.map(entry => entry.backendNodeId) },
@@ -438,6 +454,11 @@ class FakeChrome {
         if (this.resolveNodeError !== undefined) throw new Error(this.resolveNodeError)
         if (this.missingBackendNodeIds.has(Number(params['backendNodeId']))) return {}
         return params['backendNodeId'] === 0 ? {} : { object: { objectId: 'obj-1' } }
+      case 'DOM.describeNode':
+        // 区块节点的 objectId → backendNodeId（动作后默认区域观察的唯一目的）。
+        return this.enclosingBackendNodeId === undefined || this.enclosingBackendNodeId === null
+          ? {}
+          : { node: { backendNodeId: this.enclosingBackendNodeId } }
       case 'DOM.getBoxModel':
         return this.boxModel === undefined ? {} : { model: { border: [...this.boxModel] } }
       case 'DOM.releaseObject':
@@ -701,6 +722,27 @@ const PAGE_TREE: AxNode[] = [
   { nodeId: '4', role: { value: 'button' }, name: { value: 'Submit' }, ignored: false, backendDOMNodeId: 9 },
 ]
 
+/**
+ * 两个 section 的页面（动作后默认区块观察用）：backend 20 这块里是「网页对话」
+ * （标题 + 输入框 + 发送按钮），backend 30 是页面另一块。默认落点只该是 20 那一块。
+ */
+const SECTIONED_TREE: AxNode[] = [
+  { nodeId: '1', role: { value: 'RootWebArea' }, name: { value: 'Example' }, childIds: ['2', '6'], ignored: false },
+  { nodeId: '2', role: { value: 'section' }, name: { value: '' }, childIds: ['3', '4', '5'], ignored: false, backendDOMNodeId: 20 },
+  { nodeId: '3', role: { value: 'heading' }, name: { value: '网页对话' }, ignored: false, backendDOMNodeId: 21 },
+  { nodeId: '4', role: { value: 'textbox' }, name: { value: '消息' }, ignored: false, backendDOMNodeId: 22 },
+  { nodeId: '5', role: { value: 'button' }, name: { value: '发送' }, ignored: false, backendDOMNodeId: 23 },
+  { nodeId: '6', role: { value: 'section' }, name: { value: '' }, childIds: ['7', '8'], ignored: false, backendDOMNodeId: 30 },
+  { nodeId: '7', role: { value: 'heading' }, name: { value: '其它章节' }, ignored: false, backendDOMNodeId: 31 },
+  { nodeId: '8', role: { value: 'link' }, name: { value: '别处' }, ignored: false, backendDOMNodeId: 32 },
+]
+
+/** 与 {@link SECTIONED_TREE} 对应的 DOM 父子关系（`parentIndex` 指向数组下标）。 */
+const SECTIONED_DOM = {
+  backendNodeId: [1, 20, 21, 22, 23, 30, 31, 32],
+  parentIndex: [-1, 0, 1, 1, 1, 0, 5, 5],
+}
+
 describe('CdpBrowserProvider', () => {
   let chrome: FakeChrome
   let provider: CdpBrowserProvider
@@ -852,6 +894,77 @@ describe('CdpBrowserProvider', () => {
     expect(guarded.outline).toContain('新确认浮层')
     expect(guarded.epoch).toBeGreaterThan(full.epoch)
     expect(guarded.outsideRegion).toBeUndefined()
+  })
+
+  it('动作后默认区块观察：只回被操作元素所在的 section，区域外条目照常计数，纪元不推进', async () => {
+    await provider.open({})
+    chrome.axeNodes = SECTIONED_TREE
+    chrome.domTree = SECTIONED_DOM
+    const full = await provider.observe({ kind: 'snapshot', sessionId: 'tab-1' })
+    if (full.kind !== 'snapshot') throw new Error('expected a snapshot')
+    const send = full.refs.find(target => target.name === '发送')
+    if (send === undefined) throw new Error('missing the send button ref')
+    chrome.enclosingBackendNodeId = 20
+
+    const regional = await provider.observe({
+      kind: 'snapshot', sessionId: 'tab-1', region: { enclosing: send.ref }, guardGlobal: true,
+    })
+    if (regional.kind !== 'snapshot') throw new Error('expected a snapshot')
+    expect(regional.scope).toBe(`ref:${send.ref}`)
+    // 区块观察走 adopt：纪元不换，旧 ref 继续可用。
+    expect(regional.epoch).toBe(full.epoch)
+    expect(regional.outline).toContain('button "发送"')
+    expect(regional.outline).toContain('heading "网页对话"')
+    // 另一块必须真的没进来 —— 否则「默认区块」只是换了个说法的全页。
+    expect(regional.outline).not.toContain('别处')
+    expect(regional.outsideRegion).toBeGreaterThan(0)
+  })
+
+  it('反向：区块解析不出来（元素已被这次动作换掉）时回退全页，观察不算失败', async () => {
+    await provider.open({})
+    chrome.axeNodes = SECTIONED_TREE
+    chrome.domTree = SECTIONED_DOM
+    const full = await provider.observe({ kind: 'snapshot', sessionId: 'tab-1' })
+    if (full.kind !== 'snapshot') throw new Error('expected a snapshot')
+    const send = full.refs.find(target => target.name === '发送')
+    if (send === undefined) throw new Error('missing the send button ref')
+    // 页面脚本报 null = 点击把元素连同它的块一起换掉了（SPA 重渲染的常态）。
+    chrome.enclosingBackendNodeId = null
+
+    const fallback = await provider.observe({
+      kind: 'snapshot', sessionId: 'tab-1', region: { enclosing: send.ref }, guardGlobal: true,
+    })
+    if (fallback.kind !== 'snapshot') throw new Error('expected a snapshot')
+    expect(fallback.scope).toBe('full')
+    expect(fallback.outline).toContain('别处')
+    expect(fallback.outsideRegion).toBeUndefined()
+  })
+
+  it('反向：区块在 DOM 里但 AX 侧没有可呈现内容时回退全页，不返回空大纲', async () => {
+    await provider.open({})
+    chrome.axeNodes = PAGE_TREE
+    const full = await provider.observe({ kind: 'snapshot', sessionId: 'tab-1' })
+    if (full.kind !== 'snapshot') throw new Error('expected a snapshot')
+    const field = full.refs.find(target => target.name === 'Email')
+    if (field === undefined) throw new Error('missing the textbox ref')
+    // 区块（20）在 DOM 里完整存在，但 AX 树里一个节点都不落在这个子树 —— 空区域毫无信息量。
+    chrome.domTree = SECTIONED_DOM
+    chrome.enclosingBackendNodeId = 20
+
+    const fallback = await provider.observe({
+      kind: 'snapshot', sessionId: 'tab-1', region: { enclosing: field.ref }, guardGlobal: true,
+    })
+    if (fallback.kind !== 'snapshot') throw new Error('expected a snapshot')
+    expect(fallback.scope).toBe('full')
+    expect(fallback.outline).toContain('button "Submit"')
+  })
+
+  it('region.enclosing 与 region.ref 互斥（拒绝而不是猜一个）', async () => {
+    await provider.open({})
+    await provider.observe({ kind: 'snapshot', sessionId: 'tab-1' })
+    await expect(provider.observe({
+      kind: 'snapshot', sessionId: 'tab-1', region: { ref: 'e1', enclosing: 'e2' },
+    })).rejects.toThrow(expect.objectContaining({ code: 'BROWSER_PROTOCOL_ERROR' }))
   })
 
   it('region.ref snapshot adopts into the current epoch so earlier refs stay usable', async () => {

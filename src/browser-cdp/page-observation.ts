@@ -26,10 +26,12 @@ import type {
   CaptureResult,
   CaptureSnapshotResult,
   LayoutMetricsResult,
+  CallFunctionResult,
+  DescribeNodeResult,
 } from './provider-session.ts'
 import { PageNodes } from './page-nodes.ts'
 import { PageNavigation } from './page-navigation.ts'
-import { OVERLAY_PROBE_EXPRESSION } from './page-scripts.ts'
+import { OVERLAY_PROBE_EXPRESSION, ENCLOSING_BLOCK_FUNCTION } from './page-scripts.ts'
 import { pngDimensions, viewportBoxFromMetrics } from './provider-helpers.ts'
 import type { ResolvedConfig } from './provider-config.ts'
 
@@ -46,6 +48,11 @@ export class PageObservation {
    * `maxLines` 只有调用方显式给时才改限额（见 {@link resolveSnapshotLimits}：行数预算和字符
    * 预算一起抬，否则只抬一半会「我调大了还是截断」。长文页默认 800 行必截，这是报告 S3 的
    * 原始问题 —— 现在模型可以自己要求多看几屏）。
+   *
+   * 四种范围：全页（`publish`，推进纪元）/ `region.ref`（给定 ref 的子树或标题章节）/
+   * `region.viewport`·`region.box`（几何区域）/ `region.enclosing`（**动作后默认**：
+   * 被操作元素所在的区块，见 {@link enclosingAnchor}）。后三种都走 `adopt`（不换表），
+   * 并且 `enclosing` 解析不出来时静默降级成全页。
    */
   async snapshot(
     session: SessionState,
@@ -57,12 +64,13 @@ export class PageObservation {
     const options = { signal, timeoutMs: this.config.commandTimeoutMs }
     const regionKinds = [
       region?.ref !== undefined,
+      region?.enclosing !== undefined,
       region?.viewport === true,
       region?.box !== undefined,
     ].filter(Boolean).length
     if (regionKinds > 1) {
       throw new BrowserError(
-        'region.ref, region.viewport and region.box are mutually exclusive; pass exactly one',
+        'region.ref, region.enclosing, region.viewport and region.box are mutually exclusive; pass exactly one',
         'BROWSER_PROTOCOL_ERROR',
       )
     }
@@ -70,7 +78,30 @@ export class PageObservation {
     let nodes: readonly AxNode[]
     let outsideRegion: number | undefined
     let globalNodes: readonly AxNode[] | undefined
-    if (region?.ref !== undefined) {
+    if (region?.enclosing !== undefined) {
+      // 动作驱动的默认观察：区域 = 被操作元素所在的区块（见 ENCLOSING_BLOCK_FUNCTION）。
+      // 三种「不可用」都回退全页，且**不报错** —— 这是一次附带的观察，不能因为点了导航链接
+      // 把元素点没了就让「点击已派发」的调用方收到一个观察失败：
+      //   ① 元素已经不在了（`enclosingAnchor` 返回 undefined）；
+      //   ② 区块在 DOM 里找得到、但 AX 里没有可呈现内容（`keep` 为空）。
+      // 这里取全页 AX 是**必须**的：既用来过滤区块，也用来算区域外条目数（与 region.ref 同口径）。
+      const full = await session.connection.send<AxTreeResult>('Accessibility.getFullAXTree', {}, options)
+      globalNodes = full.nodes ?? []
+      const anchor = await this.enclosingAnchor(session, region.enclosing, signal)
+      const keep = anchor === undefined ? undefined : await this.backendIdsInSubtree(session, anchor, signal)
+      const filtered = keep === undefined ? [] : filterAxTreeByBackendIds(full.nodes ?? [], keep)
+      if (filtered.length === 0) {
+        regional = false
+        globalNodes = undefined
+        nodes = full.nodes ?? []
+      } else {
+        nodes = filtered
+        const limits = resolveSnapshotLimits(this.config.snapshotLimits, maxLines)
+        const fullRows = buildOutline(full.nodes ?? [], limits).rows.length
+        const partRows = buildOutline(nodes, limits).rows.length
+        outsideRegion = Math.max(0, fullRows - partRows)
+      }
+    } else if (region?.ref !== undefined) {
       const target = session.refs.resolve(region.ref)
       const full = await session.connection.send<AxTreeResult>('Accessibility.getFullAXTree', {}, options)
       globalNodes = full.nodes ?? []
@@ -136,7 +167,10 @@ export class PageObservation {
     const liveRefs = session.refs.list().filter(ref => observedRefs.has(ref.ref))
     return {
       kind: 'snapshot',
+      // `enclosing` 沿用 `ref:` 前缀（读作「包含该 ref 的区块」）：模型侧与 find 缓存只区分
+      // 「是不是全页」，多造一个前缀只会让两处判据各写一遍。
       scope: !regional ? 'full' : region?.ref !== undefined ? `ref:${region.ref}`
+        : region?.enclosing !== undefined ? `ref:${region.enclosing}`
         : region?.viewport === true ? 'viewport'
           : `box:${region!.box!.x},${region!.box!.y},${region!.box!.width},${region!.box!.height}`,
       sessionId: session.targetId,
@@ -257,6 +291,93 @@ export class PageObservation {
       height: size.height,
       ...ref !== undefined ? { ref } : {},
     }
+  }
+
+  /**
+   * 把「被操作的元素」换算成它所在区块的 `backendNodeId`（动作后默认观察）。
+   *
+   * 每一步失败都返回 `undefined`，**绝不抛**：这条链跑在动作**之后**，元素被这次点击
+   * 换掉（SPA 重渲染是常态）时 `resolveNode` / `callFunctionOn` 都会失败，而那时动作已经
+   * 派发、页面已经变了 —— 把观察打成 `observationError` 是对调用方撒谎。找不到区块的语义
+   * 就是「回退全页」，由 `snapshot()` 统一处理。
+   *
+   * 走 `resolveBackendNodeId` 而不是 `resolveObjectId`：后者带**写前门**，而这里是只读观察，
+   * 拿不到「同一份文档」的证据时也该照常拍（门是给输入事件用的）。
+   */
+  private async enclosingAnchor(session: SessionState, ref: string, signal?: AbortSignal): Promise<number | undefined> {
+    try {
+      const target = session.refs.resolve(ref)
+      const objectId = await this.nodes.resolveBackendNodeId(session, ref, target.backendNodeId, signal)
+      if (objectId === undefined) return undefined
+      try {
+        const found = await session.connection.send<CallFunctionResult>(
+          'Runtime.callFunctionOn',
+          // 返回 DOM 节点本身（不是值）：对象形态才能拿到 objectId，再换 backendNodeId。
+          { objectId, functionDeclaration: ENCLOSING_BLOCK_FUNCTION },
+          { signal, timeoutMs: this.config.commandTimeoutMs },
+        )
+        const containerId = found.result?.objectId
+        if (containerId === undefined) return undefined
+        try {
+          const described = await session.connection.send<DescribeNodeResult>(
+            'DOM.describeNode',
+            { objectId: containerId },
+            { signal, timeoutMs: this.config.commandTimeoutMs },
+          )
+          const backendNodeId = described.node?.backendNodeId
+          return typeof backendNodeId === 'number' ? backendNodeId : undefined
+        } finally {
+          this.nodes.releaseObject(session, containerId, signal)
+        }
+      } finally {
+        this.nodes.releaseObject(session, objectId, signal)
+      }
+    } catch {
+      return undefined
+    }
+  }
+
+  /**
+   * DOM 子树（含给定节点自身）→ AX 过滤用的 `backendNodeId` 集合。
+   *
+   * 用 DOM 快照的 `parentIndex` 走一遍而不是查 AX 的父子链：区块元素在 AX 里可能被折叠
+   * （`display: contents`、被 `aria-hidden` 包着），而它在 DOM 里一定在 —— 拿 DOM 子树做
+   * 判据，AX 侧只负责「谁在树上」。找不到该节点（已脱离文档）时返回空集，调用方据此回退全页。
+   */
+  private async backendIdsInSubtree(
+    session: SessionState, backendNodeId: number, signal?: AbortSignal,
+  ): Promise<Set<number>> {
+    const captured = await session.connection.send<CaptureSnapshotResult>(
+      'DOMSnapshot.captureSnapshot', { computedStyles: [] },
+      { signal, timeoutMs: this.config.commandTimeoutMs },
+    )
+    for (const document of captured.documents ?? []) {
+      const ids = document.nodes?.backendNodeId ?? []
+      const start = ids.indexOf(backendNodeId)
+      if (start < 0) continue
+      const parents = document.nodes?.parentIndex ?? []
+      const children = new Map<number, number[]>()
+      for (let index = 0; index < ids.length; index += 1) {
+        const parent = parents[index]
+        if (parent === undefined || parent < 0) continue
+        const siblings = children.get(parent) ?? []
+        siblings.push(index)
+        children.set(parent, siblings)
+      }
+      const keep = new Set<number>()
+      const visited = new Set<number>()
+      const stack = [start]
+      while (stack.length > 0) {
+        const index = stack.pop() as number
+        if (visited.has(index)) continue
+        visited.add(index)
+        const id = ids[index]
+        if (typeof id === 'number') keep.add(id)
+        for (const child of children.get(index) ?? []) stack.push(child)
+      }
+      return keep
+    }
+    return new Set()
   }
 
   /** 从标题到下一个同级/更高级标题，限制在最近 section/article/main/body 内；只读真实 DOM。 */

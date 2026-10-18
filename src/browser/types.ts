@@ -504,11 +504,17 @@ export type BrowserObserveRequest =
      */
     readonly maxLines?: number
     /**
-     * 区域快照。三种形态互斥：`ref` 子树 / `viewport: true` / `box`。
+     * 区域快照。四种形态互斥：`ref` 子树 / `enclosing` 该 ref 所在区块 / `viewport: true` / `box`。
      * 区域快照走 adopt（不换表），全页快照仍走 publish。
      */
     readonly region?: {
       readonly ref?: string
+      /**
+       * 动作后的**默认区域**：这个 ref 所在的区块（最近的 section/article/li/tr 之类）。
+       * 由 `Browser.mutate` 在 click/press 附观察时自动填，等于「被操作元素的有效范围」；
+       * 解析不出来（元素已被这次动作换掉、区块里没有可呈现内容）时静默回退全页。
+       */
+      readonly enclosing?: string
       readonly viewport?: boolean
       readonly box?: { readonly x: number; readonly y: number; readonly width: number; readonly height: number }
     }

@@ -9,7 +9,7 @@ import {
   defineTool as defineHarnessTool,
 } from '@deepseek-ai/dsh-tools'
 import { BrowserError, type BrowserCaller, presentBrowserError } from '../browser/index.ts'
-import { validateToolArguments } from './parameter-validation.ts'
+import { normalizeToolArguments, validateToolArguments } from './parameter-validation.ts'
 import type { SnapshotCache } from './snapshot-cache.ts'
 import { formatSnapshotOutput, rememberBrowserSnapshot } from './snapshot-output.ts'
 
@@ -87,8 +87,10 @@ export function defineTool<const S extends ParameterSchemaSpec, const O extends 
     execute: async (args, exec) => {
       const startedAt = performance.now()
       try {
-        validateToolArguments(options.name, strictParameters, args)
-        const value = await rawExecute(args, exec)
+        // 归一化必须先于校验，而且**用返回值**去执行：入参在打包态是冻结对象，就地改写会抛。
+        const normalized = normalizeToolArguments(strictParameters, args) as typeof args
+        validateToolArguments(options.name, strictParameters, normalized)
+        const value = await rawExecute(normalized, exec)
         if (value !== null && typeof value === 'object') {
           ;(value as Record<string, unknown>)[DURATION_KEY] = Math.round(performance.now() - startedAt)
         }

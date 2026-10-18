@@ -74,6 +74,19 @@ export interface EvaluateResult {
   readonly result?: { readonly value?: unknown }
 }
 
+/**
+ * `Runtime.callFunctionOn` 的返回体：`returnByValue: true` 时读 `value`，
+ * 传 `false`（返回 DOM 节点这类对象）时读 `objectId`。动作后默认区域观察走后者。
+ */
+export interface CallFunctionResult {
+  readonly result?: { readonly value?: unknown; readonly objectId?: string }
+}
+
+/** `DOM.describeNode` 的返回体；只取 `backendNodeId`（objectId → 节点身份）。 */
+export interface DescribeNodeResult {
+  readonly node?: { readonly backendNodeId?: number }
+}
+
 /** `Page.navigate` 的返回体。 */
 export interface NavigateResult {
   readonly errorText?: string
