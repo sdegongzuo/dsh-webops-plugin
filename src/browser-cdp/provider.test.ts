@@ -936,8 +936,68 @@ describe('CdpBrowserProvider', () => {
     })
     if (fallback.kind !== 'snapshot') throw new Error('expected a snapshot')
     expect(fallback.scope).toBe('full')
+    expect(fallback.scopeReason).toBe('anchor_unavailable')
     expect(fallback.outline).toContain('别处')
     expect(fallback.outsideRegion).toBeUndefined()
+  })
+
+  it('等待观察沿用同一纪元最近成功区块，全页读取后不再沿用', async () => {
+    await provider.open({})
+    chrome.axeNodes = SECTIONED_TREE
+    chrome.domTree = SECTIONED_DOM
+    const full = await provider.observe({ kind: 'snapshot', sessionId: 'tab-1' })
+    if (full.kind !== 'snapshot') throw new Error('expected snapshot')
+    const ref = full.refs.find(target => target.name === '发送')!.ref
+    chrome.enclosingBackendNodeId = 20
+    await provider.observe({ kind: 'snapshot', sessionId: 'tab-1', region: { enclosing: ref } })
+    const waited = await provider.observe({ kind: 'snapshot', sessionId: 'tab-1', region: { previous: true }, guardGlobal: true })
+    expect(waited).toMatchObject({ scope: `ref:${ref}`, epoch: full.epoch })
+    if (waited.kind !== 'snapshot') throw new Error('expected snapshot')
+    expect(waited.outline).not.toContain('别处')
+    await provider.observe({ kind: 'snapshot', sessionId: 'tab-1' })
+    const reset = await provider.observe({ kind: 'snapshot', sessionId: 'tab-1', region: { previous: true } })
+    expect(reset).toMatchObject({ scope: 'full', scopeReason: 'no_previous_region' })
+  })
+
+  it('等待继承区块在租约/控制权作废后回退全页，旧区域不能跨代次', async () => {
+    await provider.open({})
+    chrome.axeNodes = SECTIONED_TREE
+    chrome.domTree = SECTIONED_DOM
+    const full = await provider.observe({ kind: 'snapshot', sessionId: 'tab-1' })
+    if (full.kind !== 'snapshot') throw new Error('expected snapshot')
+    chrome.enclosingBackendNodeId = 20
+    await provider.observe({ kind: 'snapshot', sessionId: 'tab-1', region: { enclosing: full.refs.find(target => target.name === '发送')!.ref } })
+    provider.invalidateSession('tab-1')
+    const waited = await provider.observe({ kind: 'snapshot', sessionId: 'tab-1', region: { previous: true } })
+    expect(waited).toMatchObject({ scope: 'full', scopeReason: 'previous_region_expired' })
+  })
+
+  it('等待沿用区块时发现全局浮层必须回全页，并清空后续默认区域', async () => {
+    await provider.open({})
+    chrome.axeNodes = SECTIONED_TREE
+    chrome.domTree = SECTIONED_DOM
+    const full = await provider.observe({ kind: 'snapshot', sessionId: 'tab-1' })
+    if (full.kind !== 'snapshot') throw new Error('expected snapshot')
+    chrome.enclosingBackendNodeId = 20
+    await provider.observe({ kind: 'snapshot', sessionId: 'tab-1', region: { enclosing: full.refs.find(target => target.name === '发送')!.ref } })
+    chrome.overlay = { role: 'div', name: '等待期间出现的确认', hint: '#confirm' }
+    const guarded = await provider.observe({ kind: 'snapshot', sessionId: 'tab-1', region: { previous: true }, guardGlobal: true })
+    expect(guarded).toMatchObject({ scope: 'full', scopeReason: 'global_overlay' })
+    const next = await provider.observe({ kind: 'snapshot', sessionId: 'tab-1', region: { previous: true } })
+    expect(next).toMatchObject({ scope: 'full', scopeReason: 'no_previous_region' })
+  })
+
+  it('继承范围的锚点消失时全页兜底，不把正常 wait 变成旧引用错误', async () => {
+    await provider.open({})
+    chrome.axeNodes = SECTIONED_TREE
+    chrome.domTree = SECTIONED_DOM
+    const full = await provider.observe({ kind: 'snapshot', sessionId: 'tab-1' })
+    if (full.kind !== 'snapshot') throw new Error('expected snapshot')
+    chrome.enclosingBackendNodeId = 20
+    await provider.observe({ kind: 'snapshot', sessionId: 'tab-1', region: { enclosing: full.refs.find(target => target.name === '发送')!.ref } })
+    chrome.enclosingBackendNodeId = null
+    const waited = await provider.observe({ kind: 'snapshot', sessionId: 'tab-1', region: { previous: true }, guardGlobal: true })
+    expect(waited).toMatchObject({ scope: 'full', scopeReason: 'anchor_unavailable' })
   })
 
   it('反向：区块在 DOM 里但 AX 侧没有可呈现内容时回退全页，不返回空大纲', async () => {

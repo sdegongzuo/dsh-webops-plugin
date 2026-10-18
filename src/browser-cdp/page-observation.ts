@@ -62,18 +62,39 @@ export class PageObservation {
     guardGlobal = false,
   ): Promise<BrowserSnapshot> {
     const options = { signal, timeoutMs: this.config.commandTimeoutMs }
-    const regionKinds = [
+    let scopeReason: BrowserSnapshot['scopeReason']
+    let regionKinds = [
       region?.ref !== undefined,
       region?.enclosing !== undefined,
+      region?.previous === true,
       region?.viewport === true,
       region?.box !== undefined,
     ].filter(Boolean).length
     if (regionKinds > 1) {
       throw new BrowserError(
-        'region.ref, region.enclosing, region.viewport and region.box are mutually exclusive; pass exactly one',
+        'region.ref, region.enclosing, region.previous, region.viewport and region.box are mutually exclusive; pass exactly one',
         'BROWSER_PROTOCOL_ERROR',
       )
     }
+    if (region?.previous === true) {
+      const previous = session.lastObservationRegion
+      if (previous !== undefined && previous.epoch === session.refs.currentEpoch
+        && previous.controlGeneration === session.controlGeneration) {
+        try {
+          return await this.snapshot(session, signal, maxLines,
+            previous.enclosing ? { enclosing: previous.ref } : { ref: previous.ref }, guardGlobal)
+        } catch (error) {
+          // 继承范围是默认优化，旧锚点已消失时退回全页；连接、取消和预算错误仍原样返回。
+          if (!(error instanceof BrowserError) || !['BROWSER_STALE_REF', 'BROWSER_SNAPSHOT_REQUIRED'].includes(error.code)) throw error
+          scopeReason = 'anchor_unavailable'
+        }
+      } else {
+        scopeReason = previous === undefined ? 'no_previous_region' : 'previous_region_expired'
+      }
+      region = undefined
+      regionKinds = 0
+    }
+    const controlGeneration = session.controlGeneration
     let regional = regionKinds === 1
     let nodes: readonly AxNode[]
     let outsideRegion: number | undefined
@@ -91,6 +112,7 @@ export class PageObservation {
       const keep = anchor === undefined ? undefined : await this.backendIdsInSubtree(session, anchor, signal)
       const filtered = keep === undefined ? [] : filterAxTreeByBackendIds(full.nodes ?? [], keep)
       if (filtered.length === 0) {
+        scopeReason = anchor === undefined ? 'anchor_unavailable' : 'empty_region'
         regional = false
         globalNodes = undefined
         nodes = full.nodes ?? []
@@ -141,6 +163,7 @@ export class PageObservation {
       nodes = globalNodes ?? nodes
       regional = false
       outsideRegion = undefined
+      scopeReason = 'global_overlay'
     }
     const outline = buildOutline(nodes, resolveSnapshotLimits(this.config.snapshotLimits, maxLines))
     // 全页快照才查浮层：区域快照本来就是「只看这一块」，中心被别的块盖住不算异常。
@@ -156,6 +179,15 @@ export class PageObservation {
     const publication = regional
       ? session.refs.adopt(outline.rows)
       : session.refs.publish(outline.rows, outline.truncated, loaderId, meta?.url)
+    const rememberedRef = region?.ref ?? region?.enclosing
+    if (regional && rememberedRef !== undefined && controlGeneration === session.controlGeneration) {
+      session.lastObservationRegion = {
+        ref: rememberedRef, enclosing: region?.enclosing !== undefined,
+        epoch: publication.epoch, controlGeneration,
+      }
+    } else {
+      delete session.lastObservationRegion
+    }
     // 全页快照落地 = 锚点前移。**区域快照不清**：`adopt()` 不换表、旧 ref 继续有效，
     // 「页面在模型之外变过」这件事不会因为拍了一个角落就消失 —— D-5 那条静默改绑链正源于此。
     if (!regional) session.dirty.reset()
@@ -173,6 +205,7 @@ export class PageObservation {
         : region?.enclosing !== undefined ? `ref:${region.enclosing}`
         : region?.viewport === true ? 'viewport'
           : `box:${region!.box!.x},${region!.box!.y},${region!.box!.width},${region!.box!.height}`,
+      ...scopeReason !== undefined ? { scopeReason } : {},
       sessionId: session.targetId,
       epoch: publication.epoch,
       url: session.url,

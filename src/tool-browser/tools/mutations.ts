@@ -281,7 +281,7 @@ export function registerMutations(
     name: 'webpage_wait',
     action: 'wait',
     description:
-      '等待恰好一种条件：time_ms、text、ref或until="stable"（文档与DOM/network安静，不证明回复完成）。优先本轮独有完成文本，一次等待可同时确认提交。time_ms固定延时，不与timeout_ms同用；其他条件共享1–30000ms期限，默认10000。成功或正常超时附观察与可用refs，超时satisfied=false；region_ref只观察结果区域，导航/交还/新浮层回退全页。 '
+      '等待恰好一种条件：time_ms、text、ref或until="stable"（文档与DOM/network安静，不证明回复完成）。优先本轮独有完成文本，一次等待可同时确认提交。time_ms固定延时，不与timeout_ms同用；其他条件共享1–30000ms期限，默认10000。成功或正常超时附观察与refs，超时satisfied=false；默认沿用最近区域，region_ref改区域；无有效区域或导航/交还/新浮层回退全页。 '
       + STALE_NOTICE,
     parameters: {
       session_id: SESSION_ID_PARAMETER,

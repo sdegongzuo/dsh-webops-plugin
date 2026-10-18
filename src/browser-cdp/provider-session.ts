@@ -56,6 +56,13 @@ export interface SessionState {
   controlGeneration: number
   /** 人工交还后，在 agent 成功全页观察前保持为 true。 */
   needsReobserve: boolean
+  /** 仅供等待观察复用；全页观察清空，纪元或控制代次变化后不可再用。 */
+  lastObservationRegion?: {
+    readonly ref: string
+    readonly enclosing: boolean
+    readonly epoch: number
+    readonly controlGeneration: number
+  }
   /**
    * P3 locate 高亮状态位：本 session 是否画过一层 `Overlay.highlightNode` 高亮。
    * 用于 `highlight: false` 时决定要不要补发 `Overlay.hideHighlight`（只弹自己那层，`[V31]`）。

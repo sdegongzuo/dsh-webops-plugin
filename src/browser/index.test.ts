@@ -671,9 +671,9 @@ describe('BrowserRuntime tab ownership', () => {
     await browser.mutate({ kind: 'click', sessionId: session.id, ref: 'e7', observe: true, observeRef: 'e9' }, ALICE)
     expect(received[2]).toMatchObject({ kind: 'snapshot', region: { ref: 'e9' }, guardGlobal: true })
 
-    // ④ wait 没有「被操作元素」，不凭空造一个区块。
+    // ④ wait 交由 provider 安全继承最近区域；无可用区域时仍由 provider 全页兜底。
     await browser.mutate({ kind: 'wait', sessionId: session.id, timeMs: 1 }, ALICE)
-    expect(received[3]).toEqual({ kind: 'snapshot', sessionId: session.id })
+    expect(received[3]).toEqual({ kind: 'snapshot', sessionId: session.id, region: { previous: true }, guardGlobal: true })
     await browser.dispose()
   })
 
@@ -687,6 +687,8 @@ describe('BrowserRuntime tab ownership', () => {
     let received: unknown
     provider.observe = async request => { received = request; return observe(request) }
     await browser.mutate({ kind: 'wait', sessionId: session.id, text: '完成', observeRef: 'e1' }, ALICE)
+    expect(received).toEqual({ kind: 'snapshot', sessionId: session.id })
+    await browser.mutate({ kind: 'wait', sessionId: session.id, text: '完成' }, ALICE)
     expect(received).toEqual({ kind: 'snapshot', sessionId: session.id })
     await browser.dispose()
   })

@@ -393,6 +393,8 @@ export interface BrowserTextRead {
 export interface BrowserSnapshot {
   /** 实际观察范围；内部强制回退全页时为full。 */
   readonly scope?: string
+  /** 请求的区域无法安全取得时，全页回退的具体原因。 */
+  readonly scopeReason?: 'no_previous_region' | 'previous_region_expired' | 'anchor_unavailable' | 'empty_region' | 'global_overlay'
   readonly kind: 'snapshot'
   readonly sessionId: string
   /** 本次观察的 ref 纪元。 */
@@ -504,7 +506,7 @@ export type BrowserObserveRequest =
      */
     readonly maxLines?: number
     /**
-     * 区域快照。四种形态互斥：`ref` 子树 / `enclosing` 该 ref 所在区块 / `viewport: true` / `box`。
+     * 区域快照。ref 子树、enclosing 区块、previous 继承、viewport、box 五种形态互斥。
      * 区域快照走 adopt（不换表），全页快照仍走 publish。
      */
     readonly region?: {
@@ -515,6 +517,8 @@ export type BrowserObserveRequest =
        * 解析不出来（元素已被这次动作换掉、区块里没有可呈现内容）时静默回退全页。
        */
       readonly enclosing?: string
+      /** 独立 wait 默认沿用本标签同纪元、同控制代次最近成功的 ref/区块观察。 */
+      readonly previous?: boolean
       readonly viewport?: boolean
       readonly box?: { readonly x: number; readonly y: number; readonly width: number; readonly height: number }
     }

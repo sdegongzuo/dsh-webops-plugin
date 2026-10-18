@@ -517,7 +517,8 @@ export class BrowserRuntime extends Service {
         const actionRef = request.kind === 'click' || request.kind === 'press' ? request.ref : undefined
         const region = observeRef !== undefined
           ? { ref: observeRef }
-          : actionRef !== undefined ? { enclosing: actionRef } : undefined
+          : actionRef !== undefined ? { enclosing: actionRef }
+            : request.kind === 'wait' ? { previous: true } : undefined
         const snapshot = await provider.observe({ kind: 'snapshot', sessionId: request.sessionId,
           ...region !== undefined && !requiresFull ? { region, guardGlobal: true } : {},
         }, signal)

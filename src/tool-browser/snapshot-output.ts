@@ -8,6 +8,7 @@ import type { BrowserSnapshot } from '../browser/index.ts'
 export interface SnapshotOutput extends SessionOutput {
   observation_id?: number
   scope?: string
+  scope_reason?: string
   outline: string
   truncated: boolean
   /** 被截断时：实际输出的大纲行数。 */
@@ -40,6 +41,7 @@ export function formatSnapshotOutput(snapshot: SnapshotOutput, currentFullSnapsh
       : 'title: (empty — the document sets no <title>, or it is still loading)',
     `session_id=${snapshot.session_id} (ref epoch ${snapshot.epoch}, ${controls} actionable controls, ${anchors} read-only anchors)`,
     ...(snapshot.scope !== undefined ? [`scope=${snapshot.scope}; observation_id=${String(snapshot.observation_id)}`] : []),
+    ...(snapshot.scope_reason !== undefined ? [`scope_reason=${snapshot.scope_reason}`] : []),
   ].join('\n')
   // 两条告警都放在**大纲正文之前**：这份回执的正文可能几千行（实测中位 5516 字符，上限 33285），
   // 塞进末尾的 notes 等于没报 —— 模型读到那段时早就不看后面了。
@@ -124,6 +126,7 @@ export const SNAPSHOT_OUTPUT_SCHEMA = {
   properties: {
     ...SESSION_OUTPUT_SCHEMA.properties,
     observation_id: { type: 'integer' }, scope: { type: 'string' },
+    scope_reason: { type: 'string' },
     outline: { type: 'string', required: true }, truncated: { type: 'boolean', required: true },
     outline_lines: { type: 'integer' }, dropped_elements: { type: 'integer' },
     folded_repeats: { type: 'integer' }, deduped_lines: { type: 'integer' }, outside_region: { type: 'integer' },
@@ -137,6 +140,7 @@ export function toSnapshotOutput(observation: BrowserSnapshot): SnapshotOutput {
   return {
     session_id: observation.sessionId, url: observation.url, title: observation.title, epoch: observation.epoch,
     outline: observation.outline, truncated: observation.truncated, outline_lines: observation.outlineLines,
+    ...observation.scopeReason !== undefined ? { scope_reason: observation.scopeReason } : {},
     ...observation.droppedElements !== undefined ? { dropped_elements: observation.droppedElements } : {},
     ...observation.foldedRepeats !== undefined ? { folded_repeats: observation.foldedRepeats } : {},
     ...observation.dedupedLines !== undefined ? { deduped_lines: observation.dedupedLines } : {},
@@ -149,7 +153,7 @@ export function toSnapshotOutput(observation: BrowserSnapshot): SnapshotOutput {
   }
 }
 
-/** wait 的全页快照与显式 snapshot 使用同一 find 缓存写入路径。 */
+/** wait 与显式 snapshot 使用同一 find 缓存写入路径，范围以实际观察为准。 */
 export function rememberBrowserSnapshot(cache: SnapshotCache, observation: BrowserSnapshot, scope = observation.scope ?? 'full'): SnapshotOutput {
   const output = toSnapshotOutput(observation)
   const cached = rememberSnapshot(cache, output, observation.fullOutline ?? observation.outline, scope === 'full' ? undefined : scope, observation.fullTexts, observation.textBlocks)
