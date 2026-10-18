@@ -42,6 +42,9 @@
         displayName: 云知声 MaaS
         api: openai-completions
         baseURL: https://maas-api.unisound.com/v1
+        # 推理能力不代表支持 OpenAI 的 developer 角色；云知声只接受 system/user/assistant/tool。
+        compat:
+          supportsDeveloperRole: false
         # 只列文本对话模型。同平台的 TTS / ASR / OCR / 医疗影像模型不吃这套
         # chat 协议（走各自的 /docs/api/… 端点），列进来只会让模型选择器出现选不动的项。
         # contextWindow 取自官方模型广场标注；maxTokens 故意不写，走 dsh 默认的 32768
