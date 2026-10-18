@@ -50,6 +50,22 @@
           - id: u2-flash
             name: U2 Flash
             contextWindow: 524288
+            # 推理等级：**不写这段，模型菜单里连「推理等级」这一行都不会出现**
+            # （客户端只在宿主上报了 reasoning 元数据时才渲染它；手写路由不声明
+            # reasoningEfforts，pi-ai 那边就当作「非推理模型」，见 catalog.ts 的
+            # `reasoning: base?.reasoning ?? false`）。
+            # 2026-10-18 实测该网关：u2-flash 默认就吐 reasoning_content（本来就是推理模型），
+            # reasoning_effort 认 none/minimal/low/medium/high/xhigh/max，**写 off 会 400**
+            # （unknown variant `off`），所以 off 必须映射成 none —— 实测 none 能把思考关掉。
+            # 其余 17 个模型没逐个验推理支持（且本账号对它们多为 404），先不声明。
+            reasoningEfforts:
+              off: none
+              minimal: minimal
+              low: low
+              medium: medium
+              high: high
+              xhigh: xhigh
+              max: max
           - id: u2
             name: Unisound U2
             contextWindow: 163840
