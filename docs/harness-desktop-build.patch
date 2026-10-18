@@ -119,7 +119,7 @@ index d406c27235..36bb70f4fb 100644
    if (!inside(appDir, sourceRoot)) {
      // Builder's source matcher slices the appDir prefix even for external FileSets.
 diff --git a/apps/desktop/src/main.ts b/apps/desktop/src/main.ts
-index 2afdfd7194..69d7baa0d9 100644
+index 2afdfd7194..5d5f7e08b8 100644
 --- a/apps/desktop/src/main.ts
 +++ b/apps/desktop/src/main.ts
 @@ -2,7 +2,9 @@ import type { ProductEventMap, ProductEvent } from '@deepseek-ai/dsh-client-prod
@@ -132,10 +132,12 @@ index 2afdfd7194..69d7baa0d9 100644
  import { join } from 'node:path'
  import { fileURLToPath } from 'node:url'
  import {
-@@ -23,6 +25,7 @@ import {
+@@ -22,7 +24,8 @@ import {
+   type IpcMainInvokeEvent,
    type MenuItemConstructorOptions,
  } from 'electron'
- import { resolveDesktopPaths } from './paths.ts'
+-import { resolveDesktopPaths } from './paths.ts'
++import { resolveDesktopPaths, resolveInstanceName } from './paths.ts'
 +import { configurePortableData } from './portable-data.ts'
  import { DesktopProjectManager } from './project-manager.ts'
  import { DesktopHostFatalError, DesktopHostProcess, DesktopHostUncleanExitError } from './host-process.ts'
@@ -149,7 +151,7 @@ index 2afdfd7194..69d7baa0d9 100644
  import { DesktopFatalRecovery } from './fatal-recovery.ts'
  import { pruneCrashReports, RendererConsoleTail, writeCrashReport, type CrashReportSource } from './crash-report.ts'
  import { openWelcomeWindow } from './welcome-window.ts'
-@@ -62,6 +65,70 @@ import { DesktopQuitConfirmation } from './quit-confirmation.ts'
+@@ -62,6 +65,77 @@ import { DesktopQuitConfirmation } from './quit-confirmation.ts'
  import { DesktopTray } from './tray.ts'
  import { DesktopBackgroundNotice } from './background-notice.ts'
  
@@ -161,6 +163,13 @@ index 2afdfd7194..69d7baa0d9 100644
 +// 0.1.6-alpha.2 起环境改成 `{...environment}` 全量继承（见 `node-environment.ts`），
 +// 这条限制没有了 —— 但名字保持不变：插件侧读的就是 `DSH_APP_EXECUTABLE`，改它没有收益。
 +process.env.DSH_APP_EXECUTABLE = process.execPath
++
++/**
++ * 同机多开时的实例名：便携包的根目录名（`<root>\app\<exe>` 与 `<root>\home` 的 `<root>`）。
++ * 窗口标题和托盘提示都带它 —— 否则两个实例的窗口只差会话名，任务栏与 Alt+Tab 里分不出谁是谁。
++ * 普通安装（共享 home）没有可区分的名字，留 undefined 即维持原样。
++ */
++const instanceName = resolveInstanceName(process.execPath)
 +
 +// 浏览器 provider 的默认选择：桌面端里 `cdp` 与 `electron` 会**同时**「可用」——
 +// `browser-cdp` 的 `available()` 是乐观的（探测不到就返回 true），而 `browser-electron`
@@ -220,7 +229,7 @@ index 2afdfd7194..69d7baa0d9 100644
  let focusPrimaryWindow = (): void => {}
  let stopForRecovery = async (): Promise<void> => {}
  let shuttingDown = false
-@@ -82,7 +149,7 @@ const rendererConsole = new RendererConsoleTail()
+@@ -82,7 +156,7 @@ const rendererConsole = new RendererConsoleTail()
  
  // Platform-conventional logs directory (macOS ~/Library/Logs/<name>, otherwise under userData);
  // set before ready so the first fatal report already resolves under it.
@@ -229,7 +238,7 @@ index 2afdfd7194..69d7baa0d9 100644
  
  function currentDesktopLocale(): ReturnType<typeof resolveDesktopLocale> {
    return resolveDesktopLocale(windowsLanguage ?? app.getLocale())
-@@ -157,8 +224,17 @@ function runtimeResources(): RuntimeResources {
+@@ -157,8 +231,17 @@ function runtimeResources(): RuntimeResources {
    const pnpm = (development ? process.env.DSH_DESKTOP_PNPM_ENTRY : undefined)
      ?? (development ? join(app.getAppPath(), 'node_modules', 'pnpm', 'bin', 'pnpm.mjs')
        : join(process.resourcesPath, 'runtime', 'primary-runtime', 'dependencies', 'pnpm', 'bin', 'pnpm.mjs'))
@@ -248,7 +257,23 @@ index 2afdfd7194..69d7baa0d9 100644
    return { node, nodeBin, pnpm, dsh }
  }
  
-@@ -315,7 +391,11 @@ function createWindow(preload: string, show = false, primary = false): BrowserWi
+@@ -242,6 +325,15 @@ function createWindow(preload: string, show = false, primary = false): BrowserWi
+     if (['http:', 'https:'].includes(new URL(url).protocol)) void shell.openExternal(url)
+     return { action: 'deny' }
+   })
++  // 原生标题栏是隐藏的，任务栏、Alt+Tab 和鼠标悬停提示用的都是页面标题。多开时把实例名缀在末尾：
++  // 会话名保持原位置，标题被截断时实例名看不全，但悬停提示是全文。页面每换一次会话都会重写 title，
++  // 所以每次都拼，而不是只设一次。
++  if (instanceName !== undefined) {
++    window.on('page-title-updated', (event, title) => {
++      event.preventDefault()
++      window.setTitle(`${title} · ${instanceName}`)
++    })
++  }
+   if (process.platform === 'darwin' || process.platform === 'win32') {
+     // Fullscreen hides native window controls; overlays drop their caption clearance.
+     const sendFullscreen = (): void => {
+@@ -315,7 +407,11 @@ function createWindow(preload: string, show = false, primary = false): BrowserWi
  }
  
  async function main(): Promise<void> {
@@ -261,7 +286,7 @@ index 2afdfd7194..69d7baa0d9 100644
    void pruneCrashReports(app.getPath('logs'))
    const journalDirectory = process.env.DSH_DESKTOP_UPDATE_JOURNAL_DIR
    const updateJournal = journalDirectory === undefined ? undefined : new DesktopUpdateJournal(journalDirectory, app.getVersion())
-@@ -331,9 +411,9 @@ async function main(): Promise<void> {
+@@ -331,9 +427,9 @@ async function main(): Promise<void> {
    const loginShellRead = new AbortController()
    // The probe runs in its own process group, which outlives Desktop unless the read is aborted.
    app.on('will-quit', () => { loginShellRead.abort() })
@@ -273,7 +298,7 @@ index 2afdfd7194..69d7baa0d9 100644
      for (const failure of result.failures) console.warn(`desktop login shell: ${failure.shell} failed (${failure.reason})`)
      return result.environment
    })
-@@ -451,11 +531,28 @@ async function main(): Promise<void> {
+@@ -451,11 +547,28 @@ async function main(): Promise<void> {
      return {
        start: async () => {
          const ready = await host.start()
@@ -305,7 +330,7 @@ index 2afdfd7194..69d7baa0d9 100644
          analyticsEnabled = await welcomeBackend.analyticsEnabled().catch(() => false)
          if (!reportedLaunch) { reportedLaunch = true; void track('desktop_app_launch', {}) }
          stopAccount?.()
-@@ -712,7 +809,13 @@ async function main(): Promise<void> {
+@@ -712,7 +825,13 @@ async function main(): Promise<void> {
      return browserGuests.release(event.sender, lease)
    })
  
@@ -320,7 +345,16 @@ index 2afdfd7194..69d7baa0d9 100644
      if (hostUrl === undefined || hostCookie === undefined || details.webContentsId !== mainWindow?.webContents.id) {
        callback({})
        return
-@@ -1232,7 +1335,7 @@ async function main(): Promise<void> {
+@@ -992,7 +1111,7 @@ async function main(): Promise<void> {
+   if (process.platform === 'win32') {
+     // The tray is the way back to a hidden window; without it, relaunching the application still focuses it.
+     try {
+-      tray = new DesktopTray({ iconPath: trayIconPath, locale: currentDesktopLocale,
++      tray = new DesktopTray({ iconPath: trayIconPath, locale: currentDesktopLocale, instanceName,
+         open: () => { focusPrimaryWindow() }, quit: () => { app.quit() } })
+     } catch (error) { console.warn('desktop tray: unavailable', error) }
+   }
+@@ -1232,7 +1351,7 @@ async function main(): Promise<void> {
      window.focus()
    }
  
@@ -329,7 +363,7 @@ index 2afdfd7194..69d7baa0d9 100644
    app.on('open-url', (event, url) => {
      event.preventDefault()
      if (url === 'dsh://open' || url === 'dsh://open/') focusPrimaryWindow()
-@@ -1325,9 +1428,8 @@ async function main(): Promise<void> {
+@@ -1325,9 +1444,8 @@ async function main(): Promise<void> {
        refresh: async () => { await Promise.all([checkPolicyManually(), updateSchedule.check(true)]) },
        download: downloadUpdate, install: version => updates.install(version),
      })
@@ -341,7 +375,7 @@ index 2afdfd7194..69d7baa0d9 100644
    }
    automaticCheck()
    await reconcileBackend().catch(() => undefined)
-@@ -1340,17 +1442,29 @@ async function main(): Promise<void> {
+@@ -1340,17 +1458,29 @@ async function main(): Promise<void> {
    publishUpdate(updateState)
  }
  
@@ -385,7 +419,7 @@ index 2afdfd7194..69d7baa0d9 100644
 +  })
 +}
 diff --git a/apps/desktop/src/paths.ts b/apps/desktop/src/paths.ts
-index cf03e38c36..878122bcd6 100644
+index cf03e38c36..21e83ab9ea 100644
 --- a/apps/desktop/src/paths.ts
 +++ b/apps/desktop/src/paths.ts
 @@ -1,6 +1,7 @@
@@ -393,11 +427,11 @@ index cf03e38c36..878122bcd6 100644
  
 -import { join } from 'node:path'
 +import { existsSync } from 'node:fs'
-+import { dirname, join, resolve } from 'node:path'
++import { basename, dirname, join, resolve } from 'node:path'
  import { resolveDshHome } from '@deepseek-ai/dsh-home-paths'
  
  /** Stable desktop installation paths under the shared Harness home. */
-@@ -20,3 +21,17 @@ export function resolveDesktopPaths(dshHome: string = resolveDshHome()): Desktop
+@@ -20,3 +21,35 @@ export function resolveDesktopPaths(dshHome: string = resolveDshHome()): Desktop
      lock: join(dshHome, 'profiles', 'desktop', 'lock'),
    }
  }
@@ -414,6 +448,24 @@ index cf03e38c36..878122bcd6 100644
 +export function resolvePortableDshHome(executablePath: string): string | undefined {
 +  const portableHome = resolve(dirname(executablePath), '..', 'home')
 +  return existsSync(portableHome) ? portableHome : undefined
++}
++
++/**
++ * Name that tells simultaneously running instances apart.
++ *
++ * A portable bundle is `<root>\app\<exe>` with `<root>\home` beside it, so the extracted
++ * folder — the one thing a user names and renames — is the only instance identity that
++ * exists without configuration. Installed builds share one home and keep the bare product
++ * name, so they resolve to `undefined`.
++ * @param executablePath - absolute path of the desktop shell executable (`process.execPath`).
++ * @returns the portable root folder name, or undefined for an installed build.
++ */
++export function resolveInstanceName(executablePath: string): string | undefined {
++  const portableHome = resolvePortableDshHome(executablePath)
++  if (portableHome === undefined) return undefined
++  // 解压到盘根时 basename 是空串 —— 没有可区分的名字，保持原样。
++  const name = basename(dirname(portableHome))
++  return name === '' ? undefined : name
 +}
 diff --git a/apps/desktop/src/portable-data.ts b/apps/desktop/src/portable-data.ts
 new file mode 100644
@@ -507,6 +559,30 @@ index a4bb67b3bd..8cd243b194 100644
          // An existing document belongs to the user, including one created during initialization.
          if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error
        }
+diff --git a/apps/desktop/src/tray.ts b/apps/desktop/src/tray.ts
+index b2ce416bbc..1f6bb1480e 100644
+--- a/apps/desktop/src/tray.ts
++++ b/apps/desktop/src/tray.ts
+@@ -7,6 +7,8 @@ import type { DesktopLocale } from './locale.ts'
+ export interface DesktopTrayOptions {
+   /** Multi-size ICO rendered by `scripts/render-tray-icon.ts`; Windows picks the bitmap for the display scale. */
+   readonly iconPath: string
++  /** Portable instance name; several icons in the tray are otherwise identical. */
++  readonly instanceName?: string | undefined
+   readonly locale: () => DesktopLocale
+   /** Show and focus the primary window. */
+   readonly open: () => void
+@@ -31,7 +33,9 @@ export class DesktopTray {
+     const tray = this.tray
+     if (tray === undefined) return
+     const { messages } = this.options.locale()
+-    tray.setToolTip(messages.aboutProduct)
++    // 多开时托盘里是一排完全一样的图标：悬停提示带上实例名才分得清点哪个。
++    const name = this.options.instanceName
++    tray.setToolTip(name === undefined ? messages.aboutProduct : `${messages.aboutProduct} · ${name}`)
+     tray.setContextMenu(Menu.buildFromTemplate([
+       { label: messages.openApplication, click: () => { this.options.open() } },
+       { type: 'separator' },
 diff --git a/apps/desktop/src/web-document.ts b/apps/desktop/src/web-document.ts
 index a74ea7c7ef..0a410e8163 100644
 --- a/apps/desktop/src/web-document.ts
@@ -786,8 +862,49 @@ index 54ab46d85e..28512376f9 100644
    const settingsAndReference = async () => {
      const settings = await invoke({ namespace: 'settings', method: 'describe', args: {} })
      if (!record(settings) || !Array.isArray(settings.namespaces)) throw new Error('desktop welcome: missing settings namespaces')
+diff --git a/apps/desktop/tests/instance-name.spec.ts b/apps/desktop/tests/instance-name.spec.ts
+new file mode 100644
+index 0000000000..76f0f34808
+--- /dev/null
++++ b/apps/desktop/tests/instance-name.spec.ts
+@@ -0,0 +1,35 @@
++import { mkdirSync, mkdtempSync, rmSync } from 'node:fs'
++import { tmpdir } from 'node:os'
++import { join } from 'node:path'
++import { afterEach, describe, expect, it } from 'vitest'
++import { resolveInstanceName } from '../src/paths.ts'
++
++const roots: string[] = []
++
++function scratch(): string {
++  const root = mkdtempSync(join(tmpdir(), 'dsh-instance-name-'))
++  roots.push(root)
++  return root
++}
++
++/** `<root>\app\<exe>` 与 `<root>\home` 并列 —— 便携包布局。 */
++function portable(name: string): string {
++  const root = join(scratch(), name)
++  mkdirSync(join(root, 'app'), { recursive: true })
++  mkdirSync(join(root, 'home'), { recursive: true })
++  return join(root, 'app', 'DeepSeek Harness.exe')
++}
++
++afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }) })
++
++describe('便携实例名', () => {
++  it('取便携包的根目录名：同名安装复制成多份时，窗口与托盘靠它区分', () => {
++    expect(resolveInstanceName(portable('dsh-A'))).toBe('dsh-A')
++    expect(resolveInstanceName(portable('实例 B'))).toBe('实例 B')
++  })
++
++  it('普通安装（exe 旁边没有 home）没有可区分的名字', () => {
++    const executable = join(scratch(), 'DeepSeek Harness.exe')
++    expect(resolveInstanceName(executable)).toBeUndefined()
++  })
++})
 diff --git a/apps/desktop/tests/main-startup.spec.ts b/apps/desktop/tests/main-startup.spec.ts
-index d9a8f3103b..d5ccc62e6a 100644
+index d9a8f3103b..3ada05ac6a 100644
 --- a/apps/desktop/tests/main-startup.spec.ts
 +++ b/apps/desktop/tests/main-startup.spec.ts
 @@ -16,7 +16,16 @@ import { writeCrashReport } from '../src/crash-report.ts'
@@ -808,16 +925,43 @@ index d9a8f3103b..d5ccc62e6a 100644
  // Report persistence has its own unit tests; here it resolves within microtasks so the fatal
  // dialog never outlives the test that triggered it.
  vi.mock('../src/crash-report.ts', async importOriginal => ({
-@@ -317,7 +326,7 @@ vi.mock('../src/login-shell-environment.ts', async importOriginal => ({
+@@ -39,6 +48,8 @@ const harness = await vi.hoisted(async () => {
+   const hosts: FakeHost[] = []
+   const handlers = new Map<string, InvokeHandler>()
+   let pluginsEnabled = false
++  // 便携实例名：真实取值来自便携包根目录名，测试里由用例显式给，默认空（普通安装）。
++  let instanceName: string | undefined
+   let prepareUpdate: (() => Promise<boolean>) | undefined
+   let publishUpdate: ((state: DesktopUpdateState) => DesktopUpdateState) | undefined
+   let preparing = deferred()
+@@ -235,6 +246,8 @@ const harness = await vi.hoisted(async () => {
+     deferPlatformClose() { platformCloseDeferred = deferred(); return platformCloseDeferred },
+     get pluginsEnabled() { return pluginsEnabled },
+     set pluginsEnabled(value: boolean) { pluginsEnabled = value },
++    get instanceName() { return instanceName },
++    set instanceName(value: string | undefined) { instanceName = value },
+     set closeWindowsOnQuit(value: boolean) { closeWindowsOnQuit = value },
+     reset() {
+       accountListener = undefined
+@@ -246,6 +259,7 @@ const harness = await vi.hoisted(async () => {
+       app.isPackaged = true
+       windowFailure = undefined
+       pluginsEnabled = false
++      instanceName = undefined
+       closeWindowsOnQuit = false
+       prepareUpdate = undefined
+       publishUpdate = undefined
+@@ -317,7 +331,8 @@ vi.mock('../src/login-shell-environment.ts', async importOriginal => ({
    readDesktopLoginShellEnvironment: harness.loginShell,
  }))
  vi.mock('../src/runtime-tree.ts', () => ({ readDesktopRuntime: () => ({ release: { version: '1.0.0' } }) }))
 -vi.mock('../src/paths.ts', () => ({ resolveDesktopPaths: () => ({ profile: 'desktop-test-profile' }) }))
-+vi.mock('../src/paths.ts', () => ({ resolveDesktopPaths: () => ({ profile: 'desktop-test-profile' }), resolvePortableDshHome: () => undefined }))
++vi.mock('../src/paths.ts', () => ({ resolveDesktopPaths: () => ({ profile: 'desktop-test-profile' }),
++  resolvePortableDshHome: () => undefined, resolveInstanceName: () => harness.instanceName }))
  vi.mock('../src/project-manager.ts', () => ({
    DesktopProjectManager: class {
      readonly applyRelease = harness.applyRelease
-@@ -655,48 +664,22 @@ describe('desktop main startup', () => {
+@@ -655,48 +670,22 @@ describe('desktop main startup', () => {
      expect(host.stop).not.toHaveBeenCalled()
    })
  
@@ -878,7 +1022,7 @@ index d9a8f3103b..d5ccc62e6a 100644
    })
  
    it.each(['returned', 'cancelled', 'failed'] as const)('requires explicit test login and handles %s without downloading', async (outcome) => {
-@@ -708,7 +691,7 @@ describe('desktop main startup', () => {
+@@ -708,7 +697,7 @@ describe('desktop main startup', () => {
      await readyForUpdate()
      await vi.advanceTimersByTimeAsync(0)
      expect(testAuth.login).not.toHaveBeenCalled()
@@ -887,7 +1031,35 @@ index d9a8f3103b..d5ccc62e6a 100644
      harness.dialog.showMessageBox.mockClear()
      testAuth.login.mockImplementationOnce(async () => {
        request.mockImplementation(async () => Response.json({ code: 0, data: { biz_code: 0, biz_data: null } }))
-@@ -1042,6 +1025,11 @@ describe('desktop main startup', () => {
+@@ -843,6 +832,27 @@ describe('desktop main startup', () => {
+     expect(harness.hosts).toHaveLength(0)
+   })
+ 
++  it('suffixes the window title with the portable instance name so several windows stay distinguishable', async () => {
++    harness.instanceName = 'dsh-A'
++    await import('../src/main.ts')
++    await harness.preparing.promise
++    const window = harness.windows[0]!
++    const prevented = vi.fn()
++    window.emit('page-title-updated', { preventDefault: prevented }, '会话 — DeepSeek Harness')
++    expect(prevented).toHaveBeenCalledOnce()
++    expect(window.setTitle).toHaveBeenCalledWith('会话 — DeepSeek Harness · dsh-A')
++  })
++
++  it('keeps the page title untouched for an installation without an instance name', async () => {
++    await import('../src/main.ts')
++    await harness.preparing.promise
++    const window = harness.windows[0]!
++    const prevented = vi.fn()
++    window.emit('page-title-updated', { preventDefault: prevented }, 'DeepSeek Harness')
++    expect(prevented).not.toHaveBeenCalled()
++    expect(window.setTitle).not.toHaveBeenCalled()
++  })
++
+   it('serves packaged shell documents instead of rejecting the shell origin', async () => {
+     const { serveWebDocument } = await import('../src/web-document.ts')
+     vi.mocked(serveWebDocument).mockResolvedValue(new Response('shell document'))
+@@ -1042,6 +1052,11 @@ describe('desktop main startup', () => {
      harness.hosts[0]!.url = `${protocol}//127.0.0.1:3080/?token=test`
      harness.hosts[0]!.ready.resolve()
      await Promise.resolve(invoke(DESKTOP_IPC.boot))
@@ -899,7 +1071,7 @@ index d9a8f3103b..d5ccc62e6a 100644
      const handler = harness.socketHeaders.mock.calls[0]![1] as (
        details: { url: string; webContentsId: number; requestHeaders: Record<string, string> },
        callback: (result: unknown) => void,
-@@ -2231,7 +2219,8 @@ describe('desktop main startup', () => {
+@@ -2231,7 +2246,8 @@ describe('desktop main startup', () => {
      expect(harness.applyRelease).toHaveBeenCalledTimes(1)
      expect(harness.hosts[0]).toMatchObject({
        node: process.execPath,
@@ -1067,6 +1239,39 @@ index 0000000000..28d562118c
 +    expect(a.output).not.toBe(b.output)
 +  })
 +})
+diff --git a/apps/desktop/tests/tray.spec.ts b/apps/desktop/tests/tray.spec.ts
+index 11c3a48865..e974c17410 100644
+--- a/apps/desktop/tests/tray.spec.ts
++++ b/apps/desktop/tests/tray.spec.ts
+@@ -27,11 +27,11 @@ vi.mock('electron', () => ({
+ 
+ afterEach(() => { native.trays.length = 0; native.menus.length = 0; vi.clearAllMocks() })
+ 
+-function setup(locale = 'en') {
++function setup(locale = 'en', instanceName?: string) {
+   let current = resolveDesktopLocale(locale)
+   const open = vi.fn()
+   const quit = vi.fn()
+-  const tray = new DesktopTray({ iconPath: 'C:/app/resources/tray.ico', locale: () => current, open, quit })
++  const tray = new DesktopTray({ iconPath: 'C:/app/resources/tray.ico', locale: () => current, instanceName, open, quit })
+   return { tray, open, quit, native: native.trays[0]!, setLocale: (next: string) => { current = resolveDesktopLocale(next) } }
+ }
+ 
+@@ -48,6 +48,14 @@ it('shows the application icon with its name as the tooltip and an Open / Quit m
+   expect(f.native.setContextMenu).toHaveBeenCalledWith({ template: native.menus[0] })
+ })
+ 
++it('names the portable instance in the tooltip so a row of identical tray icons stays distinguishable', () => {
++  const f = setup('en', 'dsh-A')
++  expect(f.native.setToolTip).toHaveBeenCalledWith('DeepSeek Harness · dsh-A')
++  f.setLocale('zh')
++  f.tray.relabel()
++  expect(native.trays[0]!.setToolTip).toHaveBeenLastCalledWith('DeepSeek Harness · dsh-A')
++})
++
+ it('opens the window on a single click and routes menu entries to the open and quit actions', () => {
+   const f = setup()
+   f.native.emit('click')
 diff --git a/apps/desktop/tests/web-document.spec.ts b/apps/desktop/tests/web-document.spec.ts
 index 0fd9b591b1..da9b3ab383 100644
 --- a/apps/desktop/tests/web-document.spec.ts
@@ -1271,7 +1476,7 @@ index dea2905583..cb70d68123 100644
    })
  })
 diff --git a/apps/desktop/tests/welcome-startup.spec.ts b/apps/desktop/tests/welcome-startup.spec.ts
-index 7915248243..8b568d227f 100644
+index 7915248243..627145c621 100644
 --- a/apps/desktop/tests/welcome-startup.spec.ts
 +++ b/apps/desktop/tests/welcome-startup.spec.ts
 @@ -1,4 +1,10 @@
@@ -1286,12 +1491,13 @@ index 7915248243..8b568d227f 100644
  /** Welcome startup uses the Host before transitioning to the workspace. */
  
  import { afterEach, expect, it, vi } from 'vitest'
-@@ -101,7 +107,7 @@ vi.mock('electron', () => ({
+@@ -101,7 +107,8 @@ vi.mock('electron', () => ({
  // The Windows tray relabels through Menu as well; keep the menu call counts below platform-neutral.
  vi.mock('../src/tray.ts', () => ({ DesktopTray: class { relabel() {} dispose() {} } }))
  
 -vi.mock('../src/paths.ts', () => ({ resolveDesktopPaths: () => ({ profile: '/profile' }) }))
-+vi.mock('../src/paths.ts', () => ({ resolveDesktopPaths: () => ({ profile: '/profile' }), resolvePortableDshHome: () => undefined }))
++vi.mock('../src/paths.ts', () => ({ resolveDesktopPaths: () => ({ profile: '/profile' }), resolvePortableDshHome: () => undefined,
++  resolveInstanceName: () => undefined }))
  vi.mock('../src/settings.ts', () => ({ readDesktopSettings: () => ({ updates: { allowTestAuthPopupWindow: false } }) }))
  vi.mock('../src/login-shell-environment.ts', async importOriginal => ({
    ...await importOriginal<typeof import('../src/login-shell-environment.ts')>(),
