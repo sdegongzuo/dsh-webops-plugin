@@ -238,7 +238,7 @@ jobs:
       - name: 发布 Release
         # 保留式发布：**只在 Release 不存在时新建**。旧写法里「已存在就 upload --clobber
         # 覆盖附件」的分支已按本仓文件规则移除 —— 覆盖 = 先删旧资产再传新的，属于删除
-        # 分支；且已发布 tag 保持原提交与原附件（docs/打包与发版.md §10）。撞上同名
+        # 分支；且已发布 tag 保持原提交与原附件（docs/打包与发版.md §9）。撞上同名
         # Release 说明版本号被复用，明确失败让发版人换新版本号，而不是悄悄替换历史产物。
         shell: pwsh
         env:
@@ -293,5 +293,5 @@ jobs:
             }
           }
           if (-not $any) { $lines += "- 产物**没产出** —— 失败发生在打包之前，是真失败。" }
-          else { $lines += "> 若这次 run 显示失败，先看**哪一步**红：只有末步「发布 Release」红才是发布动作的问题（见 docs/打包与发版.md §11）。" }
+          else { $lines += "> 若这次 run 显示失败，先看**哪一步**红：只有末步「发布 Release」红才是发布动作的问题（见 docs/打包与发版.md §10）。" }
           $lines | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
