@@ -1662,6 +1662,416 @@ index c382f410ac..e462edd384 100644
    it.each([
      ['darwin', '/Users/a/文档/\n', '/Users/a/文档/deepseek-harness/default-workspace', 'osascript'],
      ['win32', 'D:\\Redirected Documents\r\n', 'D:\\Redirected Documents\\deepseek-harness\\default-workspace', 'powershell.exe'],
+diff --git a/packages/client/ui-permission-presets/src/client/PermissionRow.tsx b/packages/client/ui-permission-presets/src/client/PermissionRow.tsx
+index 2136974522..dee1281d23 100644
+--- a/packages/client/ui-permission-presets/src/client/PermissionRow.tsx
++++ b/packages/client/ui-permission-presets/src/client/PermissionRow.tsx
+@@ -12,7 +12,7 @@ import {
+ } from '@deepseek-ai/dsh-client-ui-primitives'
+ import type { PermissionSettingsState } from './settings-store.ts'
+ import type { PermissionSettingsKey } from './locales.ts'
+-import { displayPermissionPreset, FULL_ACCESS_PRESET } from './presentation.ts'
++import { displayPermissionPreset, AUTO_REVIEW_PRESET, FULL_ACCESS_PRESET } from './presentation.ts'
+ import css from './PermissionRow.module.css'
+ 
+ /** Registration-side business face for the host-backed preference. */
+@@ -41,7 +41,7 @@ export type PermissionRowProps =
+ export function PermissionRow({ load, select, usePermission, t }: PermissionRowProps) {
+   const state = usePermission(snapshot => snapshot)
+   const [open, setOpen] = useState(false)
+-  const [confirmingFullAccess, setConfirmingFullAccess] = useState(false)
++  const [confirming, setConfirming] = useState<string | null>(null)
+   const [acknowledged, setAcknowledged] = useState(false)
+ 
+   useEffect(() => {
+@@ -52,12 +52,12 @@ export function PermissionRow({ load, select, usePermission, t }: PermissionRowP
+     if (state.writable && state.status !== 'unavailable') return
+     setOpen(false)
+     setAcknowledged(false)
+-    setConfirmingFullAccess(false)
++    setConfirming(null)
+   }, [state.status, state.writable])
+ 
+   if (state.status === 'unavailable') return null
+   const selected = state.options.find(option => option.id === state.currentValue)
+-  const busy = state.status === 'loading' || state.status === 'saving' || confirmingFullAccess
++  const busy = state.status === 'loading' || state.status === 'saving' || confirming !== null
+   const optionLabel = (option: PermissionSettingsState['options'][number]): string =>
+     displayPermissionPreset(option.id, option.label, t)
+   const label = selected !== undefined ? optionLabel(selected) : (busy ? t('loading') : t('unavailable'))
+@@ -78,9 +78,9 @@ export function PermissionRow({ load, select, usePermission, t }: PermissionRowP
+           onSelect={(id) => {
+             setOpen(false)
+             if (id === state.currentValue) return
+-            if (id === FULL_ACCESS_PRESET) {
++            if (id === FULL_ACCESS_PRESET || id === AUTO_REVIEW_PRESET) {
+               setAcknowledged(false)
+-              setConfirmingFullAccess(true)
++              setConfirming(id)
+               return
+             }
+             void select(id)
+@@ -103,24 +103,25 @@ export function PermissionRow({ load, select, usePermission, t }: PermissionRowP
+         />
+       </div>
+       <RiskConfirmation
+-        open={confirmingFullAccess}
+-        title={t('confirm.title')}
+-        description={t('confirm.description')}
+-        acknowledgeLabel={t('confirm.acknowledge')}
++        open={confirming !== null}
++        title={confirming === AUTO_REVIEW_PRESET ? t('auto.confirm.title') : t('confirm.title')}
++        description={confirming === AUTO_REVIEW_PRESET ? t('auto.confirm.description') : t('confirm.description')}
++        acknowledgeLabel={confirming === AUTO_REVIEW_PRESET ? t('auto.confirm.acknowledge') : t('confirm.acknowledge')}
+         cancelLabel={t('confirm.cancel')}
+         closeLabel={t('close')}
+-        confirmLabel={t('confirm.enable')}
++        confirmLabel={confirming === AUTO_REVIEW_PRESET ? t('auto.confirm.enable') : t('confirm.enable')}
+         acknowledged={acknowledged}
+         disabled={!state.writable || state.status === 'saving'}
+         onAcknowledgedChange={setAcknowledged}
+         onCancel={() => {
+           setAcknowledged(false)
+-          setConfirmingFullAccess(false)
++          setConfirming(null)
+         }}
+         onConfirm={() => {
++          const preset = confirming
+           setAcknowledged(false)
+-          setConfirmingFullAccess(false)
+-          void select(FULL_ACCESS_PRESET)
++          setConfirming(null)
++          if (preset !== null) void select(preset)
+         }}
+       />
+     </>
+diff --git a/packages/client/ui-permission-presets/src/client/locales.ts b/packages/client/ui-permission-presets/src/client/locales.ts
+index 3754b8a07a..ba0967a14e 100644
+--- a/packages/client/ui-permission-presets/src/client/locales.ts
++++ b/packages/client/ui-permission-presets/src/client/locales.ts
+@@ -12,11 +12,16 @@ export const zh = {
+   'preset.readOnly': '仅可查看',
+   'preset.workspaceWrite': '工作区内修改',
+   'preset.fullAccess': '完全权限',
++  'preset.autoReview': '自动审查（实验）',
+   'confirm.title': '确认启用完全权限？',
+   'confirm.description': '启用完全权限后，新会话将减少确认步骤，并且可以直接执行更多操作，包括敏感操作、文件修改或外部命令。仅建议在你信任后续任务时使用。',
+   'confirm.acknowledge': '我已了解风险，并愿意继续',
+   'confirm.cancel': '取消',
+   'confirm.enable': '启用完全权限',
++  'auto.confirm.title': '确认把自动审查设为默认？',
++  'auto.confirm.description': '设为默认后，新建会话将以无沙箱方式运行；每次原生工具调用与 PTC 内层调用前由同一模型审查，只有被拒绝的调用才请求你审批。该功能仍属实验性，可能误放行或误拒绝，并会消耗额外 token。',
++  'auto.confirm.acknowledge': '我已了解这些风险，并愿意继续',
++  'auto.confirm.enable': '设为默认',
+ } satisfies Record<string, string>
+ 
+ /** The settings.permission namespace key union. */
+@@ -31,11 +36,16 @@ export const en = {
+   'preset.readOnly': 'Read Only',
+   'preset.workspaceWrite': 'Workspace Write',
+   'preset.fullAccess': 'Full access',
++  'preset.autoReview': 'Auto review (experimental)',
+   'confirm.title': 'Enable Full access?',
+   'confirm.description': 'Full access lets new sessions reduce confirmation steps and perform more actions directly, including sensitive operations, file changes, or external commands. Only use it when you trust subsequent tasks.',
+   'confirm.acknowledge': 'I understand the risks and want to continue',
+   'confirm.cancel': 'Cancel',
+   'confirm.enable': 'Enable Full access',
++  'auto.confirm.title': 'Make Auto review the default?',
++  'auto.confirm.description': 'New sessions will run without a sandbox: the same model reviews every native tool call and PTC inner call before it executes, and only denied calls ask you. This feature is experimental, can falsely allow or deny actions, and uses additional tokens.',
++  'auto.confirm.acknowledge': 'I understand these risks and want to continue',
++  'auto.confirm.enable': 'Make default',
+ } satisfies Record<PermissionSettingsKey, string>
+ 
+ /** Simplified Chinese dictionary for the current-session popup gate. */
+@@ -45,6 +55,7 @@ export const accessZh = {
+   'preset.readOnly': '仅可查看',
+   'preset.workspaceWrite': '工作区内修改',
+   'preset.fullAccess': '完全权限',
++  'preset.autoReview': '自动审查（实验）',
+   'confirm.title': '确认启用完全权限？',
+   'confirm.description': '启用完全权限后，智能体将减少确认步骤，并且可以直接执行更多操作，包括敏感操作、文件修改或外部命令。仅建议在你信任当前任务时使用。',
+   'confirm.acknowledge': '我已了解风险，并愿意继续',
+@@ -69,6 +80,7 @@ export const accessEn = {
+   'preset.readOnly': 'Read Only',
+   'preset.workspaceWrite': 'Workspace Write',
+   'preset.fullAccess': 'Full access',
++  'preset.autoReview': 'Auto review (experimental)',
+   'confirm.title': 'Enable Full access?',
+   'confirm.description': 'Full access reduces confirmation steps and lets the agent perform more actions directly, including sensitive operations, file changes, or external commands. Only use it when you trust the current task.',
+   'confirm.acknowledge': 'I understand the risks and want to continue',
+diff --git a/packages/client/ui-permission-presets/src/client/presentation.ts b/packages/client/ui-permission-presets/src/client/presentation.ts
+index f783c9c027..c13c0dae02 100644
+--- a/packages/client/ui-permission-presets/src/client/presentation.ts
++++ b/packages/client/ui-permission-presets/src/client/presentation.ts
+@@ -11,17 +11,20 @@ export type PermissionPresetLabelKey =
+   | 'preset.readOnly'
+   | 'preset.workspaceWrite'
+   | 'preset.fullAccess'
++  | 'preset.autoReview'
+ 
+ const PRESET_LABEL_KEYS = new Map<string, PermissionPresetLabelKey>([
+   ['read-only', 'preset.readOnly'],
+   ['workspace-write', 'preset.workspaceWrite'],
+   [FULL_ACCESS_PRESET, 'preset.fullAccess'],
++  [AUTO_REVIEW_PRESET, 'preset.autoReview'],
+ ])
+ 
+ const DEFAULT_PRESET_LABELS: Record<PermissionPresetLabelKey, string> = {
+   'preset.readOnly': en['preset.readOnly'],
+   'preset.workspaceWrite': en['preset.workspaceWrite'],
+   'preset.fullAccess': en['preset.fullAccess'],
++  'preset.autoReview': en['preset.autoReview'],
+ }
+ 
+ /**
+diff --git a/packages/client/ui-permission-presets/src/client/settings-store.ts b/packages/client/ui-permission-presets/src/client/settings-store.ts
+index 12da5f0caf..1675b24259 100644
+--- a/packages/client/ui-permission-presets/src/client/settings-store.ts
++++ b/packages/client/ui-permission-presets/src/client/settings-store.ts
+@@ -45,10 +45,16 @@ export function permissionDefaultOf(view: SettingsNamespaceView, catalog: Permis
+   currentValue: string
+   options: PermissionDefaultOption[]
+ } {
+-  const currentValue = (view.value as { defaultPreset?: string }).defaultPreset ?? catalog.defaultPreset
++  const stored = (view.value as { defaultPreset?: string }).defaultPreset
+   const options = catalog.defaultOptions.map(option => ({
+     id: option.value, label: displayPermissionPreset(option.value, option.name),
+   }))
++  // A stored value can outlive the preset it names (Auto review uninstalled, or
++  // a hand-edited document). Show the effective default instead of failing the
++  // whole row, so the user can pick a live option again.
++  const currentValue = stored !== undefined && options.some(option => option.id === stored)
++    ? stored
++    : catalog.defaultPreset
+   if (!options.some(option => option.id === currentValue)) throw new Error('permission catalog does not advertise its current default')
+   return { currentValue, options }
+ }
+diff --git a/packages/client/ui-permission-presets/tests/permission-presets-row.client.spec.tsx b/packages/client/ui-permission-presets/tests/permission-presets-row.client.spec.tsx
+index 160bd49d80..36402d2cff 100644
+--- a/packages/client/ui-permission-presets/tests/permission-presets-row.client.spec.tsx
++++ b/packages/client/ui-permission-presets/tests/permission-presets-row.client.spec.tsx
+@@ -16,6 +16,12 @@ const usePanelInfo: GlobalStandardProps['usePanelInfo'] = selector => selector({
+ 
+ const catalog = { options: [], defaultPreset: 'read-only', defaultOptions: ['read-only', 'workspace-write', 'danger-full-access'].map(value => ({ value, name: value })) }
+ const directory = { store: createSnapshotStore({ value: catalog }), load: () => Promise.resolve(catalog) }
++const autoCatalog = {
++  options: [{ value: 'auto', name: 'auto' }],
++  defaultPreset: 'read-only',
++  defaultOptions: ['read-only', 'workspace-write', 'danger-full-access', 'auto'].map(value => ({ value, name: value })),
++}
++const autoDirectory = { store: createSnapshotStore({ value: autoCatalog }), load: () => Promise.resolve(autoCatalog) }
+ 
+ /** Controller over a real mirror derived from the same scripted context. */
+ function derivedController(remote: { settings: object }) {
+@@ -23,16 +29,23 @@ function derivedController(remote: { settings: object }) {
+   return new PermissionPresetSettingsController(new SettingsDescribeMirror(ctx), ctx, directory)
+ }
+ 
++/** Controller whose catalog also advertises the runtime Auto contribution. */
++function derivedAutoController(remote: { settings: object }) {
++  const ctx = { remote } as never
++  return new PermissionPresetSettingsController(new SettingsDescribeMirror(ctx), ctx, autoDirectory)
++}
++
+ afterEach(cleanup)
+ 
+ const SCHEMA = {
+-  uid: 5,
++  uid: 6,
+   refs: {
+     1: { type: 'const', value: 'read-only' },
+     2: { type: 'const', value: 'workspace-write' },
+     3: { type: 'const', value: 'danger-full-access' },
+-    4: { type: 'union', list: [1, 2, 3] },
+-    5: { type: 'object', dict: { defaultPreset: 4 } },
++    4: { type: 'const', value: 'auto' },
++    5: { type: 'union', list: [1, 2, 3, 4] },
++    6: { type: 'object', dict: { defaultPreset: 5 } },
+   },
+ }
+ 
+@@ -131,6 +144,31 @@ describe('PermissionRow', () => {
+     expect(dialog.isConnected).toBe(false)
+   })
+ 
++  it('requires explicit acknowledgement before making auto review the default', async () => {
++    const mutate = vi.fn(() => Promise.resolve(ok(view('auto', 1))))
++    const controller = derivedAutoController({
++      settings: {
++        describe: () => Promise.resolve(ok({ writable: true, hasDocument: false, namespaces: [view('read-only')] })),
++        mutate,
++      },
++    })
++    mount(controller)
++    fireEvent.click(await screen.findByRole('button', { name: '仅可查看' }))
++    fireEvent.click(screen.getByRole('menuitem', { name: '自动审查（实验）' }))
++    expect(mutate).not.toHaveBeenCalled()
++    const dialog = screen.getByRole('dialog', { name: '确认把自动审查设为默认？' })
++    const enable = screen.getByRole('button', { name: '设为默认' })
++    expect((enable as HTMLButtonElement).disabled).toBe(true)
++    fireEvent.click(screen.getByRole('checkbox'))
++    fireEvent.click(enable)
++    await waitFor(() => { expect(mutate).toHaveBeenCalledOnce() })
++    expect(mutate.mock.calls[0]).toEqual([
++      'permission', [{ op: 'set', path: ['defaultPreset'], value: 'auto' }], 0,
++    ])
++    expect(dialog.isConnected).toBe(false)
++    await screen.findByRole('button', { name: '自动审查（实验）' })
++  })
++
+   it('hides an unavailable namespace and disables a read-only provider', async () => {
+     const absent = derivedController({
+       settings: {
+diff --git a/packages/client/ui-permission-presets/tests/settings-store.client.spec.ts b/packages/client/ui-permission-presets/tests/settings-store.client.spec.ts
+index 44b8b4a55c..1f3675bc4e 100644
+--- a/packages/client/ui-permission-presets/tests/settings-store.client.spec.ts
++++ b/packages/client/ui-permission-presets/tests/settings-store.client.spec.ts
+@@ -54,7 +54,12 @@ describe('permission settings store', () => {
+       { id: 'read-only', label: 'Read Only' }, { id: 'workspace-write', label: 'Workspace' },
+     ] })
+     expect(resolveDefault({ ...view('read-only'), value: {} }).currentValue).toBe('read-only')
+-    expect(() => resolveDefault(view('missing'))).toThrow('does not advertise')
++    // A stored value the catalog no longer offers falls back to the effective
++    // default instead of failing the row; the catalog itself must still be sane.
++    expect(resolveDefault(view('missing')).currentValue).toBe('read-only')
++    expect(() => permissionDefaultOf(view('read-only'), {
++      options: [], defaultPreset: 'ghost', defaultOptions: [{ value: 'workspace-write', name: 'workspace-write' }],
++    })).toThrow('does not advertise')
+   })
+ 
+   it('loads and writes defaultPreset with optimistic concurrency', async () => {
+@@ -228,8 +233,15 @@ describe('permission settings store', () => {
+   })
+ })
+ 
+-it('waits for the catalog, follows catalog changes, and contains invalid defaults', async () => {
+-  const ctx = { remote: { settings: { describe: async () => ok({ writable: true, hasDocument: true, namespaces: [view('read-only')] }) } } } as never
++it('shows the effective default when the stored preset is no longer offered', () => {
++  // Auto review uninstalled (or a hand-edited document): the stored value stays
++  // in the document, but the row must render a live default instead of failing.
++  expect(permissionDefaultOf(view('auto'), { ...catalog, defaultPreset: 'workspace-write' }).currentValue)
++    .toBe('workspace-write')
++  expect(resolveDefault(view('workspace-write')).currentValue).toBe('workspace-write')
++})
++
++it('waits for the catalog, follows catalog changes, and contains invalid defaults', async () => {  const ctx = { remote: { settings: { describe: async () => ok({ writable: true, hasDocument: true, namespaces: [view('read-only')] }) } } } as never
+   const mirror = new SettingsDescribeMirror(ctx)
+   const store = createSnapshotStore<{ value: typeof catalog | null }>({ value: null })
+   const controller = new PermissionPresetSettingsController(mirror, ctx, { store, load: async () => catalog })
+diff --git a/packages/interaction/permission-presets/src/index.ts b/packages/interaction/permission-presets/src/index.ts
+index 8135d74282..bb74658d34 100644
+--- a/packages/interaction/permission-presets/src/index.ts
++++ b/packages/interaction/permission-presets/src/index.ts
+@@ -166,7 +166,9 @@ export interface Config {
+   presets: Record<string, PresetSpec>
+   /**
+    * Default for new sessions. When omitted, the preset matching the composed
+-   * sandbox and approval defaults is used.
++   * sandbox and approval defaults is used. `auto` is accepted while the Auto
++   * review integration is live; without it the setting falls back to that
++   * inferred default.
+    */
+   defaultPreset: Volatile<string | undefined>
+ }
+@@ -224,11 +226,20 @@ export class PermissionPresetService extends TypertRemoteService {
+     if (defaultPreset === CUSTOM_PRESET) {
+       throw new Error('permission: composed sandbox and approval defaults match no preset; configure defaultPreset explicitly')
+     }
+-    this.resolve(defaultPreset)
++    // Auto is contributed at runtime by its integration, which mounts after this
++    // service; a stored or configured `auto` default cannot be resolved here yet.
++    if (defaultPreset !== AUTO_PRESET) this.resolve(defaultPreset)
+     this.defaultSettings = () => {
+-      const defaultPreset = config.defaultPreset.get() ?? inferredDefault
+-      if (!Object.hasOwn(this.presets, defaultPreset)) throw new Error(`permission: unknown default preset "${defaultPreset}"`)
+-      return { defaultPreset }
++      const requested = config.defaultPreset.get() ?? inferredDefault
++      // A stored `auto` is honored only while its integration is live. Once the
++      // integration is uninstalled the setting is dead, and throwing here would
++      // take down the whole catalog and settings row — fall back to the
++      // composition default instead so the user can still pick something else.
++      if (requested === AUTO_PRESET) {
++        return { defaultPreset: this.autoAdmit === undefined ? inferredDefault : AUTO_PRESET }
++      }
++      if (!Object.hasOwn(this.presets, requested)) throw new Error(`permission: unknown default preset "${requested}"`)
++      return { defaultPreset: requested }
+     }
+ 
+     const selectionSchema = zod.object({
+@@ -293,7 +304,13 @@ export class PermissionPresetService extends TypertRemoteService {
+   catalog(): PermissionCatalog {
+     return {
+       options: this.names.map(name => this.optionOf(name)),
+-      defaultOptions: Object.keys(this.presets).map(name => this.optionOf(name)),
++      // The settings row lists only `defaultOptions`, so the runtime Auto
++      // contribution must appear here too — otherwise a user could never make
++      // Auto the default even while it is selectable in the current session.
++      defaultOptions: [
++        ...Object.keys(this.presets),
++        ...this.autoAdmit === undefined ? [] : [AUTO_PRESET],
++      ].map(name => this.optionOf(name)),
+       defaultPreset: this.defaultSettings().defaultPreset,
+     }
+   }
+@@ -436,6 +453,10 @@ export class PermissionPresetService extends TypertRemoteService {
+     }
+     if (preset === null && sandbox === null && approval === null && !seeded) {
+       const name = this.defaultPreset
++      // Same admission contract as an explicit selection: the default is only
++      // reachable while the integration is live (defaultSettings guarantees it,
++      // this keeps the write path honest if that ever changes).
++      if (name === AUTO_PRESET) this.autoAdmit?.()
+       const spec = this.resolve(name)
+       session.append('permission/preset', { preset: name })
+       setSandboxMode(session, spec.sandbox)
+diff --git a/packages/interaction/permission-presets/tests/permission-presets.spec.ts b/packages/interaction/permission-presets/tests/permission-presets.spec.ts
+index 10de7a4f31..e81fd43fad 100644
+--- a/packages/interaction/permission-presets/tests/permission-presets.spec.ts
++++ b/packages/interaction/permission-presets/tests/permission-presets.spec.ts
+@@ -449,12 +449,40 @@ describe('new-session default', () => {
+     })
+   })
+ 
+-  it('fails to read a stored default outside the configured preset table until it is repaired', async () => {
++  it('honors a stored auto default while the integration is live and falls back once it is gone', async () => {
+     const ctx = await mountedStore()
+-    await mountAuto(ctx)
++    const fiber = await mountAuto(ctx)
+     await configurations.get(ctx)!.update({ defaultPreset: AUTO_PRESET })
+-    expect(() => ctx.permissionPresets.defaultPreset).toThrow(/unknown default preset/)
++    expect(ctx.permissionPresets.defaultPreset).toBe(AUTO_PRESET)
++    // The setting outlives the integration; reading it must not throw, because a
++    // throwing default would take down the whole catalog and settings row.
++    await fiber.dispose()
++    expect(ctx.permissionPresets.defaultPreset).toBe('workspace-write')
+     await configurations.get(ctx)!.update({ defaultPreset: 'workspace-write' })
+     expect(ctx.permissionPresets.defaultPreset).toBe('workspace-write')
+   })
++
++  it('advertises auto as a default option only while its integration is live', async () => {
++    const ctx = await mounted()
++    const defaults = () => ctx.permissionPresets.catalog().defaultOptions.map(option => option.value)
++    expect(defaults()).toEqual(['workspace-write', 'danger-full-access'])
++    const fiber = await mountAuto(ctx)
++    expect(defaults()).toEqual(['workspace-write', 'danger-full-access', AUTO_PRESET])
++    await fiber.dispose()
++    expect(defaults()).toEqual(['workspace-write', 'danger-full-access'])
++  })
++
++  it('pins a new session to auto when that is the configured default', async () => {
++    const ctx = await mounted({ config: { defaultPreset: AUTO_PRESET } })
++    let admissions = 0
++    await mountAuto(ctx, () => { admissions += 1 })
++    const session = ctx.sessions.create(SessionId('auto-default'))
++    expect(admissions).toBe(1)
++    expect(session.snapshotEvents().map(event => [event.type, event.data])).toEqual([
++      ['permission/preset', { preset: AUTO_PRESET }],
++      ['sandbox/mode', { mode: 'danger-full-access' }],
++      ['approval/policy', { policy: 'ask' }],
++    ])
++    expect(ctx.permissionPresets.current(session)).toBe(AUTO_PRESET)
++  })
+ })
 diff --git a/packages/sandbox/sandbox-local/src/index.ts b/packages/sandbox/sandbox-local/src/index.ts
 index 45028746ff..c929f42495 100644
 --- a/packages/sandbox/sandbox-local/src/index.ts

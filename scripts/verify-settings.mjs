@@ -143,6 +143,11 @@ check(declaredModels.includes(modelId), `声明的模型里有 ${modelId}（共 
 // 否则用户开局第一句话就会被路由到一个不存在的模型上。
 check(valueOf('provider') === route, `agent-default-model.provider = ${route}（实际 ${String(valueOf('provider'))}）`)
 check(valueOf('model') === modelId, `agent-default-model.model = ${modelId}（实际 ${String(valueOf('model'))}）`)
+// 出厂默认权限 = 自动审查（实验）。patch 命中一行时 config 是**整块替换**，所以
+// presets 必须跟着重述；只写 defaultPreset 会把 base 层的三项冲成 schema 默认的两项，
+// 设置页的「仅可查看」静默消失。
+check(patchText.includes('defaultPreset: auto'), `出厂默认权限 = auto（实际 ${String(valueOf('defaultPreset'))}）`)
+check(/presets:\s*\n\s*read-only:/u.test(patchText), 'permission 段重述了 presets（含 read-only）')
 
 // ---------------------------------------------------------------------------
 // [2/3] 起真宿主，让 dsh 自己解析这份 patch。
@@ -273,6 +278,8 @@ export function apply(ctx, config) {
       // user = 用户文档那一层；value = 与内置层合并后的生效值。
       // 两个都取：user 证明「是我们那份文件给的值」，value 证明「真的进入了运行中的条目」。
       report.llmDescriptor = { user: llm.user, value: llm.value }
+      const permission = descriptors.find(row => row.ns === 'permission')
+      if (permission !== undefined) report.permissionDescriptor = { user: permission.user, value: permission.value }
       const fallback = descriptors.find(row => row.ns === 'agent-default-model')
       if (fallback !== undefined) report.defaultDescriptor = fallback.user
     }
@@ -350,6 +357,23 @@ check(
   && report.documentPath.replace(/\\/g, '/').endsWith('/profiles/desktop/cordis.patch.yml'),
   `settings 文档落点是 profile patch（实际 ${String(report?.documentPath)}）`,
 )
+
+// 这一段同样是静态检查拿不到的那一层：describe() 的 user 过了 permission Config
+// 的 schema 投影 —— 字段名写错或 presets 被整块冲掉，都会在这里显形。
+const permissionUser = report?.permissionDescriptor?.user
+check(
+  permissionUser?.defaultPreset === 'auto',
+  `schema 收下了 permission.defaultPreset = auto（实际 ${String(permissionUser?.defaultPreset)}）`,
+)
+// presets 不是 volatile 字段：describe 的 user 只投影 volatile 表单时它本就不出现，
+// 那时这条断言无从谈起（静态检查已兜底）。它一旦出现，就必须仍是完整三项 ——
+// 这是「整块替换把 read-only 冲掉」最容易漏测的形状。
+if (permissionUser?.presets !== undefined) {
+  check(
+    Object.keys(permissionUser.presets).length === 3,
+    `permission.presets 仍是三项（实际 ${JSON.stringify(Object.keys(permissionUser.presets))}）`,
+  )
+}
 
 const userRoutes = Object.keys(report?.llmDescriptor?.user?.providers ?? {})
 check(

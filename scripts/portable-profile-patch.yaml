@@ -117,3 +117,27 @@
           - id: qwen3.6-35b-a3b
             name: Qwen3.6-35B-A3B
             contextWindow: 262144
+
+# 出厂默认权限 = 自动审查（实验）。
+#
+# 为什么要整块重述 presets：Loader 的 patch 命中一行时 **config 是整块替换、不深合并**
+# （vendor/include/src/index.ts 的 `target[key] = value`；`--dump-config` 文档同口径）。
+# 只写 defaultPreset 会把 base 层的 presets 表冲掉，回落到 schema 默认的两项 ——
+# 设置页的「仅可查看」会消失。所以这里必须把三项原样带上。
+#
+# `auto` 只有在 @deepseek-ai/dsh-experimental-auto-review 这一层活着时才是可选/可作默认；
+# 集成不在时宿主回落为推导默认（工作区内修改），设置页也不会报错（桌面补丁负责）。
+- id: permission
+  name: "@deepseek-ai/dsh-permission-presets"
+  config:
+    presets:
+      read-only:
+        sandbox: read-only
+        approval: ask
+      workspace-write:
+        sandbox: workspace-write
+        approval: ask
+      danger-full-access:
+        sandbox: danger-full-access
+        approval: never
+    defaultPreset: auto

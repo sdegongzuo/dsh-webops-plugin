@@ -400,6 +400,16 @@ describe('出厂模型配置：落点与凭据卫生', () => {
     // 用户看到的就是同一份文件该有的样子：表头逐字取自上游 profile.ts。
     expect(patch).toContain('# Your patch layer for this dsh profile, applied after every bundle layer:')
   })
+
+  it('出厂权限默认 auto 时完整重述 presets（patch 整块替换，不深合并）', () => {
+    // 判据在 vendor/include/src/index.ts 的 applyEntryPatches：命中一行时
+    // `target[key] = value` 整块替换 config。只写 defaultPreset 会把 base 层的
+    // presets 冲成 schema 默认的两项，设置页的「仅可查看」静默消失。
+    expect(patch, '出厂默认不再指向自动审查').toContain('defaultPreset: auto')
+    expect(patch, 'presets 表没跟着重述，会丢 read-only').toMatch(/presets:\s*\n\s*read-only:/u)
+    expect(patch).toMatch(/workspace-write:\s*\n\s*sandbox: workspace-write/u)
+    expect(patch).toMatch(/danger-full-access:\s*\n\s*sandbox: danger-full-access/u)
+  })
 })
 
 describe('alpha.2 宿主入口（desktop-host 不再导出 runDesktopHost）', () => {
