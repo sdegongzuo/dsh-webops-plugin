@@ -124,6 +124,15 @@ const SERP_HTML = `<!doctype html>
 </html>
 `
 
+const TABLE_HTML = `<!doctype html><meta charset="utf-8"><title>表格结果区</title>
+<table><tr><th>项目</th><th>操作</th><th>结果</th></tr>
+<tr><td>项目甲</td><td><button onclick="document.getElementById('status').textContent='TABLE-ROW-CONTEXT'">更新甲</button></td><td id="status">初始状态</td></tr>
+<tr><td>OTHER_ROW</td><td><button>其他操作</button></td><td>未变化</td></tr></table>`
+
+const SHADOW_HTML = `<!doctype html><meta charset="utf-8"><title>区块内 Shadow DOM</title>
+<section><button onclick="document.getElementById('host').shadowRoot.querySelector('p').textContent='SHADOW-RESULT'">更新影子内容</button><div id="host"></div></section>
+<section><p>OUTSIDE-SHADOW-REGION</p></section><script>document.getElementById('host').attachShadow({mode:'open'}).innerHTML='<p>初始内容</p>';</script>`
+
 describe.runIf(PROBE.run)(`live Chrome at ${ENDPOINT}`, () => {
   let server: Server
   let pageUrl: string
@@ -133,7 +142,9 @@ describe.runIf(PROBE.run)(`live Chrome at ${ENDPOINT}`, () => {
   beforeAll(async () => {
     server = createServer((request, response) => {
       // `/serp` 走 SERP 夹具，其余走基础夹具（折叠那组用例要一张有重复控件的页面）。
-      const html = request.url?.startsWith('/sections') === true ? SECTIONS_HTML
+      const html = request.url?.startsWith('/shadow') === true ? SHADOW_HTML
+        : request.url?.startsWith('/table') === true ? TABLE_HTML
+        : request.url?.startsWith('/sections') === true ? SECTIONS_HTML
         : request.url?.startsWith('/serp') === true ? SERP_HTML : FIXTURE_HTML
       response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
       response.end(html)
@@ -157,6 +168,43 @@ describe.runIf(PROBE.run)(`live Chrome at ${ENDPOINT}`, () => {
 
   it('reports the endpoint as available', () => {
     expect(provider.available()).toBe(true)
+  })
+
+  it('表格按钮默认观察整行，包含相邻结果单元格但不扩到其他行', async () => {
+    const session = await provider.open({ url: `${pageUrl}table` })
+    try {
+      const full = await provider.observe({ kind: 'snapshot', sessionId: session.id })
+      if (full.kind !== 'snapshot') throw new Error('expected snapshot')
+      const ref = full.refs.find(item => item.name === '更新甲')?.ref
+      if (ref === undefined) throw new Error('missing row button')
+      await provider.mutate({ kind: 'click', sessionId: session.id, ref })
+      const region = await provider.observe({ kind: 'snapshot', sessionId: session.id, region: { enclosing: ref }, guardGlobal: true })
+      if (region.kind !== 'snapshot') throw new Error('expected snapshot')
+      expect(region.scope).toBe(`ref:${ref}`)
+      expect(region.outline).toContain('项目甲')
+      expect(region.outline).toContain('TABLE-ROW-CONTEXT')
+      expect(region.outline).not.toContain('OTHER_ROW')
+    } finally {
+      await provider.close(session.id)
+    }
+  })
+
+  it('区块子树穿透 Shadow DOM，保留内部结果且排除区块外正文', async () => {
+    const session = await provider.open({ url: `${pageUrl}shadow` })
+    try {
+      const full = await provider.observe({ kind: 'snapshot', sessionId: session.id })
+      if (full.kind !== 'snapshot') throw new Error('expected snapshot')
+      const ref = full.refs.find(item => item.name === '更新影子内容')?.ref
+      if (ref === undefined) throw new Error('missing shadow update button')
+      await provider.mutate({ kind: 'click', sessionId: session.id, ref })
+      const region = await provider.observe({ kind: 'snapshot', sessionId: session.id, region: { enclosing: ref }, guardGlobal: true })
+      if (region.kind !== 'snapshot') throw new Error('expected snapshot')
+      expect(region.scope).toBe(`ref:${ref}`)
+      expect(region.outline).toContain('SHADOW-RESULT')
+      expect(region.outline).not.toContain('OUTSIDE-SHADOW-REGION')
+    } finally {
+      await provider.close(session.id)
+    }
   })
 
   it('真实 Chrome 第二同名锚点读取完整章节、长尾与代码空白，导航后拒绝旧锚点', async () => {

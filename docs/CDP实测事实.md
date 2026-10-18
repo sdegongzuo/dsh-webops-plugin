@@ -280,3 +280,11 @@ provider 的 `commandTimeoutMs`（30s，`provider.ts:1010` → `BrowserError('BR
 5. **DevTools**：连开 / 关 5 次，**ref 纪元一次都不该被推进**。这条现在必然通过
    （`invalidate()` 只由地址变化触发），它的价值是**防回归** —— 接入「观察失效」时最容易顺手拿
    `Inspector.detached` 推纪元。
+
+## 8. 区块 DOM 子树（2026-10-19）
+
+`DOM.describeNode({ backendNodeId, depth: -1, pierce: true })` 返回目标节点及递归子树，可按 `backendNodeId` 筛选完整 AX 树；遍历包含 `children`、`shadowRoots`、`pseudoElements` 和 `contentDocument`。本地 Chrome 实测区块内 Shadow DOM 结果可读、区块外正文被排除；表格操作应取整行 `tr`，否则最近 `td` 会漏掉相邻结果单元格。
+
+对不存在的 backend 节点，实际协议错误为 `No node found for given backend id`。只有已识别的节点消失错误转为空区域并回退全页；未知协议、连接、取消与预算错误继续上抛。
+
+5000 条目本地夹具中，7 节点子树采集约 1–4ms，全文档 10029 节点 DOMSnapshot 约 48–74ms。但替换该调用后的 25 次端到端观察没有证明提速：large 区块观察中位数约 383ms → 421ms（分轮运行）。此结果只支持减少全文档结构和布局采集，不能宣称总体延迟或模型费用下降。原始探针和两轮采样在 `D:/dsh-build/goal-20261018/subtree-probe-missing.json`、`region-benchmark-v1.json`、`region-benchmark-v2.json`；真实 Chrome 回归入口为 `src/browser-cdp/live.test.ts`。

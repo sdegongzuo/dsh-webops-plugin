@@ -28,6 +28,7 @@ import type {
   LayoutMetricsResult,
   CallFunctionResult,
   DescribeNodeResult,
+  DomNodeDescription,
 } from './provider-session.ts'
 import { PageNodes } from './page-nodes.ts'
 import { PageNavigation } from './page-navigation.ts'
@@ -373,44 +374,35 @@ export class PageObservation {
   /**
    * DOM 子树（含给定节点自身）→ AX 过滤用的 `backendNodeId` 集合。
    *
-   * 用 DOM 快照的 `parentIndex` 走一遍而不是查 AX 的父子链：区块元素在 AX 里可能被折叠
-   * （`display: contents`、被 `aria-hidden` 包着），而它在 DOM 里一定在 —— 拿 DOM 子树做
-   * 判据，AX 侧只负责「谁在树上」。找不到该节点（已脱离文档）时返回空集，调用方据此回退全页。
+   * 只描述目标子树，不再采集全文档布局；仍按 DOM 身份过滤 AX，保留被 AX 折叠的容器。
+   * 节点消失返回空集供全页兜底；连接、取消与预算故障不转成节点消失。
    */
   private async backendIdsInSubtree(
     session: SessionState, backendNodeId: number, signal?: AbortSignal,
   ): Promise<Set<number>> {
-    const captured = await session.connection.send<CaptureSnapshotResult>(
-      'DOMSnapshot.captureSnapshot', { computedStyles: [] },
-      { signal, timeoutMs: this.config.commandTimeoutMs },
-    )
-    for (const document of captured.documents ?? []) {
-      const ids = document.nodes?.backendNodeId ?? []
-      const start = ids.indexOf(backendNodeId)
-      if (start < 0) continue
-      const parents = document.nodes?.parentIndex ?? []
-      const children = new Map<number, number[]>()
-      for (let index = 0; index < ids.length; index += 1) {
-        const parent = parents[index]
-        if (parent === undefined || parent < 0) continue
-        const siblings = children.get(parent) ?? []
-        siblings.push(index)
-        children.set(parent, siblings)
-      }
-      const keep = new Set<number>()
-      const visited = new Set<number>()
-      const stack = [start]
-      while (stack.length > 0) {
-        const index = stack.pop() as number
-        if (visited.has(index)) continue
-        visited.add(index)
-        const id = ids[index]
-        if (typeof id === 'number') keep.add(id)
-        for (const child of children.get(index) ?? []) stack.push(child)
-      }
-      return keep
+    let described: DescribeNodeResult
+    try {
+      described = await session.connection.send<DescribeNodeResult>(
+        'DOM.describeNode', { backendNodeId, depth: -1, pierce: true },
+        { signal, timeoutMs: this.config.commandTimeoutMs },
+      )
+    } catch (error) {
+      if (error instanceof BrowserError && error.code === 'BROWSER_PROTOCOL_ERROR'
+        && /No node with given id|No node found for given backend id|Node with given id does not belong to the document/.test(error.message)) return new Set()
+      throw error
     }
-    return new Set()
+    const keep = new Set<number>()
+    const stack: DomNodeDescription[] = described.node === undefined ? [] : [described.node]
+    while (stack.length > 0) {
+      const node = stack.pop()!
+      if (node.backendNodeId !== undefined) {
+        if (keep.has(node.backendNodeId)) continue
+        keep.add(node.backendNodeId)
+      }
+      stack.push(...(node.children ?? []), ...(node.shadowRoots ?? []), ...(node.pseudoElements ?? []))
+      if (node.contentDocument !== undefined) stack.push(node.contentDocument)
+    }
+    return keep
   }
 
   /** 从标题到下一个同级/更高级标题，限制在最近 section/article/main/body 内；只读真实 DOM。 */

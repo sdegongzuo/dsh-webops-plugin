@@ -204,6 +204,8 @@ class FakeChrome {
   enclosingBackendNodeId: number | null | undefined = undefined
   /** 设了就用它回答 `DOMSnapshot.captureSnapshot`：区块子树要找真实父子关系。 */
   domTree: { backendNodeId: number[]; parentIndex: number[]; nodeName?: number[] } | undefined
+  /** 子树读取阶段的协议错误；与前置 objectId 描述分开，验证读取失败的分类。 */
+  subtreeError: string | undefined
   /**
    * 窗口输入权（并发网页操作方案 §4）：transport 有没有这个能力面。缺省**不挂** ——
    * 外部 Chrome 就是这个形状（没有共享窗口概念，不宣称窗口级隔离保护），既有用例
@@ -455,6 +457,17 @@ class FakeChrome {
         if (this.missingBackendNodeIds.has(Number(params['backendNodeId']))) return {}
         return params['backendNodeId'] === 0 ? {} : { object: { objectId: 'obj-1' } }
       case 'DOM.describeNode':
+        if (typeof params['backendNodeId'] === 'number') {
+          if (this.subtreeError !== undefined) throw new Error(this.subtreeError)
+          const tree = this.domTree
+          const start = tree?.backendNodeId.indexOf(params['backendNodeId']) ?? -1
+          if (tree === undefined || start < 0) return {}
+          const build = (index: number): { backendNodeId: number; children: unknown[] } => ({
+            backendNodeId: tree.backendNodeId[index]!,
+            children: tree.parentIndex.flatMap((parent, child) => parent === index ? [build(child)] : []),
+          })
+          return { node: build(start) }
+        }
         // 区块节点的 objectId → backendNodeId（动作后默认区域观察的唯一目的）。
         return this.enclosingBackendNodeId === undefined || this.enclosingBackendNodeId === null
           ? {}
@@ -918,6 +931,8 @@ describe('CdpBrowserProvider', () => {
     // 另一块必须真的没进来 —— 否则「默认区块」只是换了个说法的全页。
     expect(regional.outline).not.toContain('别处')
     expect(regional.outsideRegion).toBeGreaterThan(0)
+    expect(chrome.calls.some(call => call.method === 'DOMSnapshot.captureSnapshot')).toBe(false)
+    expect(chrome.calls.some(call => call.method === 'DOM.describeNode' && call.params['depth'] === -1 && call.params['pierce'] === true)).toBe(true)
   })
 
   it('反向：区块解析不出来（元素已被这次动作换掉）时回退全页，观察不算失败', async () => {
@@ -957,6 +972,22 @@ describe('CdpBrowserProvider', () => {
     await provider.observe({ kind: 'snapshot', sessionId: 'tab-1' })
     const reset = await provider.observe({ kind: 'snapshot', sessionId: 'tab-1', region: { previous: true } })
     expect(reset).toMatchObject({ scope: 'full', scopeReason: 'no_previous_region' })
+  })
+
+  it.each(['No node found for given backend id', 'unknown protocol failure'])('子树读取失败分类：%s', async message => {
+    await provider.open({})
+    chrome.axeNodes = SECTIONED_TREE
+    chrome.domTree = SECTIONED_DOM
+    const full = await provider.observe({ kind: 'snapshot', sessionId: 'tab-1' })
+    if (full.kind !== 'snapshot') throw new Error('expected snapshot')
+    chrome.enclosingBackendNodeId = 20
+    chrome.subtreeError = message
+    const observed = provider.observe({ kind: 'snapshot', sessionId: 'tab-1', region: { enclosing: full.refs.find(target => target.name === '发送')!.ref } })
+    if (message.startsWith('No node found')) {
+      await expect(observed).resolves.toMatchObject({ scope: 'full', scopeReason: 'empty_region' })
+    } else {
+      await expect(observed).rejects.toMatchObject({ code: 'BROWSER_PROTOCOL_ERROR', message: expect.stringContaining(message) })
+    }
   })
 
   it('等待继承区块在租约/控制权作废后回退全页，旧区域不能跨代次', async () => {

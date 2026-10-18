@@ -81,7 +81,8 @@ export const HIT_TEST_FUNCTION = 'function (point) {'
  * （`returnByValue: false` → `result.objectId`），再由调用方 `DOM.describeNode` 换号。
  *
  * 选区块的次序（自内向外，命中即停）：
- * 1. 语义地标 / 块级容器：`section`、`article`、`main`、`nav`、`form`、`li`、`tr`、`td` …；
+ * 1. 语义地标 / 块级容器：`section`、`article`、`main`、`nav`、`form`、`li`、`tr` …；
+ *    单元格不单独成为默认区块：操作与结果常在同一行的不同单元格，应保留整行上下文。
  * 2. 带块级 role 的元素（`listitem`、`row`、`tabpanel`、`dialog` …）—— 大量 SPA 只用 div + role；
  * 3. 都没有就是 `body` / `html`：**返回 null**，绝不把整页当区块（那等于没优化，还会让
  *    调用方误以为「已按区块观察」，从而不再做全页兜底）。
@@ -89,7 +90,7 @@ export const HIT_TEST_FUNCTION = 'function (point) {'
  * 上限 40 层只是防御环状 / 病态 DOM；真实页面到 body 通常不超过 15 层。
  */
 export const ENCLOSING_BLOCK_FUNCTION = 'function () {'
-  + ' const blockTags = "section,article,main,nav,aside,header,footer,form,fieldset,figure,dialog,li,tr,td,details";'
+  + ' const blockTags = "section,article,main,nav,aside,header,footer,form,fieldset,figure,dialog,li,tr,details";'
   + ' const blockRoles = ["article","region","group","listitem","row","rowgroup","tabpanel","dialog",'
   + '   "main","navigation","complementary","form","search","list","grid","tree","menu"];'
   + ' const asBlock = (el) => {'

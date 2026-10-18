@@ -89,9 +89,18 @@ export interface CallFunctionResult {
   readonly result?: { readonly value?: unknown; readonly objectId?: string }
 }
 
-/** `DOM.describeNode` 的返回体；只取 `backendNodeId`（objectId → 节点身份）。 */
+/** DOM.describeNode 的实际子树形状；pierce=true 时穿透文档和 shadow root。 */
+export interface DomNodeDescription {
+  readonly backendNodeId?: number
+  readonly children?: readonly DomNodeDescription[]
+  readonly shadowRoots?: readonly DomNodeDescription[]
+  readonly pseudoElements?: readonly DomNodeDescription[]
+  readonly contentDocument?: DomNodeDescription
+}
+
+/** `DOM.describeNode` 的节点身份或完整子树。 */
 export interface DescribeNodeResult {
-  readonly node?: { readonly backendNodeId?: number }
+  readonly node?: DomNodeDescription
 }
 
 /** `Page.navigate` 的返回体。 */
