@@ -7,6 +7,17 @@ import { readRuntimeDescriptor } from './desktop-runtime.mjs'
 import { planSlimAppCopy } from './slim-portable-app.mjs'
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..')
+
+// 出厂默认开启的实验性 bundle（2026-10-18 主上定的清单，与 package-desktop-portable.mjs
+// 的 FACTORY_EXPERIMENTAL_BUNDLES 保持一致；形状与 UI 开关 setBundleEnabled 落盘的一致
+// —— 只追加进 dsh.profile.bundles，不写 dependencies，包体由随包运行时 resources/dsh 供给）。
+const FACTORY_EXPERIMENTAL_BUNDLES = [
+  '@deepseek-ai/dsh-experimental-agent-team-profile',
+  '@deepseek-ai/dsh-experimental-auto-review',
+  '@deepseek-ai/dsh-experimental-tool-worktree',
+  '@deepseek-ai/dsh-experimental-terminal-bundle',
+  '@deepseek-ai/dsh-experimental-session-search',
+]
 const args = process.argv.slice(2)
 const allowed = ['--app', '--plugin-zip', '--version', '--stage-root', '--out']
 function required(flag) {
@@ -55,7 +66,7 @@ try {
   writeFileSync(join(profile, 'package.json'), JSON.stringify({
     name: '@deepseek-ai/dsh-desktop-runtime', private: true, version: '0.0.0',
     dependencies: { [pkg.name]: version, ...Object.fromEntries(vendor.plugins.map(p => [p.name, p.version])) },
-    dsh: { profile: { bundles: ['@deepseek-ai/dsh-base', '@deepseek-ai/dsh-web-app', pkg.name, ...vendor.plugins.map(p => p.name)] } },
+    dsh: { profile: { bundles: ['@deepseek-ai/dsh-base', '@deepseek-ai/dsh-web-app', pkg.name, ...vendor.plugins.map(p => p.name), ...FACTORY_EXPERIMENTAL_BUNDLES] } },
   }, null, 2) + '\n')
   writeFileSync(join(profile, 'pnpm-workspace.yaml'), 'nodeLinker: hoisted\nautoInstallPeers: false\nstrictDepBuilds: true\n')
   cpSync(join(ROOT, 'scripts/portable-profile-patch.yaml'), join(profile, 'cordis.patch.yml'))

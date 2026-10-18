@@ -96,6 +96,21 @@ const CACHE_MARKER = 'cache.json'
 /** 官方常量，抄自 `apps/desktop/src/project-manager.ts`（改错任何一个桌面端直接抛错）。 */
 const PROJECT_NAME = '@deepseek-ai/dsh-desktop-runtime'
 const DESKTOP_PROFILE_BUNDLES = ['@deepseek-ai/dsh-base', '@deepseek-ai/dsh-web-app']
+
+/**
+ * 出厂默认开启的实验性 bundle（2026-10-18 主上定的清单，与 package-release-portable.mjs
+ * 保持一致）。形状与 UI 开关 setBundleEnabled 落盘的一致：只追加进 dsh.profile.bundles，
+ * 不写 dependencies —— 这些包由随包运行时 app/resources/dsh/node_modules 供给
+ * （与 dsh-base / dsh-web-app 同一解析路径）。追加在 vendored 插件之后，与 UI
+ * selectBundle 的追加位置一致；这 5 个都不注入侧边栏，不触碰 better-sidebar 的防双挂载守卫。
+ */
+const FACTORY_EXPERIMENTAL_BUNDLES = [
+  '@deepseek-ai/dsh-experimental-agent-team-profile',
+  '@deepseek-ai/dsh-experimental-auto-review',
+  '@deepseek-ai/dsh-experimental-tool-worktree',
+  '@deepseek-ai/dsh-experimental-terminal-bundle',
+  '@deepseek-ai/dsh-experimental-session-search',
+]
 const WORKSPACE_SETTINGS = 'nodeLinker: hoisted\nautoInstallPeers: false\nstrictDepBuilds: true\n'
 
 /**
@@ -614,7 +629,7 @@ writeFileSync(
       // bundles 必须以前两个内置 bundle 开头（project-manager.ts:169），本插件与
       // vendored 插件按登记顺序追加在后（better-sidebar 的防双挂载守卫只看得见
       // 自己前面的行，所以聚合类 bundle 若将来登记，要排在 better-sidebar 之前）。
-      dsh: { profile: { bundles: [...DESKTOP_PROFILE_BUNDLES, pluginName, ...vendoredPlugins.map((plugin) => plugin.name)] } },
+      dsh: { profile: { bundles: [...DESKTOP_PROFILE_BUNDLES, pluginName, ...vendoredPlugins.map((plugin) => plugin.name), ...FACTORY_EXPERIMENTAL_BUNDLES] } },
     },
     null,
     2,

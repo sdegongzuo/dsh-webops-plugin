@@ -314,6 +314,21 @@ if (existsSync(profileDir)) {
     check(activePlugins.includes(name), `随包第三方插件在 activePlugins 里：${name}`)
   }
 
+  // 出厂默认开启的实验性 bundle（与两个打包脚本的 FACTORY_EXPERIMENTAL_BUNDLES 保持一致）。
+  // 只断言登记进 bundles —— 包体由运行时 resources/dsh 供给，不在 profile node_modules 里。
+  const FACTORY_EXPERIMENTAL_BUNDLES = [
+    '@deepseek-ai/dsh-experimental-agent-team-profile',
+    '@deepseek-ai/dsh-experimental-auto-review',
+    '@deepseek-ai/dsh-experimental-tool-worktree',
+    '@deepseek-ai/dsh-experimental-terminal-bundle',
+    '@deepseek-ai/dsh-experimental-session-search',
+  ]
+  for (const name of FACTORY_EXPERIMENTAL_BUNDLES) {
+    check(activePlugins.includes(name), `出厂默认实验性 bundle 在 activePlugins 里：${name}`)
+    check(existsSync(join(runtimeDir, 'node_modules', name, 'package.json')),
+      `出厂默认实验性 bundle 在随包运行时里真实存在：${name}`)
+  }
+
   const nmDir = join(profileDir, 'node_modules')
   const shipped = existsSync(nmDir) ? readdirSync(nmDir) : []
   notes.push(`出厂态 profile/node_modules 只有 ${String(shipped.length)} 个条目（${shipped.join(', ')}）——`
