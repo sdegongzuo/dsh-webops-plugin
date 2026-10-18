@@ -153,6 +153,9 @@ function artifact() {
   }
 
   const started = Date.now()
+  if (source.kind === 'dir' && existsSync(join(source.path, 'home', '.credentials.yaml'))) {
+    fail('来源包含实例凭据，拒绝作为出厂模板；请使用未注入凭据的模板，装配后再按实例注入')
+  }
   // 全部产物先落在暂存，最后**整体改名发布**：中断的构建只留下暂存证据，
   // 产物 id 不会被半成品占用（方案 §3.2「中断构建后不得启动半成品；重跑使用新目录」——
   // 改名发布让同一 id 在失败后可重试，已发布的 id 则被 rename 的 EEXIST 挡住）。
@@ -194,7 +197,8 @@ function artifact() {
   // 生产形态安装载荷：构建产物（排除 fake-llm）+ 生产 package.json + cordis.patch.yml。
   const pluginDir = join(staged, 'plugin')
   mkdirSync(pluginDir, { recursive: true })
-  cpSync(pluginBuildDir, pluginDir, {
+  // package.json 的 main/exports 指向 lib/；不能把已构建目录拍平到包根。
+  cpSync(pluginBuildDir, join(pluginDir, 'lib'), {
     recursive: true,
     filter: (src) => {
       const rel = toPosix(relative(pluginBuildDir, src))

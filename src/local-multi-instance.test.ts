@@ -129,6 +129,17 @@ describe('逐文件哈希与树摘要', () => {
 })
 
 describe('产物 manifest 与完成标记', () => {
+  it('即使完成标记与摘要匹配，带凭据的模板仍拒绝消费', () => {
+    const root = fixtureRoot()
+    const dir = makeArtifact(root)
+    writeFileSync(join(dir, 'home', '.credentials.yaml'), '仅测试占位')
+    const manifest = JSON.parse(readFileSync(join(dir, 'manifest.json'), 'utf8'))
+    manifest.outputs.home.files['.credentials.yaml'] = lib.sha256File(join(dir, 'home', '.credentials.yaml'))
+    writeFileSync(join(dir, 'manifest.json'), JSON.stringify(manifest))
+    lib.writeCompletion(dir, { kind: 'artifact', digest: lib.treeDigestOfManifestFiles(manifest) })
+    expect(lib.verifyArtifact(dir).problems).toContain('产物含实例凭据，拒绝消费；凭据只能在实例装配后注入')
+    expect(() => lib.assembleInstance({ buildRoot: root, artifactId: 'art-1', instanceId: 'blocked' })).toThrow('产物含实例凭据')
+  })
   it('完整产物通过；缺文件/多文件/内容变化分别拒绝', () => {
     const root = fixtureRoot()
     const dir = makeArtifact(root)
@@ -507,9 +518,12 @@ describe('CLI 端到端（artifact → assemble → status，DSH_DESKTOP_BUILD_R
     expect(() => lib.hashTree(join(dir, 'home', 'profiles', 'desktop', 'node_modules', 'dsh-webops-plugin'))).toThrow()
     // 生产载荷不含 fake-llm，且是本轮构建的内容。
     const plugin = lib.hashTree(join(dir, 'plugin'))
-    expect(plugin.files.has('index.js')).toBe(true)
-    expect([...plugin.files.keys()].some((rel) => rel.startsWith('fake-llm/'))).toBe(false)
-    expect(readFileSync(join(dir, 'plugin', 'index.js'), 'utf8')).toBe('built-index')
+    expect(plugin.files.has('lib/index.js')).toBe(true)
+    expect([...plugin.files.keys()].some((rel) => rel.startsWith('lib/fake-llm/'))).toBe(false)
+    const pkg = JSON.parse(readFileSync(join(dir, 'plugin', 'package.json'), 'utf8'))
+    expect(readFileSync(join(dir, 'plugin', pkg.main), 'utf8')).toBe('built-index')
+    expect(readFileSync(join(dir, 'plugin', pkg.exports['./client'].default), 'utf8')).toBe('built-client')
+    expect(readFileSync(join(dir, 'plugin', 'lib', 'browser-electron', 'host.cjs'), 'utf8')).toBe('built-host')
     const manifest = JSON.parse(readFileSync(join(dir, 'manifest.json'), 'utf8'))
     expect(manifest.inputs.repo.pluginVersion).toBe(JSON.parse(readFileSync(join(repoRoot, 'package.json'), 'utf8')).version)
     expect(manifest.build.reused).toBe(true)
@@ -532,7 +546,7 @@ describe('CLI 端到端（artifact → assemble → status，DSH_DESKTOP_BUILD_R
     const digestA = lib.treeDigest(lib.hashTree(lib.instancePluginDir(lib.instanceDir(root, 'A'))).files)
     const digestB = lib.treeDigest(lib.hashTree(lib.instancePluginDir(lib.instanceDir(root, 'B'))).files)
     expect(digestA).toBe(digestB)
-    expect(readFileSync(join(lib.instancePluginDir(lib.instanceDir(root, 'A')), 'index.js'), 'utf8')).toBe('built-index')
+    expect(readFileSync(join(lib.instancePluginDir(lib.instanceDir(root, 'A')), 'lib', 'index.js'), 'utf8')).toBe('built-index')
 
     const again = runCli(root, ['assemble', '--artifact', 't1', '--instance', 'A'])
     expect(again.status).toBe(1)

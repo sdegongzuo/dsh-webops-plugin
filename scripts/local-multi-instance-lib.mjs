@@ -22,6 +22,7 @@ import { cpSync, existsSync, mkdirSync, readFileSync, readdirSync, statSync, wri
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { findPortListener } from './run-packaged-host.mjs'
+import { prepareInstanceWritableDirectories } from './instance-workspace-acl.mjs'
 
 // 单端口占用查询沿用 run-packaged-host.mjs 的实现（netstat + tasklist，判据同源），
 // 从这里再导出，调用方只依赖本库一个入口。
@@ -211,6 +212,9 @@ export function readManifest(dir, name = ARTIFACT_MANIFEST) {
  */
 export function verifyArtifact(dir) {
   const problems = []
+  if (existsSync(join(dir, 'home', '.credentials.yaml'))) {
+    problems.push('产物含实例凭据，拒绝消费；凭据只能在实例装配后注入')
+  }
   const manifest = readManifest(dir)
   if (manifest === undefined) {
     problems.push(`manifest 缺失或损坏：${join(dir, ARTIFACT_MANIFEST)}`)
@@ -317,6 +321,8 @@ export function assembleInstance(options) {
   }
 
   try {
+    // 只处理刚刚独占创建的新实例；显式 ACE 向随后创建的默认工作区与临时目录继承。
+    prepareInstanceWritableDirectories(target)
     cpSync(join(source, 'app'), join(target, 'app'), { recursive: true })
     cpSync(join(source, 'home'), join(target, 'home'), { recursive: true })
     // 安装「同一份插件」：从产物复制，而不是让实例各自构建（阶段 A 的核心判据）。
