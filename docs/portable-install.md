@@ -94,7 +94,7 @@ dsh --profile <你的 profile 名> --dump-config
 
 当前便携桌面壳将浏览器数据保存到 `<便携包根目录>\data\browser`。切换到使用该目录的新版本后，旧目录 `<便携包根目录>\data\temp\dsh-browser-electron-host` 不会自动导入，旧登录态不会自动带入，需在新网页窗口重新登录。旧目录保留原样，不会复制、清空或删除；若需回看或自行迁移，两个目录都包含敏感登录数据，不要当作普通缓存清理。
 
-网页宿主通过独立 Electron `userData` 保存 Cookie、localStorage 与站点数据。关闭标签不会清除它们；便携实例内所有标签和对话共享同一浏览器 profile，切换对话不会切换账号。不同便携包各自使用包内目录，彼此不共享，也不会自动导入日常 Chrome、Edge 或 DSH 主界面的登录信息。运行时目录规则见[打包与发版：便携数据归属](打包与发版.md#便携数据归属)。
+网页宿主通过独立 Electron `userData` 保存 Cookie、localStorage 与站点数据。关闭标签不会清除它们；便携实例内所有标签和对话共享同一浏览器 profile，切换对话不会切换账号。不同便携包各自使用包内目录，彼此不共享，也不会自动导入日常 Chrome、Edge 或 DSH 主界面的登录信息。运行时目录规则见[便携数据归属](打包机制参考.md#便携数据归属)。
 
 升级便携桌面壳时保留原有 `home` 和 `data`。开发态 script 模式默认把浏览器数据放在当前 `DSH_HOME\data\browser`；显式设置 `DSH_BROWSER_USER_DATA_DIR` 时使用该位置。开发态旧版本曾回退到系统 temp，新目录不会自动带入旧 profile 的登录态。实现区别见[架构与实现](架构与实现.md#开发态-vs-便携版app-模式)。
 

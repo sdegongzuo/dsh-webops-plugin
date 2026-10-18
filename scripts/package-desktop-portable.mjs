@@ -122,7 +122,7 @@ const WORKSPACE_SETTINGS = 'nodeLinker: hoisted\nautoInstallPeers: false\nstrict
 function readVendoredPlugins() {
   const manifestPath = join(ROOT, 'vendor', 'plugins', 'manifest.json')
   if (!existsSync(manifestPath)) {
-    console.error(`package-desktop-portable: 缺少 ${manifestPath} —— 随包第三方插件的登记表不存在（见 docs/打包与发版.md §3）`)
+    console.error(`package-desktop-portable: 缺少 ${manifestPath} —— 随包第三方插件的登记表不存在（见 docs/打包机制参考.md「vendor 依赖登记」）`)
     process.exit(1)
   }
   const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'))

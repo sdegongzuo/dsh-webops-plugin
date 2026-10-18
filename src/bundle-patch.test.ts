@@ -574,7 +574,7 @@ describe('harness 必须放在短路径下：LibreOffice 载荷会撞 MAX_PATH',
  *      `workflow_dispatch` 下它签出的是 UI 里选的那个 ref（默认 main）⇒
  *      「用来补发某个已存在的 tag」实际是「拿 main 的代码、盖上旧 tag 的版本号」。
  *   2. `release.yml` 曾缺「tag 版本 == package.json version」断言 —— 而 AGENTS.md 与
- *      `docs/打包与发版.md` §9 都写着「两个 workflow 的第一步都会校验」。漏了不会报错：
+ *      `docs/打包与发版.md` 都要求版本与 tag 一致。漏了不会报错：
  *      `--version` 是显式传下去的，打包脚本会拿它**覆盖**产物内 package.json 的 version，
  *      于是「仓里声明的版本」与「发出去的包」从此对不上。
  *   3. 两个 workflow 都**一步测试都不跑** ⇒ 单测全红也能发版。

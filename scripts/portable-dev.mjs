@@ -5,7 +5,7 @@
  *
  * 以前每轮真机测试都 `unzip` 一份新整包（解压后 1.2G），测完就扔，`D:/dsh-build` 下堆出
  * `dsh-0.2.6-test2`、`.rel-verify-ext` 一串目录。而 dsh 版本不变时真实变化的只有插件那
- * ~160KB（`docs/打包与发版.md` §8）—— 复制 1.2G 去换 160KB 是纯浪费。
+ * ~160KB（`docs/本机打包与验收.md` §3）—— 复制 1.2G 去换 160KB 是纯浪费。
  *
  * ## 三条事实决定它怎么用（都有实测支撑，别想当然）
  *
@@ -77,7 +77,7 @@ const pluginDir = join(profileDir, 'node_modules', PLUGIN_NAME)
  *
  * 与 `package-desktop-portable.mjs` / `clean-build-residue.mjs` / `probe-tool-concurrency.mjs`
  * 同源：一律走 `local-env.mjs` 的 `buildRoot()`（`DSH_DESKTOP_BUILD_ROOT` 或 `.env.local`，
- * 缺省=仓库根）。细则见 `docs/打包与发版.md` §2。
+ * 缺省=仓库根）。细则见 `docs/本机打包与验收.md` §1。
  *
  * 注：0.2.6 之前这里还有一条「看固定目录的同级有没有 `.desktop-base`」的猜测式兜底，
  * 是为了「每次不必带环境变量」。现在值统一由 `.env.local` 提供，猜测已无必要 ——
@@ -139,7 +139,7 @@ function newestCachedApp() {
 /**
  * 删一棵树。**必须开子进程**：safe-delete 垫片在 require 期读 env，本进程内改无效，
  * 而垫片对每个 unlink 收 450ms（实测）、对 >1G 的目录还会走回收站助手并在 5 秒后抛一个
- * 没有 `.code` 的裸 Error（看着像「空报错」，见 `docs/打包与发版.md` §2 末）。
+ * 没有 `.code` 的裸 Error（看着像「空报错」）。
  */
 function removeTreeFast(target) {
   const result = spawnSync(

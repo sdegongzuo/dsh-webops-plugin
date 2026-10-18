@@ -147,7 +147,7 @@ export function harnessRoot() {
  *
  * ⚠️ **缺省必须留在仓库根** —— CI（`release-desktop.yml`）的 `actions:cache` 就是按相对路径
  * `.desktop-base` 缓存的，改默认会让缓存永远不命中。本机在 `.env.local` 里指到工作区外
- * （工作区内的 `app.asar` 会被 IDE 持句柄，见 `docs/打包与发版.md` §2）。
+ * （工作区内的 `app.asar` 会被 IDE 持句柄，见 `docs/本机打包与验收.md` §1）。
  * @returns {string}
  */
 export function buildRoot() {
