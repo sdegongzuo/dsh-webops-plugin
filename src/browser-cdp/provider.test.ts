@@ -212,6 +212,13 @@ class FakeChrome {
    * 正是在验「没有输入权保护时照旧派发」。要测临界区的用例自己显式打开。
    */
   windowInputEnabled = false
+  /**
+   * 页面是否确认「输入帧已就绪」（双 requestAnimationFrame 探测）。false = 可见但还没准备
+   * 好输入帧的 Electron 新视图 —— provider 必须在派发前拒绝，不能先量点再打空。
+   */
+  inputFrameReady = true
+  /** true = 只让「等输入帧」那条 evaluate 永不回包（验等待期取消/超时，不影响其它读）。 */
+  hangInputFrames = false
   /** false = 模拟排队超时：acquire 回 `undefined`（宿主没在预算内颁票）。 */
   windowInputGrantsTicket = true
   /** true = acquire 返回手工控制的 promise（测试精确控制「票何时到」，见 `windowInputPending`）。 */
@@ -248,6 +255,7 @@ class FakeChrome {
         return {}
       case 'Runtime.evaluate': {
         const expression = String(params['expression'])
+        if (expression.includes('requestAnimationFrame')) return { result: { value: this.inputFrameReady } }
         // L2：页面级可见性。只在夹具显式挂上时才应答 —— 缺省走兜底对象，
         // provider 的 readVisibilityState 对非字符串返回 undefined（不做无证据拒绝）。
         if (expression === 'document.visibilityState' && this.visibilityState !== undefined) {
@@ -661,7 +669,8 @@ class FakeSocket implements CdpSocket {
     }
     // B5-d：`hangEvaluate=true` 时 `Runtime.evaluate` 同样「记下命令、绝不回包」——
     // 实测就是永不 settle 的 Promise 的表现（V44）。
-    if (request.method === 'Runtime.evaluate' && this.chrome.hangEvaluate) {
+    if (request.method === 'Runtime.evaluate' && (this.chrome.hangEvaluate
+      || (this.chrome.hangInputFrames && String(params['expression']).includes('requestAnimationFrame')))) {
       this.chrome.handle(this, request.method, params)
       return
     }
@@ -3859,6 +3868,95 @@ describe('CdpBrowserProvider 窗口输入权（并发网页操作方案 §4）',
     expect(chrome.calls.at(-1)?.ticket).toBeUndefined()
     // 两张票都归还了宿主（释放 ≠ 业务动作成功，只是窗口可交给下一动作）。
     expect(chrome.windowInputReleases).toEqual(['ticket-1', 'ticket-2'])
+  })
+
+  it('click：派发前同步双帧，等帧带票且先于解析、测量和鼠标事件（双窗口漏点击候选）', async () => {
+    const { sessionId, ref } = await openWithRef()
+    const before = chrome.calls.length
+
+    await provider.mutate({ kind: 'click', sessionId, ref })
+
+    const trace = chrome.calls.slice(before)
+    const frames = trace.filter(call => call.method === 'Runtime.evaluate'
+      && String(call.params['expression']).includes('requestAnimationFrame'))
+    // 一次 click 恰一次等帧往返：多了就是重复等待，少了就是没有等到输入帧。
+    expect(frames).toHaveLength(1)
+    // 等帧发生在输入临界区内 —— 无票的等待等于没保护（票可能被撤销、人已接管）。
+    expect(frames[0]?.ticket?.ticketId).toBe(chrome.windowInputGranted.at(-1)?.ticketId)
+    const frameIndex = trace.indexOf(frames[0]!)
+    // 顺序是这条修复的全部意义：先等帧，再量点，再派发。反过来量到的是旧布局。
+    const measureIndex = trace.findIndex(call => call.method === 'DOM.resolveNode' || call.method === 'DOM.getBoxModel')
+    const pressIndex = trace.findIndex(call => call.method === 'Input.dispatchMouseEvent')
+    expect(measureIndex).toBeGreaterThan(frameIndex)
+    expect(pressIndex).toBeGreaterThan(frameIndex)
+    // 等帧本身不发输入、不激活：不得混进任何 Input.* / Page.bringToFront。
+    const waitSegment = trace.slice(frameIndex, measureIndex)
+    expect(waitSegment.filter(call => call.method.startsWith('Input.'))).toHaveLength(0)
+  })
+
+  it('click：页面没确认输入帧时在派发前拒绝，零鼠标副作用', async () => {
+    const { sessionId, ref } = await openWithRef()
+    chrome.inputFrameReady = false
+    const before = chrome.calls.length
+
+    await expect(provider.mutate({ kind: 'click', sessionId, ref })).rejects.toThrow(
+      expect.objectContaining({
+        code: 'BROWSER_PROTOCOL_ERROR',
+        message: expect.stringContaining('did not confirm input frame readiness') as unknown as string,
+      }),
+    )
+    expect(chrome.calls.slice(before).filter(call => call.method === 'Input.dispatchMouseEvent')).toHaveLength(0)
+    // 拒绝后票据照常归还，条目不会卡在「持票中」。
+    expect(chrome.windowInputReleases).toContain(chrome.windowInputGranted.at(-1)?.ticketId)
+  })
+
+
+  it('等帧期间取消：原信号透传到底层等待，零输入副作用，票据仍归还', async () => {
+    const { sessionId, ref } = await openWithRef()
+    const controller = new AbortController()
+    chrome.hangInputFrames = true
+    let fired = false
+    chrome.onCall = (method: string, params: Record<string, unknown>): void => {
+      if (fired || method !== 'Runtime.evaluate') return
+      if (!String(params['expression']).includes('requestAnimationFrame')) return
+      fired = true
+      controller.abort()
+    }
+    const before = chrome.calls.length
+
+    await expect(provider.mutate({ kind: 'click', sessionId, ref }, controller.signal)).rejects.toThrow()
+    expect(fired).toBe(true)
+    expect(chrome.calls.slice(before).filter(call => call.method.startsWith('Input.'))).toHaveLength(0)
+    expect(chrome.windowInputReleases).toContain(chrome.windowInputGranted.at(-1)?.ticketId)
+  })
+
+  it('等帧不落定：按原调用的命令预算收手，零鼠标副作用', async () => {
+    provider = new AdoptableProvider({ navigationTimeoutMs: 200, commandTimeoutMs: 200 }, chrome.transport())
+    const { sessionId, ref } = await openWithRef()
+    chrome.hangInputFrames = true
+    const before = chrome.calls.length
+    const started = Date.now()
+
+    await expect(provider.mutate({ kind: 'click', sessionId, ref })).rejects.toThrow(/within 200 ms/)
+    // 预算就是原调用那一档：既不能被等帧放大，也不能被吞成成功的空点击。
+    expect(Date.now() - started).toBeLessThan(3_000)
+    expect(chrome.calls.slice(before).filter(call => call.method.startsWith('Input.'))).toHaveLength(0)
+    expect(chrome.windowInputReleases).toContain(chrome.windowInputGranted.at(-1)?.ticketId)
+  })
+
+  it('没有窗口输入权（外部 Chrome）时不加等帧往返', async () => {
+    chrome.windowInputEnabled = false
+    // 能力面在构造时读取：必须在建 provider 之前摘掉，否则测的仍是 Electron 形状。
+    const plain = new AdoptableProvider({ navigationTimeoutMs: 200 }, chrome.transport())
+    const { sessionId, ref } = await openWithRef(plain)
+    const before = chrome.calls.length
+
+    await plain.mutate({ kind: 'click', sessionId, ref })
+
+    // 等帧只在「有共享窗口、可能抢输入权」时才有意义；外部 Chrome 不能白白多一次往返。
+    const frames = chrome.calls.slice(before).filter(call => call.method === 'Runtime.evaluate'
+      && String(call.params['expression']).includes('requestAnimationFrame'))
+    expect(frames).toHaveLength(0)
   })
 
   it('press：keyDown/keyUp 在同一张票的临界区内派发', async () => {

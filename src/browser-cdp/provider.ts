@@ -1314,6 +1314,13 @@ export class CdpBrowserProvider implements BrowserProvider {
         // 后台页面的 smooth 滚动可能暂停；先准备可见标签，再滚动和量落点。
         // 否则激活后布局已经改变，却仍把之前的视口外坐标用于真实输入。
         await this.ensureInputDispatchable(session, signal, true, lease?.ticket)
+        if (lease !== undefined) {
+          // Electron 新视图可先报告 visible，再准备好输入帧。先同步两帧再测量，
+          // 避免首击已回包但页面没有收到；等待使用原调用的信号与命令预算。
+          await this.waitForInputFrames(session, signal)
+          this.assertWritable(session)
+          this.assertInputNotRevoked(lease)
+        }
         objectId = await this.nodes.resolveObjectId(session, ref, signal)
         const box = await this.nodes.elementViewportBox(session, objectId, signal)
         const point = { x: box.x + box.width / 2, y: box.y + box.height / 2 }
@@ -1620,6 +1627,25 @@ export class CdpBrowserProvider implements BrowserProvider {
       return typeof evaluated.result?.value === 'string' ? evaluated.result.value : undefined
     } catch {
       return undefined
+    }
+  }
+
+  /** 仅供持有窗口输入票的点击准备；不派发输入、不改变焦点，失败不继续点击。 */
+  private async waitForInputFrames(session: SessionState, signal?: AbortSignal): Promise<void> {
+    const evaluated = await session.connection.send<EvaluateResult>(
+      'Runtime.evaluate',
+      {
+        expression: 'new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve(true))))',
+        awaitPromise: true,
+        returnByValue: true,
+      },
+      { signal, timeoutMs: this.config.commandTimeoutMs },
+    )
+    if (extractEvaluateException(evaluated) !== undefined || evaluated.result?.value !== true) {
+      throw new BrowserError(
+        'the visible page did not confirm input frame readiness; no mouse event was dispatched',
+        'BROWSER_PROTOCOL_ERROR',
+      )
     }
   }
 
