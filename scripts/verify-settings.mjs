@@ -44,13 +44,14 @@ import { materializeRuntimeDir } from './desktop-runtime.mjs'
 import { startPackagedDesktopHost } from './run-packaged-host.mjs'
 
 const args = process.argv.slice(2)
+const keepTemp = args.includes('--keep-temp')
 const readArg = (name) => {
   const at = args.indexOf(`--${name}`)
   return at === -1 ? undefined : args[at + 1]
 }
 
 if (readArg('dir') === undefined) {
-  console.error('用法: node scripts/verify-settings.mjs --dir <解压后的便携包根目录> [--route unisound] [--model u2-flash] [--patch <出厂配置>]')
+  console.error('用法: node scripts/verify-settings.mjs --dir <解压后的便携包根目录> [--route unisound] [--model u2-flash] [--patch <出厂配置>] [--keep-temp]')
   process.exit(1)
 }
 
@@ -317,6 +318,7 @@ const host = startPackagedDesktopHost({
   runtimeDir,
   profileDir,
   env: process.env,
+  gracefulOnly: keepTemp,
 })
 let ready
 try {
@@ -435,8 +437,11 @@ check(
 )
 
 await host.stop()
-materialized.cleanup()
-rmSync(home, { recursive: true, force: true })
+if (keepTemp) console.log(`临时目录保留：${home}`)
+else {
+  materialized.cleanup()
+  rmSync(home, { recursive: true, force: true })
+}
 
 if (failures.length > 0) {
   console.log(`\n✗ verify:settings 未通过（${failures.length} 项）`)

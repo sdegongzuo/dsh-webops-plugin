@@ -5,6 +5,11 @@ import { join } from 'node:path'
 
 export function prepareInstanceWritableDirectories(root, options = {}) {
   const directories = ['documents', 'temp'].map(name => join(root, 'data', name))
+  return prepareFreshWritableDirectories(directories, options)
+}
+
+/** 调用方只传本轮新建的测试目录；不递归修改已有用户目录。 */
+export function prepareFreshWritableDirectories(directories, options = {}) {
   const platform = options.platform ?? process.platform
   const run = options.run ?? spawnSync
   for (const directory of directories) mkdirSync(directory, { recursive: true })

@@ -109,8 +109,10 @@ import { basename, join, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { materializeRuntimeDir } from './desktop-runtime.mjs'
 import { startPackagedDesktopHost } from './run-packaged-host.mjs'
+import { prepareFreshWritableDirectories } from './instance-workspace-acl.mjs'
 
 const args = process.argv.slice(2)
+const keepTemp = args.includes('--keep-temp')
 const readArg = (name) => {
   const at = args.indexOf(`--${name}`)
   return at === -1 ? undefined : args[at + 1]
@@ -121,7 +123,7 @@ const expected = readArg('expect') ?? '42'
 // 沙箱那一次跑的程序不同，好让两侧的返回值能区分开（不至于一次成功掩盖另一次）。
 const confinedExpected = '43'
 if (readArg('dir') === undefined) {
-  console.error('用法: node scripts/verify-ptc.mjs --dir <解压后的便携包根目录> [--expect 42]')
+  console.error('用法: node scripts/verify-ptc.mjs --dir <解压后的便携包根目录> [--expect 42] [--keep-temp]')
   process.exit(1)
 }
 
@@ -304,7 +306,7 @@ check(shared.has('@deepseek-ai/dsh-ptc-runtime-node'), 'runtime 携带 @deepseek
 
 if (!nodeOk) {
   console.log('\n前置文件缺失，后续真跑无意义。')
-  materialized.cleanup()
+  if (!keepTemp) materialized.cleanup()
   process.exit(1)
 }
 
@@ -316,8 +318,11 @@ const probeDir = join(profileDir, 'node_modules', 'ptc-probe')
 const reportPath = join(home, 'report.json')
 // 沙箱那一次跑的 workspaceRoot：必须是真存在的绝对目录。
 const workspace = join(home, 'ptc-workspace')
+const runtimeTemp = join(home, 'runtime-temp')
 mkdirSync(probeDir, { recursive: true })
 mkdirSync(workspace, { recursive: true })
+mkdirSync(runtimeTemp, { recursive: true })
+prepareFreshWritableDirectories([home])
 
 // 探针插件：宿主 controller 不暴露 ctx，只能用一个真挂进 profile 的行来读服务。
 writeFileSync(join(probeDir, 'package.json'), `${JSON.stringify({
@@ -400,7 +405,8 @@ process.env.DSH_PTC_NODE = nodePath
 const host = startPackagedDesktopHost({
   runtimeDir,
   profileDir,
-  env: process.env,
+  env: { ...process.env, TEMP: runtimeTemp, TMP: runtimeTemp, TMPDIR: runtimeTemp },
+  gracefulOnly: keepTemp,
 })
 let ready
 try {
@@ -488,8 +494,11 @@ if (report?.confinedError !== undefined) check(false, `受限 PTC 程序报错�
 if (report?.confinedThrew !== undefined) check(false, `受限 PTC 程序抛异常：${report.confinedThrew}`)
 
 await host.stop()
-materialized.cleanup()
-rmSync(home, { recursive: true, force: true })
+if (keepTemp) console.log(`临时目录保留：${home}`)
+else {
+  materialized.cleanup()
+  rmSync(home, { recursive: true, force: true })
+}
 
 if (failures.length > 0) {
   console.log(`\n✗ verify:ptc 未通过（${failures.length} 项）`)
