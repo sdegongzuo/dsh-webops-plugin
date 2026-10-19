@@ -2,6 +2,56 @@ import { describe, expect, it } from 'vitest'
 import { rememberSnapshot, searchOutline, SNAPSHOT_TEXT_CACHE_CHARS, type SnapshotCache } from './snapshot-cache.ts'
 
 describe('观察缓存与完整正文检索', () => {
+  it('复选框先于同项标签时，find 上下文取本项后续文本，不借用前一列表项', () => {
+    const outline = [
+      '- text "Mark all as complete"',
+      '- list',
+      '  - listitem',
+      '    - checkbox "Toggle Todo" checked=true [ref=e1]',
+      '    - text "待办甲"',
+      '  - listitem',
+      '    - checkbox "Toggle Todo" checked=false [ref=e2]',
+      '    - text "待办乙"',
+    ].join('\n')
+    const entry = rememberSnapshot(new Map(), {
+      session_id: 's1', truncated: false,
+      refs: ['e1', 'e2'].map(ref => ({ ref, role: 'checkbox', name: 'Toggle Todo' })),
+    }, outline)
+    const matches = searchOutline(entry, line => line.includes('Toggle Todo'), 10)
+    expect(matches.map(match => ({ ref: match.ref, context: match.context }))).toEqual([
+      { ref: 'e1', context: 'text "待办甲"' },
+      { ref: 'e2', context: 'text "待办乙"' },
+    ])
+  })
+
+  it.each([
+    {
+      name: '表格行内后续单元格',
+      outline: '- table\n  - row\n    - checkbox "选择" [ref=e1]\n    - cell "项目甲"\n  - row\n    - cell "项目乙"',
+      context: 'cell "项目甲"',
+    },
+    {
+      name: '嵌套无名组沿用同一列表项标签',
+      outline: '- list\n  - listitem\n    - group\n      - checkbox "选择" [ref=e1]\n    - text "项目甲"',
+      context: 'text "项目甲"',
+    },
+    {
+      name: '命名区块作为本区块兜底',
+      outline: '- text "别的内容"\n- group "账号"\n  - checkbox "选择" [ref=e1]',
+      context: 'group "账号"',
+    },
+    {
+      name: '无标签条目不借用其他条目',
+      outline: '- list\n  - listitem\n    - text "项目甲"\n  - listitem\n    - checkbox "选择" [ref=e1]\n  - listitem\n    - text "项目丙"',
+      context: undefined,
+    },
+  ])('$name', ({ outline, context }) => {
+    const entry = rememberSnapshot(new Map(), {
+      session_id: 's1', truncated: false, refs: [{ ref: 'e1', role: 'checkbox', name: '选择' }],
+    }, outline)
+    expect(searchOutline(entry, line => line.includes('[ref=e1]'), 10)[0]?.context).toBe(context)
+  })
+
   it('整份正文缓存有总预算，超限明确标记，代码同组重复引用不重复消耗预算', () => {
     const cache: SnapshotCache = new Map()
     const entry = rememberSnapshot(cache, { session_id: 's1', refs: [], truncated: false }, '- text "code"', undefined,

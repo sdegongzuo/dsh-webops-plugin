@@ -93,7 +93,7 @@ export interface FindMatch {
    */
   anchor?: boolean
   /**
-   * 该行所属的最近 heading / 静态文本（形如 `heading "Rust 官方文档"`）。
+   * 该行语义区块内的消歧文字或区块名（形如 `text "待办甲"`），不跨相邻条目借用。
    *
    * 折叠把「点哪个」的决策转嫁给 find，但 12 个「翻译此页」在 find 结果里文本完全相同 ——
    * 没有这一条，模型拿到 12 个 ref 也不知道该点哪个，折叠反而变成「更难用」。
@@ -173,32 +173,62 @@ function outlineDepth(line: string): number {
 }
 
 /**
- * 给每一行算出「所属上下文」：祖先链上最近的 heading / 静态文本行。
- *
- * 为什么靠缩进反推而不是让 provider 传结构化行：缩进本身就是祖先链的完整编码，解析它
- * 不必给 `webpage_find` 单开一条数据通道。代价是这条格式约定必须钉在测试里
- * （`renderOutline` 的缩进规则一改，这里必须跟着改）。
- *
- * 兜底：祖先链上一个 heading / 静态文本都没有时（SERP 的结果标题常是 link，不是 heading），
- * 退到「本行之前最近的一个 heading / 静态文本」。它不保证就是同一条结果的标题，所以回执里
- * 字段叫 `context` 而不是「父节点」—— 它是消歧提示，不是结构断言。
+ * 用缩进恢复语义区块边界，在同一列表项、表格行等区块内优先取前文，没有再取后文。
+ * TodoMVC 的标签在 checkbox 后面，不能把上一项的标签当作本项上下文。
+ * 命名区块或同区块祖先可兜底；无标签的独立条目宁可不报 context，也不借用其他条目。
  */
 function outlineContexts(lines: readonly string[]): (string | undefined)[] {
-  const contexts: (string | undefined)[] = []
-  const stack: { depth: number; context: string | undefined }[] = []
-  let previous: string | undefined
-  for (const line of lines) {
+  interface Scope {
+    parent?: number
+    anchor: number
+    label?: string
+    lines: { index: number; text?: string }[]
+  }
+  const scopes: Scope[] = [{ anchor: -1, lines: [] }]
+  const stack: { depth: number; scope: number }[] = []
+  const scopeOf: number[] = []
+  const contexts: (string | undefined)[] = Array.from({ length: lines.length })
+  for (const [index, line] of lines.entries()) {
     const depth = outlineDepth(line)
     while (stack.length > 0 && (stack[stack.length - 1]?.depth ?? 0) >= depth) stack.pop()
-    const inherited = stack[stack.length - 1]?.context
-    contexts.push(inherited ?? previous)
-    const match = OUTLINE_LINE.exec(line)
-    const body = match === null ? undefined : match[2]
-    const own = body !== undefined && /^(?:heading|text)\b/u.test(body)
-      ? body.replace(/\s*\[ref=e\d+\]$/u, '')
-      : undefined
-    if (own !== undefined) previous = own
-    stack.push({ depth, context: own ?? inherited })
+    const parentScope = stack[stack.length - 1]?.scope ?? 0
+    const body = OUTLINE_LINE.exec(line)?.[2] ?? ''
+    const clean = body.replace(/\s*\[(?:ref|anchor)=e\d+\]$/u, '')
+    const text = /^(?:heading|text|cell|rowheader|columnheader|caption)\b/u.test(body)
+      && /"[^"\n]+"/u.test(body) ? clean : undefined
+    scopes[parentScope]!.lines.push({ index, ...text !== undefined ? { text } : {} })
+    scopeOf[index] = parentScope
+    let scope = parentScope
+    if (/^(?:listitem|row|group|region|article|form|dialog|alertdialog|navigation|main)\b/u.test(body)) {
+      scope = scopes.length
+      scopes.push({ parent: parentScope, anchor: index, lines: [],
+        .../"[^"\n]+"/u.test(body) ? { label: clean } : {} })
+    }
+    stack.push({ depth, scope })
+  }
+  // 两遍线性扫描，只考虑同一区块的文字；后文不会跨进相邻条目。
+  for (const scope of scopes) {
+    let previous: string | undefined
+    for (const row of scope.lines) {
+      contexts[row.index] = previous
+      if (row.text !== undefined) previous = row.text
+    }
+    let next: string | undefined
+    for (let index = scope.lines.length - 1; index >= 0; index -= 1) {
+      const row = scope.lines[index]!
+      if (scope !== scopes[0] && row.text === undefined) contexts[row.index] ??= next
+      if (row.text !== undefined) next = row.text
+    }
+  }
+  for (const [index, scopeId] of scopeOf.entries()) {
+    if (contexts[index] !== undefined) continue
+    let current = scopeId
+    while (current !== 0) {
+      const scope = scopes[current]!
+      const inherited = scope.label ?? (scope.parent !== 0 ? contexts[scope.anchor] : undefined)
+      if (inherited !== undefined) { contexts[index] = inherited; break }
+      current = scope.parent ?? 0
+    }
   }
   return contexts
 }

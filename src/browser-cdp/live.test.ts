@@ -31,6 +31,7 @@ import { LocalAttachmentStore } from '@deepseek-ai/dsh-attachment-local'
 import { CdpBrowserProvider } from './provider.ts'
 import { validateEndpoint } from './url-policy.ts'
 import { DEFAULT_SNAPSHOT_LIMITS } from './snapshot.ts'
+import { rememberSnapshot, searchOutline } from '../tool-browser/snapshot-cache.ts'
 
 const { buildRoot } = await import(new URL('../../scripts/local-env.mjs', import.meta.url).href) as {
   buildRoot(): string
@@ -133,6 +134,9 @@ const SHADOW_HTML = `<!doctype html><meta charset="utf-8"><title>区块内 Shado
 <section><button onclick="document.getElementById('host').shadowRoot.querySelector('p').textContent='SHADOW-RESULT'">更新影子内容</button><div id="host"></div></section>
 <section><p>OUTSIDE-SHADOW-REGION</p></section><script>document.getElementById('host').attachShadow({mode:'open'}).innerHTML='<p>初始内容</p>';</script>`
 
+const CHECKBOX_LIST_HTML = `<!doctype html><meta charset="utf-8"><title>标签后置列表</title>
+<p>Mark all as complete</p><ul>${['待办甲', '待办乙', '待办丙', '待办丁'].map(name => `<li><input type="checkbox" aria-label="Toggle Todo"><label>${name}</label></li>`).join('')}</ul>`
+
 describe.runIf(PROBE.run)(`live Chrome at ${ENDPOINT}`, () => {
   let server: Server
   let pageUrl: string
@@ -142,7 +146,8 @@ describe.runIf(PROBE.run)(`live Chrome at ${ENDPOINT}`, () => {
   beforeAll(async () => {
     server = createServer((request, response) => {
       // `/serp` 走 SERP 夹具，其余走基础夹具（折叠那组用例要一张有重复控件的页面）。
-      const html = request.url?.startsWith('/shadow') === true ? SHADOW_HTML
+      const html = request.url?.startsWith('/checkbox-list') === true ? CHECKBOX_LIST_HTML
+        : request.url?.startsWith('/shadow') === true ? SHADOW_HTML
         : request.url?.startsWith('/table') === true ? TABLE_HTML
         : request.url?.startsWith('/sections') === true ? SECTIONS_HTML
         : request.url?.startsWith('/serp') === true ? SERP_HTML : FIXTURE_HTML
@@ -168,6 +173,29 @@ describe.runIf(PROBE.run)(`live Chrome at ${ENDPOINT}`, () => {
 
   it('reports the endpoint as available', () => {
     expect(provider.available()).toBe(true)
+  })
+
+  it('真实列表折叠后的同名复选框按本项后置标签消歧，只切换目标项', async () => {
+    const session = await provider.open({ url: `${pageUrl}checkbox-list` })
+    try {
+      const snapshot = await provider.observe({ kind: 'snapshot', sessionId: session.id })
+      if (snapshot.kind !== 'snapshot') throw new Error('expected snapshot')
+      expect(snapshot.foldedRepeats).toBe(3)
+      const entry = rememberSnapshot(new Map(), {
+        session_id: session.id, refs: [...snapshot.refs], truncated: snapshot.truncated,
+      }, snapshot.fullOutline ?? snapshot.outline)
+      const matches = searchOutline(entry, line => line.includes('Toggle Todo'), 10)
+      expect(matches.map(match => match.context)).toEqual(['text "待办甲"', 'text "待办乙"', 'text "待办丙"', 'text "待办丁"'])
+      const ref = matches.find(match => match.context === 'text "待办乙"')?.ref
+      if (ref === undefined) throw new Error('missing target checkbox')
+      await provider.mutate({ kind: 'click', sessionId: session.id, ref })
+      const state = await provider.execute({ sessionId: session.id, method: 'Runtime.evaluate', params: {
+        expression: '[...document.querySelectorAll("li input")].map(el=>el.checked)',
+      } })
+      expect(state.value).toEqual([false, true, false, false])
+    } finally {
+      await provider.close(session.id)
+    }
   })
 
   it('表格按钮默认观察整行，包含相邻结果单元格但不扩到其他行', async () => {
