@@ -5,6 +5,7 @@ import { join, resolve, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { materializeRuntimeDir } from './desktop-runtime.mjs'
 import { fetchHostPath, startPackagedDesktopHost } from './run-packaged-host.mjs'
+import { assertDesktopBuildIdentity } from './desktop-build-identity.mjs'
 
 const ROOT = fileURLToPath(new URL('../', import.meta.url))
 const argv = process.argv.slice(2)
@@ -18,6 +19,7 @@ const { runtimeDir } = materializeRuntimeDir(join(dir, 'app'))
 const runtime = json(join(runtimeDir, 'desktop-runtime.json'))
 assert(manifest.pluginVersion === pkg.version, '便携包插件版本与发布源码不一致')
 assert(manifest.dshVersion === runtime.release.version, '便携包 DSH 版本与实际运行时不一致')
+if (manifest.desktopBuild !== undefined) assertDesktopBuildIdentity(join(dir, 'app'), manifest.desktopBuild)
 assert(runtime.platform === 'win32' && runtime.arch === 'x64', '便携包平台必须为 Windows x64')
 assert(runtime.files?.length > 0, '缺少运行时完整性清单')
 for (const file of runtime.files) {

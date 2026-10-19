@@ -42,23 +42,14 @@ env:
   # 用同一个 ref，也让本 workflow 的构建对着我们实际随包出货的那个 harness 版本。
   HARNESS_REF: ${{ inputs.harness_ref || '687f282e8625c6b8d11ff58211a90524be2e4317' }}
   TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
-  # ⚠️ 基包三项必须**一起换**，且与 dsh peer 版本同源：
-  #   · 只换 tag → 下完撞 BASE_DESKTOP_SHA256 校验；
-  #   · 只换附件名 → 撞 `package-release-portable.mjs` 的 peer 门槛（那条是**精确字符串**
-  #     相等：基包内 DSH 是 X，插件三个 dsh peer 就必须一字不差是 `^X`，不是 semver 匹配）；
-  #   · 只升 peer 不换基包 → 同上，v0.2.20 就是这样红的（peer 已 ^0.2.1-alpha.4，基包还是
-  #     alpha.2 的 v0.2.16，报 `DSH 0.2.1-alpha.2 不在插件声明的 peerDependencies 中`）。
-  # 基包取 `desktop-v<DSH 版本>` 的整包附件：它由 release-desktop 从打过
-  # docs/harness-desktop-build.patch 的 harness 源码构建，main 已含便携数据接线，
-  # 因此**不需要**再跑 prepare-release-app.mjs（0.2.17~0.2.19 需要，是因那时基包是上游原样包）。
-  BASE_DESKTOP_TAG: desktop-v0.2.1-rc.2
-  BASE_DESKTOP_ASSET: dsh-webops-desktop-v0.2.1-rc.2-win-x64-portable.zip
-  BASE_DESKTOP_SHA256: 709577497d7e3448718a346419cbf01874ae79fb5e58e8d7fc1e8763181ec520
+  DSH_ELECTRON_MIRROR: https://github.com/electron/electron/releases/download/
+  # 完整便携包从本 tag 的补丁与固定 HARNESS_REF 完整重编，不复用可能缺少新补丁的旧公开壳。
+  # DSH 版本仍取实际运行时清单；插件 peer 必须与之精确对应，不改写已发布桌面 tag。
 
 jobs:
   portable-win-x64:
     runs-on: windows-latest
-    timeout-minutes: 45
+    timeout-minutes: 180
 
     steps:
       - name: 签出本仓
@@ -100,7 +91,10 @@ jobs:
       - name: 取 deepseek-harness 源码
         shell: pwsh
         run: |
-          $dest = Join-Path (Split-Path $PWD) 'deepseek-harness'
+          # Office 载荷不支持过长路径；源码使用短根，link: 依赖仍通过原相对名字解析。
+          $dest = Join-Path (Split-Path (Split-Path $env:GITHUB_WORKSPACE)) 'h'
+          $link = Join-Path (Split-Path $env:GITHUB_WORKSPACE) 'deepseek-harness'
+          if ((Test-Path $dest) -or (Test-Path $link)) { throw '构建输入目录已存在，拒绝覆盖' }
           Write-Host "harness ref: $env:HARNESS_REF → $dest"
           New-Item -ItemType Directory -Path $dest -Force | Out-Null
           Set-Location $dest
@@ -108,26 +102,73 @@ jobs:
           git remote add origin https://github.com/deepseek-ai/deepseek-harness.git
           git fetch --depth 1 origin $env:HARNESS_REF
           git checkout --quiet FETCH_HEAD
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          New-Item -ItemType Junction -Path $link -Target $dest | Out-Null
+          Add-Content -Path $env:GITHUB_ENV -Value "HARNESS_ROOT=$dest"
+          Add-Content -Path $env:GITHUB_ENV -Value "DSH_HARNESS=$dest"
+          $buildTemp = Join-Path $env:RUNNER_TEMP 'webops-build-temp'
+          New-Item -ItemType Directory -Path $buildTemp | Out-Null
+          foreach ($name in @('TEMP', 'TMP', 'TMPDIR')) { Add-Content -Path $env:GITHUB_ENV -Value "$name=$buildTemp" }
+          Add-Content -Path $env:GITHUB_ENV -Value "PNPM_HOME=$(Join-Path $buildTemp 'pnpm-home')"
+          Add-Content -Path $env:GITHUB_ENV -Value "XDG_CACHE_HOME=$(Join-Path $buildTemp 'cache')"
+          Add-Content -Path $env:GITHUB_ENV -Value "ELECTRON_BUILDER_CACHE=$(Join-Path $buildTemp 'electron-builder-cache')"
+          Add-Content -Path $env:GITHUB_ENV -Value "npm_config_cache=$(Join-Path $buildTemp 'npm-cache')"
           Get-Content package.json | Select-Object -First 3
 
-      - name: 装 harness 的依赖
-        # link 目标内部会 import 第三方包，而 pnpm 对 `link:` 依赖不装目标的依赖，
-        # 得靠 harness 根自己的 node_modules 兜住解析。这一步失败不必然导致构建失败
-        # （first-party 包在 tsdown 里是 external，多数情况不读源码），所以不阻断。
+      - name: 应用本 tag 的桌面补丁与打包设置
         shell: pwsh
-        continue-on-error: true
-        timeout-minutes: 25
         run: |
-          Set-Location (Join-Path (Split-Path $PWD) 'deepseek-harness')
-          pnpm install --ignore-scripts --no-frozen-lockfile
+          git -C $env:HARNESS_ROOT apply --ignore-whitespace "$env:GITHUB_WORKSPACE/docs/harness-desktop-build.patch"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $path = Join-Path $env:HARNESS_ROOT 'apps/desktop/.env.windows'
+          @(
+            'DSH_DESKTOP_APP_ID=com.sdegongzuo.dshwebops'
+            'DSH_DESKTOP_AUTO_UPDATE_ENV=test'
+            'DSH_DESKTOP_MANDATORY_UPDATE_TEST_ORIGIN=https://harness-test.deepseek.com'
+            'DSH_DESKTOP_MANDATORY_UPDATE_PROD_ORIGIN=https://harness.deepseek.com'
+            'DSH_DESKTOP_MANDATORY_UPDATE_CONFIG=''{"allowedAuthOrigins":["https://harness-test.deepseek.com"]}'''
+            'DSH_DESKTOP_WINDOWS_CER_FILE='
+            'DSH_DESKTOP_WINDOWS_SIGNTOOL='
+            'DSH_DESKTOP_WINDOWS_KEY_CONTAINER='
+            'DSH_DESKTOP_WINDOWS_TOKEN_PIN='
+          ) | Set-Content -LiteralPath $path -Encoding utf8
+
+      - name: 装 harness 的依赖
+        shell: pwsh
+        timeout-minutes: 30
+        run: |
+          Set-Location $env:HARNESS_ROOT
+          pnpm install --frozen-lockfile
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: 装本仓依赖
         run: pnpm install --no-frozen-lockfile
 
-      # ⚠️ 这里**故意不跑** `pnpm typecheck` / `pnpm test`：CI 的全新 checkout 里没有 harness
-      # 的构建产物（`@deepseek-ai/*` 的 `main`/`types` 都指向被 gitignore 的 `lib/`），
-      # 跑必然炸 —— 实测 35×TS2307。完整理由与证据见 `release-desktop.yml` 同位置的注释块，
-      # 以及 `src/bundle-patch.test.ts` 的「发布链的身份契约」。
+      - name: 完整重编本次 DSH 并记录实际 app 身份
+        shell: pwsh
+        run: |
+          node scripts/patch-electron-builder.mjs $env:HARNESS_ROOT
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          # 原入口在构建子进程范围关闭删除垫片；所有输出在本作业独立源码与临时目录内。
+          $env:DSH_HARNESS = $env:HARNESS_ROOT
+          # 本机入口固定 TAR_OPTIONS=--force-local，必须给它 GNU tar，不能让 Windows bsdtar 接管。
+          $gitUsrBin = Join-Path (Split-Path (Split-Path (Get-Command git).Source)) 'usr/bin'
+          $gnuTar = Join-Path $gitUsrBin 'tar.exe'
+          if (-not (Test-Path $gnuTar) -or ((& $gnuTar --version | Out-String) -notmatch 'GNU tar')) { throw '完整构建需要 Git for Windows 的 GNU tar' }
+          $env:PATH = "$(Join-Path $env:HARNESS_ROOT 'node_modules/.bin');$gitUsrBin;$env:PATH"
+          node scripts/harness-build.mjs --no-mirror
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $app = Join-Path $env:HARNESS_ROOT 'apps/desktop/.desktop-build/targets/win-x64/unsigned-artifacts/win-unpacked'
+          $commit = (git -C $env:HARNESS_ROOT rev-parse HEAD).Trim()
+          New-Item -ItemType Directory -Path dist -Force | Out-Null
+          $receipt = Join-Path $env:GITHUB_WORKSPACE 'dist/desktop-build.json'
+          node scripts/desktop-build-identity.mjs --app $app --harness-commit $commit --patch docs/harness-desktop-build.patch --out $receipt
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Add-Content -Path $env:GITHUB_ENV -Value "RELEASE_APP=$app"
+          Add-Content -Path $env:GITHUB_ENV -Value "DESKTOP_BUILD_RECEIPT=$receipt"
+
+      # 插件类型检查与单测仍在推 tag 前本机执行；本作业负责重编、组装和包内运行验证。
+      # 不在发布途中另加开发环境测试门禁，约束见 src/bundle-patch.test.ts。
       #
       # ⚠️ 也**故意不走** `pnpm build`：它展开是 `tsdown && node scripts/copy-assets.mjs`，
       # 而 tsdown 配置里第一个 bundle `clean: true` —— 等于先整目录删除 lib/ 再重建。
@@ -161,25 +202,12 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PYTHONUTF8: '1'
         run: |
-          $baseRoot = Join-Path $env:RUNNER_TEMP 'webops-base-desktop'
-          New-Item -ItemType Directory -Path $baseRoot | Out-Null
-          gh release download $env:BASE_DESKTOP_TAG --pattern $env:BASE_DESKTOP_ASSET --dir $baseRoot
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          $baseZip = Join-Path $baseRoot $env:BASE_DESKTOP_ASSET
-          if ((Get-FileHash $baseZip -Algorithm SHA256).Hash.ToLower() -ne $env:BASE_DESKTOP_SHA256) { throw 'DSH 基包哈希不一致，拒绝发布' }
-          python scripts/unzip-portable.py --zip $baseZip --dir $baseRoot --only-prefix app/
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          # 解出来的 app 直接用，不再跑 prepare-release-app.mjs：desktop-* 基包是
-          # release-desktop 从打过 harness-desktop-build.patch 的源码构建的，便携数据接线
-          # 与工作区默认目录已经在里面了。0.2.17~0.2.19 需要那一步，是因为当时基包
-          # （v0.2.16，DSH 0.2.1-alpha.2）是上游原样包；现在再升级一遍是**二次升级** ——
-          # 那五处 replace 锚点仍可能命中，插进第二份 configurePortableData，而
-          # node --check 照样过，静默产出坏包。该脚本自己也已加版本护栏并给出这条指引。
-          $releaseApp = Join-Path $baseRoot 'app'
+          if (-not $env:RELEASE_APP -or -not $env:DESKTOP_BUILD_RECEIPT) { throw '本次 DSH 构建或身份回执缺失，禁止发布' }
+          $releaseApp = $env:RELEASE_APP
           $version = $env:PLUGIN_VERSION
           $portableZip = Join-Path dist "dsh-webops-desktop-v$version-win-x64-portable.zip"
           $stageRoot = Join-Path $env:RUNNER_TEMP 'webops-full-stage'
-          node scripts/package-release-portable.mjs --app $releaseApp --plugin-zip (Join-Path dist $env:PLUGIN_ZIP_NAME) --version $version --stage-root $stageRoot --out $portableZip
+          node scripts/package-release-portable.mjs --app $releaseApp --desktop-build-receipt $env:DESKTOP_BUILD_RECEIPT --plugin-zip (Join-Path dist $env:PLUGIN_ZIP_NAME) --version $version --stage-root $stageRoot --out $portableZip
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $checkRoot = Join-Path $env:RUNNER_TEMP 'webops-full-check'
           python scripts/unzip-portable.py --zip $portableZip --dir $checkRoot

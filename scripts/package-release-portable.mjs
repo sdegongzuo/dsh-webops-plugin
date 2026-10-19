@@ -5,6 +5,7 @@ import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { readRuntimeDescriptor } from './desktop-runtime.mjs'
 import { planSlimAppCopy } from './slim-portable-app.mjs'
+import { verifyDesktopBuildIdentity } from './desktop-build-identity.mjs'
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 
@@ -19,7 +20,7 @@ const FACTORY_EXPERIMENTAL_BUNDLES = [
   '@deepseek-ai/dsh-experimental-session-search',
 ]
 const args = process.argv.slice(2)
-const allowed = ['--app', '--plugin-zip', '--version', '--stage-root', '--out']
+const allowed = ['--app', '--plugin-zip', '--version', '--stage-root', '--out', '--desktop-build-receipt']
 function required(flag) {
   const index = args.indexOf(flag)
   if (index < 0 || !args[index + 1] || args[index + 1].startsWith('--')) throw Error(`缺少 ${flag} 的值`)
@@ -43,6 +44,9 @@ try {
   if (existsSync(out)) throw Error(`输出已存在，拒绝覆盖：${out}`)
   if (!existsSync(pluginZip)) throw Error(`插件 ZIP 不存在：${pluginZip}`)
   const runtime = readRuntimeDescriptor(app).descriptor
+  const receiptIndex = args.indexOf('--desktop-build-receipt')
+  const receipt = receiptIndex < 0 ? undefined : resolve(required('--desktop-build-receipt'))
+  const desktopBuild = receipt === undefined ? undefined : verifyDesktopBuildIdentity(app, receipt)
   const exe = readdirSync(app).find(name => name.endsWith('.exe') && !/uninstall|elevate/i.test(name))
   if (!exe) throw Error('应用目录缺少主 exe')
   mkdirSync(stageRoot, { recursive: true })
@@ -61,6 +65,7 @@ try {
   // 复制之前过滤运行时日志，不复制后删除；不读取任何用户 home。
   const copyPlan = planSlimAppCopy(app)
   cpSync(app, join(stage, 'app'), { recursive: true, filter: path => path !== join(app, 'debug.log') && copyPlan.filter(path) })
+  if (receipt !== undefined) verifyDesktopBuildIdentity(join(stage, 'app'), receipt)
   console.log(`只读核验后复制：排除${copyPlan.excluded.length}项、${copyPlan.skippedBytes}字节；输入和暂存均不执行删除`)
   const vendor = JSON.parse(readFileSync(join(ROOT, 'vendor/plugins/manifest.json'), 'utf8'))
   writeFileSync(join(profile, 'package.json'), JSON.stringify({
@@ -79,7 +84,9 @@ try {
     '只更新插件时，完全退出后使用同一 Release 的独立插件 ZIP 覆盖实际插件目录，再重启。',
     '完整安装与数据迁移说明：https://github.com/sdegongzuo/dsh-webops-plugin/blob/main/docs/portable-install.md',
   ].join('\r\n'))
-  writeFileSync(join(stage, 'release-manifest.json'), JSON.stringify({ pluginVersion: version, dshVersion: runtime.release.version }, null, 2) + '\n')
+  writeFileSync(join(stage, 'release-manifest.json'), JSON.stringify({ pluginVersion: version, dshVersion: runtime.release.version,
+    ...desktopBuild !== undefined ? { desktopBuild } : {},
+  }, null, 2) + '\n')
   mkdirSync(dirname(out), { recursive: true })
   // 与 package-desktop-portable 同级别：deflate level 6（Compress-Archive 的 Optimal），
   // 两条打包路径产出的同版本包压缩率一致；level 1=Fastest 已废弃（2026-10-16，alpha.3 实测省 ~60MB）。

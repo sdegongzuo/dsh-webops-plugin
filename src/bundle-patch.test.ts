@@ -725,8 +725,24 @@ describe('发版工作流的保留式打包（不删除、不覆盖）', () => {
     expect(workflow.indexOf('--json assets')).toBeLessThan(workflow.indexOf('--draft=false'))
     expect(workflow).toContain('node scripts/verify-release-portable.mjs')
     expect(workflow.indexOf('node scripts/verify-release-portable.mjs')).toBeLessThan(workflow.indexOf('gh release create'))
-    expect(workflow).toContain('$env:BASE_DESKTOP_SHA256')
+    expect(workflow).toContain('--desktop-build-receipt')
     expect(workflow).toContain('不能直接解压到便携版根目录')
+  })
+
+  it('完整包使用本 tag 当前补丁重编出的 DSH，并把实际构建回执传给打包器', () => {
+    const patch = workflow.indexOf('apply --ignore-whitespace')
+    const build = workflow.indexOf('node scripts/harness-build.mjs')
+    const identity = workflow.indexOf('node scripts/desktop-build-identity.mjs')
+    const pack = workflow.indexOf('node scripts/package-release-portable.mjs')
+    expect(patch).toBeGreaterThan(-1)
+    expect(build).toBeGreaterThan(patch)
+    expect(identity).toBeGreaterThan(build)
+    expect(pack).toBeGreaterThan(identity)
+    expect(workflow).toContain('$env:DSH_HARNESS')
+    expect(workflow).toContain('ELECTRON_BUILDER_CACHE=')
+    expect(workflow).toContain('GNU tar')
+    expect(workflow).toContain('--desktop-build-receipt')
+    expect(workflow).not.toContain('gh release download $env:BASE_DESKTOP_TAG')
   })
 
   it('发布步没有 --clobber：Release 已存在时明确失败，不覆盖附件', () => {
