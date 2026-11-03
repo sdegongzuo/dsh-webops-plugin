@@ -18,6 +18,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import {
   registerDisclosureProjection,
   restoreDisclosureState,
+  type DisclosureProjection,
   type SessionProjectionRegistryLike,
 } from './disclosure-projection.ts'
 
@@ -153,11 +154,17 @@ export function mountToolDisclosure(
   const hostDenied = [...options.hideHostTools ?? []]
 
   // 持久化恢复：注册表缺位（部署未组装投影）时只丢恢复能力，内存状态机照常工作。
-  const registry: SessionProjectionRegistryLike | undefined = ctx.get('sessionProjections')
-  let disposeProjection: (() => void) | undefined
+  // 弱取用走 `ctx.get(name)` 的字符串重载 —— 上游把这个服务声明成必填，
+  // 我们不能再用同名 module 增补（会撞 TS2687），也不注入它。
+  // 那次显式转换是必要的：上游 .d.ts 把 `register()` 的返回声明成 Promise，
+  // 运行时却是「disposer + thenable」的合体，本仓按运行时形状取用。
+  const registry = ctx.get('sessionProjections') as unknown as SessionProjectionRegistryLike | undefined
+  let projection: DisclosureProjection | undefined
   if (registry !== undefined) {
     try {
-      disposeProjection = registerDisclosureProjection(registry)
+      projection = registerDisclosureProjection(registry, message => {
+        ctx.logger?.warn?.(message)
+      })
     } catch (error: unknown) {
       // 注册冲突（同名不同版本）等：留痕并退化为纯内存披露，不阻断插件。
       const reason = error instanceof Error ? error.message : String(error)
@@ -171,7 +178,7 @@ export function mountToolDisclosure(
     // 首次触达即从投影播种：重启 / 重载 / fork 的对话从这里拿回已展开的状态。
     // 播种只发生一次（之后由本插件的 markOpened / load 直接推进内存状态），
     // 因此不存在「投影后来居上」把已展开状态覆盖回去的路径。
-    const restored = restoreDisclosureState(registry, (agent as DisclosureAgent).session, message => {
+    const restored = restoreDisclosureState(projection, (agent as DisclosureAgent).session, message => {
       ctx.logger?.warn?.(message)
     })
     const fresh: AgentState = {
@@ -249,8 +256,8 @@ export function mountToolDisclosure(
     for (const mask of [...hostMasks.values()]) mask()
     hostMasks.clear()
     states.clear()
-    disposeProjection?.()
-    disposeProjection = undefined
+    projection?.dispose()
+    projection = undefined
   }, 'webpage-tools.disclosure')
 
   return {

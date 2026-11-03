@@ -22,6 +22,17 @@
       "repo": "https://github.com/omdsh-dev/DSH-better-sidebar",
       "portableNote": "开放侧边栏底座：文件树/编辑器、文件变动(Git diff)、任务管理、侧边对话；自带 dsh.bundle.patch（单条 insert + 防双挂载守卫），进 bundles 后由 profile boot 自动合并，无需手写 cordis.patch.yml 挂载行",
       "runtimeDependencies": ["ws", "yaml"]
+    },
+    {
+      "name": "dsh-workbuddy-connect",
+      "version": "0.7.9",
+      "client": true,
+      "tarball": "dsh-workbuddy-connect-0.7.9.tgz",
+      "integrity": "sha512-rhSPWPuN5tZp59A3Iev20/PylCgMt9KY+H+cFhOF+e527ANkhGbqcDmZfVe6XtEsq5rs2husaG5MRBr1Bbnuhg==",
+      "source": "https://registry.npmjs.org/dsh-workbuddy-connect/-/dsh-workbuddy-connect-0.7.9.tgz",
+      "repo": "https://github.com/corrinehu/dsh-workbuddy-connect",
+      "portableNote": "WorkBuddy / WorkBuddy AI 模型、账号卡片与余额入口；复用对应 App 登录，不改变默认模型。上游只发布到 0.7.9，peer 仍钉死 DSH 0.2.1-rc.2，在 0.2.2-alpha.2 上会被判不兼容（插件页显示「异常」）—— 先随包保留、待上游放宽 peer 后再适配，见 docs/遗留问题.md §4。",
+      "runtimeLock": "workbuddy-runtime.lock.json"
     }
   ],
   "dependencies": [

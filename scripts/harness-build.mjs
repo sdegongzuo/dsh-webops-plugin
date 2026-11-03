@@ -14,6 +14,12 @@
  *    `[23] The operation was aborted due to timeout`。
  *    → 本脚本临时把那 2 处换成 `DSH_NPM_REGISTRY`（默认 npmmirror），实测 **1.8–2.5 MB/s**。
  *
+ *    ⚠️ **2026-10-28 更新（dsh 0.2.2-alpha.2）：store 那一半已经不成立了。** 上游把 pnpm store
+ *    从一次性的 `BUILD_ROOT` 挪到持久的 `BUILD_PATHS.pnpmStore`（还加了
+ *    `verify-store-integrity` 与 `package-import-method=copy`），所以「每轮冷 store → 撞 fetch
+ *    timeout」的路径消失，安装也回到了 `--frozen-lockfile`。registry 仍是 npmjs 默认值、本机
+ *    直连依旧慢，镜像注入这一半继续有效。
+ *
  *    ⚠️ **2026-09-22 更新（dsh 0.1.7-alpha.1）：这个坑上游已经修了。** `prepare-dsh.ts`
  *    现在写的是 `resolveNpmRegistry(process.env)`（`desktop-release-environment.mjs` 的
  *    `NPM_REGISTRY_ENV` = **`DSH_DESKTOP_NPM_REGISTRY`**，默认值才是 npmjs），并把解析结果
@@ -60,7 +66,11 @@
  * pnpm harness:build              # 跑 package:win:x64:dir（上游的完整链，见 buildSteps 说明）
  * pnpm harness:build --no-mirror  # 不换 registry（网络好时用，例如海外环境）
  * pnpm harness:build --dry-run    # 只打印模式判定（env / patch / off），不跑构建
+ * pnpm harness:build --refresh-runtime-lock  # 重新解析并覆盖 runtime-lock/pnpm-lock.yaml
  * ```
+ *
+ * 运行时锁：构建只消费本仓 `runtime-lock/pnpm-lock.yaml`，解析与安装后各断言一次哈希不变
+ * （见 `runtimeLockFile()`）。升级依赖必须显式重生成并提交，构建过程不允许自行改版本。
  *
  * （`--skip-prepare` 已于 2026-09-22 退役：链上只剩一步，没有「前置」可跳。）
  *
@@ -88,6 +98,26 @@ export function harnessDesktopDir() {
 /** 构建产物：`--unsigned` 会落到 `unsigned-artifacts/win-unpacked`（这就是 `set-app --from` 要的那份）。 */
 export function harnessUnpackedDir() {
   return join(harnessDesktopDir(), '.desktop-build', 'targets', 'win-x64', 'unsigned-artifacts', 'win-unpacked')
+}
+
+/**
+ * 生产运行时锁 —— 构建里**唯一的**依赖解析输入。
+ *
+ * 上游 `prepare-dsh.ts` 每轮对新建的一次性目录做 `install --lockfile-only`。没有外部锁时，
+ * 同一份源码在两次构建里会解析出不同的**传递**依赖版本：2026-10-19 实测本机 execa 10.1.1、
+ * CI 10.2.0，两端包内清单各自自洽却不是一个运行时。
+ *
+ * 安装那步曾必须去掉 `--frozen-lockfile`（本机卡在 `added 241/507`），根因是 pnpm store 每轮
+ * 都落在新建的 `BUILD_ROOT` 里、永远是冷的；0.2.2-alpha.2 起上游把 store 挪到持久
+ * `BUILD_PATHS.pnpmStore` 并加了 `verify-store-integrity` + `package-import-method=copy`，
+ * frozen 已恢复。若症状重现，先查 store 是不是又变回一次性目录，别直接删 frozen。
+ *
+ * 现在的契约（见 `docs/harness-desktop-build.patch` 的 prepare-dsh hunk）：构建只消费本仓
+ * `runtime-lock/pnpm-lock.yaml`，解析与安装后各断言一次哈希不变；升级依赖必须显式
+ * `--refresh-runtime-lock` 重新生成并提交，不在构建过程中悄悄改版本。
+ */
+export function runtimeLockFile() {
+  return join(fileURLToPath(new URL('..', import.meta.url)), 'runtime-lock', 'pnpm-lock.yaml')
 }
 
 /**
@@ -270,9 +300,16 @@ function restoreRegistry() {
 /**
  * 依次跑构建步骤。
  * @param {string|undefined} registryEnv 新版上游读的 registry 环境变量值；`undefined` = 不注入。
+ * @param {boolean} refreshRuntimeLock `true` = 重新解析并写出运行时锁（升级依赖时用）。
  */
-function runSteps(registryEnv) {
+function runSteps(registryEnv, refreshRuntimeLock) {
   const desktop = harnessDesktopDir()
+  const lock = runtimeLockFile()
+  if (!refreshRuntimeLock && !existsSync(lock)) {
+    console.error(`harness-build: 缺少生产运行时锁 ${lock}`)
+    console.error('  首次生成或用它升级依赖：pnpm harness:build --refresh-runtime-lock，然后提交该文件。')
+    return false
+  }
   const env = {
     ...process.env,
     // 本机必备（CI 不需要这两个）：
@@ -281,6 +318,10 @@ function runSteps(registryEnv) {
     CODEBUDDY_SAFE_DELETE_ENABLED: '0',
     TAR_OPTIONS: '--force-local',
     ELECTRON_MIRROR: electronMirror(),
+    // 运行时锁：正常构建只读仓库那份；--refresh-runtime-lock 才允许重新解析写回。
+    ...(refreshRuntimeLock
+      ? { DSH_DESKTOP_RUNTIME_LOCK_WRITE: lock }
+      : { DSH_DESKTOP_RUNTIME_LOCK: lock }),
     // ⚠️ 只对**新版上游**有效：它必须在子进程环境里（上游用 `process.env` 读，
     // 再显式写进 pnpm 子进程的 NPM_CONFIG_REGISTRY）。旧上游没有这个入口。
     ...(registryEnv === undefined ? {} : { DSH_DESKTOP_NPM_REGISTRY: registryEnv }),
@@ -306,8 +347,10 @@ function reportNextSteps() {
     process.exitCode = 1
     return
   }
+  const lock = runtimeLockFile()
   console.log(`
 win-unpacked  ${unpacked}
+运行时锁      ${lock}${existsSync(lock) ? `  sha256 ${sha256(readFileSync(lock)).slice(0, 12)}…` : '（尚未生成）'}
 
 放进固定测试目录（只换 app/，home/ 里的插件、会话、凭据都不动）：
   node scripts/portable-dev.mjs set-app --from "${unpacked}"
@@ -324,9 +367,10 @@ if (isEntry) {
   const argv = process.argv.slice(2)
   // `--skip-prepare` 已退役（2026-09-22）：链上只剩一步（见 buildSteps 的说明），没有「前置」可跳。
   // 仍然传它会落到下面那句「未知参数」，fail-loud 而不是被静默忽略。
-  const flags = new Set(['--no-mirror', '--dry-run'])
+  const flags = new Set(['--no-mirror', '--dry-run', '--refresh-runtime-lock'])
   const noMirror = argv.includes('--no-mirror')
   const dryRun = argv.includes('--dry-run')
+  const refreshRuntimeLock = argv.includes('--refresh-runtime-lock')
   for (const flag of argv) {
     if (!flags.has(flag)) fail(`未知参数 ${JSON.stringify(flag)}（只认 ${[...flags].join(' / ')}）`)
   }
@@ -335,6 +379,10 @@ if (isEntry) {
   console.log(`步骤      ${dryRun
     ? '（--dry-run：不跑构建）'
     : `前置 ${nativeAddonPackage()} build:js → 预热 build:lib:host → ${buildSteps().join(' → ')}`}`)
+  const lock = runtimeLockFile()
+  console.log(refreshRuntimeLock
+    ? `运行时锁  ${lock} —— ⚠️ 重新解析并覆盖（升级依赖时用，产出的文件必须提交）`
+    : `运行时锁  ${lock}${existsSync(lock) ? `  sha256 ${sha256(readFileSync(lock)).slice(0, 12)}…（只读消费）` : '（缺失，构建会在 prepare:dsh 处失败）'}`)
   // registry 两条路：新版上游走环境变量（不动文件），旧上游回落到改文件。
   const registryMode = noMirror ? 'off' : supportsRegistryEnv() ? 'env' : 'patch'
   const registryValue = registryMode === 'off' ? undefined : npmRegistry()
@@ -356,7 +404,7 @@ if (isEntry) {
   } else {
     let ok = false
     try {
-      ok = runSteps(registryMode === 'env' ? registryValue : undefined)
+      ok = runSteps(registryMode === 'env' ? registryValue : undefined, refreshRuntimeLock)
     } finally {
       restoreRegistry()
     }

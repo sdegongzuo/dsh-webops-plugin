@@ -6,6 +6,7 @@ import { fileURLToPath } from 'node:url'
 import { materializeRuntimeDir } from './desktop-runtime.mjs'
 import { fetchHostPath, startPackagedDesktopHost } from './run-packaged-host.mjs'
 import { assertDesktopBuildIdentity } from './desktop-build-identity.mjs'
+import { verifyMaterializedRuntime } from './vendored-runtime-lock.mjs'
 
 const ROOT = fileURLToPath(new URL('../', import.meta.url))
 const argv = process.argv.slice(2)
@@ -42,7 +43,10 @@ for (const plugin of [{ name: pkg.name, version: pkg.version }, ...vendor]) {
   assert(bundles.includes(plugin.name), `插件未登记：${plugin.name}`)
   assert(!existsSync(join(installed, 'lib', 'fake-llm')), `生产插件含 fake-llm：${plugin.name}`)
 }
-console.log(`运行时 ${runtime.release.version}：${runtime.files.length} 个文件哈希匹配，三个插件与出厂 home 通过`)
+for (const plugin of vendor) {
+  if (plugin.runtimeLock) verifyMaterializedRuntime(join(profile, 'node_modules', plugin.name), join(ROOT, 'vendor/plugins'), plugin.runtimeLock)
+}
+console.log(`运行时 ${runtime.release.version}：${runtime.files.length} 个文件哈希匹配，${vendor.length + 1} 个插件与出厂 home 通过`)
 // 使用新的临时 home；仅启动验收副本，不向解压出的出厂 home 写入用户数据。
 const { cpSync, mkdirSync, mkdtempSync } = await import('node:fs')
 const { tmpdir } = await import('node:os')
@@ -64,7 +68,7 @@ try {
   try { envelope = JSON.parse(sidebar.body.toString('utf8')) } catch { /* 空 405 是本次回归症状。 */ }
   assert(sidebar.status === 405 && envelope?.ok === false && envelope?.error?.code === 'method-error',
     `侧边栏后端未正常挂载：HTTP ${sidebar.status}，缺少方法校验信封`)
-  console.log(`verify-release-portable: 实际生产宿主首页、三个插件加载图与侧边栏后端路由通过；验收副本保留在 ${scratch}`)
+  console.log(`verify-release-portable: 实际生产宿主首页、${vendor.length + 1} 个插件加载图与侧边栏后端路由通过；验收副本保留在 ${scratch}`)
 } finally {
   await host.stop()
 }

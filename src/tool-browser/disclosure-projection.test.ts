@@ -15,6 +15,7 @@ import {
   registerDisclosureProjection,
   restoreDisclosureState,
   type DisclosureProjectionState,
+  type ProjectionHandleLike,
   type SessionProjectionRegistryLike,
 } from './disclosure-projection.ts'
 
@@ -149,8 +150,8 @@ describe('披露投影：注册与恢复', () => {
       register: definition => { definitions.push(definition); return () => undefined },
       stateOf: () => undefined,
     }
-    const dispose = registerDisclosureProjection(registry)
-    expect(typeof dispose).toBe('function')
+    const projection = registerDisclosureProjection(registry)
+    expect(typeof projection.dispose).toBe('function')
     const definition = definitions[0]
     expect(definition?.key).toBe(DISCLOSURE_PROJECTION_KEY)
     expect(definition?.stateVersion).toBe(DISCLOSURE_PROJECTION_STATE_VERSION)
@@ -175,19 +176,58 @@ describe('披露投影：注册与恢复', () => {
     expect(() => schema?.parse({ coreOpened: true, loaded: [1] })).toThrow()
   })
 
+  it('句柄到手后读口切到 handle.stateOf，未到手才用弃用的注册表级读', () => {
+    const reads: string[] = []
+    const projected = { coreOpened: true, loaded: ['webpage_find'], pending: {} }
+    // 上游的注册返回值是「disposer + thenable」，句柄经 then 异步交付；
+    // 桩用一个可推迟的 then 精确复现这两个时刻。
+    let deliver: ((handle: ProjectionHandleLike) => unknown) | undefined
+    const registry: SessionProjectionRegistryLike = {
+      register: () => Object.assign(() => undefined, {
+        then: (onFulfilled: (handle: ProjectionHandleLike) => unknown) => {
+          deliver = onFulfilled
+          return undefined
+        },
+      }),
+      stateOf: () => { reads.push('registry'); return undefined },
+    }
+    const projection = registerDisclosureProjection(registry)
+    expect(projection.stateOf({ id: 's1' })).toBeUndefined()
+    expect(reads).toEqual(['registry'])
+    deliver?.({ stateOf: () => { reads.push('handle'); return projected } })
+    expect(projection.stateOf({ id: 's1' })).toBe(projected)
+    expect(reads).toEqual(['registry', 'handle'])
+  })
+
+  it('注册失败（thenable 拒绝）留痕而不是静默丢恢复能力', async () => {
+    const warnings: string[] = []
+    registerDisclosureProjection({
+      register: () => Object.assign(() => undefined, {
+        then: (onFulfilled: (handle: ProjectionHandleLike) => unknown, onRejected?: (reason: unknown) => unknown) =>
+          Promise.reject(new Error('同名投影已在更高版本注册')).then(onFulfilled, onRejected),
+      }),
+    }, message => { warnings.push(message) })
+    // 拒绝经一个微任务才落到我们的 onRejected 上。
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(warnings.some(message => message.includes('registration failed'))).toBe(true)
+  })
+
   it('读不到（无注册表 / 无会话 / 无状态）时返回 undefined，不抛', () => {
+    const projection = registerDisclosureProjection({ register: () => () => undefined, stateOf: () => undefined })
     expect(restoreDisclosureState(undefined, {})).toBeUndefined()
-    expect(restoreDisclosureState({ register: () => () => undefined, stateOf: () => undefined }, undefined)).toBeUndefined()
-    expect(restoreDisclosureState({ register: () => () => undefined, stateOf: () => undefined }, {})).toBeUndefined()
+    expect(restoreDisclosureState(projection, undefined)).toBeUndefined()
+    expect(restoreDisclosureState(projection, {})).toBeUndefined()
   })
 
   it('读失败留痕并退化，不把异常抛给调用方', () => {
     const warnings: string[] = []
+    const projection = registerDisclosureProjection({
+      register: () => () => undefined,
+      stateOf: () => { throw new Error('投影缓存行损坏') },
+    })
     const restored = restoreDisclosureState(
-      {
-        register: () => () => undefined,
-        stateOf: () => { throw new Error('投影缓存行损坏') },
-      },
+      projection,
       { id: 's1' },
       message => { warnings.push(message) },
     )

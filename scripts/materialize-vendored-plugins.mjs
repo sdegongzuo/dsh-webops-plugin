@@ -18,11 +18,12 @@
  */
 import { createHash } from 'node:crypto'
 import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync, rmSync } from 'node:fs'
-import { join, resolve } from 'node:path'
+import { join, resolve, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { gunzipSync } from 'node:zlib'
 import { spawnSync } from 'node:child_process'
 import { applySidebarHostCompatibility, SIDEBAR_COMPATIBILITY_PATCH } from './sidebar-host-compatibility.mjs'
+import { materializeVendoredRuntime, readVendoredRuntimeLock } from './vendored-runtime-lock.mjs'
 
 const ROOT = resolve(fileURLToPath(import.meta.url), '..', '..')
 const VENDOR_DIR = join(ROOT, 'vendor', 'plugins')
@@ -90,12 +91,19 @@ function untar(buffer) {
 function extractTarball(tarballBody, targetDir) {
   const entries = untar(gunzipSync(tarballBody))
   if (entries.length === 0) throw new Error(`tarball 解出来是空的：${tarballBody.length} 字节`)
+  // DefinitelyTyped 的官方包使用 node/ 等根目录，不能只剥 package/。
+  const manifestEntry = entries.find(entry => /^[^/]+\/package\.json$/u.test(entry.path))
+  if (!manifestEntry) throw new Error('tarball 缺少唯一顶层目录中的 package.json')
+  const prefix = manifestEntry.path.slice(0, -'package.json'.length)
   let meta
   for (const entry of entries) {
-    const relative = entry.path.replace(/^\.?\//, '').replace(/^package\//, '')
+    const path = entry.path.replace(/^\.\//u, '')
+    if (path === prefix.slice(0, -1)) continue
+    if (!path.startsWith(prefix)) throw new Error(`tarball 含根目录外路径 ${entry.path}，拒绝解包`)
+    const relative = path.slice(prefix.length)
     if (relative === '' || relative.startsWith('PaxHeader/') || relative.includes('/PaxHeader/')) continue
-    const target = join(targetDir, relative)
-    if (!target.startsWith(targetDir)) throw new Error(`tarball 含越界路径 ${entry.path}，拒绝解包`)
+    const target = resolve(targetDir, relative)
+    if (!target.startsWith(resolve(targetDir) + sep)) throw new Error(`tarball 含越界路径 ${entry.path}，拒绝解包`)
     if (entry.type === '5') {
       mkdirSync(target, { recursive: true })
     } else if (entry.type === '0' || entry.type === '\0') {
@@ -118,12 +126,16 @@ function typeLabel(type) {
 const manifestPath = join(VENDOR_DIR, 'manifest.json')
 if (!existsSync(manifestPath)) throw new Error(`缺少 ${manifestPath} —— vendor 目录不完整`)
 const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'))
+const lockedRuntimes = new Map()
 
 // 先整体校验（哪怕只物化一个插件，所有 tgz 的完整性都过一遍 —— 便宜，且坏得早好过坏得晚）
 for (const item of [...manifest.plugins, ...manifest.dependencies]) {
   const tarball = join(VENDOR_DIR, item.tarball)
   if (!existsSync(tarball)) throw new Error(`vendor 缺 tarball：${tarball}`)
   verifyTarball(tarball, item.integrity)
+}
+for (const plugin of manifest.plugins) {
+  if (plugin.runtimeLock) lockedRuntimes.set(plugin.name, readVendoredRuntimeLock(VENDOR_DIR, plugin.runtimeLock, verifyTarball))
 }
 console.log(`vendor 完整性校验通过（${manifest.plugins.length} 插件 + ${manifest.dependencies.length} 依赖）`)
 if (checkOnly) process.exit(0)
@@ -145,6 +157,11 @@ for (const plugin of manifest.plugins) {
     throw new Error(`tarball 身份对不上：期望 ${plugin.name}@${plugin.version}，实际 ${meta?.name}@${meta?.version}`)
   }
   console.log(`+ node_modules/${plugin.name}@${plugin.version}`)
+  const locked = lockedRuntimes.get(plugin.name)
+  if (locked) {
+    materializeVendoredRuntime(pluginDir, locked, extractTarball)
+    console.log(`+ ${plugin.name} 隔离运行时（${locked.length} 个固定依赖，不执行安装脚本）`)
+  }
 
   if (plugin.hostCompatibility !== undefined) {
     if (plugin.hostCompatibility !== SIDEBAR_COMPATIBILITY_PATCH) throw new Error(`未知宿主兼容补丁：${plugin.hostCompatibility}`)

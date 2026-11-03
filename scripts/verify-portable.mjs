@@ -96,6 +96,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url'
 import { materializeRuntimeDir } from './desktop-runtime.mjs'
 import { harnessRoot } from './local-env.mjs'
 import { fetchHostPath, startPackagedDesktopHost } from './run-packaged-host.mjs'
+import { verifyMaterializedRuntime } from './vendored-runtime-lock.mjs'
 
 /* ---------- 参数 ---------- */
 
@@ -391,6 +392,14 @@ for (const plugin of vendoredPlugins) {
   for (const depName of plugin.runtimeDependencies ?? []) {
     check(existsSync(join(vendoredDir, 'node_modules', depName)),
       `随包第三方插件的运行时依赖已嵌套物化：${plugin.name}/node_modules/${depName}`)
+  }
+  if (plugin.runtimeLock) {
+    try {
+      const count = verifyMaterializedRuntime(vendoredDir, join(dirname(vendorManifestPath), ''), plugin.runtimeLock)
+      check(true, `${plugin.name} 的 ${count} 个隔离依赖版本与目录完整`)
+    } catch (error) {
+      check(false, `${plugin.name} 隔离依赖检查失败：${error.message}`)
+    }
   }
 }
 

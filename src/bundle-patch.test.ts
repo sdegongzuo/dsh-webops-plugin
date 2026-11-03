@@ -778,3 +778,45 @@ describe('package-portable 的保留安全模式', () => {
     expect(script).toContain("'--help'")
   })
 })
+
+describe('生产运行时锁：构建只消费仓库锁，不许自行解析版本', () => {
+  // 2026-10-19 收尾发现：0.2.20 的本机包与公开包**各自清单都通过完整性校验**，
+  // 但传递依赖 `execa` 分别是 10.1.1 / 10.2.0（16 项文件内容不同）——
+  // 上游 `prepare-dsh.ts` 每轮在一次性目录里重新解析，安装那步又因为本机必须去掉
+  // `--frozen-lockfile` 而失去了 pnpm 自己的 lockfile 闸门。只看「清单对得上」永远发现不了。
+  //
+  // 现在锁是**输入**：拷进构建目录 → 解析 → 断言哈希没变 → 安装 → 再断言没变。
+  // 这组断言锁的是「这道闸门还在」，以及「锁变了就必须重编，不能命中旧本体缓存」。
+  const patch = readRepoFile('docs/harness-desktop-build.patch')
+  const workflow = readRepoFile('.github/workflows/release-desktop.yml')
+  const local = readRepoFile('scripts/harness-build.mjs')
+
+  it('补丁里的 prepare-dsh 必须要求外部锁，并在解析与安装后各校验一次', () => {
+    expect(patch, '补丁不再认 DSH_DESKTOP_RUNTIME_LOCK —— 构建会回落到自行解析').toContain('DSH_DESKTOP_RUNTIME_LOCK')
+    expect(patch, '补丁没有显式重新生成入口').toContain('DSH_DESKTOP_RUNTIME_LOCK_WRITE')
+    expect(patch, '解析后没有锁定校验').toContain("'runtime:pin-lock'")
+    expect(patch, '安装后没有复核 —— 无法证明 install 没触发重新解析').toContain("'runtime:verify-lock'")
+    // 只有「拒绝」没有「说明差异」时，升级依赖的人看不出改了什么版本，会倾向于删闸门。
+    expect(patch, '锁漂移时不给差异摘要').toContain('lockfileDrift')
+  })
+
+  it('CI 直接打包那一步必须喂锁，且缓存 key 包含锁文件', () => {
+    expect(workflow, 'CI 没给 DSH_DESKTOP_RUNTIME_LOCK，构建会 fail-loud 或静默解析').toContain('DSH_DESKTOP_RUNTIME_LOCK:')
+    const key = workflow.slice(workflow.indexOf('key: dsh-win-unpacked-'), workflow.indexOf('steps.', workflow.indexOf('key: dsh-win-unpacked-')))
+    expect(key, '本体缓存 key 没带锁文件 —— 换锁后仍命中旧产物，等于锁没生效').toContain('runtime-lock/pnpm-lock.yaml')
+  })
+
+  it('本机入口默认只读消费，重新生成必须显式开开关', () => {
+    expect(local, 'harness:build 没把仓库锁传给上游').toContain('DSH_DESKTOP_RUNTIME_LOCK: lock')
+    expect(local, '重新生成入口丢了').toContain('--refresh-runtime-lock')
+    expect(local, '锁缺失时没有 fail-loud').toContain('缺少生产运行时锁')
+  })
+
+  it('锁文件本身存在且真的钉住了传递依赖', () => {
+    const lock = readRepoFile('runtime-lock/pnpm-lock.yaml')
+    expect(lock, '锁文件不是 v9 形态，生成方式可能换了').toContain("lockfileVersion: '9.0'")
+    // 用 execa 当探针：它正是 2026-10-19 漂移的那个包，且是传递依赖，只钉直接依赖发现不了。
+    expect(lock, '锁里没有 execa —— 可能是一份空壳锁').toMatch(/execa@\d+\.\d+\.\d+:/u)
+    expect(lock.length, '锁文件过小，像被截断').toBeGreaterThan(100_000)
+  })
+})

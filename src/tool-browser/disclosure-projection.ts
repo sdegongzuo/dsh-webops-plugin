@@ -12,9 +12,12 @@
  * 2. 状态必须纯 JSON（宿主投影缓存的前提），`pending` 只留未结算的调用。
  * 3. 不 import 上游类型：本仓不依赖 `@deepseek-ai/dsh-session-projection`，
  *    按结构形状声明用到的注册表面（与 `disclosure.ts` 对 agent 的同一口径）。
+ *    也**不**做 `declare module '@deepseek-ai/cordis'` 增补：上游已把
+ *    `sessionProjections` 声明成必填服务，我们再加一个可选同名声明会撞
+ *    TS2687（同名成员修饰符必须一致）。弱取用改由 `ctx.get(name)` 的字符串
+ *    重载承担，语义不变。
  */
 
-import type { Context } from '@deepseek-ai/cordis'
 import { WEBPAGE_LOADABLE_TOOLS, WEBPAGE_LOADER_TOOL, webpageToolName } from './disclosure.ts'
 
 /** 投影 key：与宿主自己的投影（modelSelection 等）平级，host-only，无 wire。 */
@@ -47,8 +50,39 @@ interface SessionEventLike {
   readonly data: unknown
 }
 
+/** 宿主投影句柄的最小形状（上游 `ProjectionHandle`）：读口 + 可选的异步释放。 */
+export interface ProjectionHandleLike {
+  /**
+   * 读某会话当前状态；宿主按需从已提交事件补齐（懒建 cell）。
+   * @param session - 该对话的 Session。
+   */
+  stateOf(session: unknown): unknown
+  /** 反注册（上游的 release 是异步的）。 */
+  dispose?(): unknown
+}
+
+/**
+ * `register()` 的返回形状：**上游 .d.ts 与运行时不一致**，这里按运行时声明。
+ *
+ * .d.ts 写的是 `Promise<ProjectionHandle<S>>`，运行时返回的却是
+ * `Object.assign(dispose, promise)` —— 既能直接当 disposer 调用，又是 thenable
+ * （上游源码把这种形态称作 legacy 插件兼容）。旧插件靠「调用返回值即反注册」
+ * 活着，我们也是；`then` 因此按可选声明，纯 Promise 形态（未来的上游）同样能用。
+ */
+export type ProjectionRegistration = (() => void | Promise<void>) & {
+  then?: (
+    onFulfilled: (handle: ProjectionHandleLike) => unknown,
+    onRejected?: (reason: unknown) => unknown,
+  ) => unknown
+}
+
 /** 宿主投影注册表的最小形状：宿主实现只用到结构里的这几个成员。 */
 export interface SessionProjectionRegistryLike {
+  /**
+   * 注册一个投影单元。返回形状按**运行时**声明（见 `ProjectionRegistration`），
+   * 与上游 .d.ts 的 `Promise<ProjectionHandle>` 不同 —— 因此把 `ctx.get(...)`
+   * 取到的上游类型转成本接口时，调用点需要一次显式转换。
+   */
   register(definition: {
     key: string
     /** 宿主只在 parse 持久化行时调用；形状不符必须抛错（与 zod 语义一致）。 */
@@ -56,18 +90,21 @@ export interface SessionProjectionRegistryLike {
     init(header: unknown, inheritedEventCount: number): unknown
     apply(state: unknown, event: unknown): unknown
     stateVersion: number
-  }): () => void
-  stateOf(session: unknown, key: string): unknown
+  }): ProjectionRegistration
+  /**
+   * 注册表级读口。上游已标记弃用（每个 key 首次读会打一条警告），
+   * 只在注册句柄就绪前兜底用。
+   * @deprecated 优先用 `handle.stateOf(session)`。
+   */
+  stateOf?(session: unknown, key: string): unknown
 }
 
-declare module '@deepseek-ai/cordis' {
-  interface Context {
-    /**
-     * 宿主会话投影注册表；部署未组装时为 undefined。
-     * 弱取用而非注入：缺它只丢恢复能力，不阻断插件加载。
-     */
-    readonly sessionProjections?: SessionProjectionRegistryLike
-  }
+/** 本插件持有的投影订阅：反注册 + 读口，合成一个对象免得两处各存一半。 */
+export interface DisclosureProjection {
+  /** 反注册；宿主释放是异步的，调用方不必等（失败只留痕）。 */
+  dispose(): void
+  /** 读某会话的投影状态；句柄未就绪且宿主没有注册表级读口时返回 undefined。 */
+  stateOf(session: unknown): unknown
 }
 
 /** 空状态：没有网页工具调用过的对话。 */
@@ -197,11 +234,20 @@ const STATE_SCHEMA = {
 /**
  * 注册披露投影：把 fold 挂到宿主注册表上，由宿主按会话事件驱动。
  *
+ * 两种读口并存是刻意的：上游把「注册」做成了异步握手，句柄要过一个微任务才
+ * 到手，而本插件的装配（装屏蔽、注册工具）是同步的、顺序敏感，不能在这里
+ * await。所以注册用老的可调用返回值拿到反注册，句柄到了就切到新读口，
+ * 没到就临时走注册表级读（已弃用，只在极早期生效）。
+ *
  * @param registry - 宿主投影注册表（`ctx.get('sessionProjections')`）。
- * @returns 反注册 disposer；插件卸载时必须调用（注册表活在根 ctx，不随我们消亡）。
+ * @param warn - 注册失败或读口降级时留痕用；不给就静默退化。
+ * @returns 反注册与读口；插件卸载时必须 dispose（注册表活在根 ctx，不随我们消亡）。
  */
-export function registerDisclosureProjection(registry: SessionProjectionRegistryLike): () => void {
-  return registry.register({
+export function registerDisclosureProjection(
+  registry: SessionProjectionRegistryLike,
+  warn?: (message: string) => void,
+): DisclosureProjection {
+  const registration = registry.register({
     key: DISCLOSURE_PROJECTION_KEY,
     stateSchema: STATE_SCHEMA,
     init: () => initialDisclosureState(),
@@ -211,6 +257,41 @@ export function registerDisclosureProjection(registry: SessionProjectionRegistry
     ),
     stateVersion: DISCLOSURE_PROJECTION_STATE_VERSION,
   })
+  /** 句柄下一个微任务后到手；在此之前 `handle` 是 undefined。 */
+  let handle: ProjectionHandleLike | undefined
+  const report = (message: string, error: unknown): void => {
+    const reason = error instanceof Error ? error.message : String(error)
+    warn?.(`${message}: ${reason}`)
+  }
+  // 顺着 thenable 取句柄。上游对「没人观察的拒绝」会自己补日志，我们既然接了
+  // 就自己报，别让注册失败变成静默丢恢复能力。
+  try {
+    registration.then?.(
+      ready => { handle = ready },
+      (error: unknown) => { report('webpage-tools: disclosure projection registration failed', error) },
+    )
+  } catch (error: unknown) {
+    report('webpage-tools: disclosure projection registration failed', error)
+  }
+  return {
+    dispose: () => {
+      // 两种形态都兜住：可调用的 legacy disposer（现在的宿主）优先，
+      // 只剩纯 Promise + 句柄形态时退回 `handle.dispose()`。
+      const release = (): unknown => (typeof registration === 'function'
+        ? registration()
+        : handle?.dispose?.())
+      try {
+        void Promise.resolve(release()).catch(
+          (error: unknown) => { report('webpage-tools: disclosure projection release failed', error) },
+        )
+      } catch (error: unknown) {
+        report('webpage-tools: disclosure projection release failed', error)
+      }
+    },
+    stateOf: session => (handle !== undefined
+      ? handle.stateOf(session)
+      : registry.stateOf?.(session, DISCLOSURE_PROJECTION_KEY)),
+  }
 }
 
 /**
@@ -218,18 +299,18 @@ export function registerDisclosureProjection(registry: SessionProjectionRegistry
  *
  * 失败（含投影缓存行损坏）不抛：恢复是增益不是前提，调用方退化为内存状态。
  *
- * @param registry - 宿主投影注册表。
+ * @param projection - 本插件的投影订阅；注册失败或宿主未组装时为 undefined。
  * @param session - 该对话的 Session；缺失时无从恢复。
  * @param warn - 失败留痕用（与屏蔽装不上同一口径：不静默）。
  */
 export function restoreDisclosureState(
-  registry: SessionProjectionRegistryLike | undefined,
+  projection: DisclosureProjection | undefined,
   session: unknown,
   warn?: (message: string) => void,
 ): DisclosureProjectionState | undefined {
-  if (registry === undefined || session === undefined || session === null) return undefined
+  if (projection === undefined || session === undefined || session === null) return undefined
   try {
-    const state = registry.stateOf(session, DISCLOSURE_PROJECTION_KEY)
+    const state = projection.stateOf(session)
     return state === undefined ? undefined : STATE_SCHEMA.parse(state)
   } catch (error: unknown) {
     const reason = error instanceof Error ? error.message : String(error)

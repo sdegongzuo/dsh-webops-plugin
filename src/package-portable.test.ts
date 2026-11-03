@@ -84,7 +84,7 @@ describe('每次发布的完整便携包', () => {
     expect(credentials.status).toBe(1)
     expect(credentials.stderr).toContain('出厂包含用户数据')
   })
-  it('真实组装三个生产插件和出厂 home，拒绝覆盖与宿主版本不匹配', () => {
+  it('真实组装生产插件和出厂 home，拒绝覆盖与宿主版本不匹配', () => {
     const data = fixture()
     const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'))
     const pluginZip = join(data.root, 'current-plugin.zip')
@@ -98,7 +98,9 @@ describe('每次发布的完整便携包', () => {
     const startup = join(runtime, 'node_modules', '@deepseek-ai', 'dsh-web-app', 'lib')
     mkdirSync(startup, { recursive: true })
     writeFileSync(join(startup, 'startup.js'), 'const WEB_STARTUP_SERVICE = "webStartup";\n')
-    writeFileSync(descriptor, JSON.stringify({ release: { version: '0.2.1-rc.2' } }))
+    // 打包脚本会拿这个版本去比对插件声明的 peerDependencies（package-release-portable.mjs），
+    // 所以夹具必须跟 package.json 的 DSH peer 同源；升上游时这两处一起改。
+    writeFileSync(descriptor, JSON.stringify({ release: { version: '0.2.2-alpha.2' } }))
     writeFileSync(join(app, 'DeepSeek Harness.exe'), '测试本体')
     writeFileSync(join(app, 'debug.log'), '运行时日志不出货')
     const preservedInputs = ['locales/en-US.pak', 'locales/zh-CN.pak', 'locales/ja.pak',
@@ -114,7 +116,7 @@ describe('每次发布的完整便携包', () => {
     const result = run(out)
     expect(result.status, result.stderr).toBe(0)
     const inspected = spawnSync('python', ['-c',
-      'import json,sys,zipfile; z=zipfile.ZipFile(sys.argv[1]); print(json.dumps({"bad":z.testzip(),"names":z.namelist(),"manifest":json.loads(z.read("release-manifest.json")),"profile":json.loads(z.read("home/profiles/desktop/package.json"))}))', out], { encoding: 'utf8' })
+      'import json,sys,zipfile; z=zipfile.ZipFile(sys.argv[1]); print(json.dumps({"bad":z.testzip(),"names":z.namelist(),"manifest":json.loads(z.read("release-manifest.json")),"profile":json.loads(z.read("home/profiles/desktop/package.json"))}))', out], { encoding: 'utf8', maxBuffer: 16 * 1024 * 1024 })
     expect(inspected.status, inspected.stderr).toBe(0)
     const zip = JSON.parse(inspected.stdout)
     expect(zip.bad).toBeNull()
@@ -124,11 +126,11 @@ describe('每次发布的完整便携包', () => {
     expect(zip.names).toContain('app/resources/runtime/primary-runtime/dependencies/pnpm/index.js')
     expect(zip.names).not.toContain('app/locales/ja.pak')
     expect(zip.names).not.toContain('app/resources/runtime/pnpm/index.js')
-    expect(zip.manifest).toEqual({ pluginVersion: pkg.version, dshVersion: '0.2.1-rc.2' })
+    expect(zip.manifest).toEqual({ pluginVersion: pkg.version, dshVersion: '0.2.2-alpha.2' })
     // 2026-10-18 起出厂默认追加 5 个实验性 bundle（FACTORY_EXPERIMENTAL_BUNDLES，
     // 见 scripts/package-release-portable.mjs）；这里故意硬编码，钉住意外变动。
     expect(zip.profile.dsh.profile.bundles).toEqual(['@deepseek-ai/dsh-base', '@deepseek-ai/dsh-web-app',
-      'dsh-webops-plugin', 'dsh-context', 'dsh-better-sidebar',
+      'dsh-webops-plugin', 'dsh-context', 'dsh-better-sidebar', 'dsh-workbuddy-connect',
       '@deepseek-ai/dsh-experimental-agent-team-profile',
       '@deepseek-ai/dsh-experimental-auto-review',
       '@deepseek-ai/dsh-experimental-tool-worktree',
@@ -146,10 +148,15 @@ describe('每次发布的完整便携包', () => {
     expect(shipped.stdout).toContain('const fence = (req) => ctx.connection.requestRejection(req) === void 0;')
     expect(shipped.stdout).not.toContain('ctx.get("webRuntime")?.trustedHosts ?? []')
     expect(zip.names).not.toContain('home/profiles/desktop/node_modules/dsh-better-sidebar/dsh-host-compatibility.json')
-    for (const name of ['dsh-webops-plugin', 'dsh-context', 'dsh-better-sidebar']) {
+    for (const name of ['dsh-webops-plugin', 'dsh-context', 'dsh-better-sidebar', 'dsh-workbuddy-connect']) {
       expect(zip.names).toContain(`home/profiles/desktop/node_modules/${name}/package.json`)
     }
-    expect(zip.names.some((name: string) => /fake-llm|debug\.log|credentials|conversations/.test(name))).toBe(false)
+    expect(zip.profile.dependencies['dsh-workbuddy-connect']).toBe('0.7.9')
+    expect(zip.names).toContain('home/profiles/desktop/node_modules/dsh-workbuddy-connect/node_modules/@earendil-works/pi-ai/package.json')
+    expect(zip.names).toContain('home/profiles/desktop/node_modules/dsh-workbuddy-connect/node_modules/openai/package.json')
+    // SDK 含 credential-provider 和 conversations API；用户数据按 home 根目录识别。
+    expect(zip.names.some((name: string) => /(?:^|\/)(?:fake-llm|debug\.log)(?:\/|$)/.test(name)
+      || /^home\/(?:\.credentials\.yaml|credentials|sessions|storages|conversations)(?:\/|$)/.test(name))).toBe(false)
     const digest = () => createHash('sha256').update(readFileSync(out)).digest('hex')
     const before = digest()
     expect(run(out).status).toBe(1)
@@ -159,7 +166,7 @@ describe('每次发布的完整便携包', () => {
     expect(wrong.status).toBe(1)
     expect(wrong.stderr).toContain('peerDependencies')
     expect(readdirSync(data.root)).not.toContain('incompatible.zip')
-  }, 20_000)
+  }, 60_000)
 })
 
 describe('纯插件包保留模式的真实 ZIP', () => {
