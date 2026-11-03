@@ -100,7 +100,7 @@ describe('每次发布的完整便携包', () => {
     writeFileSync(join(startup, 'startup.js'), 'const WEB_STARTUP_SERVICE = "webStartup";\n')
     // 打包脚本会拿这个版本去比对插件声明的 peerDependencies（package-release-portable.mjs），
     // 所以夹具必须跟 package.json 的 DSH peer 同源；升上游时这两处一起改。
-    writeFileSync(descriptor, JSON.stringify({ release: { version: '0.2.2-alpha.2' } }))
+    writeFileSync(descriptor, JSON.stringify({ release: { version: '0.2.2-alpha.3' } }))
     writeFileSync(join(app, 'DeepSeek Harness.exe'), '测试本体')
     writeFileSync(join(app, 'debug.log'), '运行时日志不出货')
     const preservedInputs = ['locales/en-US.pak', 'locales/zh-CN.pak', 'locales/ja.pak',
@@ -126,7 +126,7 @@ describe('每次发布的完整便携包', () => {
     expect(zip.names).toContain('app/resources/runtime/primary-runtime/dependencies/pnpm/index.js')
     expect(zip.names).not.toContain('app/locales/ja.pak')
     expect(zip.names).not.toContain('app/resources/runtime/pnpm/index.js')
-    expect(zip.manifest).toEqual({ pluginVersion: pkg.version, dshVersion: '0.2.2-alpha.2' })
+    expect(zip.manifest).toEqual({ pluginVersion: pkg.version, dshVersion: '0.2.2-alpha.3' })
     // 2026-10-18 起出厂默认追加 5 个实验性 bundle（FACTORY_EXPERIMENTAL_BUNDLES，
     // 见 scripts/package-release-portable.mjs）；这里故意硬编码，钉住意外变动。
     expect(zip.profile.dsh.profile.bundles).toEqual(['@deepseek-ai/dsh-base', '@deepseek-ai/dsh-web-app',

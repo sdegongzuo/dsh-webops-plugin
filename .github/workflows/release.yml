@@ -38,9 +38,9 @@ concurrency:
 
 env:
   # 默认 pin 到与本机 checkout 一致的提交，避免上游 main 漂移把构建搞挂。
-  # f3803c9697 = tag `dsh-v0.2.2-alpha.2`：与 `release-desktop.yml`
+  # 05b1cae8db = tag `dsh-v0.2.2-alpha.3`：与 `release-desktop.yml`
   # 用同一个 ref，也让本 workflow 的构建对着我们实际随包出货的那个 harness 版本。
-  HARNESS_REF: ${{ inputs.harness_ref || 'f3803c96974ad4a94195fb97e5c637e9c2a3afe3' }}
+  HARNESS_REF: ${{ inputs.harness_ref || '05b1cae8db6e674c5685101494d4eec24652424a' }}
   TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
   DSH_ELECTRON_MIRROR: https://github.com/electron/electron/releases/download/
   # 完整便携包从本 tag 的补丁与固定 HARNESS_REF 完整重编，不复用可能缺少新补丁的旧公开壳。
@@ -82,7 +82,9 @@ jobs:
       - name: 装 pnpm + Node
         uses: pnpm/action-setup@v5
         with:
-          version: 11.12.0
+          # 与上游 harness 根 package.json 的 `packageManager: pnpm@11.28.5` 对齐：
+          # 版本低于它时 pnpm 会要求 purge 整棵 node_modules（无 TTY 直接 abort）。
+          version: 11.28.5
       - uses: actions/setup-node@v5
         with:
           # dsh 0.2.2-alpha.2 起 engines.node = ">=24.9.0"（0.2.1-rc.2 还是 ^22.19 || >=24），

@@ -1,5 +1,5 @@
 diff --git a/apps/desktop/README.md b/apps/desktop/README.md
-index f961a72a92..4ea12de66d 100644
+index fe24b24568..ab088e766c 100644
 --- a/apps/desktop/README.md
 +++ b/apps/desktop/README.md
 @@ -6,6 +6,8 @@ description: "Desktop runs the Harness workspace in a native application. This r
@@ -12,7 +12,7 @@ index f961a72a92..4ea12de66d 100644
  
  Desktop runs the Harness workspace in a native application. This reference covers application behavior, development and integration; the packaging, Windows signing and publication guides own build and release operations.
 diff --git a/apps/desktop/README.zh.md b/apps/desktop/README.zh.md
-index a7500d5d28..c791288105 100644
+index 933e329ce1..915771d415 100644
 --- a/apps/desktop/README.zh.md
 +++ b/apps/desktop/README.zh.md
 @@ -6,6 +6,8 @@ description: "Desktop 在原生应用中运行 Harness 工作区。本参考文
@@ -218,10 +218,10 @@ index d406c27235..36bb70f4fb 100644
    if (!inside(appDir, sourceRoot)) {
      // Builder's source matcher slices the appDir prefix even for external FileSets.
 diff --git a/apps/desktop/src/main.ts b/apps/desktop/src/main.ts
-index 4770fe83bf..e4b211b81e 100644
+index d8d0e30c4c..854926e40b 100644
 --- a/apps/desktop/src/main.ts
 +++ b/apps/desktop/src/main.ts
-@@ -2,7 +2,9 @@ import type { ProductEventMap, ProductEvent } from '@deepseek-ai/dsh-client-prod
+@@ -3,7 +3,9 @@ import type { ProductEventMap, ProductEvent } from '@deepseek-ai/dsh-client-prod
  import { WINDOWS_TITLEBAR_HEIGHT } from './windows-layout.ts'
  /** Electron shell: desktop project ownership, custom protocol, windows, and lifecycle. */
  
@@ -231,7 +231,7 @@ index 4770fe83bf..e4b211b81e 100644
  import { join } from 'node:path'
  import { fileURLToPath } from 'node:url'
  import {
-@@ -22,7 +24,8 @@ import {
+@@ -23,7 +25,8 @@ import {
    type IpcMainInvokeEvent,
    type MenuItemConstructorOptions,
  } from 'electron'
@@ -241,7 +241,7 @@ index 4770fe83bf..e4b211b81e 100644
  import { DesktopProjectManager } from './project-manager.ts'
  import { DesktopHostFatalError, DesktopHostProcess, DesktopHostUncleanExitError } from './host-process.ts'
  import { DesktopPlatformView, PLATFORM_IPC, platformBounds } from './platform-view.ts'
-@@ -38,7 +41,7 @@ import { desktopUpdateChannel } from './update-channel.ts'
+@@ -39,7 +42,7 @@ import { desktopUpdateChannel } from './update-channel.ts'
  import { DesktopUpdateCoordinator } from './update-coordinator.ts'
  import { prepareDesktopUpdateWindow } from './update-window.ts'
  import { DesktopCommandManager } from './command-management.ts'
@@ -250,7 +250,7 @@ index 4770fe83bf..e4b211b81e 100644
  import { DesktopFatalRecovery } from './fatal-recovery.ts'
  import { pruneCrashReports, RendererConsoleTail, writeCrashReport, type CrashReportSource } from './crash-report.ts'
  import { OperationJournal } from './operation-journal.ts'
-@@ -67,6 +70,77 @@ import { DesktopQuitConfirmation } from './quit-confirmation.ts'
+@@ -68,6 +71,77 @@ import { DesktopQuitConfirmation } from './quit-confirmation.ts'
  import { DesktopTray } from './tray.ts'
  import { DesktopBackgroundNotice } from './background-notice.ts'
  
@@ -328,7 +328,7 @@ index 4770fe83bf..e4b211b81e 100644
  let focusPrimaryWindow = (): void => {}
  let stopForRecovery = async (): Promise<void> => { await stopOperationReports() }
  let shuttingDown = false
-@@ -87,7 +161,7 @@ const rendererConsole = new RendererConsoleTail()
+@@ -88,7 +162,7 @@ const rendererConsole = new RendererConsoleTail()
  
  // Platform-conventional logs directory (macOS ~/Library/Logs/<name>, otherwise under userData);
  // set before ready so the first fatal report already resolves under it.
@@ -337,7 +337,7 @@ index 4770fe83bf..e4b211b81e 100644
  
  function currentDesktopLocale(): ReturnType<typeof resolveDesktopLocale> {
    return resolveDesktopLocale(windowsLanguage ?? app.getLocale())
-@@ -207,8 +281,17 @@ function runtimeResources(): RuntimeResources {
+@@ -208,8 +282,17 @@ function runtimeResources(): RuntimeResources {
    const pnpm = (development ? process.env.DSH_DESKTOP_PNPM_ENTRY : undefined)
      ?? (development ? join(app.getAppPath(), 'node_modules', 'pnpm', 'bin', 'pnpm.mjs')
        : join(process.resourcesPath, 'runtime', 'primary-runtime', 'dependencies', 'pnpm', 'bin', 'pnpm.mjs'))
@@ -356,7 +356,7 @@ index 4770fe83bf..e4b211b81e 100644
    return { node, nodeBin, pnpm, dsh }
  }
  
-@@ -292,6 +375,15 @@ function createWindow(preload: string, show = false, primary = false): BrowserWi
+@@ -293,6 +376,15 @@ function createWindow(preload: string, show = false, primary = false): BrowserWi
      if (['http:', 'https:'].includes(new URL(url).protocol)) void shell.openExternal(url)
      return { action: 'deny' }
    })
@@ -372,7 +372,7 @@ index 4770fe83bf..e4b211b81e 100644
    if (process.platform === 'darwin' || process.platform === 'win32') {
      // Fullscreen hides native window controls; overlays drop their caption clearance.
      const sendFullscreen = (): void => {
-@@ -365,6 +457,11 @@ function createWindow(preload: string, show = false, primary = false): BrowserWi
+@@ -366,6 +458,11 @@ function createWindow(preload: string, show = false, primary = false): BrowserWi
  }
  
  async function main(): Promise<void> {
@@ -384,7 +384,7 @@ index 4770fe83bf..e4b211b81e 100644
    const desktopSettings = readDesktopSettings(app.getPath('userData'))
    void pruneCrashReports(app.getPath('logs'))
    const journalDirectory = process.env.DSH_DESKTOP_UPDATE_JOURNAL_DIR
-@@ -381,9 +478,9 @@ async function main(): Promise<void> {
+@@ -382,9 +479,9 @@ async function main(): Promise<void> {
    const loginShellRead = new AbortController()
    // The probe runs in its own process group, which outlives Desktop unless the read is aborted.
    app.on('will-quit', () => { loginShellRead.abort() })
@@ -396,7 +396,7 @@ index 4770fe83bf..e4b211b81e 100644
      for (const failure of result.failures) console.warn(`desktop login shell: ${failure.shell} failed (${failure.reason})`)
      return result.environment
    })
-@@ -528,11 +625,28 @@ async function main(): Promise<void> {
+@@ -529,11 +626,28 @@ async function main(): Promise<void> {
      return {
        start: async () => {
          const ready = await host.start()
@@ -428,7 +428,7 @@ index 4770fe83bf..e4b211b81e 100644
          analyticsEnabled = await welcomeBackend.analyticsEnabled().catch(() => false)
          if (!reportedLaunch) { reportedLaunch = true; void track('desktop_app_launch', {}) }
          stopAccount?.()
-@@ -807,7 +921,13 @@ async function main(): Promise<void> {
+@@ -808,7 +922,13 @@ async function main(): Promise<void> {
      return browserGuests.release(event.sender, lease)
    })
  
@@ -443,7 +443,7 @@ index 4770fe83bf..e4b211b81e 100644
      if (hostUrl === undefined || hostCookie === undefined || details.webContentsId !== mainWindow?.webContents.id) {
        callback({})
        return
-@@ -1088,7 +1208,7 @@ async function main(): Promise<void> {
+@@ -1093,7 +1213,7 @@ async function main(): Promise<void> {
    if (process.platform === 'win32') {
      // The tray is the way back to a hidden window; without it, relaunching the application still focuses it.
      try {
@@ -452,7 +452,7 @@ index 4770fe83bf..e4b211b81e 100644
          open: () => { focusPrimaryWindow() }, quit: () => { app.quit() } })
      } catch (error) { console.warn('desktop tray: unavailable', error) }
    }
-@@ -1327,7 +1447,7 @@ async function main(): Promise<void> {
+@@ -1332,7 +1452,7 @@ async function main(): Promise<void> {
      window.focus()
    }
  
@@ -461,7 +461,7 @@ index 4770fe83bf..e4b211b81e 100644
    app.on('open-url', (event, url) => {
      event.preventDefault()
      if (url === 'dsh://open' || url === 'dsh://open/') focusPrimaryWindow()
-@@ -1425,9 +1545,8 @@ async function main(): Promise<void> {
+@@ -1430,9 +1550,8 @@ async function main(): Promise<void> {
        refresh: async () => { await Promise.all([checkPolicyManually(), updateSchedule.check(true)]) },
        download: downloadUpdate, install: version => updates.install(version),
      })
@@ -473,7 +473,7 @@ index 4770fe83bf..e4b211b81e 100644
    }
    automaticCheck()
    await reconcileBackend().catch(() => undefined)
-@@ -1440,19 +1559,31 @@ async function main(): Promise<void> {
+@@ -1445,19 +1564,31 @@ async function main(): Promise<void> {
    publishUpdate(updateState)
  }
  
@@ -975,7 +975,7 @@ index 0000000000..76f0f34808
 +  })
 +})
 diff --git a/apps/desktop/tests/main-startup.spec.ts b/apps/desktop/tests/main-startup.spec.ts
-index 20325642a2..ebf5c87ef0 100644
+index 3b1e63e00c..4e9ab1d199 100644
 --- a/apps/desktop/tests/main-startup.spec.ts
 +++ b/apps/desktop/tests/main-startup.spec.ts
 @@ -22,7 +22,16 @@ type InvokeHandler = (event: InvokeEvent, ...args: unknown[]) => unknown
@@ -1022,7 +1022,7 @@ index 20325642a2..ebf5c87ef0 100644
        closeWindowsOnQuit = false
        prepareUpdate = undefined
        publishUpdate = undefined
-@@ -343,7 +357,8 @@ vi.mock('../src/login-shell-environment.ts', async importOriginal => ({
+@@ -344,7 +358,8 @@ vi.mock('../src/login-shell-environment.ts', async importOriginal => ({
    readDesktopLoginShellEnvironment: harness.loginShell,
  }))
  vi.mock('../src/runtime-tree.ts', () => ({ readDesktopRuntime: () => ({ release: { version: '1.0.0' } }) }))
@@ -1032,7 +1032,7 @@ index 20325642a2..ebf5c87ef0 100644
  vi.mock('../src/project-manager.ts', () => ({
    DesktopProjectManager: class {
      readonly applyRelease = harness.applyRelease
-@@ -686,48 +701,23 @@ describe('desktop main startup', () => {
+@@ -724,48 +739,23 @@ describe('desktop main startup', () => {
      expect(host.stop).not.toHaveBeenCalled()
    })
  
@@ -1094,7 +1094,7 @@ index 20325642a2..ebf5c87ef0 100644
    })
  
    it.each(['returned', 'cancelled', 'failed'] as const)('requires explicit test login and handles %s without downloading', async (outcome) => {
-@@ -739,7 +729,7 @@ describe('desktop main startup', () => {
+@@ -777,7 +767,7 @@ describe('desktop main startup', () => {
      await readyForUpdate()
      await vi.advanceTimersByTimeAsync(0)
      expect(testAuth.login).not.toHaveBeenCalled()
@@ -1103,7 +1103,7 @@ index 20325642a2..ebf5c87ef0 100644
      harness.dialog.showMessageBox.mockClear()
      testAuth.login.mockImplementationOnce(async () => {
        request.mockImplementation(async () => Response.json({ code: 0, data: { biz_code: 0, biz_data: null } }))
-@@ -874,6 +864,27 @@ describe('desktop main startup', () => {
+@@ -912,6 +902,27 @@ describe('desktop main startup', () => {
      expect(harness.hosts).toHaveLength(0)
    })
  
@@ -1131,7 +1131,7 @@ index 20325642a2..ebf5c87ef0 100644
    it('serves packaged shell documents instead of rejecting the shell origin', async () => {
      const { serveWebDocument } = await import('../src/web-document.ts')
      vi.mocked(serveWebDocument).mockResolvedValue(new Response('shell document'))
-@@ -1099,6 +1110,11 @@ describe('desktop main startup', () => {
+@@ -1134,6 +1145,11 @@ describe('desktop main startup', () => {
      harness.hosts[0]!.url = `${protocol}//127.0.0.1:3080/?token=test`
      harness.hosts[0]!.ready.resolve()
      await Promise.resolve(invoke(DESKTOP_IPC.boot))
@@ -1143,7 +1143,7 @@ index 20325642a2..ebf5c87ef0 100644
      const handler = harness.socketHeaders.mock.calls[0]![1] as (
        details: { url: string; webContentsId: number; requestHeaders: Record<string, string> },
        callback: (result: unknown) => void,
-@@ -2522,7 +2538,8 @@ describe('desktop main startup', () => {
+@@ -2557,7 +2573,8 @@ describe('desktop main startup', () => {
      expect(harness.applyRelease).toHaveBeenCalledTimes(1)
      expect(harness.hosts[0]).toMatchObject({
        node: process.execPath,
@@ -1548,7 +1548,7 @@ index dea2905583..cb70d68123 100644
    })
  })
 diff --git a/apps/desktop/tests/welcome-startup.spec.ts b/apps/desktop/tests/welcome-startup.spec.ts
-index 7915248243..627145c621 100644
+index 4ae8743e2e..14b43c07d9 100644
 --- a/apps/desktop/tests/welcome-startup.spec.ts
 +++ b/apps/desktop/tests/welcome-startup.spec.ts
 @@ -1,4 +1,10 @@
@@ -1563,7 +1563,7 @@ index 7915248243..627145c621 100644
  /** Welcome startup uses the Host before transitioning to the workspace. */
  
  import { afterEach, expect, it, vi } from 'vitest'
-@@ -101,7 +107,8 @@ vi.mock('electron', () => ({
+@@ -102,7 +108,8 @@ vi.mock('electron', () => ({
  // The Windows tray relabels through Menu as well; keep the menu call counts below platform-neutral.
  vi.mock('../src/tray.ts', () => ({ DesktopTray: class { relabel() {} dispose() {} } }))
  
@@ -2069,10 +2069,10 @@ index 12da5f0caf..1675b24259 100644
    return { currentValue, options }
  }
 diff --git a/packages/client/ui-permission-presets/tests/permission-presets-row.client.spec.tsx b/packages/client/ui-permission-presets/tests/permission-presets-row.client.spec.tsx
-index 160bd49d80..36402d2cff 100644
+index 869eef7130..30c80f0f60 100644
 --- a/packages/client/ui-permission-presets/tests/permission-presets-row.client.spec.tsx
 +++ b/packages/client/ui-permission-presets/tests/permission-presets-row.client.spec.tsx
-@@ -16,6 +16,12 @@ const usePanelInfo: GlobalStandardProps['usePanelInfo'] = selector => selector({
+@@ -17,6 +17,12 @@ const usePanelInfo: GlobalStandardProps['usePanelInfo'] = selector => selector({
  
  const catalog = { options: [], defaultPreset: 'read-only', defaultOptions: ['read-only', 'workspace-write', 'danger-full-access'].map(value => ({ value, name: value })) }
  const directory = { store: createSnapshotStore({ value: catalog }), load: () => Promise.resolve(catalog) }
@@ -2085,7 +2085,7 @@ index 160bd49d80..36402d2cff 100644
  
  /** Controller over a real mirror derived from the same scripted context. */
  function derivedController(remote: { settings: object }) {
-@@ -23,16 +29,23 @@ function derivedController(remote: { settings: object }) {
+@@ -24,16 +30,23 @@ function derivedController(remote: { settings: object }) {
    return new PermissionPresetSettingsController(new SettingsDescribeMirror(ctx), ctx, directory)
  }
  
@@ -2112,7 +2112,7 @@ index 160bd49d80..36402d2cff 100644
    },
  }
  
-@@ -131,6 +144,31 @@ describe('PermissionRow', () => {
+@@ -133,6 +146,31 @@ describe('PermissionRow', () => {
      expect(dialog.isConnected).toBe(false)
    })
  
@@ -2247,10 +2247,10 @@ index b071d0297a..1e1757e3a6 100644
        session.append('permission/preset', { preset: name })
        setSandboxMode(session, spec.sandbox)
 diff --git a/packages/interaction/permission-presets/tests/permission-presets.spec.ts b/packages/interaction/permission-presets/tests/permission-presets.spec.ts
-index 6f7b9b361b..56980b6bb5 100644
+index 6f7b9b361b..e3a5b3cbff 100644
 --- a/packages/interaction/permission-presets/tests/permission-presets.spec.ts
 +++ b/packages/interaction/permission-presets/tests/permission-presets.spec.ts
-@@ -461,12 +461,40 @@ describe('new-session default', () => {
+@@ -461,12 +461,42 @@ describe('new-session default', () => {
      })
    })
  
@@ -2284,7 +2284,9 @@ index 6f7b9b361b..56980b6bb5 100644
 +    const ctx = await mounted({ config: { defaultPreset: AUTO_PRESET } })
 +    let admissions = 0
 +    await mountAuto(ctx, () => { admissions += 1 })
-+    const session = ctx.sessions.create(SessionId('auto-default'))
++    // 走 `agents.create`（真实创建路径）：权限事实是在 `agent/created` 里钉的，
++    // 只调 `sessions.create` 不会触发，也不该触发。
++    const session = (await ctx.agents.create({ sessionId: SessionId('auto-default') })).agent.session
 +    expect(admissions).toBe(1)
 +    expect(session.snapshotEvents().map(event => [event.type, event.data])).toEqual([
 +      ['permission/preset', { preset: AUTO_PRESET }],

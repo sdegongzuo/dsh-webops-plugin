@@ -66,10 +66,10 @@ concurrency:
 
 env:
   # 默认 pin 到与本机 checkout 一致的提交，避免上游 main 漂移把构建搞挂。
-  # f3803c9697 = tag `dsh-v0.2.2-alpha.2`（2026-10-28）。之所以必须跟着上游走：
+  # 05b1cae8db = tag `dsh-v0.2.2-alpha.3`（2026-11-03）。之所以必须跟着上游走：
   # `docs/harness-desktop-build.patch` 的上下文行取自这个提交，pin 旧 ref 会直接 apply 失败。
   # 换 ref 会让本体缓存 key 失效，CI 得全量重建一次（~18min），属预期。
-  HARNESS_REF: ${{ inputs.harness_ref || 'f3803c96974ad4a94195fb97e5c637e9c2a3afe3' }}
+  HARNESS_REF: ${{ inputs.harness_ref || '05b1cae8db6e674c5685101494d4eec24652424a' }}
   TAG: ${{ github.event_name == 'workflow_dispatch' && format('desktop-v{0}', inputs.version) || github.ref_name }}
   # ⚠️ 这一条**不生效**：dsh 0.1.6-alpha.2 起 `loadDesktopPackageEnvironment()` 会把环境变量里的
   # release 设置全部过滤掉（`AMBIENT_RELEASE_SETTING`），`DSH_DESKTOP_APP_ID` 只能由
@@ -105,7 +105,9 @@ jobs:
       - name: 装 pnpm + Node
         uses: pnpm/action-setup@v5
         with:
-          version: 11.12.0
+          # 与上游 harness 根 package.json 的 `packageManager: pnpm@11.28.5` 对齐：
+          # 版本低于它时 pnpm 会要求 purge 整棵 node_modules（无 TTY 直接 abort）。
+          version: 11.28.5
       - uses: actions/setup-node@v5
         with:
           # dsh 0.2.2-alpha.2 起 engines.node = ">=24.9.0"，上游 CI 的 PRIMARY_NODE_VERSION 也是 24；
