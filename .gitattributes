@@ -1,12 +1,14 @@
 # CI（GitHub 的 Windows runner）默认 core.autocrlf=true，检出会把文本文件转成 CRLF。
-# 下面这两份文件的**字节**就是判据，不是内容，必须钉死 LF：
+# 下面这份文件的**字节**就是判据，不是内容，必须钉死 LF：
 #
 # - runtime-lock/pnpm-lock.yaml：prepare:dsh 把它拷进一次性 BUILD_ROOT 做解析，解析后
 #   断言 sha256 没变（pnpm 写回的一定是 LF）。检出成 CRLF 时这条断言必挂，报出来的是
 #   「生产运行时锁被重新解析」——差异计数看起来像依赖漂移，实际只是换行：该断言用
 #   Set 去重后比较行集合，CRLF 转换正好产生「删除 4125 行、新增 4125 行」这个特征数
 #   （2026-11-04 v0.2.21 首次带锁跑 CI 就死在这里）。
-# - docs/harness-desktop-build.patch：桌面构建回执里记 patchSha256，本机与 CI 应当同源；
-#   补丁本身也以 LF 上下文应用。
+#
+# 刻意**不**钉 docs/harness-desktop-build.patch：CI 是在自己 clone 的 harness 检出
+# （同样是 CRLF）上 `git apply --ignore-whitespace`。补丁跟着检出一起转 CRLF 时上下文
+# 才与目标文件一致；单方面把补丁钉成 LF 反而有应用不上的风险。代价只是桌面构建回执里的
+# patchSha256 两侧不同（`asarSha256` 才是包身份，判据看它）。
 runtime-lock/pnpm-lock.yaml text eol=lf
-docs/harness-desktop-build.patch text eol=lf
