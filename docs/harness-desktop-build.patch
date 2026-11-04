@@ -50,7 +50,7 @@ index cf0c19e895..2cbeb41007 100644
        // Windows tray bitmaps; macOS keeps the Dock and ships no menu bar icon.
        ...(packagesWindows ? [{ from: fileURLToPath(new URL('../resources/tray-windows.ico', import.meta.url)), to: 'tray.ico' }] : []),
 diff --git a/apps/desktop/scripts/prepare-dsh.ts b/apps/desktop/scripts/prepare-dsh.ts
-index a069888036..aa6aab5f1e 100644
+index a069888036..5c51b82cad 100644
 --- a/apps/desktop/scripts/prepare-dsh.ts
 +++ b/apps/desktop/scripts/prepare-dsh.ts
 @@ -6,7 +6,7 @@ import { spawn } from 'node:child_process'
@@ -62,7 +62,7 @@ index a069888036..aa6aab5f1e 100644
  import { desktopNodeEnvironment } from '../src/node-environment.ts'
  import { createRuntimeProjectMetadata } from '../src/project-manager.ts'
  import { DESKTOP_HOST_PROTOCOL_VERSION } from '../src/host-protocol.ts'
-@@ -47,12 +47,51 @@ const PACKAGE_SET_ROOT = BUILD_PATHS.packageSet
+@@ -47,12 +47,65 @@ const PACKAGE_SET_ROOT = BUILD_PATHS.packageSet
  const NODE = join(BUILD_PATHS.electron, process.platform === 'win32' ? 'electron.exe' : 'Electron.app/Contents/MacOS/Electron')
  const PNPM = join(RUNTIME_ROOT, 'primary-runtime', 'dependencies', 'pnpm', 'bin', 'pnpm.mjs')
  
@@ -100,6 +100,20 @@ index a069888036..aa6aab5f1e 100644
 +  return `删除 ${String(removed.length)} 行、新增 ${String(added.length)} 行${sample.length === 0 ? '' : `，例如：\n${sample.join('\n')}`}`
 +}
 +
++/**
++ * 本地打包 tarball 的 sha512 不参与「依赖版本漂移」判定。
++ *
++ * `desktop-packages/*.tgz` 是构建过程**自己**从工作区打出来的，字节会随打包环境变（文件遍历
++ * 顺序、构建机工具链）。把它们的 integrity 当成身份判据，会让同一份源码换台机器必然对不上：
++ * 2026-11-04 v0.2.22 就这么挂在 CI 上，80 行差异全是同名的 tarball、不同的 sha512。
++ * 真正要钉的是「从 registry 解析出来的版本」，那部分 integrity 仍然严格比对。
++ */
++const LOCAL_TARBALL_INTEGRITY = /(resolution: \{integrity: )sha512-[A-Za-z0-9+/=]+,( tarball: file:)/gu
++
++function normalizeLocalTarballIntegrity(text: string): string {
++  return text.replace(LOCAL_TARBALL_INTEGRITY, '$1<built-locally>$2')
++}
++
 +/** 校验锁输入契约：要么喂仓库锁，要么显式要求重新生成，二者必居其一。 */
 +function runtimeLockInput(): string | undefined {
 +  if (RUNTIME_LOCK_OUTPUT !== '') return undefined
@@ -114,7 +128,7 @@ index a069888036..aa6aab5f1e 100644
  function desktopRelease(): DesktopRelease {
    const version = manifestVersion(join(APP_ROOT, 'package.json'), 'desktop package')
    const dshVersion = manifestVersion(resolve(APP_ROOT, '..', '..', 'package.json'), 'root dsh package')
-@@ -129,15 +168,50 @@ async function main(): Promise<void> {
+@@ -129,15 +182,54 @@ async function main(): Promise<void> {
        createRuntimeProjectMetadata(BUILD_ROOT, release)
        return prepareRuntimePatches(BUILD_ROOT, resolve(APP_ROOT, '..', '..'))
      })
@@ -141,9 +155,13 @@ index a069888036..aa6aab5f1e 100644
 +        return
 +      }
 +      if (expectedLock !== undefined && sha256File(RUNTIME_LOCK_FILE) !== expectedLock) {
-+        throw new Error(`desktop runtime: 生产运行时锁被重新解析（输入 ${String(lockInput)}）；构建不允许自行改依赖版本。`
-+          + `差异：${lockfileDrift(readFileSync(String(lockInput), 'utf8'), resolved)}。`
-+          + '确认要升级时用 DSH_DESKTOP_RUNTIME_LOCK_WRITE 重新生成并提交 runtime-lock/pnpm-lock.yaml')
++        const before = readFileSync(String(lockInput), 'utf8')
++        if (normalizeLocalTarballIntegrity(before) !== normalizeLocalTarballIntegrity(resolved)) {
++          throw new Error(`desktop runtime: 生产运行时锁被重新解析（输入 ${String(lockInput)}）；构建不允许自行改依赖版本。`
++            + `差异：${lockfileDrift(before, resolved)}。`
++            + '确认要升级时用 DSH_DESKTOP_RUNTIME_LOCK_WRITE 重新生成并提交 runtime-lock/pnpm-lock.yaml')
++        }
++        console.warn('desktop runtime: 本地打包 tarball 的 sha512 与本机不同（打包环境差异，不影响依赖版本），按解析结果继续')
 +      }
 +    })
      verifyDesktopCoreLockfile(
