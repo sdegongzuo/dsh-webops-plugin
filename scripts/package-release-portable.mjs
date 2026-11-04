@@ -6,6 +6,7 @@ import { fileURLToPath } from 'node:url'
 import { readRuntimeDescriptor } from './desktop-runtime.mjs'
 import { planSlimAppCopy } from './slim-portable-app.mjs'
 import { verifyDesktopBuildIdentity } from './desktop-build-identity.mjs'
+import { writeProfileExemptions } from './vendor-compatibility.mjs'
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 
@@ -76,6 +77,14 @@ try {
   writeFileSync(join(profile, 'pnpm-workspace.yaml'), 'nodeLinker: hoisted\nautoInstallPeers: false\nstrictDepBuilds: true\n')
   cpSync(join(ROOT, 'scripts/portable-profile-patch.yaml'), join(profile, 'cordis.patch.yml'))
   run(process.execPath, [join(ROOT, 'scripts/materialize-vendored-plugins.mjs'), '--profile-dir', profile])
+  // 物化之后才能读到真实 manifest：厂商插件若把 peer 钉成精确版（workbuddy-connect 钉
+  // 0.2.1-rc.2 就是），宿主会把它当不兼容**静默跳过**，功能整块消失。豁免写进出厂 profile。
+  await writeProfileExemptions({
+    appDir: join(stage, 'app'),
+    profileDir: profile,
+    runtimeVersion: runtime.release.version,
+    names: [pkg.name, ...vendor.plugins.map(p => p.name)],
+  })
   writeFileSync(join(stage, '启动.cmd'), ['@echo off', 'setlocal', 'set "DSH_HOME=%~dp0home"', `start "" "%~dp0app\\${exe}" %*`, ''].join('\r\n'))
   writeFileSync(join(stage, '使用说明.txt'), [
     `插件发布版本：${version}；DSH 本体：${runtime.release.version}；Windows x64 完整便携包。`,

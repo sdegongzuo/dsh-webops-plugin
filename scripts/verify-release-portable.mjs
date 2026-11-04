@@ -7,6 +7,7 @@ import { materializeRuntimeDir } from './desktop-runtime.mjs'
 import { fetchHostPath, startPackagedDesktopHost } from './run-packaged-host.mjs'
 import { assertDesktopBuildIdentity } from './desktop-build-identity.mjs'
 import { verifyMaterializedRuntime } from './vendored-runtime-lock.mjs'
+import { COMPATIBILITY_FILE, loadHostCompatibility } from './vendor-compatibility.mjs'
 
 const ROOT = fileURLToPath(new URL('../', import.meta.url))
 const argv = process.argv.slice(2)
@@ -45,6 +46,18 @@ for (const plugin of [{ name: pkg.name, version: pkg.version }, ...vendor]) {
 }
 for (const plugin of vendor) {
   if (plugin.runtimeLock) verifyMaterializedRuntime(join(profile, 'node_modules', plugin.name), join(ROOT, 'vendor/plugins'), plugin.runtimeLock)
+}
+// 宿主的 bundle 准入：判不满足就把整层**静默跳过**（只进 skippedBundles），症状只是功能
+// 消失、客户端加载图少一行 —— 2026-11-04 就是这么红的。这里先用宿主自己的读入器与判定
+// 实现把话说清楚，免得又靠「首页少个名字」间接定位。豁免写在哪见 scripts/vendor-compatibility.mjs。
+const hostApi = await loadHostCompatibility(join(dir, 'app'))
+const compatibility = hostApi.readProfileCompatibility(profile)
+assert(compatibility.warnings.length === 0,
+  `出厂 profile 的 ${COMPATIBILITY_FILE} 有宿主不接受的记录：${compatibility.warnings.join('；')}`)
+for (const name of [pkg.name, ...vendor.map(p => p.name)]) {
+  const issue = hostApi.evaluatePluginCompatibility(json(join(profile, 'node_modules', name, 'package.json')), compatibility.exemptions, runtime.release.version)
+  assert(issue === undefined || issue.exempted,
+    `插件 ${name} 在 dsh ${runtime.release.version} 下不兼容，且出厂 profile 没有它的精确版本豁免：要求 ${JSON.stringify(issue?.requirements)}`)
 }
 console.log(`运行时 ${runtime.release.version}：${runtime.files.length} 个文件哈希匹配，${vendor.length + 1} 个插件与出厂 home 通过`)
 // 使用新的临时 home；仅启动验收副本，不向解压出的出厂 home 写入用户数据。

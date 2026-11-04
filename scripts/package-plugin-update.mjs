@@ -107,6 +107,29 @@ if (probeToken !== undefined) {
   console.log(`  · 注入自检探针 ${probeToken}`)
 }
 
+/**
+ * 增量包**不能**替用户写 `home\profiles\desktop\compatibility.json`（那是 profile 根文件，
+ * 与 package.json 同级、属于用户）。所以这里把「老 home 要自己补一次」写进说明。
+ *
+ * 背景见 scripts/vendor-compatibility.mjs：厂商插件把 dsh peer 钉成精确版时，宿主会判
+ * 不兼容并把整层**静默跳过** —— 不报错，只是模型列表里没有 WorkBuddy 那几项。
+ */
+const workbuddy = JSON.parse(readFileSync(join(ROOT, 'vendor/plugins/manifest.json'), 'utf8'))
+  .plugins.find(plugin => plugin.name === 'dsh-workbuddy-connect')
+const knownLimitation = workbuddy === undefined ? [] : [
+  '【已知限制：WorkBuddy 提供的模型不出现】',
+  `  ${workbuddy.name}@${workbuddy.version} 把 dsh 的 peer 依赖钉成了精确版本（不带 ^），dsh 按 peer`,
+  '  判兼容性 —— 版本对不上就把它整层静默跳过（不报错，只是模型列表里没有 WorkBuddy 那几项）。',
+  '  整包新装已经随包写好豁免；用本增量包升级的旧 home 需要补一次（重启生效）：',
+  '',
+  '    在 home\\profiles\\desktop\\compatibility.json 写入（文件不存在就新建，只此一行内容）：',
+  `      { "${workbuddy.name}@${workbuddy.version}": ["<你的 dsh 版本>"] }`,
+  '',
+  '  dsh 版本看 app\\resources\\dsh\\desktop-runtime.json 的 release.version；也可以走 CLI：',
+  `      dsh plugin allow-version ${workbuddy.name}@${workbuddy.version} --dsh-version <版本> --accept-risk`,
+  '',
+]
+
 writeFileSync(
   join(stage, '更新说明.txt'),
   [
@@ -139,6 +162,7 @@ writeFileSync(
     '  profile 的 package.json 不动 —— 那是你的文件，可能登记了你自己装过的其它插件，',
     '  整份覆盖会把它们抹掉。插件管理页读取插件自身 package.json 的 version，更新后以本包版本为准。',
     '',
+    ...knownLimitation,
     '【没生效怎么查】',
     '  · 确认 dsh 已经完全退出后重新覆盖一次（最常见的失败就是进程还占着文件）',
     '  · 确认解压目标层面对（见上面第 2 步）',

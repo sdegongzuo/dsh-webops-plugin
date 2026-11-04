@@ -60,6 +60,7 @@ import { buildRoot } from './local-env.mjs'
 import { readRuntimeDescriptor } from './desktop-runtime.mjs'
 import { desktopReleaseVersion } from './desktop-release-version.mjs'
 import { slimApp } from './slim-portable-app.mjs'
+import { writeProfileExemptions } from './vendor-compatibility.mjs'
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const DIST = join(ROOT, 'dist')
@@ -717,6 +718,15 @@ if (materialize.status !== 0) {
   process.exit(1)
 }
 console.log(`  + home/profiles/desktop/node_modules/{${vendoredPlugins.map((plugin) => plugin.name).join(', ')}}（vendor 物化）`)
+
+// 3.6) 精确版本豁免（与 package-release-portable 同一份实现）：厂商插件把 dsh peer
+//      钉成精确版时，宿主会判不兼容并**静默跳过**该 bundle，功能整块消失且不报错。
+await writeProfileExemptions({
+  appDir: join(STAGE, 'app'),
+  profileDir,
+  runtimeVersion: runtime.release.version,
+  names: [pluginName, ...vendoredPlugins.map((plugin) => plugin.name)],
+})
 
 // 4) 启动器：把 DSH_HOME 指到包内，配置就随包走
 //    （apps/desktop/src/paths.ts:26 默认参数 resolveDshHome() 读 $DSH_HOME）

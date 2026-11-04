@@ -98,6 +98,14 @@ describe('每次发布的完整便携包', () => {
     const startup = join(runtime, 'node_modules', '@deepseek-ai', 'dsh-web-app', 'lib')
     mkdirSync(startup, { recursive: true })
     writeFileSync(join(startup, 'startup.js'), 'const WEB_STARTUP_SERVICE = "webStartup";\n')
+    // 组装脚本会调 vendor-compatibility 求精确版本豁免，而真实现是**动态 import 随包运行的
+    // app-boot**（判定与宿主同一份字节）。夹具里的运行时是假的，所以这里放一个「全都满足」的
+    // 桩：豁免的判定语义与写入格式由 vendor-compatibility.test.ts 管，是否需要豁免由
+    // verify-release-portable 用真 app-boot 在真包上验。这里只保证组装流程跑得通。
+    const appBoot = join(runtime, 'node_modules', '@deepseek-ai', 'dsh-app-boot', 'lib')
+    mkdirSync(appBoot, { recursive: true })
+    writeFileSync(join(appBoot, 'index.js'),
+      'export function evaluatePluginCompatibility() { return undefined }\nexport function validatePluginVersionExemption() {}\n')
     // 打包脚本会拿这个版本去比对插件声明的 peerDependencies（package-release-portable.mjs），
     // 所以夹具必须跟 package.json 的 DSH peer 同源；升上游时这两处一起改。
     writeFileSync(descriptor, JSON.stringify({ release: { version: '0.2.2-alpha.3' } }))
@@ -148,6 +156,8 @@ describe('每次发布的完整便携包', () => {
     expect(shipped.stdout).toContain('const fence = (req) => ctx.connection.requestRejection(req) === void 0;')
     expect(shipped.stdout).not.toContain('ctx.get("webRuntime")?.trustedHosts ?? []')
     expect(zip.names).not.toContain('home/profiles/desktop/node_modules/dsh-better-sidebar/dsh-host-compatibility.json')
+    // 夹具里所有插件都判满足，所以出厂 profile 不该出现豁免文件 —— 别让「有 exemptions」变成常态。
+    expect(zip.names).not.toContain('home/profiles/desktop/compatibility.json')
     for (const name of ['dsh-webops-plugin', 'dsh-context', 'dsh-better-sidebar', 'dsh-workbuddy-connect']) {
       expect(zip.names).toContain(`home/profiles/desktop/node_modules/${name}/package.json`)
     }
