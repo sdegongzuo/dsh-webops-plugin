@@ -332,7 +332,9 @@ async function launch() {
   if (!Number.isInteger(cdpPort) || cdpPort < 1 || cdpPort > 65535) fail(`--cdp 端口不合法：${String(cdpPort)}`)
   const holder = findPortListener(cdpPort)
   if (holder !== undefined) {
-    fail(`CDP 端口 ${String(cdpPort)} 已被占用（PID ${String(holder.pid)}${holder.name === undefined ? '' : ` ${holder.name}`}）—— 换一个 --cdp 端口；绑定竞争失败会明确返回，不连接其他实例充数。`)
+    // 兜底探针命中时拿不到 PID 与镜像名（见 run-packaged-host.mjs 的 probeLoopbackAccept）。
+    const who = holder.pid === undefined ? '' : `PID ${String(holder.pid)}${holder.name === undefined ? '' : ` ${holder.name}`}`
+    fail(`CDP 端口 ${String(cdpPort)} 已被占用${who === '' ? '（占用者 PID 未知）' : `（${who}）`}—— 换一个 --cdp 端口；绑定竞争失败会明确返回，不连接其他实例充数。`)
   }
 
   // run-id 同一秒内只允许一个实例占用；第二个实例起自动加后缀（并发启动不互相覆盖）。

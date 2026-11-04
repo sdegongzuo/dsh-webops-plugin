@@ -45,34 +45,63 @@ function sleepSync(ms) {
 }
 
 /**
- * 查谁在 LISTEN 这个端口。只认 `netstat -ano` 的 LISTENING 行 ——
- * 不用「绑一下试试」那套：在 Windows 上绑 `127.0.0.1:<port>` 与占用者绑 `0.0.0.0:<port>`
- * **不冲突**，会得到「端口空闲」的假阴性（2026-09-18 实测）。
+ * loopback 连接探针：有人 listen 就必然完成握手，没人 listen 立刻 `ECONNREFUSED`。
+ *
+ * 这是 `findPortListener` 的兜底，不是主判据 —— 它只为 `netstat` 不可靠时保底。
+ * 2026-11-04 本机实测：绑 `127.0.0.1` 的监听在 `netstat -ano` 与
+ * `Get-NetTCPConnection` 里状态都被报成 **CLOSED**（同一时刻绑 `0.0.0.0` 的则正常
+ * 显示 LISTENING），于是「已占用」被静默判成「空闲」，`mi:launch` 与端口预检一起失守。
+ * `connect` 不看状态字段，因此不受这个缺陷影响。
+ *
+ * 不能换成「bind 一下试试」：Windows 上绑 `127.0.0.1:<port>` 与占用者绑 `0.0.0.0:<port>`
+ * 并不冲突，那才是真正的假阴性（2026-09-18 实测）。
+ */
+function probeLoopbackAccept(port) {
+  // 结论必须**直接退出**进程：只 destroy socket 会让下面的 setTimeout 也把结论写进 stdout，
+  // 拼成 `busyfree` 之类，调用方按精确匹配就永远读到「空闲」（2026-11-04 踩过一次）。
+  const script = [
+    "const net=require('node:net')",
+    `const socket=net.connect({port:${String(Number(port))},host:'127.0.0.1'})`,
+    "const done=(v)=>{process.stdout.write(v);process.exit(0)}",
+    "socket.once('connect',()=>done('busy'))",
+    "socket.once('error',()=>done('free'))",
+    "setTimeout(()=>done('free'),1500)",
+  ].join(';')
+  const result = spawnSync(process.execPath, ['-e', script], { encoding: 'utf8', windowsHide: true, timeout: 5_000 })
+  return String(result.stdout ?? '').trim() === 'busy'
+}
+
+/**
+ * 查谁在 LISTEN 这个端口。主判据是 `netstat -ano` 的 LISTENING 行（能拿到 PID 与镜像名），
+ * netstat 说「没人」时再用 loopback 握手兜一次 —— 状态字段被系统报错的情形见
+ * `probeLoopbackAccept`。不用「绑一下试试」，理由同上。
  *
  * @param port - 待查端口。
  * @returns `{ pid?, name? }`；没人监听则 `undefined`。非 Windows 一律返回 `undefined`。
+ * 兜底命中时 PID 未知（返回 `{}`）—— 此时调用方的消息要能容忍缺失的 PID。
  */
 export function findPortListener(port = HOST_PORT) {
   if (process.platform !== 'win32') return undefined
   const netstat = spawnSync(systemExe('netstat.exe'), ['-ano'], { encoding: 'utf8', windowsHide: true })
-  if (netstat.error !== undefined || netstat.stdout === null) return undefined
-  for (const line of String(netstat.stdout).split(/\r?\n/)) {
-    if (!/\bLISTENING\b/iu.test(line)) continue
-    // 字段固定为：Proto / 本地地址 / 外部地址 / 状态 / PID。
-    const fields = line.trim().split(/\s+/u)
-    if (fields.length < 4) continue
-    if (!fields[1].endsWith(`:${String(port)}`)) continue
-    const pid = Number.parseInt(fields[fields.length - 1], 10)
-    if (Number.isNaN(pid)) return {}
-    const tasklist = spawnSync(systemExe('tasklist.exe'), ['/FI', `PID eq ${String(pid)}`, '/FO', 'CSV', '/NH'], {
-      encoding: 'utf8',
-      windowsHide: true,
-    })
-    // CSV 里第一列就是镜像名；这里在 Node 里解析，不受「grep 被 CSV 引号骗过」那个坑影响。
-    const name = String(tasklist.stdout ?? '').trim().replace(/^"/u, '').split('","', 1)[0]
-    return { pid, name: name === '' ? undefined : name }
+  if (netstat.error === undefined && netstat.stdout !== null) {
+    for (const line of String(netstat.stdout).split(/\r?\n/)) {
+      if (!/\bLISTENING\b/iu.test(line)) continue
+      // 字段固定为：Proto / 本地地址 / 外部地址 / 状态 / PID。
+      const fields = line.trim().split(/\s+/u)
+      if (fields.length < 4) continue
+      if (!fields[1].endsWith(`:${String(port)}`)) continue
+      const pid = Number.parseInt(fields[fields.length - 1], 10)
+      if (Number.isNaN(pid)) return {}
+      const tasklist = spawnSync(systemExe('tasklist.exe'), ['/FI', `PID eq ${String(pid)}`, '/FO', 'CSV', '/NH'], {
+        encoding: 'utf8',
+        windowsHide: true,
+      })
+      // CSV 里第一列就是镜像名；这里在 Node 里解析，不受「grep 被 CSV 引号骗过」那个坑影响。
+      const name = String(tasklist.stdout ?? '').trim().replace(/^"/u, '').split('","', 1)[0]
+      return { pid, name: name === '' ? undefined : name }
+    }
   }
-  return undefined
+  return probeLoopbackAccept(port) ? {} : undefined
 }
 
 /**
