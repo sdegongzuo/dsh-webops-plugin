@@ -6,6 +6,9 @@
  * 0.28.0 起上游原生 inject「connection」，栅栏直接用
  * `(req) => ctx.connection.requestRejection(req) === void 0`，与宿主提供的
  * connection.requestRejection（401/403/undefined）一致，无需补丁、不进下方集合。
+ * 0.28.2（2026-11-04 升级）复核：OLD_INJECT / OLD_FENCE / PREVIOUS_* 计数均为 0、
+ * `ctx.connection.requestRejection` 消费点 1 处，且 cordis.patch.yml 与 0.28.0 逐字节相同，
+ * 故同样不进下方集合、manifest 不启用 hostCompatibility。
  */
 import { createHash } from 'node:crypto'
 import { existsSync, readFileSync, writeFileSync } from 'node:fs'

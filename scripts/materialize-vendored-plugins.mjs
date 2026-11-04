@@ -3,9 +3,10 @@
  * profile node_modules 下的**真实文件**（symlink 会被桌面端校验直接拒）。
  *
  * 设计要点：
- *  · tarball 一律先做 sha512 校验（manifest.integrity，与 npm registry 的
- *    dist.integrity 逐字节一致）再解包 —— vendor 里的 tgz 被篡改/截断时在这里爆，
- *    而不是打包出一份带着坏插件的 zip。
+ *  · tarball 一律先按 manifest.integrity 做 sha512 校验再解包 —— vendor 里的 tgz
+ *    被篡改/截断时在这里爆，而不是打包出一份带着坏插件的 zip。npm 官方包的 integrity
+ *    与 registry dist.integrity 逐字节一致；带 sourceCommit 的源码构建条目是本地 npm pack
+ *    产物自算值，只与仓库里那一份 tgz 自洽，不能跨机重建后来比对。
  *  · 解包是纯 Node（zlib + 512 字节 tar 头解析），不依赖外部 tar —— Windows 自带
  *    bsdtar 但 spawn('tar') 在无 shell 的 Node 子进程里不保证命中 PATH。
  *  · 运行时依赖（如 dsh-context 的 zod）按 npm 的嵌套规则落在

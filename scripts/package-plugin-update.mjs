@@ -108,25 +108,19 @@ if (probeToken !== undefined) {
 }
 
 /**
- * 增量包**不能**替用户写 `home\profiles\desktop\compatibility.json`（那是 profile 根文件，
- * 与 package.json 同级、属于用户）。所以这里把「老 home 要自己补一次」写进说明。
- *
- * 背景见 scripts/vendor-compatibility.mjs：厂商插件把 dsh peer 钉成精确版时，宿主会判
- * 不兼容并把整层**静默跳过** —— 不报错，只是模型列表里没有 WorkBuddy 那几项。
+ * 2026-11-04 起随包 WorkBuddy 插件换成 dsh-connect-workbuddy（范围 peer，不再需要精确版本豁免）。
+ * 本增量包只更新 dsh-webops-plugin 自身，不带也不增删随包插件；老 profile 里若仍登记旧包名，
+ * 只能由用户自己迁移（增量包刻意不写 profile 根文件），所以把步骤写进说明。
  */
-const workbuddy = JSON.parse(readFileSync(join(ROOT, 'vendor/plugins/manifest.json'), 'utf8'))
-  .plugins.find(plugin => plugin.name === 'dsh-workbuddy-connect')
-const knownLimitation = workbuddy === undefined ? [] : [
-  '【已知限制：WorkBuddy 提供的模型不出现】',
-  `  ${workbuddy.name}@${workbuddy.version} 把 dsh 的 peer 依赖钉成了精确版本（不带 ^），dsh 按 peer`,
-  '  判兼容性 —— 版本对不上就把它整层静默跳过（不报错，只是模型列表里没有 WorkBuddy 那几项）。',
-  '  整包新装已经随包写好豁免；用本增量包升级的旧 home 需要补一次（重启生效）：',
-  '',
-  '    在 home\\profiles\\desktop\\compatibility.json 写入（文件不存在就新建，只此一行内容）：',
-  `      { "${workbuddy.name}@${workbuddy.version}": ["<你的 dsh 版本>"] }`,
-  '',
-  '  dsh 版本看 app\\resources\\dsh\\desktop-runtime.json 的 release.version；也可以走 CLI：',
-  `      dsh plugin allow-version ${workbuddy.name}@${workbuddy.version} --dsh-version <版本> --accept-risk`,
+const vendorMigration = [
+  '【随包 WorkBuddy 插件已更换（仅完整便携包）】',
+  '  完整便携包新装自带 dsh-connect-workbuddy，范围 peer，无需 compatibility.json 豁免。',
+  '  本增量包只更新 dsh-webops-plugin 自身，不含、也不改动任何随包插件与你的 profile。',
+  '  已在用的旧 home 若仍登记 dsh-workbuddy-connect，需要自己迁移一次：把新插件目录放到',
+  '  home\\profiles\\desktop\\node_modules\\，并在该 profile 的 package.json 里把',
+  '  dsh.profile.bundles / dependencies 中的旧名换成 dsh-connect-workbuddy；',
+  '  compatibility.json 里旧包的豁免记录可以删掉（新包不需要）。',
+  '  最省事的路是用完整便携包重新铺底（注意会换掉 home，先备份自己的数据）。',
   '',
 ]
 
@@ -162,7 +156,7 @@ writeFileSync(
     '  profile 的 package.json 不动 —— 那是你的文件，可能登记了你自己装过的其它插件，',
     '  整份覆盖会把它们抹掉。插件管理页读取插件自身 package.json 的 version，更新后以本包版本为准。',
     '',
-    ...knownLimitation,
+    ...vendorMigration,
     '【没生效怎么查】',
     '  · 确认 dsh 已经完全退出后重新覆盖一次（最常见的失败就是进程还占着文件）',
     '  · 确认解压目标层面对（见上面第 2 步）',

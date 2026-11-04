@@ -138,15 +138,16 @@ describe('每次发布的完整便携包', () => {
     // 2026-10-18 起出厂默认追加 5 个实验性 bundle（FACTORY_EXPERIMENTAL_BUNDLES，
     // 见 scripts/package-release-portable.mjs）；这里故意硬编码，钉住意外变动。
     expect(zip.profile.dsh.profile.bundles).toEqual(['@deepseek-ai/dsh-base', '@deepseek-ai/dsh-web-app',
-      'dsh-webops-plugin', 'dsh-context', 'dsh-better-sidebar', 'dsh-workbuddy-connect',
+      'dsh-webops-plugin', 'dsh-context', 'dsh-better-sidebar', 'dsh-connect-workbuddy',
       '@deepseek-ai/dsh-experimental-agent-team-profile',
       '@deepseek-ai/dsh-experimental-auto-review',
       '@deepseek-ai/dsh-experimental-tool-worktree',
       '@deepseek-ai/dsh-experimental-terminal-bundle',
       '@deepseek-ai/dsh-experimental-session-search'])
-    expect(zip.profile.dependencies['dsh-better-sidebar']).toBe(
-      JSON.parse(readFileSync(new URL('../vendor/plugins/manifest.json', import.meta.url), 'utf8'))
-        .plugins.find((plugin: { name: string }) => plugin.name === 'dsh-better-sidebar').version)
+    const vendorManifest = JSON.parse(readFileSync(new URL('../vendor/plugins/manifest.json', import.meta.url), 'utf8'))
+    const vendorVersion = (name: string) => vendorManifest.plugins
+      .find((plugin: { name: string }) => plugin.name === name).version
+    expect(zip.profile.dependencies['dsh-better-sidebar']).toBe(vendorVersion('dsh-better-sidebar'))
     const shipped = spawnSync('python', ['-c',
       'import sys,zipfile; z=zipfile.ZipFile(sys.argv[1]); print(z.read("home/profiles/desktop/node_modules/dsh-better-sidebar/lib/index.js").decode())', out], { encoding: 'utf8' })
     expect(shipped.status, shipped.stderr).toBe(0)
@@ -158,12 +159,13 @@ describe('每次发布的完整便携包', () => {
     expect(zip.names).not.toContain('home/profiles/desktop/node_modules/dsh-better-sidebar/dsh-host-compatibility.json')
     // 夹具里所有插件都判满足，所以出厂 profile 不该出现豁免文件 —— 别让「有 exemptions」变成常态。
     expect(zip.names).not.toContain('home/profiles/desktop/compatibility.json')
-    for (const name of ['dsh-webops-plugin', 'dsh-context', 'dsh-better-sidebar', 'dsh-workbuddy-connect']) {
+    for (const name of ['dsh-webops-plugin', 'dsh-context', 'dsh-better-sidebar', 'dsh-connect-workbuddy']) {
       expect(zip.names).toContain(`home/profiles/desktop/node_modules/${name}/package.json`)
     }
-    expect(zip.profile.dependencies['dsh-workbuddy-connect']).toBe('0.7.9')
-    expect(zip.names).toContain('home/profiles/desktop/node_modules/dsh-workbuddy-connect/node_modules/@earendil-works/pi-ai/package.json')
-    expect(zip.names).toContain('home/profiles/desktop/node_modules/dsh-workbuddy-connect/node_modules/openai/package.json')
+    expect(zip.profile.dependencies['dsh-connect-workbuddy']).toBe(vendorVersion('dsh-connect-workbuddy'))
+    // 新插件沿用 workbuddy-runtime.lock.json 的隔离运行时（pi-ai 及其传递依赖）。
+    expect(zip.names).toContain('home/profiles/desktop/node_modules/dsh-connect-workbuddy/node_modules/@earendil-works/pi-ai/package.json')
+    expect(zip.names).toContain('home/profiles/desktop/node_modules/dsh-connect-workbuddy/node_modules/openai/package.json')
     // SDK 含 credential-provider 和 conversations API；用户数据按 home 根目录识别。
     expect(zip.names.some((name: string) => /(?:^|\/)(?:fake-llm|debug\.log)(?:\/|$)/.test(name)
       || /^home\/(?:\.credentials\.yaml|credentials|sessions|storages|conversations)(?:\/|$)/.test(name))).toBe(false)

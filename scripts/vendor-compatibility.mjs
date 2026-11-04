@@ -15,6 +15,9 @@
  * 判定**必须**用宿主自己的实现：这里动态 import 随包运行时里的
  * `@deepseek-ai/dsh-app-boot`，不自己复刻 semver 语义（`includePrerelease: true`、
  * `engines.dsh` 优先于 peers、`workspace:` 前缀替换等细节，复刻一遍就等于埋分叉）。
+ *
+ * 2026-11-04 换包后随包的 `dsh-connect-workbuddy` 用范围 peer，出厂 profile 不再产生豁免；
+ * 这套机制保留为发布门禁（未来任何 bundle 精确 peer 失配仍会被当场点名），不是死代码。
  */
 import { existsSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'

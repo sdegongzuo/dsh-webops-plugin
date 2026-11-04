@@ -6,6 +6,9 @@
  * 只守我们新增的胶水：谁被豁免、键怎么拼、文件写不写、格式与宿主读入端一致、
  * 缺包时说不说得清。语义层由 `verify-release-portable` 用**真** app-boot 验
  * （2026-11-04 就是它替我们抓到「不兼容的 bundle 被静默跳过」）。
+ *
+ * 夹具里的 `dsh-workbuddy-connect@0.7.9` 是那次真实故障的包名，2026-11-04 换包后已不再随包；
+ * 这里保留它只是作为「精确 peer 失配」的回归样本，测的是通用胶水，与当前随包清单无关。
  */
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'

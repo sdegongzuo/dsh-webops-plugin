@@ -117,8 +117,9 @@ const WORKSPACE_SETTINGS = 'nodeLinker: hoisted\nautoInstallPeers: false\nstrict
 /**
  * 随包出厂的第三方插件登记表（vendor/plugins/manifest.json，单一真相源）。
  * 登记进 manifest 的插件自动进 profile 的 dependencies + bundles，tarball 由
- * materialize-vendored-plugins.mjs 物化（sha512 与 npm registry dist.integrity
- * 逐字节一致才落盘）。新加插件只需：放 tgz、登记 manifest、跑自检——本脚本不再改。
+ * materialize-vendored-plugins.mjs 按 manifest.integrity 做 sha512 校验后才落盘
+ * （npm 官方包对齐 registry dist.integrity；带 sourceCommit 的源码构建条目对齐仓库里那一份 tgz）。
+ * 新加插件只需：放 tgz、登记 manifest、跑自检——本脚本不再改。
  */
 function readVendoredPlugins() {
   const manifestPath = join(ROOT, 'vendor', 'plugins', 'manifest.json')
