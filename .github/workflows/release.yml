@@ -114,7 +114,12 @@ jobs:
           New-Item -ItemType Directory -Path $buildTemp | Out-Null
           foreach ($name in @('TEMP', 'TMP', 'TMPDIR')) { Add-Content -Path $env:GITHUB_ENV -Value "$name=$buildTemp" }
           Add-Content -Path $env:GITHUB_ENV -Value "PNPM_HOME=$(Join-Path $buildTemp 'pnpm-home')"
-          Add-Content -Path $env:GITHUB_ENV -Value "XDG_CACHE_HOME=$(Join-Path $buildTemp 'cache')"
+          # ⚠️ **不要**改 XDG_CACHE_HOME（2026-11-04 实测踩过）。pnpm 的 store 位置跟着它走，
+          # 而 `actions/setup-node` 的 `cache: pnpm` 在**它自己那一步**用 `pnpm store path`
+          # 算出要缓存的目录（那时还没设这个变量 → 默认位置），post 阶段再拿同一路径去存缓存，
+          # 发现路径不存在 → 整个 run 被标红 `Path Validation Error: Path(s) … do(es) not exist`。
+          # 讽刺的是所有实质步骤都成功了、Release 也发出去了，红的是收尾的缓存保存。
+          # 需要把缓存挪出 C 盘就显式改 `store-dir` **并且**在 setup-node 之前设置，不要用这个变量。
           Add-Content -Path $env:GITHUB_ENV -Value "ELECTRON_BUILDER_CACHE=$(Join-Path $buildTemp 'electron-builder-cache')"
           Add-Content -Path $env:GITHUB_ENV -Value "npm_config_cache=$(Join-Path $buildTemp 'npm-cache')"
           Get-Content package.json | Select-Object -First 3
@@ -227,37 +232,13 @@ jobs:
       - name: 写 release 说明
         shell: pwsh
         run: |
-          $notes = @'
-          ## dsh-webops-plugin __TAG__ · 完整便携包与独立插件包
-
-          本版修复双窗口并发时的首击丢失：取得窗口输入权并确认标签可见后，先与页面同步两帧，再重新核对可写状态与票据，然后才测量落点并派发鼠标事件。两个独立窗口同时点击时，各自页面都能收到一次可信点击；同窗口两条逻辑通道的临界区仍不重叠。外部 Chrome 没有共享窗口概念，不加这次等待，行为不变。
-
-          本版同时包含网页操作后的观察改进：点击等动作默认返回目标所在区块，表格保留整行；独立 wait 复用当前页面纪元内最近的有效区域。区域失效或页面没有合适区块时回退全页，并说明回退原因。find 的上下文限定在对应列表项或行内，避免把复选框与相邻条目名称混淆。
-
-          模型配置修复 U2 Flash 请求中的角色兼容问题；保留工具逐步披露与会话恢复。完整便携包从固定 DSH 上游加本版桌面补丁重新编译，随包记录并校验源码、补丁及实际桌面文件身份，包含当前实例标题和默认权限选项。
-
-          本次改进不保证所有站点都更快或更省 token，具体成本受页面结构与模型调用路径影响。外部 Chrome 不提供 Electron 宿主的窗口级输入保护；已派发 Chromium 输入不能保证撤销。实例的用户数据与浏览器资料继续保存在各自便携目录，旧系统数据按安装说明处理。
-
-          下载 `__PLUGIN_ZIP__`，包内包含完整编译插件及 INSTALL.md，无需重新下载 DSH 桌面整包。
-
-          首次安装下载 `__PORTABLE_ZIP__`，解压后双击启动.cmd；内置本次插件、Context 与 Better Sidebar 三个插件。DSH 本体版本为 __DSH_VERSION__，插件版本为 __VERSION__。首次使用请在设置中填写自己的 API Key；不含凭据或会话数据。
-
-          ### 更新已有插件
-
-          1. 完全退出 DSH。
-          2. 将 ZIP 内的文件合并覆盖到实际加载的 `dsh-webops-plugin` 插件目录。
-             便携版默认位置：`home/profiles/desktop/node_modules/dsh-webops-plugin/`。
-             本包根目录是插件内容，不能直接解压到便携版根目录。
-          3. 重新启动，核对插件 package.json 的 version 为 `__VERSION__`，并实际调用网页工具。
-
-          保留旧 chunk 和用户 profile 登记。首次安装按包内 INSTALL.md 执行 `dsh plugin add`。
-          每次发布都提供完整便携包；已有用户也可只更新插件。其他宿主版本的兼容性以实测为准。
-
-          | 文件 | 大小 | SHA-256 |
-          | --- | --- | --- |
-          | __PLUGIN_ZIP__ | __PLUGIN_KB__ KB | __PLUGIN_SHA__ |
-          | __PORTABLE_ZIP__ | __PORTABLE_KB__ KB | __PORTABLE_SHA__ |
-          '@
+          # 说明正文放在仓库里（docs/release-notes.md），每版发布前改它 —— 原来写死在这个
+          # here-string 里，结果 0.2.21~0.2.24 连着四版发的都是 0.2.20 的文案（讲双窗口
+          # 首击、还写「三个插件」），用户完全看不出这一版改了什么。文件缺失直接失败，
+          # 免得又静默发一份过期文案。
+          $notesPath = Join-Path $env:GITHUB_WORKSPACE 'docs/release-notes.md'
+          if (-not (Test-Path $notesPath)) { throw "缺少发版说明 $notesPath —— 每版发布前先更新它（占位符见下方替换表）" }
+          $notes = Get-Content $notesPath -Raw
           $notes = $notes -replace '__TAG__', $env:TAG `
                            -replace '__VERSION__', $env:PLUGIN_VERSION `
                            -replace '__PLUGIN_ZIP__', $env:PLUGIN_ZIP_NAME `

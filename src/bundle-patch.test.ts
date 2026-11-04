@@ -726,7 +726,11 @@ describe('发版工作流的保留式打包（不删除、不覆盖）', () => {
     expect(workflow).toContain('node scripts/verify-release-portable.mjs')
     expect(workflow.indexOf('node scripts/verify-release-portable.mjs')).toBeLessThan(workflow.indexOf('gh release create'))
     expect(workflow).toContain('--desktop-build-receipt')
-    expect(workflow).toContain('不能直接解压到便携版根目录')
+    // 发版说明 0.2.24 起从仓库文件读（原来写死在 workflow 的 here-string 里，结果连续四版
+    // 发的都是 0.2.20 的文案）。所以「用户看得见那段解压指引」要同时断言两件事：
+    // workflow 真的去读那个文件，且那个文件里还留着这段话。
+    expect(workflow).toContain("docs/release-notes.md")
+    expect(readRepoFile('docs/release-notes.md')).toContain('不能直接解压到便携版根目录')
   })
 
   it('完整包使用本 tag 当前补丁重编出的 DSH，并把实际构建回执传给打包器', () => {
