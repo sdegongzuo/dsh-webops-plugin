@@ -22,7 +22,7 @@
  * 不传（`undefined`）至少会退回 `pnpmCommand`。
  */
 import { spawn, spawnSync } from 'node:child_process'
-import { existsSync } from 'node:fs'
+import { existsSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
 
 /**
@@ -175,6 +175,16 @@ export function startPackagedDesktopHost(options) {
   // 给半个反而会造出「paths 是空串的 pnpm」。
   const packageManager = existsSync(pnpm) ? [pnpm, nodeBin] : []
 
+  // 真桌面壳在 spawn 宿主时注入 `DSH_CLIENT_VERSION`（`apps/desktop/src/main.ts:618`，值来自
+  // 构建期固化的客户端版本，与随包 dsh 版本同源）。自检不注入时，web-app 的
+  // `serviceVersion: !!js process.env.DSH_CLIENT_VERSION` 就取到空值 → product-telemetry
+  // 配置校验失败（`$.serviceVersion missing required value`），连带 product-analytics 一直
+  // pending，stderr 里稳定多两条 `entries did not activate`（2026-11-04 差点当成包坏了）。
+  // 这里按同一语义补齐；调用方显式给的值优先。
+  const descriptor = join(runtimeDir, 'desktop-runtime.json')
+  const clientVersion = options.env?.DSH_CLIENT_VERSION
+    ?? (existsSync(descriptor) ? JSON.parse(readFileSync(descriptor, 'utf8')).release.version : undefined)
+
   const child = spawn(node, [
     '--expose-internals',
     entry,
@@ -184,7 +194,11 @@ export function startPackagedDesktopHost(options) {
     ...packageManager,
   ], {
     cwd: profileDir,
-    env: { ...(options.env ?? process.env), ELECTRON_RUN_AS_NODE: '1' },
+    env: {
+      ...(options.env ?? process.env),
+      ELECTRON_RUN_AS_NODE: '1',
+      ...clientVersion === undefined ? {} : { DSH_CLIENT_VERSION: clientVersion },
+    },
     stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
   })
 
