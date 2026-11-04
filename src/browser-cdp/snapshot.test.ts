@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
-import { boundsToBox, boxesIntersect, buildOutline, DEFAULT_SNAPSHOT_LIMITS, filterAxTreeByBackendIds, MAX_SNAPSHOT_LINES, renderOutline, resolveSnapshotLimits } from './snapshot.ts'
-import type { AxNode, OutlineLine } from './snapshot.ts'
+import { boundsToBox, boxesIntersect, buildOutline, DEFAULT_SNAPSHOT_LIMITS, DEFAULT_TAIL_LINES, filterAxTreeByBackendIds, MAX_SNAPSHOT_LINES, MAX_TAIL_LINES, renderOutline, resolveSnapshotLimits, sliceOutlineTail } from './snapshot.ts'
+import type { AxNode, OutlineLine, SnapshotOutline } from './snapshot.ts'
 import { RefRegistry } from './refs.ts'
 
 /** 造一个 AX 节点；省略的字段保持缺省。 */
@@ -759,5 +759,84 @@ describe('buildOutline：正文读取（项 3 · 2026-10-07）', () => {
     expect(outline.unfoldedLines.find(line => line.full !== undefined)?.fullLength).toBe(50000)
     expect(full).not.toContain('truncated')
     expect(outline.lines[0]?.text).not.toContain('TAIL-739')
+  })
+})
+
+/** 十轮长对话的 AX 形状：前面是旧轮回答，末尾是本轮回答 + 发送按钮。 */
+function longConversationPage(rounds: number): AxNode[] {
+  const ids = Array.from({ length: rounds * 2 + 1 }, (_, index) => `n${String(index)}`)
+  return [
+    node({ nodeId: 'root', role: { value: 'RootWebArea' }, childIds: ['wrap'] }),
+    node({ nodeId: 'wrap', role: { value: 'generic' }, childIds: ids }),
+    ...Array.from({ length: rounds * 2 }, (_, index) => node({
+      nodeId: `n${String(index)}`,
+      role: { value: index % 2 === 0 ? 'heading' : 'statictext' },
+      name: { value: index % 2 === 0 ? `第 ${String(index / 2 + 1)} 轮回答` : `回答正文 ${String(index)}` },
+      ...index % 2 === 0 ? { backendDOMNodeId: 100 + index } : {},
+    })),
+    node({ nodeId: `n${String(rounds * 2)}`, role: { value: 'button' }, name: { value: '发送' }, backendDOMNodeId: 999 }),
+  ]
+}
+
+describe('sliceOutlineTail（文档尾部有界读取 · 会话 07e69431）', () => {
+  it('保留文档末尾 N 行而不是从头截断，头部省略行数与全页截断分开报告', () => {
+    const source = buildOutline(longConversationPage(10))
+    expect(source.lines.length).toBeGreaterThan(10)
+    const { outline, omittedLines } = sliceOutlineTail(source, 4)
+
+    const texts = outline.lines.map(line => line.text)
+    expect(texts).toEqual(source.lines.slice(-4).map(line => line.text))
+    expect(texts.join('\n')).toContain('第 10 轮回答')
+    expect(texts.join('\n')).toContain('button "发送"')
+    expect(texts.join('\n')).not.toContain('第 1 轮回答')
+    expect(omittedLines).toBe(source.lines.length - 4)
+    // 主动省略 ≠ 预算截断：droppedElements 仍按源如实带出，不混成一个数。
+    expect(outline.truncated).toBe(source.truncated)
+    expect(outline.droppedElements).toBe(source.droppedElements)
+    expect(outline.foldedRepeats).toBe(0)
+    expect(outline.dedupedLines).toBe(0)
+  })
+
+  it('只发布尾部真实见过的 ref：rows 裁剪后 targetRow 全部重映射且不越界', () => {
+    const source = buildOutline(longConversationPage(10))
+    const { outline } = sliceOutlineTail(source, 4)
+    for (const line of [...outline.lines, ...outline.unfoldedLines]) {
+      if (line.targetRow === undefined) continue
+      expect(line.targetRow).toBeGreaterThanOrEqual(0)
+      expect(line.targetRow).toBeLessThan(outline.rows.length)
+    }
+    // 尾部 4 行里只有末尾这一轮的 heading 锚点与发送按钮可寻址，前面的轮次一律不发布。
+    expect(outline.rows.length).toBeGreaterThan(0)
+    expect(outline.rows.length).toBeLessThan(source.rows.length)
+    expect(outline.rows.map(row => row.name)).toContain('发送')
+    expect(outline.rows.map(row => row.name)).not.toContain('第 1 轮回答')
+  })
+
+  it('find 底稿按行身份对齐，不依赖两份数组的对象引用', () => {
+    // 直接构造「打印行」与「底稿行」是两个不同对象、只共享 lineId 的情形：
+    // buildOutline 的 normalizeDepths 分别对两份数组跑，真实链路里就会出现这种形状。
+    const mk = (lineId: number, text: string, extra = false): OutlineLine =>
+      ({ depth: 0, text, lineId, ...extra ? { full: `${text} 的完整原文` } : {} })
+    const source: SnapshotOutline = {
+      lines: [mk(0, '旧轮 1'), mk(1, '旧轮 2'), { depth: 0, text: '×3 个重复' }, mk(3, '本轮回答')],
+      unfoldedLines: [mk(0, '旧轮 1'), mk(1, '旧轮 2'), mk(2, '折叠实例', true), mk(3, '本轮回答', true)],
+      rows: [], truncated: false, droppedElements: 0, foldedRepeats: 1, dedupedLines: 0,
+    }
+    const { outline, omittedLines } = sliceOutlineTail(source, 2)
+    expect(omittedLines).toBe(2)
+    expect(outline.lines.map(line => line.text)).toEqual(['×3 个重复', '本轮回答'])
+    // 起点是折叠标记行时必须从「代表行之后」切底稿：该折叠组的实例不能整段丢掉，
+    // 否则打印大纲还留着 ×N 标记，find 却再也拿不回它们的 ref。
+    expect(outline.unfoldedLines.map(line => line.text)).toEqual(['折叠实例', '本轮回答'])
+    expect(outline.unfoldedLines[0]?.full).toBe('折叠实例 的完整原文')
+  })
+
+  it('尾部行数预算被夹到 1–MAX_TAIL_LINES，缺省常量是 200', () => {
+    const source = buildOutline(longConversationPage(3))
+    expect(DEFAULT_TAIL_LINES).toBe(200)
+    expect(sliceOutlineTail(source, 0).outline.lines).toHaveLength(1)
+    const clamped = sliceOutlineTail(source, MAX_TAIL_LINES + 1000).outline
+    expect(clamped.lines.length).toBeLessThanOrEqual(MAX_TAIL_LINES)
+    expect(clamped.lines.length).toBe(source.lines.length)
   })
 })

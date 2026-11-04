@@ -391,10 +391,16 @@ export interface BrowserTextRead {
  * 导航或人工接管直接作废。用旧 ref 必须报 `BROWSER_STALE_REF`，绝不能静默命中别的元素。
  */
 export interface BrowserSnapshot {
-  /** 实际观察范围；内部强制回退全页时为full。 */
+  /** 实际观察范围；内部强制回退全页时为full；文档尾部有界读取为tail。 */
   readonly scope?: string
-  /** 请求的区域无法安全取得时，全页回退的具体原因。 */
-  readonly scopeReason?: 'no_previous_region' | 'previous_region_expired' | 'anchor_unavailable' | 'empty_region' | 'global_overlay'
+  /**
+   * 请求的区域无法安全取得时，全页回退的具体原因；`default_reply_tail` / `inherited_*`
+   * 说明本次**为什么落在局部区域**，不是回退。
+   */
+  readonly scopeReason?: 'no_previous_region' | 'previous_region_expired' | 'previous_region_is_action_block'
+    | 'anchor_unavailable' | 'empty_region' | 'global_overlay' | 'tail_empty' | 'tail_source_truncated'
+    | 'default_reply_tail' | 'inherited_tail_recomputed' | 'inherited_viewport_recomputed'
+    | 'inherited_box_recomputed' | 'inherited_ref'
   readonly kind: 'snapshot'
   readonly sessionId: string
   /** 本次观察的 ref 纪元。 */
@@ -457,6 +463,16 @@ export interface BrowserSnapshot {
   /** 区域快照：区域外还有几个可操作元素。与 foldedRepeats 口径独立。 */
   readonly outsideRegion?: number
   /**
+   * `scope=tail` 独有：文档顺序里**前面被省略**的大纲行数。
+   * 与全页截断的 `droppedElements` 是两套口径 —— 这里是有界读取主动不取的旧历史，
+   * 不是预算不够没输出；抬 `max_lines` 不会让它们出现在 tail 里（只扩大 tail 预算）。
+   */
+  readonly tailOmittedLines?: number
+  /** `scope=tail` 独有：本次实际输出的大纲行数。 */
+  readonly tailLines?: number
+  /** 观察时刻的文档滚动位置（CSS 像素），仅供模型判断「是否滚到了别处」。 */
+  readonly scrollTop?: number
+  /**
    * 页面上一次全量快照之后在**本会话之外**变过的分类计数（方案 §6.2 ①②，字段**脏时才出现**）。
    *
    * 与 `takeover` 是两个维度，别混：`takeover` = 「有人正开着 DevTools」，`changed` =
@@ -506,7 +522,7 @@ export type BrowserObserveRequest =
      */
     readonly maxLines?: number
     /**
-     * 区域快照。ref 子树、enclosing 区块、previous 继承、viewport、box 五种形态互斥。
+     * 区域快照。ref 子树、enclosing 区块、previous 继承、tail 文档尾部、viewport、box 互斥。
      * 区域快照走 adopt（不换表），全页快照仍走 publish。
      */
     readonly region?: {
@@ -515,10 +531,20 @@ export type BrowserObserveRequest =
        * 动作后的**默认区域**：这个 ref 所在的区块（最近的 section/article/li/tr 之类）。
        * 由 `Browser.mutate` 在 click/press 附观察时自动填，等于「被操作元素的有效范围」；
        * 解析不出来（元素已被这次动作换掉、区块里没有可呈现内容）时静默回退全页。
+       * ⚠️ 输入框所在区块**不是**回复区域，因此这种观察不写入 `lastObservationRegion`，
+       * 独立 wait 不会把它当成本轮结果区继承。
        */
       readonly enclosing?: string
-      /** 独立 wait 默认沿用本标签同纪元、同控制代次最近成功的 ref/区块观察。 */
+      /** 独立 wait 默认沿用本标签同纪元、同控制代次最近成功的可继承区域观察。 */
       readonly previous?: boolean
+      /**
+       * 文档尾部有界读取：按 AX 文档顺序取大纲末尾 `tailLines` 行，与滚动位置无关。
+       * 新回复追加到文档末尾时自动进入；`scope=tail`，省略的头部行数单独报告。
+       */
+      readonly tail?: boolean
+      /** tail 的行数预算（1-800，默认 DEFAULT_TAIL_LINES）；只在 tail=true 时有效。 */
+      readonly tailLines?: number
+      /** 按**当前视口**重新裁剪；继承时也重算，不复用上次视口的 DOM 锚点。 */
       readonly viewport?: boolean
       readonly box?: { readonly x: number; readonly y: number; readonly width: number; readonly height: number }
     }
@@ -534,6 +560,39 @@ export type BrowserObserveRequest =
 
 export type BrowserObservation = BrowserSnapshot | BrowserScreenshot
 
+/** 工具层非 ref 区域策略：文档尾部 / 当前视口，映射到 `BrowserObserveRequest.region`。 */
+export interface BrowserObserveRegion {
+  readonly tail?: boolean
+  /** tail 行数预算（1-800）。 */
+  readonly tailLines?: number
+  readonly viewport?: boolean
+}
+
+/**
+ * 本轮回复完成证据（结构化，不是提示文案）。
+ *
+ * 严格区分「页面安静」「新内容出现」「本轮回复完成」：stable / time_ms / ref / 新节点 /
+ * 输入清空都不独立证明完成；等待开始前就已存在的文本（旧轮完成标记）也不满足本轮。
+ * 证据不足时 completion='unverified'，模型不得从截断大纲推断完整回答。
+ */
+export interface BrowserCompletionEvidence {
+  readonly condition: 'time' | 'text' | 'ref' | 'stable'
+  readonly conditionMet: boolean
+  readonly completion: 'verified' | 'unverified'
+  readonly basis: 'exclusive_text_marker' | 'preexisting_marker' | 'quiet_only' | 'node_only'
+    | 'fixed_delay' | 'timeout' | 'baseline_unavailable' | 'wait_failed'
+  /** 等待期间页面正文是否增长（只报事实，不证明回复完成）。 */
+  readonly newContent: 'observed' | 'not_observed' | 'unknown'
+  readonly outlineComplete: boolean
+  /** 大纲是裁切预览；完整正文须 webpage_find(full_text=true)。 */
+  readonly textComplete: false
+  readonly scope: string
+  readonly truncated: boolean
+}
+
+/** provider 侧的等待原始证据；范围与完整性由 BrowserRuntime 拿到附观察后补齐。 */
+export type BrowserWaitEvidence = Pick<BrowserCompletionEvidence, 'condition' | 'conditionMet' | 'completion' | 'basis' | 'newContent'>
+
 /**
  * P1 的页面操作请求。**全部按 ref 定位**（wait 的 hidden 语义也吃 ref）：
  * provider 必须在发出**任何**页面命令之前先过 ref 纪元 —— 旧 ref 直接
@@ -548,6 +607,8 @@ export type BrowserMutationRequest =
     readonly observe?: boolean
     /** 仅动作后附观察的区域；导航/交还/新浮层时回退全页。 */
     readonly observeRef?: string
+    /** 非 ref 区域策略（tail / viewport），与 observeRef 互斥。 */
+    readonly observeRegion?: BrowserObserveRegion
     /** 等待页面正文出现指定文本；超时后仍附带快照。 */
     readonly waitText?: string
     /** 等待期限：wait_text 的完成等待，或 observe=true 的页面安静等待（至多该毫秒）。省略时用默认等待时长。 */
@@ -562,6 +623,8 @@ export type BrowserMutationRequest =
     /** 动作完成后附带一份快照；已知结果区时用 observeRef 只读该区域，否则为全页。wait_text 存在时观察总会附加。 */
     readonly observe?: boolean
     readonly observeRef?: string
+    /** 非 ref 区域策略（tail / viewport），与 observeRef 互斥。 */
+    readonly observeRegion?: BrowserObserveRegion
     /** 等待页面正文出现指定文本；超时后仍附带快照。 */
     readonly waitText?: string
     /** 等待期限：wait_text 的完成等待，或 observe=true 的页面安静等待（至多该毫秒）。省略时用默认等待时长。 */
@@ -584,6 +647,8 @@ export type BrowserMutationRequest =
     readonly kind: 'wait'
     readonly sessionId: string
     readonly observeRef?: string
+    /** 非 ref 区域策略（tail / viewport），与 observeRef 互斥。 */
+    readonly observeRegion?: BrowserObserveRegion
     /** 纯等待。 */
     readonly timeMs?: number
     /** 等页面文本包含该串。 */
@@ -659,6 +724,13 @@ export interface BrowserMutationResult {
   readonly pageChanged?: BrowserPageChanged
   /** wait 或 click/press 的 waitText：条件是否在超时前成立（正常超时为 false）。 */
   readonly satisfied?: boolean
+  /**
+   * 本轮回复完成证据：wait / click·press 的 wait_text 与 follow-up stable 等待都会带。
+   * 由 provider 算条件与页面正文基线，BrowserRuntime 在拿到附观察后补范围/截断信息。
+   */
+  readonly completion?: BrowserCompletionEvidence
+  /** provider 侧原始等待证据，供 BrowserRuntime 组装 completion（不直接给模型）。 */
+  readonly waitEvidence?: BrowserWaitEvidence
   /** wait 完成或正常超时、或 click/press 显式请求后的完整观察；在 owner 门禁内补取。 */
   readonly snapshot?: BrowserSnapshot
   /** 后续等待或观察失败时，原动作已成功派发；模型不得重发原动作。 */

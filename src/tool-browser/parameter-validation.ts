@@ -3,7 +3,7 @@
 import { validateJsonSchemaValue } from '@deepseek-ai/dsh-tools'
 import { BrowserError } from '../browser/index.ts'
 import { MAX_P2_LIMIT, MAX_WAIT_TIME_MS } from '../browser-cdp/provider-config.ts'
-import { MAX_SNAPSHOT_LINES } from '../browser-cdp/snapshot.ts'
+import { MAX_SNAPSHOT_LINES, MAX_TAIL_LINES } from '../browser-cdp/snapshot.ts'
 import { MAX_FIND_LIMIT } from './snapshot-cache.ts'
 
 /**
@@ -49,7 +49,16 @@ export function validateToolArguments(toolName: string, schema: Record<string, u
       const example = toolName === 'webpage_execute'
         ? ' 示例：{"session_id":"t1","code":"return { title: document.title };","timeout_ms":5000}。'
         : ''
-      throwInvalidParams(toolName, `未知字段 ${unknown.map(key => `"${key}"`).join(', ')}；允许字段：${allowed.join(', ') || '(无)'}。${example}`)
+      // 会话 07e69431 的 fill 被传 observe:"true" 后只拿到「允许字段」列表，模型下一步仍不知道
+      // 该把观察放在哪个工具上；这里给出可直接照做的纠正路径（不改 schema、不隐式修正参数）。
+      const fillHint = toolName === 'webpage_fill'
+        && unknown.some(key => ['observe', 'wait_text', 'region_ref', 'observe_ref', 'region_tail', 'region_viewport', 'timeout_ms', 'tail_lines'].includes(key))
+        ? ' webpage_fill 只负责写字段，没有观察/等待参数。要观察提交后的结果，请在其后的 webpage_press'
+          + '(observe=true 或 wait_text=本轮独有完成原文，结果区用 region_ref)'
+          + '，或在 webpage_wait(text=本轮独有完成原文, region_tail=true) 上设置；webpage_snapshot 也支持 region_tail。'
+          + '本次未派发任何浏览器操作。'
+        : ''
+      throwInvalidParams(toolName, `未知字段 ${unknown.map(key => `"${key}"`).join(', ')}；允许字段：${allowed.join(', ') || '(无)'}。${example}${fillHint}`)
     }
   }
   const violations = validateJsonSchemaValue(schema as never, args, '')
@@ -113,9 +122,10 @@ function semanticParameterErrors(toolName: string, args: Record<string, unknown>
     case 'webpage_snapshot':
       nonEmpty('session_id', 'region_ref')
       range('max_lines', 1, MAX_SNAPSHOT_LINES)
-      if ([args.region_ref !== undefined, args.region_viewport === true, args.region_box !== undefined].filter(Boolean).length > 1) {
-        errors.push('region_ref、region_viewport=true、region_box 互斥；只能提供其中一个')
+      if ([args.region_ref !== undefined, args.region_viewport === true, args.region_tail === true, args.region_box !== undefined].filter(Boolean).length > 1) {
+        errors.push('region_ref、region_viewport=true、region_tail=true、region_box 互斥；只能提供其中一个')
       }
+      if (args.region_tail === true) range('max_lines', 1, MAX_TAIL_LINES)
       if (args.region_box !== undefined && args.region_box !== null && typeof args.region_box === 'object') {
         const box = args.region_box as Record<string, unknown>
         for (const field of ['x', 'y', 'width', 'height']) {
@@ -143,6 +153,8 @@ function semanticParameterErrors(toolName: string, args: Record<string, unknown>
         onlyOne(['region_ref', 'observe_ref'])
         if (args.region_ref !== undefined && args.observe !== true && args.wait_text === undefined) errors.push('region_ref 必须与 observe=true 或 wait_text 同用')
         if (args.observe_ref !== undefined && args.observe !== true && args.wait_text === undefined) errors.push('observe_ref 必须与 observe=true 或 wait_text 同用')
+        // click/press 不暴露 region_tail：尾部读取属于 webpage_wait / webpage_snapshot。
+        // 误传会在上面的未知字段校验处直接拒绝，并给出纠正路径。
         range('timeout_ms', 1, MAX_WAIT_TIME_MS)
         // timeout_ms 有两种合法用法：wait_text 的完成等待期限，或 observe=true 的「动作后等待页面安静」期限。
         // 既不等完成也不观察时单独的 timeout_ms 没有意义，也不静默忽略。
@@ -169,6 +181,9 @@ function semanticParameterErrors(toolName: string, args: Record<string, unknown>
     case 'webpage_wait': {
       nonEmpty('session_id', 'text', 'ref', 'region_ref', 'observe_ref')
       onlyOne(['region_ref', 'observe_ref'])
+      if (args.region_tail === true && (args.region_ref !== undefined || args.observe_ref !== undefined)) {
+        errors.push('region_tail 与 region_ref / observe_ref 互斥；只能提供一种区域')
+      }
       const conditions = ['time_ms', 'text', 'ref', 'until'].filter(field => args[field] !== undefined)
       if (conditions.length !== 1) errors.push('time_ms、text、ref、until 必须且只能提供一个')
       range('time_ms', 1, MAX_WAIT_TIME_MS)

@@ -13,6 +13,12 @@ import {
   resolveSnapshotLimits,
   renderOutline,
   renderOverlayNotice,
+  sliceOutlineTail,
+  DEFAULT_TAIL_LINES,
+  MAX_TAIL_LINES,
+  MAX_SNAPSHOT_LINES,
+  type SnapshotLimits,
+  type SnapshotOutline,
   type BoxRect,
   boundsToBox,
   boxesIntersect,
@@ -64,39 +70,83 @@ export class PageObservation {
   ): Promise<BrowserSnapshot> {
     const options = { signal, timeoutMs: this.config.commandTimeoutMs }
     let scopeReason: BrowserSnapshot['scopeReason']
-    let regionKinds = [
+    const regionKinds = [
       region?.ref !== undefined,
       region?.enclosing !== undefined,
       region?.previous === true,
+      region?.tail === true,
       region?.viewport === true,
       region?.box !== undefined,
     ].filter(Boolean).length
     if (regionKinds > 1) {
       throw new BrowserError(
-        'region.ref, region.enclosing, region.previous, region.viewport and region.box are mutually exclusive; pass exactly one',
+        'region.ref, region.enclosing, region.previous, region.tail, region.viewport and region.box are mutually exclusive; pass exactly one',
         'BROWSER_PROTOCOL_ERROR',
       )
     }
+    let limits = resolveSnapshotLimits(this.config.snapshotLimits, maxLines)
+    let regional = regionKinds === 1
+    let prebuiltOutline: SnapshotOutline | undefined
+    let tailOmittedLines: number | undefined
+    let tailBudget: number | undefined
+    let scrollTop: number | undefined
     if (region?.previous === true) {
       const previous = session.lastObservationRegion
-      if (previous !== undefined && previous.epoch === session.refs.currentEpoch
-        && previous.controlGeneration === session.controlGeneration) {
+      const valid = previous !== undefined
+        && previous.epoch === session.refs.currentEpoch
+        && previous.controlGeneration === session.controlGeneration
+      if (valid && previous?.kind === 'ref' && previous.ref !== undefined) {
+        // ref 继承按锚点重新解析；锚点已消失时失效恢复到全页（不猜新目标）。
         try {
-          return await this.snapshot(session, signal, maxLines,
-            previous.enclosing ? { enclosing: previous.ref } : { ref: previous.ref }, guardGlobal)
+          const inherited = await this.snapshot(session, signal, maxLines, { ref: previous.ref }, guardGlobal)
+          // 内层若因全局浮层等回退全页，它给出的失效/兜底原因比「继承成功」更重要，
+          // 不能被外层覆盖成 inherited_ref（否则模型会误以为仍只读了回复区）。
+          const inheritedScope = inherited.kind === 'snapshot' ? inherited.scope : undefined
+          if (inheritedScope !== undefined && inheritedScope.startsWith('ref:')) {
+            return { ...inherited, scopeReason: 'inherited_ref' as const }
+          }
+          return inherited
         } catch (error) {
-          // 继承范围是默认优化，旧锚点已消失时退回全页；连接、取消和预算错误仍原样返回。
           if (!(error instanceof BrowserError) || !['BROWSER_STALE_REF', 'BROWSER_SNAPSHOT_REQUIRED'].includes(error.code)) throw error
           scopeReason = 'anchor_unavailable'
+          region = undefined
+          regional = false
+        }
+      } else if (valid) {
+        // tail / viewport / box 继承 = 按**当前页面**重新求值，不复用上次观察的 DOM 节点。
+        // 滚动后的语义：tail 读当前文档末尾，viewport 读当前视口，box 读当前坐标下的内容。
+        if (previous?.kind === 'tail') {
+          region = { tail: true, ...previous.tailLines !== undefined ? { tailLines: previous.tailLines } : {} }
+          scopeReason = 'inherited_tail_recomputed'
+        } else if (previous?.kind === 'viewport') {
+          region = { viewport: true }
+          scopeReason = 'inherited_viewport_recomputed'
+        } else if (previous?.box !== undefined) {
+          region = { box: previous.box }
+          scopeReason = 'inherited_box_recomputed'
+        } else {
+          region = { tail: true }
+          scopeReason = 'no_previous_region'
         }
       } else {
-        scopeReason = previous === undefined ? 'no_previous_region' : 'previous_region_expired'
+        const actionBlock = session.lastActionBlockObservation
+        const recentActionBlock = actionBlock !== undefined
+          && actionBlock.epoch === session.refs.currentEpoch
+          && actionBlock.controlGeneration === session.controlGeneration
+        if (previous !== undefined) {
+          // 纪元或控制代次已变：继承状态失效，按失效恢复回退**全页**，不猜新区域。
+          scopeReason = 'previous_region_expired'
+          region = undefined
+          regional = false
+        } else {
+          // 区分「没有前次区域」「前次是动作区块（输入框区块不是回复区）」，避免把继承空转
+          // 伪装成正常；这两种情况按**文档尾部有界区域**读取，而不是整页。
+          scopeReason = recentActionBlock ? 'previous_region_is_action_block' : 'no_previous_region'
+          region = { tail: true }
+        }
       }
-      region = undefined
-      regionKinds = 0
     }
     const controlGeneration = session.controlGeneration
-    let regional = regionKinds === 1
     let nodes: readonly AxNode[]
     let outsideRegion: number | undefined
     let globalNodes: readonly AxNode[] | undefined
@@ -119,7 +169,6 @@ export class PageObservation {
         nodes = full.nodes ?? []
       } else {
         nodes = filtered
-        const limits = resolveSnapshotLimits(this.config.snapshotLimits, maxLines)
         const fullRows = buildOutline(full.nodes ?? [], limits).rows.length
         const partRows = buildOutline(nodes, limits).rows.length
         outsideRegion = Math.max(0, fullRows - partRows)
@@ -143,18 +192,71 @@ export class PageObservation {
         )
         nodes = partial.nodes ?? []
       }
-      const fullRows = buildOutline(full.nodes ?? [], resolveSnapshotLimits(this.config.snapshotLimits, maxLines)).rows.length
-      const partRows = buildOutline(nodes, resolveSnapshotLimits(this.config.snapshotLimits, maxLines)).rows.length
-      outsideRegion = Math.max(0, fullRows - partRows)
+      const partOutline = buildOutline(nodes, limits)
+      const fullRows = buildOutline(full.nodes ?? [], limits).rows.length
+      outsideRegion = Math.max(0, fullRows - partOutline.rows.length)
+      // 区域解析成功但里面没有可呈现内容：不能把空大纲当成「继承成功」发给模型。
+      if (partOutline.lines.length === 0) {
+        scopeReason = 'empty_region'
+        regional = false
+        globalNodes = undefined
+        outsideRegion = undefined
+        nodes = full.nodes ?? []
+      }
     } else if (region?.viewport === true || region?.box !== undefined) {
       const full = await session.connection.send<AxTreeResult>('Accessibility.getFullAXTree', {}, options)
       globalNodes = full.nodes ?? []
       const keep = await this.backendIdsInRegion(session, region, signal)
       nodes = filterAxTreeByBackendIds(full.nodes ?? [], keep)
-      const limits = resolveSnapshotLimits(this.config.snapshotLimits, maxLines)
+      const partOutline = buildOutline(nodes, limits)
       const fullRows = buildOutline(full.nodes ?? [], limits).rows.length
-      const partRows = buildOutline(nodes, limits).rows.length
-      outsideRegion = Math.max(0, fullRows - partRows)
+      outsideRegion = Math.max(0, fullRows - partOutline.rows.length)
+      if (partOutline.lines.length === 0) {
+        scopeReason = 'empty_region'
+        regional = false
+        globalNodes = undefined
+        outsideRegion = undefined
+        nodes = full.nodes ?? []
+      }
+    } else if (region?.tail === true) {
+      // 文档尾部有界读取。全页大纲默认 800 行会**从头保留**、把最新回复截掉（会话 07e69431
+      // 后三轮 100/202/335 条未返回）。这里先按**输入规模**给足源预算建出完整大纲，
+      // 再在行层取后缀；sliceOutlineTail 同时裁剪 rows 与 find 底稿，保证不发布区域外 ref。
+      //
+      // 为什么不能写死 MAX_SNAPSHOT_LINES=5000：buildOutline 的预算截断是「从头保留」，
+      // 文档超过 5000 行时 source 丢掉的恰好是真尾部，后缀取到的只是「第 4801–5000 行」。
+      // 源大纲不进模型上下文，预算按 AX 节点数给足即可：每个候选最多产出 1 行 + 1 折叠标记，
+      // 每行文本被 maxTextLength 夹住、字符消耗有上界；最终对模型的输出仍被 sliceOutlineTail
+      // 夹到 1–800 行。这不是调整全局 spill 阈值，只换掉 tail 内部的中间产物预算。
+      const full = await session.connection.send<AxTreeResult>('Accessibility.getFullAXTree', {}, options)
+      const fullNodes = full.nodes ?? []
+      globalNodes = fullNodes
+      tailBudget = Math.max(1, Math.min(Math.floor(region.tailLines ?? DEFAULT_TAIL_LINES), MAX_TAIL_LINES))
+      const source = buildOutline(fullNodes, {
+        ...limits,
+        maxLines: Math.max(MAX_SNAPSHOT_LINES, fullNodes.length * 2 + 1),
+        maxOutlineChars: Math.max(
+          limits.maxOutlineChars,
+          MAX_SNAPSHOT_LINES * 60,
+          fullNodes.length * 500 + 1000,
+        ),
+      } satisfies SnapshotLimits)
+      const sliced = sliceOutlineTail(source, tailBudget)
+      if (sliced.outline.lines.length === 0) {
+        scopeReason = 'tail_empty'
+        regional = false
+        globalNodes = undefined
+        nodes = fullNodes
+      } else {
+        prebuiltOutline = sliced.outline
+        tailOmittedLines = sliced.omittedLines
+        limits = resolveSnapshotLimits(this.config.snapshotLimits, tailBudget)
+        outsideRegion = Math.max(0, source.lines.length - sliced.outline.lines.length)
+        nodes = fullNodes
+        scrollTop = await this.readScrollTop(session, signal)
+        // 源大纲仍被 maxDepth/字符预算截断时如实标出：真尾部可能不完整，不能伪装成干净后缀。
+        scopeReason ??= source.truncated ? 'tail_source_truncated' : 'default_reply_tail'
+      }
     } else {
       const tree = await session.connection.send<AxTreeResult>('Accessibility.getFullAXTree', {}, options)
       nodes = tree.nodes ?? []
@@ -164,9 +266,15 @@ export class PageObservation {
       nodes = globalNodes ?? nodes
       regional = false
       outsideRegion = undefined
+      // 回退全页时预建的尾部大纲必须一起作废，否则「全页」回执会只印尾部那几行。
+      prebuiltOutline = undefined
+      tailOmittedLines = undefined
+      tailBudget = undefined
+      scrollTop = undefined
+      limits = resolveSnapshotLimits(this.config.snapshotLimits, maxLines)
       scopeReason = 'global_overlay'
     }
-    const outline = buildOutline(nodes, resolveSnapshotLimits(this.config.snapshotLimits, maxLines))
+    const outline = prebuiltOutline ?? buildOutline(nodes, limits)
     // 全页快照才查浮层：区域快照本来就是「只看这一块」，中心被别的块盖住不算异常。
     const overlay = regional ? undefined : guardedOverlay ?? await this.detectOverlay(session, signal)
     // 地址与 `loaderId` 必须**随这一份 ref 表一起落地**、不能延后再读（粗门比的就是「发布那一刻的地址」，
@@ -180,14 +288,30 @@ export class PageObservation {
     const publication = regional
       ? session.refs.adopt(outline.rows)
       : session.refs.publish(outline.rows, outline.truncated, loaderId, meta?.url)
-    const rememberedRef = region?.ref ?? region?.enclosing
-    if (regional && rememberedRef !== undefined && controlGeneration === session.controlGeneration) {
+    // 可继承状态按**区域种类**记录：动作区块（输入框所在块）不是回复区，只留诊断记录；
+    // tail/viewport/box 记种类，后续 wait 按当前页面重算；全页观察清空两者。
+    if (!regional || controlGeneration !== session.controlGeneration) {
+      delete session.lastObservationRegion
+      delete session.lastActionBlockObservation
+    } else if (region?.ref !== undefined) {
+      session.lastObservationRegion = { kind: 'ref', ref: region.ref, epoch: publication.epoch, controlGeneration }
+    } else if (region?.tail === true) {
       session.lastObservationRegion = {
-        ref: rememberedRef, enclosing: region?.enclosing !== undefined,
+        kind: 'tail', ...tailBudget !== undefined ? { tailLines: tailBudget } : {},
         epoch: publication.epoch, controlGeneration,
       }
-    } else {
-      delete session.lastObservationRegion
+    } else if (region?.viewport === true) {
+      session.lastObservationRegion = { kind: 'viewport', epoch: publication.epoch, controlGeneration }
+    } else if (region?.box !== undefined) {
+      session.lastObservationRegion = { kind: 'box', box: region.box, epoch: publication.epoch, controlGeneration }
+    } else if (region?.enclosing !== undefined) {
+      session.lastActionBlockObservation = { ref: region.enclosing, epoch: publication.epoch, controlGeneration }
+      // 动作区块不是回复区。提交动作之后，此前按几何裁剪的 viewport/box 只是「上一次的屏幕」，
+      // 不能让下一次 wait 继承它当本轮结果区（滚动/重渲染后它甚至不含回复尾部）。
+      // 显式结果区 ref 会按锚点重新解析、tail 会按当前文档末尾重算，二者仍有效，予以保留。
+      if (session.lastObservationRegion?.kind === 'viewport' || session.lastObservationRegion?.kind === 'box') {
+        delete session.lastObservationRegion
+      }
     }
     // 全页快照落地 = 锚点前移。**区域快照不清**：`adopt()` 不换表、旧 ref 继续有效，
     // 「页面在模型之外变过」这件事不会因为拍了一个角落就消失 —— D-5 那条静默改绑链正源于此。
@@ -204,6 +328,7 @@ export class PageObservation {
       // 「是不是全页」，多造一个前缀只会让两处判据各写一遍。
       scope: !regional ? 'full' : region?.ref !== undefined ? `ref:${region.ref}`
         : region?.enclosing !== undefined ? `ref:${region.enclosing}`
+        : region?.tail === true ? 'tail'
         : region?.viewport === true ? 'viewport'
           : `box:${region!.box!.x},${region!.box!.y},${region!.box!.width},${region!.box!.height}`,
       ...scopeReason !== undefined ? { scopeReason } : {},
@@ -239,6 +364,9 @@ export class PageObservation {
       ...outline.foldedRepeats > 0 ? { foldedRepeats: outline.foldedRepeats } : {},
       ...outline.dedupedLines > 0 ? { dedupedLines: outline.dedupedLines } : {},
       ...outsideRegion !== undefined ? { outsideRegion } : {},
+      // tail 的「前面主动省略」与全页截断的 droppedElements 是两套口径，分别报告。
+      ...tailOmittedLines !== undefined ? { tailOmittedLines, tailLines: outline.lines.length } : {},
+      ...scrollTop !== undefined ? { scrollTop } : {},
       // 人工接管只加提示，**不动 epoch** —— 开合 DevTools 不该作废模型的 ref（[V31]）。
       ...session.takeover ? { takeover: true } : {},
       // P2：页面在本会话之外变过的分类计数（脏时才出现）。
@@ -246,6 +374,24 @@ export class PageObservation {
       // D-5：本次区域快照把哪几个号的指针换到了别的节点上（只报不作废）。只有 `adopt()`
       // 那条路会产生它 —— 全页 `publish()` 一律发新号，恒为空。
       ...publication.rebound.length > 0 ? { reboundRefs: publication.rebound } : {},
+    }
+  }
+
+  /**
+   * 观察时刻的文档滚动位置（仅信息）。tail 不依赖它，viewport 每次按当前视口重算；
+   * 读不到就省略，绝不把探测失败当成「没滚动」。
+   */
+  private async readScrollTop(session: SessionState, signal?: AbortSignal): Promise<number | undefined> {
+    try {
+      const evaluated = await session.connection.send<EvaluateResult>(
+        'Runtime.evaluate',
+        { expression: 'Math.round((document.scrollingElement || document.documentElement || {}).scrollTop || 0)', returnByValue: true },
+        { signal, timeoutMs: this.config.commandTimeoutMs },
+      )
+      const value = evaluated.result?.value
+      return typeof value === 'number' && Number.isFinite(value) ? value : undefined
+    } catch {
+      return undefined
     }
   }
 

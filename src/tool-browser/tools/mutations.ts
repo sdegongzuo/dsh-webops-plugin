@@ -5,7 +5,9 @@ import type { ParameterSchemaSpec } from '@deepseek-ai/dsh-tools'
 import {
   PAGE_CHANGED_SCHEMA,
   TAB_ITEM_SCHEMA,
+  formatCompletionOutput,
   formatMutationOutput,
+  type CompletionOutput,
   type MutationOutput,
   toPageChangedOutput,
   toTabOutput,
@@ -18,6 +20,21 @@ import type { BrowserMutationRequest } from '../../browser/index.ts'
 import { SNAPSHOT_OUTPUT_SCHEMA, formatSnapshotOutput, rememberBrowserSnapshot, type SnapshotOutput } from './observation.ts'
 
 /** 五个 mutation 工具共用的输出契约。 */
+const COMPLETION_OUTPUT_SCHEMA = {
+  type: 'object', additionalProperties: false,
+  properties: {
+    condition: { type: 'string', required: true },
+    condition_met: { type: 'boolean', required: true },
+    completion: { type: 'string', required: true },
+    basis: { type: 'string', required: true },
+    new_content: { type: 'string', required: true },
+    outline_complete: { type: 'boolean', required: true },
+    text_complete: { type: 'boolean', required: true },
+    scope: { type: 'string', required: true },
+    truncated: { type: 'boolean', required: true },
+  },
+} as const
+
 const MUTATION_OUTPUT_SCHEMA = {
   type: 'object',
   additionalProperties: false,
@@ -66,6 +83,8 @@ const MUTATION_OUTPUT_SCHEMA = {
     },
     snapshot: SNAPSHOT_OUTPUT_SCHEMA,
     action_dispatched: { type: 'boolean' },
+    // 等待后的完成证据与附观察分开：前者严格区分页面安静/新内容/本轮完成，后者只是读取范围。
+    completion: COMPLETION_OUTPUT_SCHEMA,
     observation_error: {
       type: 'object', additionalProperties: false,
       properties: { code: { type: 'string', required: true }, message: { type: 'string', required: true } },
@@ -86,20 +105,30 @@ const WAIT_OUTPUT_SCHEMA = {
 } as const
 
 const POST_ACTION_PARAMETERS = {
-  observe: { type: 'boolean', description: '布尔值true/false，不加引号。附观察，默认只回被操作元素所在区块（全页用snapshot）；配timeout_ms只等安静，不证明完成。region_ref改区域；wait_text时忽略。' },
-  wait_text: { type: 'string', description: '本轮独有完成原文；动作后等待并附观察，可配region_ref。' },
-  timeout_ms: { type: 'integer', description: '整数毫秒，如30000，不加引号；1–30000，默认10000。必须配wait_text或observe=true。' },
-  region_ref: { type: 'string', description: '同snapshot.region_ref，不是按钮ref；默认已取被操作元素所在区块，要换才传。导航/交还/新浮层回退全页。' },
+  observe: { type: 'boolean', description: 'true/false不加引号；附观察默认回操作元素所在区块，配timeout_ms只等安静，wait_text时忽略。' },
+  wait_text: { type: 'string', description: '本轮独有完成原文；动作后等待并附观察。' },
+  timeout_ms: { type: 'integer', description: '1–30000ms整数，默认10000；须配wait_text或observe=true。' },
+  region_ref: { type: 'string', description: '同snapshot.region_ref，不是按钮ref；浮层/导航回退全页。' },
   observe_ref: { type: 'string', description: '旧名；优先region_ref，二者互斥。' },
 } as const
 
-/** 两个公开参数名只映射一次；互斥与类型在统一参数边界验证。 */
-function observationRegion(args: Record<string, unknown>): { observeRef?: string } {
+/** 仅 wait 与 webpage_snapshot 暴露：文档尾部有界读取，不绑在被操作元素所在区块上。 */
+const REGION_TAIL_PARAMETER = {
+  type: 'boolean',
+  description: 'true读文档末尾当前回复，有界200行。',
+} as const
+
+/** 非 ref 区域参数只映射一次；互斥与类型在统一参数边界验证。 */
+function observationRegion(args: Record<string, unknown>): { observeRef?: string; observeRegion?: { tail: true; tailLines?: number } } {
   const ref = args['region_ref'] ?? args['observe_ref']
-  return typeof ref === 'string' ? { observeRef: ref } : {}
+  const out: { observeRef?: string; observeRegion?: { tail: true; tailLines?: number } } = {}
+  if (typeof ref === 'string') out.observeRef = ref
+  // wait / click / press 的 tail 用固定 200 行预算；snapshot 侧可用 max_lines 调。
+  if (args['region_tail'] === true) out.observeRegion = { tail: true }
+  return out
 }
 
-function postActionOptions(args: Record<string, unknown>): Pick<Extract<BrowserMutationRequest, { kind: 'click' | 'press' }>, 'observe' | 'waitText' | 'timeoutMs' | 'observeRef'> {
+function postActionOptions(args: Record<string, unknown>): Pick<Extract<BrowserMutationRequest, { kind: 'click' | 'press' }>, 'observe' | 'waitText' | 'timeoutMs' | 'observeRef' | 'observeRegion'> {
   const waitText = args['wait_text']
   const timeoutMs = args['timeout_ms']
   return {
@@ -138,9 +167,11 @@ function registerMutationTool(
         const hasSnapshot = mutation.snapshot !== undefined
         const full = hasSnapshot && (mutation.snapshot?.scope === undefined || mutation.snapshot.scope === 'full')
         const text = formatMutationOutput(mutation, hasSnapshot, full)
+        // 完成证据恒在最前：大纲正文可能几千行，塞到末尾等于没报（会话 07e69431 的教训）。
+        const completion = mutation.completion === undefined ? '' : `${formatCompletionOutput(mutation.completion)}\n\n`
         return [{ type: 'text', text: mutation.snapshot === undefined
-          ? text
-          : `${text}\n\n${spec.action === 'wait' ? 'Observation after wait' : 'Observation after action'}:\n${formatSnapshotOutput(mutation.snapshot, full)}` }]
+          ? `${completion}${text}`
+          : `${completion}${text}\n\n${spec.action === 'wait' ? 'Observation after wait' : 'Observation after action'}:\n${formatSnapshotOutput(mutation.snapshot, full)}` }]
       },
     },
     timeoutMs: spec.timeoutMs,
@@ -153,6 +184,17 @@ function registerMutationTool(
       const snapshot = result.snapshot === undefined ? undefined : rememberBrowserSnapshot(cache, result.snapshot)
       if (spec.action === 'wait' && snapshot === undefined) {
         throw new Error('webpage_wait completed without its required full snapshot')
+      }
+      const completion: CompletionOutput | undefined = result.completion === undefined ? undefined : {
+        condition: result.completion.condition,
+        condition_met: result.completion.conditionMet,
+        completion: result.completion.completion,
+        basis: result.completion.basis,
+        new_content: result.completion.newContent,
+        outline_complete: result.completion.outlineComplete,
+        text_complete: result.completion.textComplete,
+        scope: result.completion.scope,
+        truncated: result.completion.truncated,
       }
       return {
         session_id: result.sessionId,
@@ -171,6 +213,7 @@ function registerMutationTool(
         ...result.openedTabs !== undefined ? { opened_tabs: result.openedTabs.map(toTabOutput) } : {},
         ...result.target !== undefined ? { target: result.target } : {},
         ...result.unconfirmed === true ? { unconfirmed: true } : {},
+        ...completion !== undefined ? { completion } : {},
       }
     },
     presentCall: rawArgs => observeCall(
@@ -191,7 +234,7 @@ export function registerMutations(
   // "from the latest webpage_snapshot" 是纯浪费（每个工具的 ref 参数描述里已经写了），
   // 而这段 ×4 是每一步都付的前缀成本（方案 §2.T-C2）。
   const STALE_NOTICE =
-    'BROWSER_STALE_REF: attached fresh snapshot first, else full snapshot; never retry old refs.'
+    'BROWSER_STALE_REF: attached fresh snapshot first, else full; never retry old refs.'
 
   if (enabled.click) registerMutationTool(ctx, cache, {
     name: 'webpage_click',
@@ -281,7 +324,7 @@ export function registerMutations(
     name: 'webpage_wait',
     action: 'wait',
     description:
-      '等待恰好一种条件：time_ms、text、ref或until="stable"（文档与DOM/network安静，不证明回复完成）。优先本轮独有完成文本，一次等待可同时确认提交。time_ms固定延时，不与timeout_ms同用；其他条件共享1–30000ms期限，默认10000。成功或正常超时附观察与refs，超时satisfied=false；默认沿用最近区域，region_ref改区域；无有效区域或导航/交还/新浮层回退全页。 '
+      '等待恰好一种条件：time_ms、text、ref或until="stable"（安静不证明回复完成）。优先本轮独有完成文本，一次等待可同时确认提交。time_ms固定延时不与timeout_ms同用；其余共享1–30000ms期限，默认10000，超时satisfied=false。回执completion标verified/unverified：stable、延时、ref、旧轮标记均unverified，不得从截断大纲推断完整回答。默认继承最近回复区，无区域时用region_tail=true读尾部；region_ref指定结果区；首次/导航/交还/新浮层回退全页。'
       + STALE_NOTICE,
     parameters: {
       session_id: SESSION_ID_PARAMETER,
@@ -293,6 +336,7 @@ export function registerMutations(
       until: { type: 'string', enum: ['stable'], description: 'Page quietness; timeout_ms sets the shared wait deadline.' },
       timeout_ms: { type: 'integer', description: 'Shared deadline for text/ref/stable (1-30000 ms; default 10000). Cannot combine with time_ms.' },
       region_ref: POST_ACTION_PARAMETERS.region_ref,
+      region_tail: REGION_TAIL_PARAMETER,
       observe_ref: POST_ACTION_PARAMETERS.observe_ref,
     },
     timeoutMs: BROWSER_WAIT_TIMEOUT_MS,

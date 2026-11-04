@@ -56,10 +56,25 @@ export interface SessionState {
   controlGeneration: number
   /** 人工交还后，在 agent 成功全页观察前保持为 true。 */
   needsReobserve: boolean
-  /** 仅供等待观察复用；全页观察清空，纪元或控制代次变化后不可再用。 */
+  /**
+   * 可被后续 wait 继承的**回复区域**观察。
+   *
+   * 与「被操作元素所在区块」严格分开：输入框区块不是回复区，动作后 `region.enclosing`
+   * 的观察只写进 {@link SessionState.lastActionBlockObservation} 做诊断，不写这里。
+   * `tail` / `viewport` / `box` 继承时按**当前页面重新求值**（滚动后的语义见设计记录），
+   * `ref` 继承按锚点解析。只有 ref 纪元与控制代次都一致才允许继承。
+   */
   lastObservationRegion?: {
+    readonly kind: 'ref' | 'tail' | 'viewport' | 'box'
+    readonly ref?: string
+    readonly tailLines?: number
+    readonly box?: { readonly x: number; readonly y: number; readonly width: number; readonly height: number }
+    readonly epoch: number
+    readonly controlGeneration: number
+  }
+  /** 最近一次动作区块观察：只用于说明「为什么没有可继承的回复区」，不参与继承。 */
+  lastActionBlockObservation?: {
     readonly ref: string
-    readonly enclosing: boolean
     readonly epoch: number
     readonly controlGeneration: number
   }

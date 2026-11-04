@@ -671,9 +671,52 @@ describe('BrowserRuntime tab ownership', () => {
     await browser.mutate({ kind: 'click', sessionId: session.id, ref: 'e7', observe: true, observeRef: 'e9' }, ALICE)
     expect(received[2]).toMatchObject({ kind: 'snapshot', region: { ref: 'e9' }, guardGlobal: true })
 
-    // ④ wait 交由 provider 安全继承最近区域；无可用区域时仍由 provider 全页兜底。
+    // ④ wait 交由 provider 按可继承区域重算；无有效回复区时由 provider 默认读文档尾部。
     await browser.mutate({ kind: 'wait', sessionId: session.id, timeMs: 1 }, ALICE)
     expect(received[3]).toEqual({ kind: 'snapshot', sessionId: session.id, region: { previous: true }, guardGlobal: true })
+    await browser.dispose()
+  })
+
+  it('wait 的 region_tail 显式请求映射成 tail 区域，不用动作区块冒充回复区', async () => {
+    const { browser, provider } = await mountWithProvider()
+    const session = await browser.open({}, ALICE)
+    Object.assign(provider, { hasFullObservation: () => true })
+    const original = provider.observe.bind(provider)
+    let received: unknown
+    provider.observe = async request => { received = request; return original(request) }
+    await browser.mutate({
+      kind: 'wait', sessionId: session.id, text: '本轮完成', observeRegion: { tail: true, tailLines: 60 },
+    }, ALICE)
+    expect(received).toMatchObject({
+      kind: 'snapshot', region: { tail: true, tailLines: 60 }, guardGlobal: true,
+    })
+    await browser.dispose()
+  })
+
+  it('completion 的范围与完整性取附观察的**实际**结果，不拿请求参数冒充', async () => {
+    const { browser, provider } = await mountWithProvider()
+    const session = await browser.open({}, ALICE)
+    Object.assign(provider, { hasFullObservation: () => true })
+    provider.mutate = async request => ({
+      kind: 'mutation', sessionId: session.id, action: 'wait', epoch: 4,
+      url: SESSION.url, title: SESSION.title, navigated: false, satisfied: true,
+      waitEvidence: {
+        condition: 'text', conditionMet: true, completion: 'verified',
+        basis: 'exclusive_text_marker', newContent: 'observed',
+      },
+    })
+    // 请求 tail，但 provider 因新浮层强制回退成全页且截断：completion 必须如实跟随。
+    const original = provider.observe.bind(provider)
+    provider.observe = async request => ({
+      ...await original(request), scope: 'full', truncated: true,
+    })
+    const result = await browser.mutate({
+      kind: 'wait', sessionId: session.id, text: '本轮完成', observeRegion: { tail: true },
+    }, ALICE)
+    expect(result.completion).toMatchObject({
+      completion: 'verified', basis: 'exclusive_text_marker',
+      scope: 'full', truncated: true, outlineComplete: false, textComplete: false,
+    })
     await browser.dispose()
   })
 
@@ -766,6 +809,12 @@ describe('BrowserRuntime tab ownership', () => {
       observationError: { code: 'BROWSER_HUMAN_HOLDING', message: 'human took over' },
     })
     expect(result.snapshot).toBeUndefined()
+    // 等待失败同样是「证据不足」：必须显式报 completion=unverified，不能让字段缺席。
+    expect(result.completion).toMatchObject({
+      condition: 'text', conditionMet: false, completion: 'unverified', basis: 'wait_failed',
+      newContent: 'unknown', outlineComplete: false, textComplete: false,
+      scope: 'unobserved', truncated: true,
+    })
     await browser.dispose()
   })
 

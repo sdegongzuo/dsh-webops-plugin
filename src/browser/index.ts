@@ -29,6 +29,7 @@ import { TabCallQueue } from './tab-call-queue.ts'
 import type { TabLeaseReleaseListener } from './lease.ts'
 import type {
   BrowserCaller,
+  BrowserCompletionEvidence,
   BrowserConsoleRequest,
   BrowserConsoleResult,
   BrowserErrorCode,
@@ -52,7 +53,29 @@ import type {
   BrowserTabInfo,
   BrowserTabsRequest,
   BrowserTabsResult,
+  BrowserWaitEvidence,
 } from './types.ts'
+
+/**
+ * 把 provider 的等待原始证据补成模型可见的完成证据。
+ *
+ * 范围、大纲完整性只能等附观察真正拿到之后再填：请求里写了 `region_tail` 不等于
+ * 最后真的落在 tail（首次/导航/交还/新浮层会强制全页）。观察缺失时一律按
+ * `outlineComplete=false` / `truncated=true` 的保守值，绝不把「未观察」写成「完整」。
+ */
+function withCompletion(result: BrowserMutationResult): BrowserMutationResult {
+  const evidence = result.waitEvidence
+  if (evidence === undefined) return result
+  const snapshot = result.snapshot
+  const completion: BrowserCompletionEvidence = {
+    ...evidence,
+    outlineComplete: snapshot !== undefined && snapshot.truncated === false,
+    textComplete: false,
+    scope: snapshot?.scope ?? 'unobserved',
+    truncated: snapshot?.truncated ?? true,
+  }
+  return { ...result, completion }
+}
 
 function mergePageChanges(first: BrowserPageChanged | undefined, second: BrowserPageChanged | undefined): BrowserPageChanged | undefined {
   if (first === undefined) return second
@@ -477,11 +500,20 @@ export class BrowserRuntime extends Service {
         try {
           waited = await provider.mutate(followUpWait, signal)
         } catch (error) {
-          return {
+          // 等待本身失败也是「证据不足」，必须显式报 completion=unverified；
+          // 只回一句 observation_error 会让模型把缺失的完成证据当成不需要证明。
+          return withCompletion({
             ...filtered,
             actionDispatched: true,
             observationError: observationFailure(error),
-          }
+            waitEvidence: {
+              condition: followUpWait.text !== undefined ? 'text' : 'stable',
+              conditionMet: false,
+              completion: 'unverified',
+              basis: 'wait_failed',
+              newContent: 'unknown',
+            } satisfies BrowserWaitEvidence,
+          })
         }
         const waitResult = this.filterOpenedTabs(provider, ownerId, waited)
         const openedTabs = new Map<string, BrowserTabInfo>()
@@ -497,6 +529,7 @@ export class BrowserRuntime extends Service {
           navigated: filtered.navigated || waitResult.navigated,
           ...(pageChanged !== undefined ? { pageChanged } : {}),
           ...(waitResult.satisfied !== undefined ? { satisfied: waitResult.satisfied } : {}),
+          ...waitResult.waitEvidence !== undefined ? { waitEvidence: waitResult.waitEvidence } : {},
           ...waitResult.signals !== undefined ? { signals: waitResult.signals } : {},
           ...(openedTabs.size > 0 ? { openedTabs: [...openedTabs.values()] } : {}),
         })
@@ -507,28 +540,31 @@ export class BrowserRuntime extends Service {
       if (!shouldSnapshot) return filtered
       try {
         const observeRef = request.kind === 'wait' || request.kind === 'click' || request.kind === 'press' ? request.observeRef : undefined
+        const observeRegion = request.kind === 'wait' || request.kind === 'click' || request.kind === 'press' ? request.observeRegion : undefined
         const requiresFull = filtered.navigated || (filtered.pageChanged?.navigated ?? 0) > 0
           || provider.needsReobserve?.(request.sessionId) === true || provider.hasFullObservation?.(request.sessionId) !== true
-        // 动作后的默认落点是**被操作元素所在的区块**（2026-10-18）：点击能改变的范围几乎总是
-        // 它所在的那一块，而整页重拍正是 S15 单请求峰值 +9.80% 的来源（两条件的区域观察次数
-        // 都是 1，峰值升高只来自「动作驱动的全页」）。显式 region_ref 仍然最优先，其次是这个
-        // 默认区块；两者都不可用时才全页 —— 区块能不能定位由 provider 判断，它拿不到就自己
-        // 回退全页（`region.enclosing` 的降级语义见 PageObservation.snapshot）。
-        const actionRef = request.kind === 'click' || request.kind === 'press' ? request.ref : undefined
-        const region = observeRef !== undefined
+        // 显式区域最优先：已知结果区用 region_ref，未知但回复在文档尾部用 region_tail=true，
+        // 只看当前屏幕用 region_viewport=true。它们都指向「本轮回复」，不是被操作元素所在区块。
+        const explicitRegion = observeRef !== undefined
           ? { ref: observeRef }
-          : actionRef !== undefined ? { enclosing: actionRef }
-            : request.kind === 'wait' ? { previous: true } : undefined
+          : observeRegion?.tail === true
+            ? { tail: true, ...observeRegion.tailLines !== undefined ? { tailLines: observeRegion.tailLines } : {} }
+            : observeRegion?.viewport === true ? { viewport: true } : undefined
+        // 动作后的默认落点仍是**被操作元素所在的区块**（2026-10-18），但独立 wait 不再回退整页：
+        // `previous` 由 provider 按可继承区域重算，无有效区域时默认落文档尾部有界区域。
+        const actionRef = request.kind === 'click' || request.kind === 'press' ? request.ref : undefined
+        const region = explicitRegion ?? (actionRef !== undefined ? { enclosing: actionRef }
+          : request.kind === 'wait' ? { previous: true } : undefined)
         const snapshot = await provider.observe({ kind: 'snapshot', sessionId: request.sessionId,
           ...region !== undefined && !requiresFull ? { region, guardGlobal: true } : {},
         }, signal)
         if (snapshot.kind !== 'snapshot') {
           throw new BrowserError(`mutation received a "${snapshot.kind}" observation`, 'BROWSER_PROTOCOL_ERROR')
         }
-        return { ...filtered, epoch: snapshot.epoch, url: snapshot.url, title: snapshot.title, snapshot }
+        return withCompletion({ ...filtered, epoch: snapshot.epoch, url: snapshot.url, title: snapshot.title, snapshot })
       } catch (error) {
         if (request.kind === 'click' || request.kind === 'press') {
-          return { ...filtered, actionDispatched: true, observationError: observationFailure(error) }
+          return withCompletion({ ...filtered, actionDispatched: true, observationError: observationFailure(error) })
         }
         throw error
       }

@@ -90,6 +90,16 @@ export const DEFAULT_SNAPSHOT_LIMITS: SnapshotLimits = {
  */
 export const MAX_SNAPSHOT_LINES = 5_000
 
+/**
+ * 文档尾部有界读取的默认/最大行数。
+ *
+ * `region_tail` 解决的是「旧历史把整页预算吃满、当前轮被截在 800 行之外」：它按文档
+ * 顺序只保留末尾若干行，与滚动位置无关。默认 200 行足以覆盖一轮长回复的 AX 大纲，
+ * 上限 800 与全页默认行数预算同量级，不允许模型把 tail 悄悄扩成整页。
+ */
+export const DEFAULT_TAIL_LINES = 200
+export const MAX_TAIL_LINES = 800
+
 /** 单行平均字符数（缩进 + 角色 + 名称）的估计值，用来按行数缩放字符预算。 */
 const OUTLINE_CHARS_PER_LINE = 60
 
@@ -209,6 +219,14 @@ const REPORTED_PROPERTIES = [
 export interface OutlineLine {
   readonly depth: number
   readonly text: string
+  /**
+   * 内部行身份（buildOutline 的候选下标），只用于 {@link sliceOutlineTail} 在「打印行」
+   * 与「find 底稿」之间对齐起点。不进模型回执。
+   *
+   * 不能靠对象引用：`normalizeDepths()` 分别对两份数组跑，缩进被改写时会产出副本，
+   * 且两份数组的祖先栈不同（底稿含折叠实例行），同一条原始行在两侧未必是同一个对象。
+   */
+  readonly lineId?: number
   /** 该行绑定了一个可操作元素时，是它在 `rows` 里的下标。 */
   readonly targetRow?: number
   /**
@@ -720,6 +738,7 @@ export function buildOutline(
     const line: OutlineLine = {
       depth: candidate.depth,
       text: candidate.text,
+      lineId: index,
       ...candidate.targetRow !== undefined ? { targetRow: candidate.targetRow } : {},
       ...full !== undefined ? { full } : {},
       ...full !== undefined ? { fullLength: candidate.raw.length } : {},
@@ -926,4 +945,79 @@ export function filterAxTreeByBackendIds(
       if (node.childIds === undefined) return node
       return { ...node, childIds: node.childIds.filter(id => keep.has(id)) }
     })
+}
+
+/**
+ * 把一份大纲裁成**文档顺序的末尾若干行**（`region_tail` 的实现核心）。
+ *
+ * 为什么不是「先按尾部 AX 节点筛再 buildOutline」：`buildOutline` 的预算截断是**从头保留**，
+ * 节点子集一旦超过行数预算，被丢掉的恰好是最新回复所在的尾部 —— 正是本功能要修的毛病。
+ * 所以这里先用放大的预算建出完整大纲，再在**行**这一层取后缀。
+ *
+ * 三件必须一起处理的事：
+ * 1. `rows` 只保留尾部行引用的可操作元素，并重映射 `targetRow`（区域观察不能发布模型
+ *    从未见过的 ref，`adopt()` 拿到的就是这份裁剪过的 rows）。
+ * 2. `unfoldedLines`（find 的检索底稿）包含折叠实例行，用**行身份 `lineId`** 定位起点，
+ *    保证底稿与打印行同范围、行号仍然逐行对齐（两份数组各自 normalizeDepths 过，不能靠引用）。
+ * 3. 折叠 / 去重计数是全页口径，对尾部子集无意义，置 0 让回执不输出这两项；
+ *    前面主动省略的行数由 `omittedLines` 单独报告，与 `droppedElements` 不是一回事。
+ */
+export function sliceOutlineTail(
+  outline: SnapshotOutline,
+  tailLines: number,
+): { outline: SnapshotOutline; omittedLines: number } {
+  const keep = Math.max(1, Math.min(Math.floor(tailLines), MAX_TAIL_LINES))
+  const start = Math.max(0, outline.lines.length - keep)
+  const keptLines = outline.lines.slice(start)
+  // 用 lineId 而不是对象引用：两份数组都经过 normalizeDepths，同一条原始行可能已是不同对象。
+  const markerAtHead = keptLines[0]?.lineId === undefined
+  // 尾部第一行若是折叠标记行（无 lineId），它的代表行在 start 之前、折叠实例紧跟代表行之后。
+  // 底稿起点必须落在「代表行之后」，否则这个折叠组的实例会整段丢失 —— 而打印大纲里还留着
+  // 「×N 个重复」，find 就再也拿不回那些 ref 了。
+  const anchorId = markerAtHead
+    ? [...outline.lines.slice(0, start)].reverse().find(line => line.lineId !== undefined)?.lineId
+    : keptLines.find(line => line.lineId !== undefined)?.lineId
+  const anchorIndex = anchorId === undefined
+    ? -1
+    : outline.unfoldedLines.findIndex(line => line.lineId === anchorId)
+  const unfoldedStart = anchorIndex < 0
+    ? outline.unfoldedLines.length
+    : markerAtHead ? anchorIndex + 1 : anchorIndex
+  const keptUnfolded = unfoldedStart < 0 ? [] : outline.unfoldedLines.slice(unfoldedStart)
+
+  const usedRows = new Set<number>()
+  for (const line of keptLines) {
+    if (line.targetRow !== undefined) usedRows.add(line.targetRow)
+  }
+  for (const line of keptUnfolded) {
+    if (line.targetRow !== undefined) usedRows.add(line.targetRow)
+  }
+  const remap = new Map<number, number>()
+  const rows: RefPublishRow[] = []
+  for (let index = 0; index < outline.rows.length; index += 1) {
+    if (!usedRows.has(index)) continue
+    remap.set(index, rows.length)
+    rows.push(outline.rows[index] as RefPublishRow)
+  }
+  const project = (line: OutlineLine): OutlineLine => {
+    if (line.targetRow === undefined) return line
+    const mapped = remap.get(line.targetRow)
+    if (mapped !== undefined) return { ...line, targetRow: mapped }
+    const copy: OutlineLine & { targetRow?: number } = { ...line }
+    delete copy.targetRow
+    return copy
+  }
+  return {
+    outline: {
+      lines: keptLines.map(project),
+      unfoldedLines: keptUnfolded.map(project),
+      rows,
+      // tail 内没有被预算裁掉；只有超过 MAX_SNAPSHOT_LINES 的源才如实报截断。
+      truncated: outline.truncated,
+      droppedElements: outline.droppedElements,
+      foldedRepeats: 0,
+      dedupedLines: 0,
+    },
+    omittedLines: start,
+  }
 }

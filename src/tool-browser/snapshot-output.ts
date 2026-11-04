@@ -21,6 +21,12 @@ export interface SnapshotOutput extends SessionOutput {
   deduped_lines?: number
   /** 区域外的可引用大纲条目数，包含控件与只读锚点。 */
   outside_region?: number
+  /** `scope=tail` 独有：文档前面主动省略的大纲行数（与全页截断分开计）。 */
+  tail_omitted_lines?: number
+  /** `scope=tail` 独有：本次实际输出的大纲行数。 */
+  tail_lines?: number
+  /** 观察时刻的滚动位置（CSS 像素）；tail 不依赖它，viewport 每次按当前视口重算。 */
+  scroll_top?: number
   refs: { ref: string; role: string; name: string; anchor?: boolean }[]
   /** P3：有人正开着 DevTools 操作这个页面（结果可能随时失效，但 ref 纪元不受影响）。 */
   takeover?: boolean
@@ -42,6 +48,8 @@ export function formatSnapshotOutput(snapshot: SnapshotOutput, currentFullSnapsh
     `session_id=${snapshot.session_id} (ref epoch ${snapshot.epoch}, ${controls} actionable controls, ${anchors} read-only anchors)`,
     ...(snapshot.scope !== undefined ? [`scope=${snapshot.scope}; observation_id=${String(snapshot.observation_id)}`] : []),
     ...(snapshot.scope_reason !== undefined ? [`scope_reason=${snapshot.scope_reason}`] : []),
+    ...(snapshot.tail_lines !== undefined ? [`tail_lines=${String(snapshot.tail_lines)}; tail_omitted_lines=${String(snapshot.tail_omitted_lines ?? 0)}`] : []),
+    ...(snapshot.scroll_top !== undefined ? [`scroll_top=${String(snapshot.scroll_top)}`] : []),
   ].join('\n')
   // 两条告警都放在**大纲正文之前**：这份回执的正文可能几千行（实测中位 5516 字符，上限 33285），
   // 塞进末尾的 notes 等于没报 —— 模型读到那段时早就不看后面了。
@@ -116,6 +124,31 @@ export function formatSnapshotOutput(snapshot: SnapshotOutput, currentFullSnapsh
       + `Default max_lines is ${String(DEFAULT_SNAPSHOT_LIMITS.maxLines)} — raise it only when the result says truncated.`,
     )
   }
+  if (snapshot.scope === 'viewport') {
+    notes.unshift(
+      'VIEWPORT READ: this is the CURRENT viewport, re-clipped on every call. After scrolling it shows different content '
+      + 'and may NOT contain the current reply tail. Use region_tail=true or a known result-area region_ref for the reply.',
+    )
+  }
+  if (snapshot.scope === 'tail') {
+    notes.unshift(
+      `TAIL BOUNDED READ: only the last ${String(snapshot.tail_lines ?? 0)} document-order outline lines are shown; `
+      + `${String(snapshot.tail_omitted_lines ?? 0)} earlier lines were intentionally omitted — that is NOT full-page `
+      + 'truncation, and must not be mixed with truncated/dropped_elements. This is a document tail, not a viewport: scrolling does not change which lines '
+      + 'are read, and newly appended reply text enters the read automatically. '
+      + 'It is a bounded PREVIEW for locating the CURRENT reply, not verbatim or complete text (text_complete=false). '
+      + 'If the reply is not in the tail, use the result area region_ref or a full snapshot; for exact long text use '
+      + 'webpage_find(full_text=true). Do not claim a complete answer from a bounded or truncated outline.',
+    )
+    if (snapshot.truncated || snapshot.scope_reason === 'tail_source_truncated') {
+      notes.unshift(
+        'TAIL SOURCE TRUNCATED: the internal outline source still hit its depth/character budget, so the TRUE end of '
+        + 'the document may be missing from this tail. dropped_elements here counts SOURCE nodes, not tail output rows; '
+        + 'raising max_lines (the tail budget, 1-800) will NOT recover them. Read a known result area with region_ref '
+        + 'or take a full snapshot with a larger max_lines, and report the reply as not verified.',
+      )
+    }
+  }
   const head = warnings.length === 0 ? header : `${header}\n\n${warnings.join('\n\n')}`
   return `${head}\n\n${body}\n\n${notes.join('\n')}`
 }
@@ -130,6 +163,7 @@ export const SNAPSHOT_OUTPUT_SCHEMA = {
     outline: { type: 'string', required: true }, truncated: { type: 'boolean', required: true },
     outline_lines: { type: 'integer' }, dropped_elements: { type: 'integer' },
     folded_repeats: { type: 'integer' }, deduped_lines: { type: 'integer' }, outside_region: { type: 'integer' },
+    tail_omitted_lines: { type: 'integer' }, tail_lines: { type: 'integer' }, scroll_top: { type: 'integer' },
     refs: { type: 'array', required: true, items: REF_ITEM_SCHEMA }, takeover: { type: 'boolean' },
     page_changed: PAGE_CHANGED_SCHEMA, rebound_refs: { type: 'array', items: REF_ITEM_SCHEMA },
   },
@@ -145,6 +179,9 @@ export function toSnapshotOutput(observation: BrowserSnapshot): SnapshotOutput {
     ...observation.foldedRepeats !== undefined ? { folded_repeats: observation.foldedRepeats } : {},
     ...observation.dedupedLines !== undefined ? { deduped_lines: observation.dedupedLines } : {},
     ...observation.outsideRegion !== undefined ? { outside_region: observation.outsideRegion } : {},
+    ...observation.tailOmittedLines !== undefined ? { tail_omitted_lines: observation.tailOmittedLines } : {},
+    ...observation.tailLines !== undefined ? { tail_lines: observation.tailLines } : {},
+    ...observation.scrollTop !== undefined ? { scroll_top: observation.scrollTop } : {},
     refs: observation.refs.map(({ ref, role, name, anchor }) => ({ ref, role, name, ...anchor === true ? { anchor: true } : {} })),
     ...observation.takeover === true ? { takeover: true } : {},
     ...observation.pageChanged !== undefined ? { page_changed: toPageChangedOutput(observation.pageChanged) } : {},

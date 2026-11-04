@@ -45,15 +45,20 @@ function snapshotRegionFromArgs(args: {
   region_ref?: unknown
   region_viewport?: unknown
   region_box?: unknown
-}): { ref?: string; viewport?: boolean; box?: { x: number; y: number; width: number; height: number } } | undefined {
+  region_tail?: unknown
+  max_lines?: unknown
+}): { ref?: string; viewport?: boolean; tail?: boolean; tailLines?: number; box?: { x: number; y: number; width: number; height: number } } | undefined {
   const ref = typeof args.region_ref === 'string' ? args.region_ref : undefined
   const viewport = args.region_viewport === true
+  const tail = args.region_tail === true
   const box = parseRegionBox(args.region_box)
-  const kinds = [ref !== undefined, viewport, box !== undefined].filter(Boolean).length
+  const kinds = [ref !== undefined, viewport, tail, box !== undefined].filter(Boolean).length
   if (kinds > 1) {
-    throw new Error('region_ref, region_viewport and region_box are mutually exclusive; pass at most one')
+    throw new Error('region_ref, region_viewport, region_tail and region_box are mutually exclusive; pass at most one')
   }
   if (ref !== undefined) return { ref }
+  // `max_lines` 在 region_tail 下就是尾部行数预算（默认 200，上限 800 由 provider 夹住）。
+  if (tail) return { tail: true, ...typeof args.max_lines === 'number' ? { tailLines: args.max_lines } : {} }
   if (viewport) return { viewport: true }
   if (box !== undefined) return { box }
   return undefined
@@ -205,6 +210,10 @@ export function registerSnapshot(ctx: Context, cache: SnapshotCache): void {
         type: 'boolean',
         description: 'Only elements intersecting the viewport.',
       },
+      region_tail: {
+        type: 'boolean',
+        description: '布尔true：文档末尾当前回复，有界200行，max_lines可调；预览不是完整原文。',
+      },
       region_box: {
         type: 'object',
         additionalProperties: false,
@@ -238,11 +247,15 @@ export function registerSnapshot(ctx: Context, cache: SnapshotCache): void {
       // 底稿 = 打印行 ∪ 被折叠的实例行 —— 折叠标记承诺「用 find 拿全部实例的 ref」，缓存里少了实例，
       // 这句承诺就是假的（provider 不提供 fullOutline 时退回模型看到的那份，至少不更差）。
       // find 的契约是 LAST snapshot；区域新回复不能继续读旧全页缓存。
-      const scope = region === undefined ? 'full'
+      // ⚠️ 范围优先取 provider 的**实际**范围：请求 region_tail 也可能因首次/导航/交还/新浮层
+      // 被强制回退成全页，按请求参数记缓存会让 find 误以为只搜过尾部。provider 未给 scope
+      // 的兼容夹具才按请求推导（真实 provider 一定给）。
+      const requestedScope = region === undefined ? 'full'
         : region.ref !== undefined ? `ref:${region.ref}`
-          : region.viewport === true ? 'viewport'
-            : `box:${region.box!.x},${region.box!.y},${region.box!.width},${region.box!.height}`
-      return rememberBrowserSnapshot(cache, observation, scope)
+          : region.tail === true ? 'tail'
+            : region.viewport === true ? 'viewport'
+              : `box:${region.box!.x},${region.box!.y},${region.box!.width},${region.box!.height}`
+      return rememberBrowserSnapshot(cache, observation, observation.scope ?? requestedScope)
     },
     presentCall: args => observeCall(`Snapshot ${args.session_id}`, 'read', args.session_id),
   }, cache))

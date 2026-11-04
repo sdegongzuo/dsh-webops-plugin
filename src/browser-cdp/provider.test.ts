@@ -104,6 +104,17 @@ class FakeChrome {
   frameTreeUrl: string | undefined = undefined
   /** P1：wait-text 里页面文本是否包含目标串。 */
   waitTextFound = true
+  /**
+   * 完成证据基线探针：`readContentBaseline` 读到的正文长度。每次读自增 10，
+   * 让「等待前后正文增长」这一事实在夹具里真的发生，而不是靠测试替身自证。
+   */
+  bodyTextLength = 100
+  /** 完成证据基线探针：本轮标记在等待开始前是否已存在（旧轮完成标记场景）。 */
+  markerPresentBeforeWait = false
+  /** 基线探针读不到（页面空白 / 命令失败）：完成证据必须保守标 unverified。 */
+  baselineUnavailable = false
+  /** `readScrollTop` 的返回值；undefined = 读不到（探测失败按「省略」处理）。 */
+  scrollTopValue: number | undefined = undefined
   /** `until: 'stable'`：每次读 DOM 探针返回的增量（0 = 本窗口安静）。 */
   domMutationDelta = 0
   /**
@@ -281,8 +292,19 @@ class FakeChrome {
             },
           }
         }
+        // 等待前/后的正文基线探针（完成证据）：与 wait-text 的命中探针都含 innerText，
+        // 但返回体是 {length, textPresent}，必须先认出来，否则基线会恒为「读不到」。
+        if (expression.includes('textPresent')) {
+          if (this.baselineUnavailable) return { result: { value: true } }
+          const length = this.bodyTextLength
+          this.bodyTextLength += 10
+          return { result: { value: { length, textPresent: this.markerPresentBeforeWait } } }
+        }
         if (expression.includes('innerText')) {
           return { result: { value: this.waitTextFound } }
+        }
+        if (expression.includes('scrollingElement') && this.scrollTopValue !== undefined) {
+          return { result: { value: this.scrollTopValue } }
         }
         if (expression === '1 + 1') {
           return { result: { value: 2 } }
@@ -965,22 +987,28 @@ describe('CdpBrowserProvider', () => {
     expect(fallback.outsideRegion).toBeUndefined()
   })
 
-  it('等待观察沿用同一纪元最近成功区块，全页读取后不再沿用', async () => {
+  it('等待沿用同一纪元最近成功的显式区域；动作区块不是回复区，不参与继承', async () => {
     await provider.open({})
     chrome.axeNodes = SECTIONED_TREE
     chrome.domTree = SECTIONED_DOM
     const full = await provider.observe({ kind: 'snapshot', sessionId: 'tab-1' })
     if (full.kind !== 'snapshot') throw new Error('expected snapshot')
     const ref = full.refs.find(target => target.name === '发送')!.ref
-    chrome.enclosingBackendNodeId = 20
-    await provider.observe({ kind: 'snapshot', sessionId: 'tab-1', region: { enclosing: ref } })
+    // 显式 region_ref 是「结果区」，可继承；enclosing 是「被操作元素所在区块」，不可继承。
+    await provider.observe({ kind: 'snapshot', sessionId: 'tab-1', region: { ref } })
     const waited = await provider.observe({ kind: 'snapshot', sessionId: 'tab-1', region: { previous: true }, guardGlobal: true })
-    expect(waited).toMatchObject({ scope: `ref:${ref}`, epoch: full.epoch })
+    expect(waited).toMatchObject({ scope: `ref:${ref}`, epoch: full.epoch, scopeReason: 'inherited_ref' })
     if (waited.kind !== 'snapshot') throw new Error('expected snapshot')
     expect(waited.outline).not.toContain('别处')
+    chrome.enclosingBackendNodeId = 20
+    await provider.observe({ kind: 'snapshot', sessionId: 'tab-1', region: { enclosing: ref } })
+    const fromActionBlock = await provider.observe({ kind: 'snapshot', sessionId: 'tab-1', region: { previous: true } })
+    // 动作区块观察不能覆盖先前的回复区：仍继承显式 ref 区域。
+    expect(fromActionBlock).toMatchObject({ scope: `ref:${ref}`, scopeReason: 'inherited_ref' })
     await provider.observe({ kind: 'snapshot', sessionId: 'tab-1' })
     const reset = await provider.observe({ kind: 'snapshot', sessionId: 'tab-1', region: { previous: true } })
-    expect(reset).toMatchObject({ scope: 'full', scopeReason: 'no_previous_region' })
+    // 全页观察清空继承：不再回整页，改读文档尾部有界区域并说明原因。
+    expect(reset).toMatchObject({ scope: 'tail', scopeReason: 'no_previous_region' })
   })
 
   it.each(['No node found for given backend id', 'unknown protocol failure'])('子树读取失败分类：%s', async message => {
@@ -999,45 +1027,49 @@ describe('CdpBrowserProvider', () => {
     }
   })
 
-  it('等待继承区块在租约/控制权作废后回退全页，旧区域不能跨代次', async () => {
+  it('等待继承区域在租约/控制权作废后回退全页，旧区域不能跨代次', async () => {
     await provider.open({})
     chrome.axeNodes = SECTIONED_TREE
     chrome.domTree = SECTIONED_DOM
     const full = await provider.observe({ kind: 'snapshot', sessionId: 'tab-1' })
     if (full.kind !== 'snapshot') throw new Error('expected snapshot')
-    chrome.enclosingBackendNodeId = 20
-    await provider.observe({ kind: 'snapshot', sessionId: 'tab-1', region: { enclosing: full.refs.find(target => target.name === '发送')!.ref } })
+    const ref = full.refs.find(target => target.name === '发送')!.ref
+    await provider.observe({ kind: 'snapshot', sessionId: 'tab-1', region: { ref } })
     provider.invalidateSession('tab-1')
     const waited = await provider.observe({ kind: 'snapshot', sessionId: 'tab-1', region: { previous: true } })
     expect(waited).toMatchObject({ scope: 'full', scopeReason: 'previous_region_expired' })
   })
 
-  it('等待沿用区块时发现全局浮层必须回全页，并清空后续默认区域', async () => {
+  it('等待沿用区域时发现全局浮层必须回全页，并清空后续默认区域', async () => {
     await provider.open({})
     chrome.axeNodes = SECTIONED_TREE
     chrome.domTree = SECTIONED_DOM
     const full = await provider.observe({ kind: 'snapshot', sessionId: 'tab-1' })
     if (full.kind !== 'snapshot') throw new Error('expected snapshot')
-    chrome.enclosingBackendNodeId = 20
-    await provider.observe({ kind: 'snapshot', sessionId: 'tab-1', region: { enclosing: full.refs.find(target => target.name === '发送')!.ref } })
+    const ref = full.refs.find(target => target.name === '发送')!.ref
+    await provider.observe({ kind: 'snapshot', sessionId: 'tab-1', region: { ref } })
     chrome.overlay = { role: 'div', name: '等待期间出现的确认', hint: '#confirm' }
     const guarded = await provider.observe({ kind: 'snapshot', sessionId: 'tab-1', region: { previous: true }, guardGlobal: true })
     expect(guarded).toMatchObject({ scope: 'full', scopeReason: 'global_overlay' })
     const next = await provider.observe({ kind: 'snapshot', sessionId: 'tab-1', region: { previous: true } })
-    expect(next).toMatchObject({ scope: 'full', scopeReason: 'no_previous_region' })
+    expect(next).toMatchObject({ scope: 'tail', scopeReason: 'no_previous_region' })
   })
 
-  it('继承范围的锚点消失时全页兜底，不把正常 wait 变成旧引用错误', async () => {
+  it('动作区块观察不可继承为回复区，独立 wait 改读文档尾部并说明原因', async () => {
     await provider.open({})
     chrome.axeNodes = SECTIONED_TREE
     chrome.domTree = SECTIONED_DOM
     const full = await provider.observe({ kind: 'snapshot', sessionId: 'tab-1' })
     if (full.kind !== 'snapshot') throw new Error('expected snapshot')
     chrome.enclosingBackendNodeId = 20
-    await provider.observe({ kind: 'snapshot', sessionId: 'tab-1', region: { enclosing: full.refs.find(target => target.name === '发送')!.ref } })
+    const send = full.refs.find(target => target.name === '发送')!.ref
+    await provider.observe({ kind: 'snapshot', sessionId: 'tab-1', region: { enclosing: send } })
     chrome.enclosingBackendNodeId = null
     const waited = await provider.observe({ kind: 'snapshot', sessionId: 'tab-1', region: { previous: true }, guardGlobal: true })
-    expect(waited).toMatchObject({ scope: 'full', scopeReason: 'anchor_unavailable' })
+    expect(waited).toMatchObject({ scope: 'tail', scopeReason: 'previous_region_is_action_block' })
+    if (waited.kind !== 'snapshot') throw new Error('expected snapshot')
+    expect(waited.scope).not.toBe('full')
+    expect(waited.outline.length).toBeGreaterThan(0)
   })
 
   it('反向：区块在 DOM 里但 AX 侧没有可呈现内容时回退全页，不返回空大纲', async () => {
@@ -4244,5 +4276,222 @@ describe('CdpBrowserProvider 窗口输入权（并发网页操作方案 §4）',
     grant(`wi-${b.sessionId}-2`, 'ticket-B', b.sessionId)
     await expect(pendingB).resolves.toMatchObject({ action: 'click' })
     expect(chrome.windowInputReleases).toContain('ticket-B')
+  })
+})
+
+/**
+ * 十轮长会话的复现夹具：900 行历史 + 末尾「本轮回复」+「发送」。
+ * 默认全页 800 行预算会**从头保留**，恰好把本轮回复截掉（原始会话后三轮
+ * 100/202/335 条未返回）；tail 从文档末尾读则必然包含它。
+ */
+function longConversationTree(historyLines = 900): AxNode[] {
+  const childIds = Array.from({ length: historyLines + 2 }, (_, index) => `n${String(index)}`)
+  return [
+    { nodeId: 'root', role: { value: 'RootWebArea' }, name: { value: 'Example' }, childIds: ['wrap'], ignored: false },
+    { nodeId: 'wrap', role: { value: 'generic' }, childIds, ignored: false },
+    ...Array.from({ length: historyLines }, (_, index) => ({
+      nodeId: `n${String(index)}`,
+      role: { value: 'heading' },
+      name: { value: `历史第 ${String(index + 1)} 行` },
+      ignored: false,
+      backendDOMNodeId: 1000 + index,
+    })),
+    { nodeId: `n${String(historyLines)}`, role: { value: 'heading' }, name: { value: '本轮回复' }, ignored: false, backendDOMNodeId: 9000 },
+    { nodeId: `n${String(historyLines + 1)}`, role: { value: 'button' }, name: { value: '发送' }, ignored: false, backendDOMNodeId: 9001 },
+  ]
+}
+
+describe('连续对话观察：尾部有界读取与区域继承（会话 07e69431）', () => {
+  let chrome: FakeChrome
+  let provider: CdpBrowserProvider
+
+  beforeEach(() => {
+    chrome = new FakeChrome()
+    chrome.axeNodes = longConversationTree()
+    provider = new CdpBrowserProvider({ navigationTimeoutMs: 200 }, chrome.transport())
+  })
+
+  it('全页 800 行预算会截掉当前轮；tail 从文档末尾读能拿回本轮回复', async () => {
+    await provider.open({})
+    const full = await provider.observe({ kind: 'snapshot', sessionId: 'tab-1' })
+    if (full.kind !== 'snapshot') throw new Error('expected snapshot')
+    expect(full.truncated).toBe(true)
+    expect(full.outline).not.toContain('本轮回复')
+
+    const tailed = await provider.observe({ kind: 'snapshot', sessionId: 'tab-1', region: { tail: true } })
+    if (tailed.kind !== 'snapshot') throw new Error('expected snapshot')
+    expect(tailed).toMatchObject({ scope: 'tail', scopeReason: 'default_reply_tail' })
+    expect(tailed.outline).toContain('本轮回复')
+    expect(tailed.outline).toContain('发送')
+    expect(tailed.outline).not.toContain('历史第 1 行')
+    expect(tailed.tailLines).toBeLessThanOrEqual(200)
+    expect(tailed.tailOmittedLines).toBeGreaterThan(0)
+    // 主动省略的头部行数与预算截断分开报告，不能混成一个数。
+    expect(tailed.tailOmittedLines).not.toBe(tailed.droppedElements)
+  })
+
+  it('独立 wait 无有效回复区时默认落到 tail，不再整页重拍', async () => {
+    await provider.open({})
+    await provider.observe({ kind: 'snapshot', sessionId: 'tab-1' })
+    const waited = await provider.observe({
+      kind: 'snapshot', sessionId: 'tab-1', region: { previous: true }, guardGlobal: true,
+    })
+    if (waited.kind !== 'snapshot') throw new Error('expected snapshot')
+    expect(waited).toMatchObject({ scope: 'tail', scopeReason: 'no_previous_region' })
+    expect(waited.outline).toContain('本轮回复')
+  })
+
+  it('显式 tail 行数被记住；previous 继承按当前页面重算而不是复用旧大纲', async () => {
+    await provider.open({})
+    await provider.observe({ kind: 'snapshot', sessionId: 'tab-1' })
+    const explicit = await provider.observe({
+      kind: 'snapshot', sessionId: 'tab-1', region: { tail: true, tailLines: 5 },
+    })
+    if (explicit.kind !== 'snapshot') throw new Error('expected snapshot')
+    expect(explicit.tailLines).toBe(5)
+    expect(explicit.tailOmittedLines).toBeGreaterThan(0)
+
+    const inherited = await provider.observe({ kind: 'snapshot', sessionId: 'tab-1', region: { previous: true } })
+    if (inherited.kind !== 'snapshot') throw new Error('expected snapshot')
+    expect(inherited).toMatchObject({ scope: 'tail', scopeReason: 'inherited_tail_recomputed', tailLines: 5 })
+    expect(inherited.outline).toContain('本轮回复')
+  })
+
+  it('tail 是文档顺序，不随滚动位置变化，也不需要布局盒', async () => {
+    await provider.open({})
+    await provider.observe({ kind: 'snapshot', sessionId: 'tab-1' })
+    chrome.scrollTopValue = 0
+    const beforeScroll = await provider.observe({ kind: 'snapshot', sessionId: 'tab-1', region: { tail: true } })
+    chrome.scrollTopValue = 12_345
+    const afterScroll = await provider.observe({ kind: 'snapshot', sessionId: 'tab-1', region: { tail: true } })
+    if (beforeScroll.kind !== 'snapshot' || afterScroll.kind !== 'snapshot') throw new Error('expected snapshots')
+    expect(beforeScroll.scrollTop).toBe(0)
+    expect(afterScroll.scrollTop).toBe(12_345)
+    expect(afterScroll.outline).toBe(beforeScroll.outline)
+    expect(chrome.calls.some(call => call.method === 'Page.getLayoutMetrics')).toBe(false)
+  })
+
+  it('viewport 也是可继承区域，但每次按当前视口重算', async () => {
+    await provider.open({})
+    // 视口内只放本轮回复与发送按钮：几何区域按布局盒裁剪，必须有盒才可能命中。
+    chrome.layoutBoxes = [
+      { backendNodeId: 9000, bounds: [0, 600, 400, 30] },
+      { backendNodeId: 9001, bounds: [0, 640, 120, 30] },
+    ]
+    await provider.observe({ kind: 'snapshot', sessionId: 'tab-1' })
+    const viewport = await provider.observe({ kind: 'snapshot', sessionId: 'tab-1', region: { viewport: true } })
+    if (viewport.kind !== 'snapshot') throw new Error('expected snapshot')
+    expect(viewport.scope).toBe('viewport')
+    const inherited = await provider.observe({ kind: 'snapshot', sessionId: 'tab-1', region: { previous: true } })
+    if (inherited.kind !== 'snapshot') throw new Error('expected snapshot')
+    expect(inherited).toMatchObject({ scope: 'viewport', scopeReason: 'inherited_viewport_recomputed' })
+    expect(chrome.calls.filter(call => call.method === 'Page.getLayoutMetrics')).toHaveLength(2)
+  })
+
+  it('等待期间出现全局浮层：tail 也必须回退全页并清空继承', async () => {
+    await provider.open({})
+    await provider.observe({ kind: 'snapshot', sessionId: 'tab-1' })
+    chrome.overlay = { role: 'dialog', name: '确认', hint: '#confirm' }
+    const guarded = await provider.observe({
+      kind: 'snapshot', sessionId: 'tab-1', region: { previous: true }, guardGlobal: true,
+    })
+    if (guarded.kind !== 'snapshot') throw new Error('expected snapshot')
+    expect(guarded).toMatchObject({ scope: 'full', scopeReason: 'global_overlay' })
+    expect(guarded.tailOmittedLines).toBeUndefined()
+    expect(guarded.tailLines).toBeUndefined()
+    chrome.overlay = null
+    const next = await provider.observe({ kind: 'snapshot', sessionId: 'tab-1', region: { previous: true } })
+    if (next.kind !== 'snapshot') throw new Error('expected snapshot')
+    expect(next).toMatchObject({ scope: 'tail', scopeReason: 'no_previous_region' })
+  })
+})
+
+describe('本轮回复完成证据：只有本轮独有文本标记才 verified', () => {
+  let chrome: FakeChrome
+  let provider: CdpBrowserProvider
+
+  beforeEach(() => {
+    chrome = new FakeChrome()
+    chrome.axeNodes = PAGE_TREE
+    provider = new CdpBrowserProvider({ navigationTimeoutMs: 200 }, chrome.transport())
+  })
+
+  it('等待前不存在、等待中出现的本轮标记 → verified / exclusive_text_marker', async () => {
+    await provider.open({})
+    await provider.observe({ kind: 'snapshot', sessionId: 'tab-1' })
+    chrome.waitTextFound = true
+    chrome.markerPresentBeforeWait = false
+    const result = await provider.mutate({ kind: 'wait', sessionId: 'tab-1', text: '本轮完成' })
+    expect(result.waitEvidence).toMatchObject({
+      condition: 'text', conditionMet: true, completion: 'verified',
+      basis: 'exclusive_text_marker', newContent: 'observed',
+    })
+    const baselines = chrome.calls.filter(call => call.method === 'Runtime.evaluate'
+      && String(call.params['expression']).includes('textPresent'))
+    expect(baselines).toHaveLength(2)
+    // 第一条基线必须带本轮标记，且发生在等待轮询之前（旧轮标记不能拿来充数）。
+    expect(String(baselines[0]?.params['expression'])).toContain('本轮完成')
+    expect(String(baselines[1]?.params['expression'])).not.toContain('本轮完成')
+    const baselineAt = chrome.calls.findIndex(call => String(call.params['expression']).includes('textPresent'))
+    const pollAt = chrome.calls.findIndex(call => String(call.params['expression']).includes('innerText')
+      && !String(call.params['expression']).includes('textPresent'))
+    expect(baselineAt).toBeLessThan(pollAt)
+  })
+
+  it('等待前就存在的旧轮标记 → unverified / preexisting_marker', async () => {
+    await provider.open({})
+    await provider.observe({ kind: 'snapshot', sessionId: 'tab-1' })
+    chrome.waitTextFound = true
+    chrome.markerPresentBeforeWait = true
+    const result = await provider.mutate({ kind: 'wait', sessionId: 'tab-1', text: '上一轮已完成' })
+    expect(result.waitEvidence).toMatchObject({
+      condition: 'text', conditionMet: true, completion: 'unverified', basis: 'preexisting_marker',
+    })
+  })
+
+  it('基线读不到 → unverified / baseline_unavailable，不把探测失败当成本轮证据', async () => {
+    await provider.open({})
+    await provider.observe({ kind: 'snapshot', sessionId: 'tab-1' })
+    chrome.waitTextFound = true
+    chrome.baselineUnavailable = true
+    const result = await provider.mutate({ kind: 'wait', sessionId: 'tab-1', text: '本轮完成' })
+    expect(result.waitEvidence).toMatchObject({
+      completion: 'unverified', basis: 'baseline_unavailable', newContent: 'unknown',
+    })
+  })
+
+  it('页面安静、固定延时、节点变化都只能 unverified', async () => {
+    chrome.readyStateComplete = true
+    chrome.domMutationDelta = 0
+    const stableProvider = new CdpBrowserProvider({
+      navigationTimeoutMs: 200, stableQuietWindowMs: 20, stableNetworkGraceMs: 50,
+    }, chrome.transport())
+    await stableProvider.open({})
+    await stableProvider.observe({ kind: 'snapshot', sessionId: 'tab-1' })
+    const stable = await stableProvider.mutate({ kind: 'wait', sessionId: 'tab-1', until: 'stable', timeoutMs: 400 })
+    expect(stable.waitEvidence).toMatchObject({ condition: 'stable', completion: 'unverified', basis: 'quiet_only' })
+
+    const timed = await stableProvider.mutate({ kind: 'wait', sessionId: 'tab-1', timeMs: 5 })
+    expect(timed.waitEvidence).toMatchObject({ condition: 'time', completion: 'unverified', basis: 'fixed_delay' })
+
+    const snapshot = await stableProvider.observe({ kind: 'snapshot', sessionId: 'tab-1' })
+    if (snapshot.kind !== 'snapshot') throw new Error('expected snapshot')
+    const ref = snapshot.refs.find(entry => entry.anchor !== true)?.ref
+    if (ref === undefined) throw new Error('missing actionable ref')
+    chrome.elementConnected = false
+    const node = await stableProvider.mutate({ kind: 'wait', sessionId: 'tab-1', ref })
+    expect(node.waitEvidence).toMatchObject({ condition: 'ref', completion: 'unverified', basis: 'node_only' })
+  })
+
+  it('条件未命中/超时 → unverified / timeout，且不再发第二次探测', async () => {
+    const timeoutProvider = new CdpBrowserProvider({ waitTimeoutMs: 120 }, chrome.transport())
+    await timeoutProvider.open({})
+    chrome.waitTextFound = false
+    const result = await timeoutProvider.mutate({ kind: 'wait', sessionId: 'tab-1', text: 'Never' })
+    expect(result.waitEvidence).toMatchObject({
+      conditionMet: false, completion: 'unverified', basis: 'timeout', newContent: 'unknown',
+    })
+    const baselines = chrome.calls.filter(call => String(call.params['expression']).includes('textPresent'))
+    expect(baselines).toHaveLength(1)
   })
 })

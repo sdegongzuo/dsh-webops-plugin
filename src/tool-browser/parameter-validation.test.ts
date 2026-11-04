@@ -114,3 +114,44 @@ describe('网页工具统一参数边界', () => {
     expect(frozen.observe).toBe('true')
   })
 })
+
+describe('region_tail 参数契约（会话 07e69431）', () => {
+  it.each([
+    ['webpage_wait', { session_id: 's1', text: 'x', region_tail: true, region_ref: 'e2' }, 'region_tail'],
+    ['webpage_wait', { session_id: 's1', text: 'x', region_tail: true, observe_ref: 'e2' }, 'region_tail'],
+    ['webpage_snapshot', { session_id: 's1', region_tail: true, region_viewport: true }, '互斥'],
+    ['webpage_snapshot', { session_id: 's1', region_tail: true, region_ref: 'e2' }, '互斥'],
+    ['webpage_snapshot', { session_id: 's1', region_tail: true, max_lines: 801 }, 'max_lines'],
+  ] as const)('%s 拒绝互相矛盾的尾部读取参数 %s', async (name, args, hint) => {
+    const h = mount()
+    await expect(h.execute(name, args)).rejects.toThrow('BROWSER_INVALID_PARAMS')
+    await expect(h.execute(name, args)).rejects.toThrow(hint)
+    expect(h.dispatched).toEqual([])
+  })
+
+  it.each([
+    ['webpage_wait', { session_id: 's1', text: '本轮完成', region_tail: true }],
+    ['webpage_snapshot', { session_id: 's1', region_tail: true }],
+    ['webpage_snapshot', { session_id: 's1', region_tail: true, max_lines: 800 }],
+    ['webpage_snapshot', { session_id: 's1', region_tail: true, max_lines: 1 }],
+  ] as const)('%s 合法尾部读取可派发', async (name, args) => {
+    const h = mount()
+    await expect(h.execute(name, args)).rejects.toBe(h.sentinel)
+    expect(h.dispatched).toHaveLength(1)
+  })
+
+  it('fill 误传 observe 给出准确纠正路径，且明确未派发任何浏览器操作', async () => {
+    const h = mount()
+    const call = h.execute('webpage_fill', { session_id: 's1', ref: 'e1', value: '你好', observe: true })
+    await expect(call).rejects.toThrow('BROWSER_INVALID_PARAMS')
+    await expect(h.execute('webpage_fill', { session_id: 's1', ref: 'e1', value: '你好', observe: true }))
+      .rejects.toThrow(/webpage_press.*webpage_wait.*region_tail/s)
+    await expect(h.execute('webpage_fill', { session_id: 's1', ref: 'e1', value: '你好', observe: true }))
+      .rejects.toThrow('本次未派发任何浏览器操作')
+    // 纠正路径不能指向 click/press 上并不存在的 region_tail 参数。
+    const message = await h.execute('webpage_fill', { session_id: 's1', ref: 'e1', value: '你好', observe: true })
+      .catch((error: unknown) => (error as Error).message)
+    expect(message).not.toContain('webpage_press(observe=true 或 wait_text=本轮独有完成原文，并可用 region_ref / region_tail')
+    expect(h.dispatched).toEqual([])
+  })
+})

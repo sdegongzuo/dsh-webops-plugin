@@ -1,6 +1,6 @@
 /** 时间、文本、元素状态及稳定性等待；导航收尾复用 PageNavigation。 */
 
-import { type BrowserMutationRequest, type BrowserMutationResult, BrowserError } from '../browser/types.ts'
+import { type BrowserMutationRequest, type BrowserMutationResult, type BrowserWaitEvidence, BrowserError } from '../browser/types.ts'
 import type { SessionState, EvaluateResult } from './provider-session.ts'
 import { MAX_WAIT_TIME_MS, STABLE_QUIET_WINDOWS, type ResolvedConfig } from './provider-config.ts'
 import { delay, pollUntil } from './polling.ts'
@@ -41,6 +41,13 @@ export class PageWait {
       throw new BrowserError(`webpage_wait timeout_ms must be between 1 and ${String(MAX_WAIT_TIME_MS)}`, 'BROWSER_PROTOCOL_ERROR')
     }
     const beforeUrl = session.url
+    // 完成证据的基线：等待**开始前**的正文长度与本轮标记是否已存在。
+    // 「旧轮完成标记」在等待前就在页面上，命中它不能证明本轮回复完成 —— 必须在这里先量一次，
+    // 不能只靠回执文案提醒模型。探测一律受本次等待期限约束，不能让短期限 wait 多阻塞两条命令。
+    const evidenceDeadlineMs = Date.now() + (deadlineMs ?? request.timeMs ?? this.config.waitTimeoutMs)
+    const baseline = await this.readContentBaseline(
+      session, wantsText ? request.text as string : undefined, signal, evidenceDeadlineMs - Date.now(),
+    )
     let satisfied = true
     let signals: BrowserMutationResult['signals']
     let refState: 'hidden' | 'visible' | 'removed' | undefined
@@ -136,12 +143,81 @@ export class PageWait {
         this.nodes.releaseObject(session, objectId, signal)
       }
     }
+    // 条件未成立时期限通常已耗尽，不再发第二条命令；newContent 如实报 unknown。
+    const after = satisfied
+      ? await this.readContentBaseline(session, undefined, signal, evidenceDeadlineMs - Date.now())
+      : undefined
+    const newContent: BrowserWaitEvidence['newContent'] =
+      baseline?.length === undefined || after?.length === undefined
+        ? 'unknown'
+        : after.length > baseline.length ? 'observed' : 'not_observed'
+    const condition: BrowserWaitEvidence['condition'] = wantsTime ? 'time'
+      : wantsText ? 'text' : wantsRef ? 'ref' : 'stable'
+    let basis: BrowserWaitEvidence['basis']
+    let completion: BrowserWaitEvidence['completion'] = 'unverified'
+    if (wantsText) {
+      if (!satisfied) basis = 'timeout'
+      else if (baseline === undefined) basis = 'baseline_unavailable'
+      else if (baseline.textPresent === true) basis = 'preexisting_marker'
+      else {
+        basis = 'exclusive_text_marker'
+        completion = 'verified'
+      }
+    } else if (wantsStable) {
+      basis = satisfied ? 'quiet_only' : 'timeout'
+    } else if (wantsTime) {
+      basis = 'fixed_delay'
+    } else {
+      basis = satisfied ? 'node_only' : 'timeout'
+    }
+    const waitEvidence: BrowserWaitEvidence = {
+      condition, conditionMet: satisfied, completion, basis, newContent,
+    }
     const result = await this.navigation.settleMutation(session, 'wait', beforeUrl, false, signal)
     return {
       ...result,
       satisfied,
+      waitEvidence,
       ...signals !== undefined ? { signals } : {},
       ...refState !== undefined ? { refState } : {},
+    }
+  }
+
+  /**
+   * 一次 `Runtime.evaluate` 读页面正文长度（以及可选标记是否已存在）。
+   *
+   * 这是**只读探测**，不是完成判据：正文变长可能来自广告、时间戳或别的轮次，
+   * 所以它只写进 `newContent`，不参与 `completion` 判定。读不到返回 undefined，
+   * 让上层保守地标 `baseline_unavailable` / `unknown`，不把探测失败伪装成没变化。
+   */
+  private async readContentBaseline(
+    session: SessionState,
+    marker: string | undefined,
+    signal: AbortSignal | undefined,
+    remainingMs: number,
+  ): Promise<{ length: number; textPresent: boolean } | undefined> {
+    if (remainingMs <= 0) return undefined
+    const includes = marker === undefined ? 'false' : `t.includes(${JSON.stringify(marker)})`
+    try {
+      const evaluated = await session.connection.send<EvaluateResult>(
+        'Runtime.evaluate',
+        {
+          expression: `(() => { const el = document.body; const t = el && el.innerText !== undefined ? el.innerText : '';`
+            + ` return { length: t.length, textPresent: ${includes} }; })()`,
+          returnByValue: true,
+        },
+        { signal, timeoutMs: Math.min(this.config.commandTimeoutMs, remainingMs) },
+      )
+      const value = evaluated.result?.value
+      if (value === null || typeof value !== 'object') return undefined
+      const record = value as Record<string, unknown>
+      const length = record['length']
+      if (typeof length !== 'number' || !Number.isFinite(length)) return undefined
+      return { length, textPresent: record['textPresent'] === true }
+    } catch (error) {
+      // 期限到点/命令超时按「读不到」处理；取消必须原样传播，不能吞掉 abort。
+      if (signal?.aborted === true) throw signal.reason ?? error
+      return undefined
     }
   }
 
