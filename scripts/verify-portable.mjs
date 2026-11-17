@@ -318,8 +318,7 @@ if (existsSync(profileDir)) {
   // 出厂默认开启的实验性 bundle（与两个打包脚本的 FACTORY_EXPERIMENTAL_BUNDLES 保持一致）。
   // 只断言登记进 bundles —— 包体由运行时 resources/dsh 供给，不在 profile node_modules 里。
   const FACTORY_EXPERIMENTAL_BUNDLES = [
-    '@deepseek-ai/dsh-experimental-agent-team-profile',
-    '@deepseek-ai/dsh-experimental-auto-review',
+      '@deepseek-ai/dsh-experimental-auto-review',
     '@deepseek-ai/dsh-experimental-tool-worktree',
     '@deepseek-ai/dsh-experimental-terminal-bundle',
     '@deepseek-ai/dsh-experimental-session-search',

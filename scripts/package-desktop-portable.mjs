@@ -103,10 +103,12 @@ const DESKTOP_PROFILE_BUNDLES = ['@deepseek-ai/dsh-base', '@deepseek-ai/dsh-web-
  * 保持一致）。形状与 UI 开关 setBundleEnabled 落盘的一致：只追加进 dsh.profile.bundles，
  * 不写 dependencies —— 这些包由随包运行时 app/resources/dsh/node_modules 供给
  * （与 dsh-base / dsh-web-app 同一解析路径）。追加在 vendored 插件之后，与 UI
- * selectBundle 的追加位置一致；这 5 个都不注入侧边栏，不触碰 better-sidebar 的防双挂载守卫。
+ * selectBundle 的追加位置一致；这几个都不注入侧边栏，不触碰 better-sidebar 的防双挂载守卫。
+ * ⚠️ 2026-11-17 起 `@deepseek-ai/dsh-experimental-agent-team-profile` 已被上游退役
+ * （dsh 0.2.2-rc.3 的 commit a57e5e0d「remove retired package residue」，Team 能力改由
+ * `dsh-agent-team` 系列承载），出厂清单同步去掉它；留着会让 verify:portable 判失败。
  */
 const FACTORY_EXPERIMENTAL_BUNDLES = [
-  '@deepseek-ai/dsh-experimental-agent-team-profile',
   '@deepseek-ai/dsh-experimental-auto-review',
   '@deepseek-ai/dsh-experimental-tool-worktree',
   '@deepseek-ai/dsh-experimental-terminal-bundle',

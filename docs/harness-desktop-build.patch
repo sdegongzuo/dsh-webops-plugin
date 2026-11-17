@@ -1,5 +1,5 @@
 diff --git a/apps/desktop/README.md b/apps/desktop/README.md
-index fe24b24568..ab088e766c 100644
+index 3ef2f63f2dc..ae6f76ee08d 100644
 --- a/apps/desktop/README.md
 +++ b/apps/desktop/README.md
 @@ -6,6 +6,8 @@ description: "Desktop runs the Harness workspace in a native application. This r
@@ -12,7 +12,7 @@ index fe24b24568..ab088e766c 100644
  
  Desktop runs the Harness workspace in a native application. This reference covers application behavior, development and integration; the packaging, Windows signing and publication guides own build and release operations.
 diff --git a/apps/desktop/README.zh.md b/apps/desktop/README.zh.md
-index 933e329ce1..915771d415 100644
+index 26b8e34ba3b..7721285be63 100644
 --- a/apps/desktop/README.zh.md
 +++ b/apps/desktop/README.zh.md
 @@ -6,6 +6,8 @@ description: "Desktop 在原生应用中运行 Harness 工作区。本参考文
@@ -25,10 +25,10 @@ index 933e329ce1..915771d415 100644
  
  Desktop 在原生应用中运行 Harness 工作区。本参考文档说明应用行为、开发与集成；打包、Windows 签名和发布指南分别维护构建与发布操作。
 diff --git a/apps/desktop/scripts/electron-builder-config.mjs b/apps/desktop/scripts/electron-builder-config.mjs
-index cf0c19e895..2cbeb41007 100644
+index d5522e3da9d..e8695701cea 100644
 --- a/apps/desktop/scripts/electron-builder-config.mjs
 +++ b/apps/desktop/scripts/electron-builder-config.mjs
-@@ -150,13 +150,17 @@ export function createElectronBuilderConfig(
+@@ -152,13 +152,17 @@ export function createElectronBuilderConfig(
        'package.json',
        '!node_modules/**/*.{js,cjs,mjs,ts,cts,mts,css}.map',
        '!node_modules/**/*.tsbuildinfo',
@@ -50,7 +50,7 @@ index cf0c19e895..2cbeb41007 100644
        // Windows tray bitmaps; macOS keeps the Dock and ships no menu bar icon.
        ...(packagesWindows ? [{ from: fileURLToPath(new URL('../resources/tray-windows.ico', import.meta.url)), to: 'tray.ico' }] : []),
 diff --git a/apps/desktop/scripts/prepare-dsh.ts b/apps/desktop/scripts/prepare-dsh.ts
-index a069888036..5c51b82cad 100644
+index a069888036a..5c51b82cad2 100644
 --- a/apps/desktop/scripts/prepare-dsh.ts
 +++ b/apps/desktop/scripts/prepare-dsh.ts
 @@ -6,7 +6,7 @@ import { spawn } from 'node:child_process'
@@ -184,7 +184,7 @@ index a069888036..5c51b82cad 100644
      const targetName = resolveDesktopBuildTarget()
      const target = desktopTargetPlatform(targetName)
 diff --git a/apps/desktop/scripts/smoke-packaged-runtime.ts b/apps/desktop/scripts/smoke-packaged-runtime.ts
-index 6c3c12c857..dbdb6097ae 100644
+index 6c3c12c8572..dbdb6097ae7 100644
 --- a/apps/desktop/scripts/smoke-packaged-runtime.ts
 +++ b/apps/desktop/scripts/smoke-packaged-runtime.ts
 @@ -1,4 +1,5 @@
@@ -217,7 +217,7 @@ index 6c3c12c857..dbdb6097ae 100644
 +await smokePreparedRuntime(external ? externalRuntime : join(resources, 'app.asar', 'dsh'), executable,
 +  join(resources, 'runtime'), descriptor)
 diff --git a/apps/desktop/scripts/windows-asar-unpack.mjs b/apps/desktop/scripts/windows-asar-unpack.mjs
-index d406c27235..36bb70f4fb 100644
+index d406c272358..36bb70f4fbb 100644
 --- a/apps/desktop/scripts/windows-asar-unpack.mjs
 +++ b/apps/desktop/scripts/windows-asar-unpack.mjs
 @@ -26,6 +26,14 @@ export async function prepareWindowsAsarUnpack(context, sourceRoot) {
@@ -236,20 +236,28 @@ index d406c27235..36bb70f4fb 100644
    if (!inside(appDir, sourceRoot)) {
      // Builder's source matcher slices the appDir prefix even for external FileSets.
 diff --git a/apps/desktop/src/main.ts b/apps/desktop/src/main.ts
-index d8d0e30c4c..854926e40b 100644
+index 8f9cd823a54..7d2473ddb21 100644
 --- a/apps/desktop/src/main.ts
 +++ b/apps/desktop/src/main.ts
-@@ -3,7 +3,9 @@ import type { ProductEventMap, ProductEvent } from '@deepseek-ai/dsh-client-prod
+@@ -7,7 +7,9 @@ import { DesktopUpdateSettings } from './update-settings.ts'
+ import { isDesktopUpdateChannel } from './settings-file.ts'
+ import type { ProductEventMap, ProductEvent } from '@deepseek-ai/dsh-client-product-analytics/types'
  import { WINDOWS_TITLEBAR_HEIGHT } from './windows-layout.ts'
- /** Electron shell: desktop project ownership, custom protocol, windows, and lifecycle. */
- 
 +import { existsSync } from 'node:fs'
  import { access, readFile, writeFile } from 'node:fs/promises'
 +import { createRequire } from 'node:module'
  import { join } from 'node:path'
  import { fileURLToPath } from 'node:url'
  import {
-@@ -23,7 +25,8 @@ import {
+@@ -17,6 +19,7 @@ import {
+   dialog,
+   ipcMain,
+   Menu,
++  net,
+   powerMonitor,
+   nativeImage,
+   nativeTheme,
+@@ -26,7 +29,8 @@ import {
    type IpcMainInvokeEvent,
    type MenuItemConstructorOptions,
  } from 'electron'
@@ -259,16 +267,16 @@ index d8d0e30c4c..854926e40b 100644
  import { DesktopProjectManager } from './project-manager.ts'
  import { DesktopHostFatalError, DesktopHostProcess, DesktopHostUncleanExitError } from './host-process.ts'
  import { DesktopPlatformView, PLATFORM_IPC, platformBounds } from './platform-view.ts'
-@@ -39,7 +42,7 @@ import { desktopUpdateChannel } from './update-channel.ts'
+@@ -43,7 +47,7 @@ import { desktopUpdateChannel } from './update-channel.ts'
  import { DesktopUpdateCoordinator } from './update-coordinator.ts'
  import { prepareDesktopUpdateWindow } from './update-window.ts'
  import { DesktopCommandManager } from './command-management.ts'
--import { serveWebDocument, authenticateWebHost, forwardWebRequest } from './web-document.ts'
-+import { serveWebDocument, authenticateLoopbackHost, exchangeProbe, jarProbe, forwardWebRequest } from './web-document.ts'
+-import { serveWebDocument, authenticateWebHost, forwardWebRequest, removeLegacyHostCookies } from './web-document.ts'
++import { serveWebDocument, authenticateLoopbackHost, exchangeProbe, jarProbe, forwardWebRequest, removeLegacyHostCookies } from './web-document.ts'
  import { DesktopFatalRecovery } from './fatal-recovery.ts'
  import { pruneCrashReports, RendererConsoleTail, writeCrashReport, type CrashReportSource } from './crash-report.ts'
  import { OperationJournal } from './operation-journal.ts'
-@@ -68,6 +71,77 @@ import { DesktopQuitConfirmation } from './quit-confirmation.ts'
+@@ -72,6 +76,77 @@ import { DesktopQuitConfirmation } from './quit-confirmation.ts'
  import { DesktopTray } from './tray.ts'
  import { DesktopBackgroundNotice } from './background-notice.ts'
  
@@ -346,7 +354,7 @@ index d8d0e30c4c..854926e40b 100644
  let focusPrimaryWindow = (): void => {}
  let stopForRecovery = async (): Promise<void> => { await stopOperationReports() }
  let shuttingDown = false
-@@ -88,7 +162,7 @@ const rendererConsole = new RendererConsoleTail()
+@@ -92,7 +167,7 @@ const rendererConsole = new RendererConsoleTail()
  
  // Platform-conventional logs directory (macOS ~/Library/Logs/<name>, otherwise under userData);
  // set before ready so the first fatal report already resolves under it.
@@ -355,7 +363,7 @@ index d8d0e30c4c..854926e40b 100644
  
  function currentDesktopLocale(): ReturnType<typeof resolveDesktopLocale> {
    return resolveDesktopLocale(windowsLanguage ?? app.getLocale())
-@@ -208,8 +282,17 @@ function runtimeResources(): RuntimeResources {
+@@ -212,8 +287,17 @@ function runtimeResources(): RuntimeResources {
    const pnpm = (development ? process.env.DSH_DESKTOP_PNPM_ENTRY : undefined)
      ?? (development ? join(app.getAppPath(), 'node_modules', 'pnpm', 'bin', 'pnpm.mjs')
        : join(process.resourcesPath, 'runtime', 'primary-runtime', 'dependencies', 'pnpm', 'bin', 'pnpm.mjs'))
@@ -374,7 +382,7 @@ index d8d0e30c4c..854926e40b 100644
    return { node, nodeBin, pnpm, dsh }
  }
  
-@@ -293,6 +376,15 @@ function createWindow(preload: string, show = false, primary = false): BrowserWi
+@@ -299,6 +383,15 @@ function createWindow(preload: string, show = false, primary = false): BrowserWi
      if (['http:', 'https:'].includes(new URL(url).protocol)) void shell.openExternal(url)
      return { action: 'deny' }
    })
@@ -390,7 +398,7 @@ index d8d0e30c4c..854926e40b 100644
    if (process.platform === 'darwin' || process.platform === 'win32') {
      // Fullscreen hides native window controls; overlays drop their caption clearance.
      const sendFullscreen = (): void => {
-@@ -366,6 +458,11 @@ function createWindow(preload: string, show = false, primary = false): BrowserWi
+@@ -379,6 +472,11 @@ function createWindow(preload: string, show = false, primary = false): BrowserWi
  }
  
  async function main(): Promise<void> {
@@ -399,10 +407,10 @@ index d8d0e30c4c..854926e40b 100644
 +  // 0.2.1-alpha.2 时代用 `{ allowTestAuthPopupWindow: true }` 兜底，是为了保住「手动检查
 +  // 更新时询问登录」；现在这条兜底会直接推翻上游契约，而便携版本就没有飞书登录入口，
 +  // 于是退回上游默认（false）：「启动不弹」仍由下面删掉 queuePolicyAuthentication 的那处保证。
-   const desktopSettings = readDesktopSettings(app.getPath('userData'))
+   const desktopSettings = await readDesktopSettings(app.getPath('userData'))
    void pruneCrashReports(app.getPath('logs'))
    const journalDirectory = process.env.DSH_DESKTOP_UPDATE_JOURNAL_DIR
-@@ -382,9 +479,9 @@ async function main(): Promise<void> {
+@@ -395,9 +493,9 @@ async function main(): Promise<void> {
    const loginShellRead = new AbortController()
    // The probe runs in its own process group, which outlives Desktop unless the read is aborted.
    app.on('will-quit', () => { loginShellRead.abort() })
@@ -414,39 +422,47 @@ index d8d0e30c4c..854926e40b 100644
      for (const failure of result.failures) console.warn(`desktop login shell: ${failure.shell} failed (${failure.reason})`)
      return result.environment
    })
-@@ -529,11 +626,28 @@ async function main(): Promise<void> {
+@@ -545,14 +643,34 @@ async function main(): Promise<void> {
      return {
        start: async () => {
          const ready = await host.start()
--        hostCookie = await authenticateWebHost(ready.url)
+-        const cookie = await authenticateWebHost(ready.url)
+-        hostCookie = cookie
 -        hostUrl = ready.url
+-        void removeLegacyHostCookies(session.defaultSession.cookies, ready.url)
 +        // 回环兜底：连不上就换另一个回环名再试（企业策略常常只放通其中一个）。
 +        // ⚠️ 判定必须**跨栈**：这个名字既喂给文档转发（Node `fetch`），也通过
 +        // `streamBaseUrl` 喂给渲染进程自己的 WebSocket（Chromium 网络栈，读系统代理与
 +        // 终端策略）。只按 Node 那条选过，就会出现「文档能打开、事件流永远重连」——
 +        // 2026-09-28 实测的现场。所以两条栈都点头的名字才算数，见 web-document.ts 的
 +        // WebHostProbe。
++        // 第二栈只能用 `jarProbe`：Chromium 的 `redirect: 'manual'` 回的是 opaque-redirect
++        // （status 0、headers 不可读），拿不到 303 与 `set-cookie`，交换式探针在那条栈上必然假失败。
++        // 代价是这次探测会把 cookie 写进 defaultSession —— 上游 0.2.2-rc.x 修过一起生产事故：
++        // 每次启动留一个 30 天的 `dsh-auth-*` cookie（cookie 不分端口），约 70 次启动后 Cookie 头
++        // 超 16 KiB、Host 回 431、启动直接失败。所以**探测完立刻清掉**（见下面的 removeLegacyHostCookies），
++        // 认证结论与 cookie 都走显式传值，不依赖 jar 长期留存。
 +        const authenticated = await authenticateLoopbackHost(ready.url, [
-+          jarProbe('net.fetch', (input, init) => net.fetch(input, init),
-+            async (url: string) => (await session.defaultSession.cookies.get({ url })).map(cookie => `${cookie.name}=${cookie.value}`).join('; ')),
 +          exchangeProbe(),
++          jarProbe('net.fetch', (input: string, init?: RequestInit) => net.fetch(input, init),
++            async (url: string) => (await session.defaultSession.cookies.get({ url })).map(cookie => `${cookie.name}=${cookie.value}`).join('; ')),
 +        ])
 +        hostCookie = authenticated.cookie
 +        hostUrl = authenticated.url
++        // 兼作清理：清旧版遗留的 `dsh-auth-*`，也把上面探测刚写进 jar 的那一个删掉。
++        void removeLegacyHostCookies(session.defaultSession.cookies, authenticated.url)
+           .catch((error: unknown) => { console.error('desktop: legacy Host cookie cleanup failed', error) })
          if (ready.injections === undefined) throw new Error('Desktop Host did not provide boot injections')
          injections = ready.injections
--        welcomeBackend = await connectDesktopWelcome(ready.url, (input, init) => net.fetch(input, init), async () => (await session.defaultSession.cookies.get({ url: ready.url })).map(cookie => `${cookie.name}=${cookie.value}`).join('; '))
-+        // ⚠️ 欢迎页**不能**沿用上面那个结论：它走的是另一条传输栈（Electron `net.fetch`，
-+        // 读系统代理与终端策略），而上面是 Node 的全局 `fetch`。两条栈对「哪个回环名字通」
-+        // 的判断可以不同，所以把原始 URL 交给它、由它按自己的栈重解析一遍
-+        // （见 welcome-backend.ts 的 authenticateReachableHost）。
-+        welcomeBackend = await connectDesktopWelcome(ready.url,
-+          (input, init) => net.fetch(input, init),
-+          async (url: string) => (await session.defaultSession.cookies.get({ url })).map(cookie => `${cookie.name}=${cookie.value}`).join('; '))
+-        welcomeBackend = connectDesktopWelcome(ready.url, cookie)
++        // 欢迎页沿用主窗口选出的名字与 cookie：名字已经过**两条栈**验证，它自己的 `net.fetch`
++        // 必然落在能通的回环名上；cookie 走显式请求头（上游 0.2.2-rc.x 起不再用 jar）。
++        welcomeBackend = connectDesktopWelcome(authenticated.url, authenticated.cookie,
++          (input: string, init?: RequestInit) => net.fetch(input, init))
          analyticsEnabled = await welcomeBackend.analyticsEnabled().catch(() => false)
          if (!reportedLaunch) { reportedLaunch = true; void track('desktop_app_launch', {}) }
          stopAccount?.()
-@@ -808,7 +922,13 @@ async function main(): Promise<void> {
+@@ -843,7 +961,13 @@ async function main(): Promise<void> {
      return browserGuests.release(event.sender, lease)
    })
  
@@ -461,7 +477,7 @@ index d8d0e30c4c..854926e40b 100644
      if (hostUrl === undefined || hostCookie === undefined || details.webContentsId !== mainWindow?.webContents.id) {
        callback({})
        return
-@@ -1093,7 +1213,7 @@ async function main(): Promise<void> {
+@@ -1244,7 +1368,7 @@ async function main(): Promise<void> {
    if (process.platform === 'win32') {
      // The tray is the way back to a hidden window; without it, relaunching the application still focuses it.
      try {
@@ -470,7 +486,7 @@ index d8d0e30c4c..854926e40b 100644
          open: () => { focusPrimaryWindow() }, quit: () => { app.quit() } })
      } catch (error) { console.warn('desktop tray: unavailable', error) }
    }
-@@ -1332,7 +1452,7 @@ async function main(): Promise<void> {
+@@ -1485,7 +1609,7 @@ async function main(): Promise<void> {
      window.focus()
    }
  
@@ -479,8 +495,8 @@ index d8d0e30c4c..854926e40b 100644
    app.on('open-url', (event, url) => {
      event.preventDefault()
      if (url === 'dsh://open' || url === 'dsh://open/') focusPrimaryWindow()
-@@ -1430,9 +1550,8 @@ async function main(): Promise<void> {
-       refresh: async () => { await Promise.all([checkPolicyManually(), updateSchedule.check(true)]) },
+@@ -1586,9 +1710,8 @@ async function main(): Promise<void> {
+       },
        download: downloadUpdate, install: version => updates.install(version),
      })
 -    void mandatoryPolicy.check('launch').then((state) => {
@@ -491,7 +507,7 @@ index d8d0e30c4c..854926e40b 100644
    }
    automaticCheck()
    await reconcileBackend().catch(() => undefined)
-@@ -1445,19 +1564,31 @@ async function main(): Promise<void> {
+@@ -1601,19 +1724,31 @@ async function main(): Promise<void> {
    publishUpdate(updateState)
  }
  
@@ -539,7 +555,7 @@ index d8d0e30c4c..854926e40b 100644
 +  })
 +}
 diff --git a/apps/desktop/src/paths.ts b/apps/desktop/src/paths.ts
-index cf03e38c36..21e83ab9ea 100644
+index cf03e38c365..21e83ab9ea4 100644
 --- a/apps/desktop/src/paths.ts
 +++ b/apps/desktop/src/paths.ts
 @@ -1,6 +1,7 @@
@@ -589,7 +605,7 @@ index cf03e38c36..21e83ab9ea 100644
 +}
 diff --git a/apps/desktop/src/portable-data.ts b/apps/desktop/src/portable-data.ts
 new file mode 100644
-index 0000000000..e768e62373
+index 00000000000..e768e623735
 --- /dev/null
 +++ b/apps/desktop/src/portable-data.ts
 @@ -0,0 +1,55 @@
@@ -649,7 +665,7 @@ index 0000000000..e768e62373
 +  return home
 +}
 diff --git a/apps/desktop/src/tray.ts b/apps/desktop/src/tray.ts
-index b2ce416bbc..1f6bb1480e 100644
+index b2ce416bbcd..1f6bb1480e9 100644
 --- a/apps/desktop/src/tray.ts
 +++ b/apps/desktop/src/tray.ts
 @@ -7,6 +7,8 @@ import type { DesktopLocale } from './locale.ts'
@@ -673,10 +689,10 @@ index b2ce416bbc..1f6bb1480e 100644
        { label: messages.openApplication, click: () => { this.options.open() } },
        { type: 'separator' },
 diff --git a/apps/desktop/src/web-document.ts b/apps/desktop/src/web-document.ts
-index a74ea7c7ef..0a410e8163 100644
+index 15f289e14bc..fe671fcf6d7 100644
 --- a/apps/desktop/src/web-document.ts
 +++ b/apps/desktop/src/web-document.ts
-@@ -35,16 +35,183 @@ export async function serveWebDocument(request: Request, root: string): Promise<
+@@ -35,16 +35,188 @@ export async function serveWebDocument(request: Request, root: string): Promise<
    })
  }
  
@@ -821,11 +837,16 @@ index a74ea7c7ef..0a410e8163 100644
 +}
 +
 +/**
-+ * Probe for a client that keeps cookies in its own jar (Chromium `net.fetch`)。
++ * Probe for Chromium's network stack (`net.fetch`), which keeps cookies in the session jar.
 + *
-+ * 这条栈**不接受 303 就算完**：它跟着跳转走到底（`net.fetch` 的默认行为），cookie 由会话
-+ * cookie jar 持有。所以判据是「最终响应成功」+「jar 里真拿到了非空 cookie」——后者是必须的，
-+ * 因为壳里给渲染进程注入 WS 握手 cookie 用的就是 jar 里那一份；jar 空 = 名字通了也白通。
++ * 这条栈**不接受 303 就算完**：`redirect: 'manual'` 在 Chromium 上回的是 opaque-redirect
++ * （status 0、headers 不可读），既读不到 303 也读不到 `set-cookie` —— 交换式探针在这里必然假失败。
++ * 所以判据是「跟随跳转后的最终响应成功」+「jar 里真拿到了非空 cookie」。
++ *
++ * ⚠️ **调用方必须在探测后清掉这次写进 jar 的 cookie。** 每次启动留一个 30 天的
++ * `dsh-auth-*` cookie（cookie 不分端口），约 70 次启动后 Cookie 头超 16 KiB、Host 回 431、
++ * 启动直接失败 —— 上游 0.2.2-rc.x 修的就是这起事故。壳里认证结论与 cookie 都走显式传值
++ * （见 `main.ts` 的 `removeLegacyHostCookies` 调用），jar 只在本探针的这一刻被写。
 + *
 + * @param label - Stack name reported in failures.
 + * @param send - Transport of that stack (Electron `net.fetch`).
@@ -863,97 +884,9 @@ index a74ea7c7ef..0a410e8163 100644
    const end = cookie.indexOf(';')
    return end < 0 ? cookie : cookie.slice(0, end)
  }
-diff --git a/apps/desktop/src/welcome-backend.ts b/apps/desktop/src/welcome-backend.ts
-index 54ab46d85e..28512376f9 100644
---- a/apps/desktop/src/welcome-backend.ts
-+++ b/apps/desktop/src/welcome-backend.ts
-@@ -3,6 +3,7 @@ import type { ProductEvent } from '@deepseek-ai/dsh-client-product-analytics/typ
- 
- import { randomUUID } from 'node:crypto'
- import { desktopAccountBackend, type DesktopAccountBackend } from './account-backend.ts'
-+import { loopbackCandidates } from './web-document.ts'
- 
- /** Metadata needed before the native entry or workspace becomes visible. */
- export interface WelcomeState {
-@@ -34,21 +35,58 @@ function record(value: unknown): value is Record<string, unknown> {
-   return typeof value === 'object' && value !== null && !Array.isArray(value)
- }
- 
-+/**
-+ * Authenticate against whichever loopback host name this transport stack can actually reach.
-+ *
-+ * 中文备注（本段是本地补丁，非上游原稿）：**回环兜底必须用调用方自己的 `send` 重跑一遍**，
-+ * 不能沿用 shell 主窗口那条线的结论。主窗口转发走 Node 的全局 `fetch`，欢迎页走 Electron 的
-+ * `net.fetch`（Chromium 网络栈，读系统代理与终端策略）—— 两者对「哪个回环名字通」的判断
-+ * 可以不同。只给主窗口做兜底的结果是：在「只放通 `localhost`」的机器上主窗口正常、
-+ * 欢迎页却报 `desktop welcome: Web authentication failed`，因为它还在拿原始名字连。
-+ *
-+ * 握手本身就是一次 HTTP 往返，所以它兼任探测：**只有握手成功才算通** —— 连不上、
-+ * 被 Host 拒绝、被中间设备（企业代理 / 网关）拒绝，一律换下一个候选。不能把「拿到了否定答复」
-+ * 当终局：企业代理会**代替** Host 回 403 / 407 / 错误页（2026-09-28 实测：代理对 `127.0.0.1`
-+ * 回 403、只放通 `localhost`），而「哪个回环名能过代理」正是换名要试的东西。
-+ * 全部失败时错误里带上每个候选各自的原因（主机名 + 状态码 / 传输错误）。
-+ *
-+ * @param hostUrl - URL reported by the owned Host process (token included).
-+ * @param send - Transport used by every later welcome request; the probe must share it.
-+ * @returns The origin that answered, for both RPC and cookie lookups.
-+ */
-+async function authenticateReachableHost(
-+  hostUrl: string,
-+  send: (input: string, init?: RequestInit) => Promise<Response>,
-+): Promise<string> {
-+  const failures: string[] = []
-+  for (const candidate of loopbackCandidates(hostUrl)) {
-+    const host = new URL(candidate).host
-+    try {
-+      const response = await send(candidate, { credentials: 'include' })
-+      await response.body?.cancel()
-+      if (response.ok) return new URL(candidate).origin
-+      // 「拿到了答复」**不等于**「Host 答复了」—— 见上面的说明，仍要换下一个名字。
-+      failures.push(`${host} → HTTP ${String(response.status)}`)
-+    } catch (error: unknown) {
-+      failures.push(`${host} → ${error instanceof Error ? error.message : String(error)}`)
-+    }
-+  }
-+  throw new Error(`desktop welcome: Web authentication failed (${failures.join('; ')})`)
-+}
-+
- /**
-  * Authenticate the native HTTP client through the Web application's launch URL.
-- * @param authenticatedUrl - URL supplied by the running Desktop Host.
-+ * @param hostUrl - URL supplied by the running Desktop Host; its own host name is tried first.
-  * @param send - Electron session fetch, retaining the Web authentication cookie.
-+ * @param cookies - Electron session cookie reader, keyed by the host name that answered.
-  * @returns metadata reads and write-only credential operations over standard RPC.
-  */
- export async function connectDesktopWelcome(
--  authenticatedUrl: string,
-+  hostUrl: string,
-   send: (input: string, init?: RequestInit) => Promise<Response>,
--  cookies: () => Promise<string> = () => Promise.resolve(''),
-+  cookies: (url: string) => Promise<string> = () => Promise.resolve(''),
- ): Promise<DesktopWelcomeBackend> {
--  const origin = new URL(authenticatedUrl).origin
--  const authenticated = await send(authenticatedUrl, { credentials: 'include' })
--  await authenticated.body?.cancel()
--  if (!authenticated.ok) throw new Error('desktop welcome: Web authentication failed')
-+  const origin = await authenticateReachableHost(hostUrl, send)
-   const invoke = async (
-     request: { namespace: string; method: string; args: Record<string, unknown> },
-     signal?: AbortSignal,
-@@ -68,7 +106,8 @@ export async function connectDesktopWelcome(
-     }
-     return envelope.result.value
-   }
--  const account = desktopAccountBackend(origin, invoke, cookies)
-+  // Cookie lookups follow the host name that answered, not the one the Host announced.
-+  const account = desktopAccountBackend(origin, invoke, () => cookies(origin))
-   const settingsAndReference = async () => {
-     const settings = await invoke({ namespace: 'settings', method: 'describe', args: {} })
-     if (!record(settings) || !Array.isArray(settings.namespaces)) throw new Error('desktop welcome: missing settings namespaces')
 diff --git a/apps/desktop/tests/instance-name.spec.ts b/apps/desktop/tests/instance-name.spec.ts
 new file mode 100644
-index 0000000000..76f0f34808
+index 00000000000..76f0f348082
 --- /dev/null
 +++ b/apps/desktop/tests/instance-name.spec.ts
 @@ -0,0 +1,35 @@
@@ -993,14 +926,15 @@ index 0000000000..76f0f34808
 +  })
 +})
 diff --git a/apps/desktop/tests/main-startup.spec.ts b/apps/desktop/tests/main-startup.spec.ts
-index 3b1e63e00c..4e9ab1d199 100644
+index 17e16cec09c..514bf15623d 100644
 --- a/apps/desktop/tests/main-startup.spec.ts
 +++ b/apps/desktop/tests/main-startup.spec.ts
-@@ -22,7 +22,16 @@ type InvokeHandler = (event: InvokeEvent, ...args: unknown[]) => unknown
+@@ -22,8 +22,15 @@ type InvokeHandler = (event: InvokeEvent, ...args: unknown[]) => unknown
  const fileDrag = vi.hoisted(() => ({ dispose: vi.fn<() => Promise<void>>(), install: vi.fn() }))
  vi.mock('../src/file-drag.ts', () => ({ installDesktopFileDrag: () => { fileDrag.install(); return fileDrag.dispose } }))
  
--vi.mock('../src/web-document.ts', () => ({ authenticateWebHost: async () => 'test-cookie', serveWebDocument: vi.fn(), forwardWebRequest: vi.fn() }))
+-vi.mock('../src/web-document.ts', () => ({
+-  authenticateWebHost: async () => 'test-cookie', serveWebDocument: vi.fn(), forwardWebRequest: vi.fn(),
 +vi.mock('../src/web-document.ts', async importOriginal => ({
 +  ...await importOriginal<typeof import('../src/web-document.ts')>(),
 +  // Loopback fallback returns the host name together with its cookie; the shell
@@ -1010,11 +944,10 @@ index 3b1e63e00c..4e9ab1d199 100644
 +  authenticateLoopbackHost: async (url: string) => ({ url, cookie: 'test-cookie' }),
 +  serveWebDocument: vi.fn(),
 +  forwardWebRequest: vi.fn(),
-+}))
+   removeLegacyHostCookies: harness.removeLegacyHostCookies,
+ }))
  vi.mock('../src/operation-report-job.ts', () => ({ runOperationReportJob: vi.fn(async () => ({ appended: false, timedOut: false, cancelled: false })) }))
- // Report persistence has its own unit tests; here it resolves within microtasks so the fatal
- // dialog never outlives the test that triggered it.
-@@ -46,6 +55,8 @@ const harness = await vi.hoisted(async () => {
+@@ -49,6 +56,8 @@ const harness = await vi.hoisted(async () => {
    const hosts: FakeHost[] = []
    const handlers = new Map<string, InvokeHandler>()
    let pluginsEnabled = false
@@ -1023,7 +956,7 @@ index 3b1e63e00c..4e9ab1d199 100644
    let prepareUpdate: (() => Promise<boolean>) | undefined
    let publishUpdate: ((state: DesktopUpdateState) => DesktopUpdateState) | undefined
    let preparing = deferred()
-@@ -257,6 +268,8 @@ const harness = await vi.hoisted(async () => {
+@@ -267,6 +276,8 @@ const harness = await vi.hoisted(async () => {
      deferPlatformClose() { platformCloseDeferred = deferred(); return platformCloseDeferred },
      get pluginsEnabled() { return pluginsEnabled },
      set pluginsEnabled(value: boolean) { pluginsEnabled = value },
@@ -1032,7 +965,7 @@ index 3b1e63e00c..4e9ab1d199 100644
      set closeWindowsOnQuit(value: boolean) { closeWindowsOnQuit = value },
      reset() {
        accountListener = undefined
-@@ -269,6 +282,7 @@ const harness = await vi.hoisted(async () => {
+@@ -279,6 +290,7 @@ const harness = await vi.hoisted(async () => {
        app.isPackaged = true
        windowFailure = undefined
        pluginsEnabled = false
@@ -1040,7 +973,17 @@ index 3b1e63e00c..4e9ab1d199 100644
        closeWindowsOnQuit = false
        prepareUpdate = undefined
        publishUpdate = undefined
-@@ -344,7 +358,8 @@ vi.mock('../src/login-shell-environment.ts', async importOriginal => ({
+@@ -332,6 +344,9 @@ vi.mock('electron', () => ({
+   } },
+   protocol: { registerSchemesAsPrivileged: vi.fn(), handle: harness.protocolHandle },
+   powerMonitor: harness.powerMonitor,
++  // 回环兜底的第二栈探针要构造 `net.fetch` 闭包；上游 0.2.2-rc.x 不再用它后删掉了这个导出，
++  // 但便携补丁仍要在 Chromium 栈上验一次可达性。
++  net: { fetch: vi.fn() },
+   Tray: harness.FakeTray,
+   nativeImage: { createFromPath: (path: string) => ({ path }) },
+ }))
+@@ -354,7 +369,8 @@ vi.mock('../src/login-shell-environment.ts', async importOriginal => ({
    readDesktopLoginShellEnvironment: harness.loginShell,
  }))
  vi.mock('../src/runtime-tree.ts', () => ({ readDesktopRuntime: () => ({ release: { version: '1.0.0' } }) }))
@@ -1050,7 +993,7 @@ index 3b1e63e00c..4e9ab1d199 100644
  vi.mock('../src/project-manager.ts', () => ({
    DesktopProjectManager: class {
      readonly applyRelease = harness.applyRelease
-@@ -724,48 +739,23 @@ describe('desktop main startup', () => {
+@@ -982,48 +998,23 @@ describe('desktop main startup', () => {
      expect(host.stop).not.toHaveBeenCalled()
    })
  
@@ -1112,7 +1055,7 @@ index 3b1e63e00c..4e9ab1d199 100644
    })
  
    it.each(['returned', 'cancelled', 'failed'] as const)('requires explicit test login and handles %s without downloading', async (outcome) => {
-@@ -777,7 +767,7 @@ describe('desktop main startup', () => {
+@@ -1035,7 +1026,7 @@ describe('desktop main startup', () => {
      await readyForUpdate()
      await vi.advanceTimersByTimeAsync(0)
      expect(testAuth.login).not.toHaveBeenCalled()
@@ -1121,8 +1064,8 @@ index 3b1e63e00c..4e9ab1d199 100644
      harness.dialog.showMessageBox.mockClear()
      testAuth.login.mockImplementationOnce(async () => {
        request.mockImplementation(async () => Response.json({ code: 0, data: { biz_code: 0, biz_data: null } }))
-@@ -912,6 +902,27 @@ describe('desktop main startup', () => {
-     expect(harness.hosts).toHaveLength(0)
+@@ -1235,6 +1226,27 @@ describe('desktop main startup', () => {
+     expect(harness.nativeTheme.themeSource).toBe('dark')
    })
  
 +  it('suffixes the window title with the portable instance name so several windows stay distinguishable', async () => {
@@ -1149,10 +1092,16 @@ index 3b1e63e00c..4e9ab1d199 100644
    it('serves packaged shell documents instead of rejecting the shell origin', async () => {
      const { serveWebDocument } = await import('../src/web-document.ts')
      vi.mocked(serveWebDocument).mockResolvedValue(new Response('shell document'))
-@@ -1134,6 +1145,11 @@ describe('desktop main startup', () => {
+@@ -1468,8 +1480,16 @@ describe('desktop main startup', () => {
      harness.hosts[0]!.url = `${protocol}//127.0.0.1:3080/?token=test`
      harness.hosts[0]!.ready.resolve()
      await Promise.resolve(invoke(DESKTOP_IPC.boot))
+-    expect(harness.connectWelcome).toHaveBeenCalledWith(`${protocol}//127.0.0.1:3080/?token=test`, 'test-cookie')
++    // 欢迎页拿的是「两条栈都验证过的那个名字 + 显式 cookie」；第三参数是它自己的 `net.fetch`。
++    expect(harness.connectWelcome).toHaveBeenCalledWith(
++      `${protocol}//127.0.0.1:3080/?token=test`, 'test-cookie', expect.any(Function))
++    // 清理走**选中的名字**：探测刚写进 jar 的那个 `dsh-auth-*` 也要一起删掉。
+     expect(harness.removeLegacyHostCookies).toHaveBeenCalledWith(harness.hostCookies, `${protocol}//127.0.0.1:3080/?token=test`)
 +    // 兜底可能把 Host 定在 `localhost`（代理只放通它），过滤名单必须跟得上 ——
 +    // 名单里没有那个名字时，`ws://localhost/...` 一条都匹配不上，cookie 注入不进来，
 +    // 握手被拒，界面照样永远「重新连接中…」。
@@ -1161,7 +1110,7 @@ index 3b1e63e00c..4e9ab1d199 100644
      const handler = harness.socketHeaders.mock.calls[0]![1] as (
        details: { url: string; webContentsId: number; requestHeaders: Record<string, string> },
        callback: (result: unknown) => void,
-@@ -2557,7 +2573,8 @@ describe('desktop main startup', () => {
+@@ -2998,7 +3018,8 @@ describe('desktop main startup', () => {
      expect(harness.applyRelease).toHaveBeenCalledTimes(1)
      expect(harness.hosts[0]).toMatchObject({
        node: process.execPath,
@@ -1173,7 +1122,7 @@ index 3b1e63e00c..4e9ab1d199 100644
      })
 diff --git a/apps/desktop/tests/portable-data.spec.ts b/apps/desktop/tests/portable-data.spec.ts
 new file mode 100644
-index 0000000000..28d562118c
+index 00000000000..28d562118cd
 --- /dev/null
 +++ b/apps/desktop/tests/portable-data.spec.ts
 @@ -0,0 +1,152 @@
@@ -1330,7 +1279,7 @@ index 0000000000..28d562118c
 +  })
 +})
 diff --git a/apps/desktop/tests/tray.spec.ts b/apps/desktop/tests/tray.spec.ts
-index 11c3a48865..e974c17410 100644
+index 11c3a488659..e974c17410a 100644
 --- a/apps/desktop/tests/tray.spec.ts
 +++ b/apps/desktop/tests/tray.spec.ts
 @@ -27,11 +27,11 @@ vi.mock('electron', () => ({
@@ -1363,19 +1312,19 @@ index 11c3a48865..e974c17410 100644
    const f = setup()
    f.native.emit('click')
 diff --git a/apps/desktop/tests/web-document.spec.ts b/apps/desktop/tests/web-document.spec.ts
-index 0fd9b591b1..da9b3ab383 100644
+index 6507712ef67..e3aada9206d 100644
 --- a/apps/desktop/tests/web-document.spec.ts
 +++ b/apps/desktop/tests/web-document.spec.ts
 @@ -2,7 +2,7 @@ import { afterEach, expect, it, vi } from 'vitest'
  import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises'
  import { tmpdir } from 'node:os'
  import { join } from 'node:path'
--import { authenticateWebHost, forwardWebRequest, serveWebDocument } from '../src/web-document.ts'
-+import { authenticateLoopbackHost, authenticateWebHost, exchangeProbe, forwardWebRequest, jarProbe, serveWebDocument } from '../src/web-document.ts'
+-import { authenticateWebHost, forwardWebRequest, removeLegacyHostCookies, serveWebDocument } from '../src/web-document.ts'
++import { authenticateLoopbackHost, authenticateWebHost, exchangeProbe, forwardWebRequest, jarProbe, removeLegacyHostCookies, serveWebDocument } from '../src/web-document.ts'
  
  const roots: string[] = []
  afterEach(async () => {
-@@ -35,6 +35,121 @@ it('requires the Host authentication exchange and retains only its cookie value'
+@@ -35,6 +35,123 @@ it('requires the Host authentication exchange and retains only its cookie value'
    await expect(authenticateWebHost('http://127.0.0.1:1234/')).rejects.toThrow('authentication failed')
  })
  
@@ -1462,7 +1411,9 @@ index 0fd9b591b1..da9b3ab383 100644
 +})
 +
 +it('refuses a name the Chromium stack answered without storing a cookie', async () => {
-+  // 名字通了但 jar 是空的 = 壳没有 cookie 可注入 WS 握手，渲染进程照样连不上。
++  // 名字通了但 jar 里没有 cookie = 这条栈没把 Host 的认证当回事（`set-cookie` 属性不被接受时
++  // Chromium 会直接丢弃）。壳后续所有请求都带显式 cookie，但这条栈一旦不认认证，
++  // 渲染进程自己的事件流仍然会半死不活 —— 所以按「这条栈没通过」处理。
 +  const fetch = vi.fn()
 +  vi.stubGlobal('fetch', fetch)
 +  const chromium = vi.fn(async () => new Response('app', { status: 200 }))
@@ -1497,91 +1448,26 @@ index 0fd9b591b1..da9b3ab383 100644
  it('forwards upload bytes and cancellation with Host credentials while keeping the response streaming', async () => {
    const body = new ReadableStream({ start(controller) { controller.enqueue(new TextEncoder().encode('stream')); controller.close() } })
    const fetch = vi.fn().mockResolvedValue(new Response(body, { headers: { 'content-encoding': 'gzip', 'set-cookie': 'private' } }))
-diff --git a/apps/desktop/tests/welcome-host.spec.ts b/apps/desktop/tests/welcome-host.spec.ts
-index dea2905583..cb70d68123 100644
---- a/apps/desktop/tests/welcome-host.spec.ts
-+++ b/apps/desktop/tests/welcome-host.spec.ts
-@@ -93,7 +93,6 @@ describe('desktop welcome Web operations', () => {
-     await expect(backend.read()).rejects.toThrow('Web RPC failed')
-   })
- 
--
-   it('submits native analytics through authenticated RPC with a bounded request', async () => {
-     const host = transport()
-     const backend = await connectDesktopWelcome(url, host.send)
-@@ -106,8 +105,53 @@ describe('desktop welcome Web operations', () => {
-     expect(JSON.parse(init!.body as string)).toMatchObject({ payload: { args: { event } } })
-   })
- 
--  it('refuses an unauthenticated Web launch', async () => {
-+  it('keeps trying the next name when an intermediary answers on the Host behalf', async () => {
-+    // 代理代替 Host 回 403（`ok === false`）时**不能**当终局 —— 它只说明这个名字没通过。
-+    // 2026-09-28 真机照单：代理对 `127.0.0.1` 回 403、对 `localhost` 放行。
-+    const attempts: string[] = []
-+    const send = vi.fn<Parameters<typeof connectDesktopWelcome>[1]>(async (input) => {
-+      attempts.push(input)
-+      if (input.includes('127.0.0.1')) return new Response('blocked by policy', { status: 403 })
-+      return new Response('index')
-+    })
-+
-+    await expect(connectDesktopWelcome(url, send)).resolves.toBeDefined()
-+    expect(attempts).toEqual([url, 'http://localhost:19387/?token=fixture'])
-+  })
-+
-+  it('reports every host name it tried when none of them authenticates', async () => {
-     const send = vi.fn<Parameters<typeof connectDesktopWelcome>[1]>(async () => new Response(null, { status: 401 }))
--    await expect(connectDesktopWelcome(url, send)).rejects.toThrow('Web authentication failed')
-+    let failure: Error | undefined
-+    try {
-+      await connectDesktopWelcome(url, send)
-+    } catch (error: unknown) {
-+      failure = error as Error
-+    }
-+    expect(failure).toBeInstanceOf(Error)
-+    expect(failure?.message).toContain('Web authentication failed')
-+    expect(failure?.message).toContain('127.0.0.1:19387 → HTTP 401')
-+    expect(failure?.message).toContain('localhost:19387 → HTTP 401')
-+    expect(send).toHaveBeenCalledTimes(2)
-+  })
-+
-+  it('falls back to the next loopback name when this transport stack cannot reach the announced one', async () => {
-+    const rpc: string[] = []
-+    const send = vi.fn<Parameters<typeof connectDesktopWelcome>[1]>(async (input, init) => {
-+      // 「只放通 localhost」的终端策略：被拦的名字在传输层直接失败，而不是回一个错误码。
-+      if (input.includes('127.0.0.1')) throw new TypeError('fetch failed')
-+      if (init?.method !== 'POST') return new Response('index')
-+      rpc.push(input)
-+      const { rpcId } = JSON.parse(init.body as string) as { rpcId: string }
-+      return Response.json({
-+        type: 'server-response', rpcId,
-+        result: { ok: true, value: { namespaces: [{ ns: 'locale', value: { preference: 'zh' } }] } },
-+      })
-+    })
-+
-+    const backend = await connectDesktopWelcome(url, send)
-+
-+    expect(await backend.readLocalePreference()).toBe('zh')
-+    // 探测与后续请求必须落在同一个名字上，否则 RPC 会发给那个连不通的名字。
-+    expect(rpc).toEqual(['http://localhost:19387/api/settings/describe'])
-   })
- })
 diff --git a/apps/desktop/tests/welcome-startup.spec.ts b/apps/desktop/tests/welcome-startup.spec.ts
-index 4ae8743e2e..14b43c07d9 100644
+index 1f9bc8a5cfc..dd1070f835e 100644
 --- a/apps/desktop/tests/welcome-startup.spec.ts
 +++ b/apps/desktop/tests/welcome-startup.spec.ts
-@@ -1,4 +1,10 @@
--vi.mock('../src/web-document.ts', () => ({ authenticateWebHost: async () => 'test-cookie', serveWebDocument: vi.fn(), forwardWebRequest: vi.fn() }))
+@@ -1,5 +1,12 @@
+-vi.mock('../src/web-document.ts', () => ({
+-  authenticateWebHost: async () => 'test-cookie', serveWebDocument: vi.fn(), forwardWebRequest: vi.fn(), removeLegacyHostCookies: async () => {},
 +vi.mock('../src/web-document.ts', async importOriginal => ({
 +  ...await importOriginal<typeof import('../src/web-document.ts')>(),
-+  authenticateWebHost: async () => 'test-cookie',
++  // 回环兜底把选中的名字和 cookie 一起返回，壳后续所有请求都发给这个名字。
++  // 探测工厂（`exchangeProbe` / `jarProbe`）保持真身：它们是纯函数、不需要 Electron，
++  // 而 main.ts 会在调 `authenticateLoopbackHost` **之前**先构造它们。
 +  authenticateLoopbackHost: async (url: string) => ({ url, cookie: 'test-cookie' }),
 +  serveWebDocument: vi.fn(),
 +  forwardWebRequest: vi.fn(),
-+}))
++  removeLegacyHostCookies: async () => {},
+ }))
  /** Welcome startup uses the Host before transitioning to the workspace. */
  
- import { afterEach, expect, it, vi } from 'vitest'
-@@ -102,7 +108,8 @@ vi.mock('electron', () => ({
+@@ -105,7 +112,8 @@ vi.mock('electron', () => ({
  // The Windows tray relabels through Menu as well; keep the menu call counts below platform-neutral.
  vi.mock('../src/tray.ts', () => ({ DesktopTray: class { relabel() {} dispose() {} } }))
  
@@ -1593,7 +1479,7 @@ index 4ae8743e2e..14b43c07d9 100644
    ...await importOriginal<typeof import('../src/login-shell-environment.ts')>(),
 diff --git a/docs/upgrade-guide/v0.2.1-alpha.2/portable-data/guide.i18n.yaml b/docs/upgrade-guide/v0.2.1-alpha.2/portable-data/guide.i18n.yaml
 new file mode 100644
-index 0000000000..cb57abea66
+index 00000000000..cb57abea66b
 --- /dev/null
 +++ b/docs/upgrade-guide/v0.2.1-alpha.2/portable-data/guide.i18n.yaml
 @@ -0,0 +1,19 @@
@@ -1618,7 +1504,7 @@ index 0000000000..cb57abea66
 +  zh: 278c7efc5f04fc84
 diff --git a/docs/upgrade-guide/v0.2.1-alpha.2/portable-data/guide.md b/docs/upgrade-guide/v0.2.1-alpha.2/portable-data/guide.md
 new file mode 100644
-index 0000000000..7752feafab
+index 00000000000..7752feafab6
 --- /dev/null
 +++ b/docs/upgrade-guide/v0.2.1-alpha.2/portable-data/guide.md
 @@ -0,0 +1,20 @@
@@ -1644,7 +1530,7 @@ index 0000000000..7752feafab
 +4. Launch bundles from two different directories, create separate sessions and change configuration in each. Restart and verify that sessions, configuration and `data/electron` remain separate. Launching the same directory again should focus the running window.
 diff --git a/docs/upgrade-guide/v0.2.1-alpha.2/portable-data/guide.zh.md b/docs/upgrade-guide/v0.2.1-alpha.2/portable-data/guide.zh.md
 new file mode 100644
-index 0000000000..03218a6383
+index 00000000000..03218a6383f
 --- /dev/null
 +++ b/docs/upgrade-guide/v0.2.1-alpha.2/portable-data/guide.zh.md
 @@ -0,0 +1,20 @@
@@ -1669,7 +1555,7 @@ index 0000000000..03218a6383
 +3. 如需原共享智能体配置，将所需文件复制到 `home/.agents`。外部工具继续使用原用户配置，无需迁移 npm 或 Python 配置。
 +4. 启动两个不同目录的便携包，分别建立会话和修改配置。重启后核对各自会话、配置与 `data/electron` 均保持独立。同目录再次启动应聚焦已运行的窗口。
 diff --git a/packages/api/workspace-controller/README.i18n.yaml b/packages/api/workspace-controller/README.i18n.yaml
-index e3cb08a719..652890de9b 100644
+index e3cb08a7193..652890de9bf 100644
 --- a/packages/api/workspace-controller/README.i18n.yaml
 +++ b/packages/api/workspace-controller/README.i18n.yaml
 @@ -18,8 +18,8 @@
@@ -1684,7 +1570,7 @@ index e3cb08a719..652890de9b 100644
    en: 4f399d6a27daf683
    zh: 13811489fe636127
 diff --git a/packages/api/workspace-controller/README.md b/packages/api/workspace-controller/README.md
-index 27c26c7d9b..5c9f929d93 100644
+index 27c26c7d9b4..5c9f929d93a 100644
 --- a/packages/api/workspace-controller/README.md
 +++ b/packages/api/workspace-controller/README.md
 @@ -40,6 +40,8 @@ The [Workspace registry](../../workspace/workspace/README.md#first-use-workspace
@@ -1697,7 +1583,7 @@ index 27c26c7d9b..5c9f929d93 100644
  
  Documents lookup holds the registry mutation queue, so other Workspace mutations, including registration of a picked directory, can wait up to `documentsLookupTimeoutMs`. Cancellation can stop the lookup; after resolution succeeds, it does not roll back creation or registration.
 diff --git a/packages/api/workspace-controller/README.zh.md b/packages/api/workspace-controller/README.zh.md
-index 4772d0c9b1..e5a7189faf 100644
+index 4772d0c9b17..e5a7189faf0 100644
 --- a/packages/api/workspace-controller/README.zh.md
 +++ b/packages/api/workspace-controller/README.zh.md
 @@ -40,6 +40,8 @@ Client 入口提供 `ClientWorkspaceModel` 和 `createWorkspaceStateStream()`。
@@ -1710,7 +1596,7 @@ index 4772d0c9b1..e5a7189faf 100644
  
  Documents 查询占用注册表变更队列，因此其他 Workspace 变更（包括登记已选目录）最多可能等待 `documentsLookupTimeoutMs`。取消可以停止查询；解析成功后，取消不会回滚创建或登记。
 diff --git a/packages/api/workspace-controller/src/default-directory.ts b/packages/api/workspace-controller/src/default-directory.ts
-index b15fea8b94..b17e86b6cc 100644
+index b15fea8b94b..b17e86b6cc2 100644
 --- a/packages/api/workspace-controller/src/default-directory.ts
 +++ b/packages/api/workspace-controller/src/default-directory.ts
 @@ -7,6 +7,7 @@ import { DEFAULT_WORKSPACE_DIRECTORY } from './default-workspace.ts'
@@ -1732,7 +1618,7 @@ index b15fea8b94..b17e86b6cc 100644
      const run = internals.run ?? runNativeCommand
      let stdout: string
 diff --git a/packages/api/workspace-controller/tests/default-directory.host.spec.ts b/packages/api/workspace-controller/tests/default-directory.host.spec.ts
-index c382f410ac..e462edd384 100644
+index c382f410acc..e462edd384f 100644
 --- a/packages/api/workspace-controller/tests/default-directory.host.spec.ts
 +++ b/packages/api/workspace-controller/tests/default-directory.host.spec.ts
 @@ -3,6 +3,16 @@ import type { NativeCommandRunner } from '@deepseek-ai/dsh-native-command'
@@ -1753,7 +1639,7 @@ index c382f410ac..e462edd384 100644
      ['darwin', '/Users/a/文档/\n', '/Users/a/文档/deepseek-harness/default-workspace', 'osascript'],
      ['win32', 'D:\\Redirected Documents\r\n', 'D:\\Redirected Documents\\deepseek-harness\\default-workspace', 'powershell.exe'],
 diff --git a/packages/client/ui-permission-presets/src/client/PermissionRow.tsx b/packages/client/ui-permission-presets/src/client/PermissionRow.tsx
-index 2136974522..dee1281d23 100644
+index 21369745220..dee1281d239 100644
 --- a/packages/client/ui-permission-presets/src/client/PermissionRow.tsx
 +++ b/packages/client/ui-permission-presets/src/client/PermissionRow.tsx
 @@ -12,7 +12,7 @@ import {
@@ -1836,7 +1722,7 @@ index 2136974522..dee1281d23 100644
        />
      </>
 diff --git a/packages/client/ui-permission-presets/src/client/locales.ts b/packages/client/ui-permission-presets/src/client/locales.ts
-index 9fe5025f87..841ce17da8 100644
+index 9fe5025f875..841ce17da80 100644
 --- a/packages/client/ui-permission-presets/src/client/locales.ts
 +++ b/packages/client/ui-permission-presets/src/client/locales.ts
 @@ -12,11 +12,16 @@ export const zh = {
@@ -2040,7 +1926,7 @@ index 9fe5025f87..841ce17da8 100644
    'confirm.description': 'O acesso total reduz as etapas de confirmação e permite que o agente execute mais ações diretamente, incluindo operações confidenciais, alterações de arquivos ou comandos externos. Use-o apenas quando confiar na tarefa atual.',
    'confirm.acknowledge': 'Entendo os riscos e quero continuar',
 diff --git a/packages/client/ui-permission-presets/src/client/presentation.ts b/packages/client/ui-permission-presets/src/client/presentation.ts
-index f783c9c027..c13c0dae02 100644
+index f783c9c0278..c13c0dae024 100644
 --- a/packages/client/ui-permission-presets/src/client/presentation.ts
 +++ b/packages/client/ui-permission-presets/src/client/presentation.ts
 @@ -11,17 +11,20 @@ export type PermissionPresetLabelKey =
@@ -2065,7 +1951,7 @@ index f783c9c027..c13c0dae02 100644
  
  /**
 diff --git a/packages/client/ui-permission-presets/src/client/settings-store.ts b/packages/client/ui-permission-presets/src/client/settings-store.ts
-index 12da5f0caf..1675b24259 100644
+index 12da5f0cafa..1675b24259f 100644
 --- a/packages/client/ui-permission-presets/src/client/settings-store.ts
 +++ b/packages/client/ui-permission-presets/src/client/settings-store.ts
 @@ -45,10 +45,16 @@ export function permissionDefaultOf(view: SettingsNamespaceView, catalog: Permis
@@ -2087,7 +1973,7 @@ index 12da5f0caf..1675b24259 100644
    return { currentValue, options }
  }
 diff --git a/packages/client/ui-permission-presets/tests/permission-presets-row.client.spec.tsx b/packages/client/ui-permission-presets/tests/permission-presets-row.client.spec.tsx
-index 869eef7130..30c80f0f60 100644
+index 869eef7130b..30c80f0f605 100644
 --- a/packages/client/ui-permission-presets/tests/permission-presets-row.client.spec.tsx
 +++ b/packages/client/ui-permission-presets/tests/permission-presets-row.client.spec.tsx
 @@ -17,6 +17,12 @@ const usePanelInfo: GlobalStandardProps['usePanelInfo'] = selector => selector({
@@ -2163,7 +2049,7 @@ index 869eef7130..30c80f0f60 100644
      const absent = derivedController({
        settings: {
 diff --git a/packages/client/ui-permission-presets/tests/settings-store.client.spec.ts b/packages/client/ui-permission-presets/tests/settings-store.client.spec.ts
-index 44b8b4a55c..1f3675bc4e 100644
+index 44b8b4a55ca..1f3675bc4e8 100644
 --- a/packages/client/ui-permission-presets/tests/settings-store.client.spec.ts
 +++ b/packages/client/ui-permission-presets/tests/settings-store.client.spec.ts
 @@ -54,7 +54,12 @@ describe('permission settings store', () => {
@@ -2199,7 +2085,7 @@ index 44b8b4a55c..1f3675bc4e 100644
    const store = createSnapshotStore<{ value: typeof catalog | null }>({ value: null })
    const controller = new PermissionPresetSettingsController(mirror, ctx, { store, load: async () => catalog })
 diff --git a/packages/interaction/permission-presets/src/index.ts b/packages/interaction/permission-presets/src/index.ts
-index b071d0297a..1e1757e3a6 100644
+index b071d0297ae..1e1757e3a60 100644
 --- a/packages/interaction/permission-presets/src/index.ts
 +++ b/packages/interaction/permission-presets/src/index.ts
 @@ -160,7 +160,9 @@ export interface Config {
@@ -2265,7 +2151,7 @@ index b071d0297a..1e1757e3a6 100644
        session.append('permission/preset', { preset: name })
        setSandboxMode(session, spec.sandbox)
 diff --git a/packages/interaction/permission-presets/tests/permission-presets.spec.ts b/packages/interaction/permission-presets/tests/permission-presets.spec.ts
-index 6f7b9b361b..e3a5b3cbff 100644
+index 6f7b9b361b9..e3a5b3cbff0 100644
 --- a/packages/interaction/permission-presets/tests/permission-presets.spec.ts
 +++ b/packages/interaction/permission-presets/tests/permission-presets.spec.ts
 @@ -461,12 +461,42 @@ describe('new-session default', () => {
@@ -2315,10 +2201,10 @@ index 6f7b9b361b..e3a5b3cbff 100644
 +  })
  })
 diff --git a/packages/sandbox/sandbox-local/src/index.ts b/packages/sandbox/sandbox-local/src/index.ts
-index acf4b4e738..a4d5e433db 100644
+index af8dae004f3..f8f7f469ce4 100644
 --- a/packages/sandbox/sandbox-local/src/index.ts
 +++ b/packages/sandbox/sandbox-local/src/index.ts
-@@ -148,6 +148,41 @@ interface AclTempCapability {
+@@ -166,6 +166,41 @@ interface AclTempCapability {
    grant: AclWriteGrant
  }
  
@@ -2360,7 +2246,7 @@ index acf4b4e738..a4d5e433db 100644
  /**
   * The runner chain per platform — selection is BY PLATFORM first, probes
   * second: a platform's chain is probed in preference order only when it has
-@@ -569,13 +604,15 @@ export class LocalSandboxProvider extends SandboxProvider {
+@@ -609,13 +644,15 @@ export class LocalSandboxProvider extends SandboxProvider {
     * Pin the source loader and TypeScript paths to this installation, independently
     * of target cwd or environment overrides.
     * The prefix stays `[node, runner, ...]` — a future native-exe runner keeps
@@ -2379,7 +2265,7 @@ index acf4b4e738..a4d5e433db 100644
      const sourceConfig = fileURLToPath(new URL('../../../../tsconfig.base.json', import.meta.url))
      const registration = `import { register } from ${JSON.stringify(import.meta.resolve('tsx/esm/api'))}; register({ tsconfig: ${JSON.stringify(sourceConfig)} });`
 diff --git a/packages/spill/spill-local/README.i18n.yaml b/packages/spill/spill-local/README.i18n.yaml
-index 62cd34b4ae..9c068a87fd 100644
+index 62cd34b4ae5..9c068a87fd6 100644
 --- a/packages/spill/spill-local/README.i18n.yaml
 +++ b/packages/spill/spill-local/README.i18n.yaml
 @@ -3,8 +3,11 @@
@@ -2459,7 +2345,7 @@ index 62cd34b4ae..9c068a87fd 100644
    en: 7cc389241a5b9a4c
    zh: af4b8e65ed565ec6
 diff --git a/packages/spill/spill-local/README.md b/packages/spill/spill-local/README.md
-index 5ebb404f0b..4a58178a5c 100644
+index 5ebb404f0ba..4a58178a5cb 100644
 --- a/packages/spill/spill-local/README.md
 +++ b/packages/spill/spill-local/README.md
 @@ -29,6 +29,8 @@ Mount this backend in a composition that spills text to the local filesystem. It
@@ -2472,7 +2358,7 @@ index 5ebb404f0b..4a58178a5c 100644
  
  ```yaml
 diff --git a/packages/spill/spill-local/README.zh.md b/packages/spill/spill-local/README.zh.md
-index aba434f495..d97799403d 100644
+index aba434f495a..d97799403db 100644
 --- a/packages/spill/spill-local/README.zh.md
 +++ b/packages/spill/spill-local/README.zh.md
 @@ -29,6 +29,8 @@ kind: "package-reference"
@@ -2485,7 +2371,7 @@ index aba434f495..d97799403d 100644
  
  ```yaml
 diff --git a/packages/spill/spill-local/src/index.ts b/packages/spill/spill-local/src/index.ts
-index feb9f32fb3..2b2a5ebcc2 100644
+index feb9f32fb30..2b2a5ebcc2a 100644
 --- a/packages/spill/spill-local/src/index.ts
 +++ b/packages/spill/spill-local/src/index.ts
 @@ -11,13 +11,12 @@
@@ -2513,7 +2399,7 @@ index feb9f32fb3..2b2a5ebcc2 100644
  
    async saveText(input: SaveTextSpill): Promise<SpillRef> {
 diff --git a/packages/spill/spill-local/src/store.ts b/packages/spill/spill-local/src/store.ts
-index ba518cf035..bfa2ee9d9d 100644
+index ba518cf035f..bfa2ee9d9d9 100644
 --- a/packages/spill/spill-local/src/store.ts
 +++ b/packages/spill/spill-local/src/store.ts
 @@ -34,10 +34,15 @@ let defaultRoot: string | undefined
@@ -2534,7 +2420,7 @@ index ba518cf035..bfa2ee9d9d 100644
  /* jscpd:ignore-start */
  /**
 diff --git a/packages/subprocess/subprocess-local/README.i18n.yaml b/packages/subprocess/subprocess-local/README.i18n.yaml
-index 98a5c40de8..dbd6f2b4be 100644
+index b81bef5b961..1e0feafb026 100644
 --- a/packages/subprocess/subprocess-local/README.i18n.yaml
 +++ b/packages/subprocess/subprocess-local/README.i18n.yaml
 @@ -24,8 +24,8 @@
@@ -2549,7 +2435,7 @@ index 98a5c40de8..dbd6f2b4be 100644
    en: 7f14cd108b614c98
    zh: da54e49e2b1896d2
 diff --git a/packages/subprocess/subprocess-local/README.md b/packages/subprocess/subprocess-local/README.md
-index 05a6c3e41c..40f2c79f2d 100644
+index 6ede37c8d1c..ee6caf9c99b 100644
 --- a/packages/subprocess/subprocess-local/README.md
 +++ b/packages/subprocess/subprocess-local/README.md
 @@ -44,6 +44,8 @@ Windows ordinary subprocesses start the private Job runner with `windowsHide` an
@@ -2562,7 +2448,7 @@ index 05a6c3e41c..40f2c79f2d 100644
  
  The `./output` export shares this collector and retained-spill storage with process adapters. `snapshot()` returns the retained raw bytes and total byte count, allowing remote adapters to preserve offsets without forwarding the complete stream.
 diff --git a/packages/subprocess/subprocess-local/README.zh.md b/packages/subprocess/subprocess-local/README.zh.md
-index e8589765c0..042414aeaa 100644
+index 0240ea3c500..248cfa5e126 100644
 --- a/packages/subprocess/subprocess-local/README.zh.md
 +++ b/packages/subprocess/subprocess-local/README.zh.md
 @@ -44,6 +44,8 @@ Windows 普通子进程通过 `windowsHide` 启动私有 Job runner，并为原
@@ -2575,7 +2461,7 @@ index e8589765c0..042414aeaa 100644
  
  `./output` 导出向进程适配器共享该收集器与保留 spill 的存储。`snapshot()` 返回保留的原始字节及总字节数，使远程适配器能够保留偏移量，而无需转发完整的流。
 diff --git a/packages/subprocess/subprocess-local/src/output.ts b/packages/subprocess/subprocess-local/src/output.ts
-index 837d9e1e60..ea1c0c4f17 100644
+index 837d9e1e605..ea1c0c4f178 100644
 --- a/packages/subprocess/subprocess-local/src/output.ts
 +++ b/packages/subprocess/subprocess-local/src/output.ts
 @@ -40,7 +40,7 @@ let defaultSpillDir: string | undefined

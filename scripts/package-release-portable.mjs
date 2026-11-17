@@ -14,7 +14,6 @@ const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 // 的 FACTORY_EXPERIMENTAL_BUNDLES 保持一致；形状与 UI 开关 setBundleEnabled 落盘的一致
 // —— 只追加进 dsh.profile.bundles，不写 dependencies，包体由随包运行时 resources/dsh 供给）。
 const FACTORY_EXPERIMENTAL_BUNDLES = [
-  '@deepseek-ai/dsh-experimental-agent-team-profile',
   '@deepseek-ai/dsh-experimental-auto-review',
   '@deepseek-ai/dsh-experimental-tool-worktree',
   '@deepseek-ai/dsh-experimental-terminal-bundle',
