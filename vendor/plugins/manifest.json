@@ -1,37 +1,35 @@
 {
-  "note": "预置进便携包的第三方插件与运行时依赖。带 sourceCommit 的条目是 GitHub 固定 commit 源码构建（integrity 为本地 npm pack 产物自算 sha512，非 registry dist.integrity，重建会得到不同值，必须整份 tgz 随仓库提交）；其余为 npm 官方 tarball，sha512 与 registry dist.integrity 逐字节一致。提取逻辑见 scripts/materialize-vendored-plugins.mjs；改包必须连校验值一起换。",
+  "note": "预置进便携包的第三方插件与运行时依赖。带 sourceCommit 的条目是 GitHub 固定 commit 源码构建（integrity 为本地 npm pack 产物自算 sha512，非 registry dist.integrity，重建会得到不同值，必须整份 tgz 随仓库提交；当前三条插件均取自 npm 官方 tarball，该规则保留给下次源码构建）；其余为 npm 官方 tarball，sha512 与 registry dist.integrity 逐字节一致。提取逻辑见 scripts/materialize-vendored-plugins.mjs；改包必须连校验值一起换。",
   "plugins": [
     {
       "name": "dsh-context",
-      "version": "0.81.0",
+      "version": "0.85.1",
       "client": true,
-      "tarball": "dsh-context-0.81.0.tgz",
-      "integrity": "sha512-jhZ3sp0nVtIu7ELPe2vbIB1lYCVH/Bl/ykPqdVIsHlAX2Nn/JcqqW/qZXYIoj4XRaMJuc4rtCDdsFj+wAn+Qgg==",
-      "source": "https://registry.npmjs.org/dsh-context/-/dsh-context-0.81.0.tgz",
+      "tarball": "dsh-context-0.85.1.tgz",
+      "integrity": "sha512-M0Ycbx86SQF19HYRe7zlfsvagtkVGInFUDSZ9je8ti1aSQbxwoECKk0xDd5YcbUCgJLZXMWAgEx61tE0tCkSPA==",
+      "source": "https://registry.npmjs.org/dsh-context/-/dsh-context-0.85.1.tgz",
       "repo": "https://github.com/bowenliang123/dsh-context",
       "portableNote": "Context 上下文面板与 /context 命令（透视上下文组成、演进、压缩与剪枝），侧栏一级入口可见",
       "runtimeDependencies": ["zod"]
     },
     {
       "name": "dsh-better-sidebar",
-      "version": "0.28.2",
+      "version": "0.32.1",
       "client": true,
-      "tarball": "dsh-better-sidebar-0.28.2.tgz",
-      "integrity": "sha512-JxtRoCoNA/02VexkInZ1K4+c/1Tvk+DVS01dRfjbGKxWfXGZ6NEyemsdERGOhQ3DsLxOWc4Mj0ol+5s+6V0Egg==",
-      "source": "https://registry.npmjs.org/dsh-better-sidebar/-/dsh-better-sidebar-0.28.2.tgz",
+      "tarball": "dsh-better-sidebar-0.32.1.tgz",
+      "integrity": "sha512-UcIEAkLuZXz0SkNDwMtycCoO59yCasowG6DqhxkG+jAjQfofF0BbXIOctfjqsU8WyaP6XoSvi4LgMFhEfinBsw==",
+      "source": "https://registry.npmjs.org/dsh-better-sidebar/-/dsh-better-sidebar-0.32.1.tgz",
       "repo": "https://github.com/omdsh-dev/DSH-better-sidebar",
       "portableNote": "开放侧边栏底座：文件树/编辑器、文件变动(Git diff)、任务管理、侧边对话；自带 dsh.bundle.patch（单条 insert + 防双挂载守卫），进 bundles 后由 profile boot 自动合并，无需手写 cordis.patch.yml 挂载行",
       "runtimeDependencies": ["ws", "yaml"]
     },
     {
       "name": "dsh-connect-workbuddy",
-      "version": "5.18.0",
+      "version": "5.24.14",
       "client": true,
-      "tarball": "dsh-connect-workbuddy-5.18.0.tgz",
-      "integrity": "sha512-0OYHZFSkhN9+JOGz5Z7NlKKtSlgIjHBvbuKrERISF8ohp5LlARhaAZmY+n3CUxv3xEOlA0f55SDgDzy28NnY3Q==",
-      "source": "https://codeload.github.com/dingminhua/dsh-connect-workbuddy/tar.gz/b783a3ba702a6e9599015c92329c62aeee09bb82",
-      "sourceCommit": "b783a3ba702a6e9599015c92329c62aeee09bb82",
-      "sourceNote": "GitHub main 固定 commit（2026-11-04，含 image 多图数组修复 #216）；pnpm install --frozen-lockfile 后 npm pack 产出，非 npm 发布包（npm latest 当时为 5.17.0）。",
+      "tarball": "dsh-connect-workbuddy-5.24.14.tgz",
+      "integrity": "sha512-jJsZre7frxbR2nLhMmakHQKVXGs64gQmNl4GrkmVloRq3syLjFtBMkH/a5q9G+CTe9Frw35suxL7WuCCAku6sQ==",
+      "source": "https://registry.npmjs.org/dsh-connect-workbuddy/-/dsh-connect-workbuddy-5.24.14.tgz",
       "repo": "https://github.com/dingminhua/dsh-connect-workbuddy",
       "portableNote": "WorkBuddy 模型连接：复用桌面端登录态，含积分/模型管理、生图与视频工具；不改变默认模型。v5.x 的 @deepseek-ai/dsh-* peer 全为范围（>=0.1.7-rc.1 <0.3.0-0），宿主不再需要 compatibility.json 精确版本豁免。隔离运行时（pi-ai 及传递依赖）沿用 workbuddy-runtime.lock.json。",
       "runtimeLock": "workbuddy-runtime.lock.json"
@@ -40,11 +38,11 @@
   "dependencies": [
     {
       "name": "zod",
-      "version": "4.4.3",
-      "tarball": "zod-4.4.3.tgz",
-      "integrity": "sha512-ytENFjIJFl2UwYglde2jchW2Hwm4GJFLDiSXWdTrJQBIN9Fcyp7n4DhxJEiWNAJMV1/BqWfW/kkg71UDcHJyTQ==",
-      "source": "https://registry.npmjs.org/zod/-/zod-4.4.3.tgz",
-      "satisfies": "dsh-context@0.81.0 dependencies.zod 4.4.3（精确版本，不能再上浮；0.81.0 起由 ^4.4.3 收紧）"
+      "version": "4.6.7",
+      "tarball": "zod-4.6.7.tgz",
+      "integrity": "sha512-g8W2D2kU6a8untc053fX1uVBKzM7yqAxW/3zwk83+6RyF2+SKOuV+c0wBDhUwzV1PaGapmZH+rmcUzPf+3CGwg==",
+      "source": "https://registry.npmjs.org/zod/-/zod-4.6.7.tgz",
+      "satisfies": "dsh-context@0.85.1 dependencies.zod ^4.6.6（0.85.1 起由精确 4.4.3 放开成 caret，取满足范围的最新 4.6.7）"
     },
     {
       "name": "ws",
@@ -52,7 +50,7 @@
       "tarball": "ws-8.22.1.tgz",
       "integrity": "sha512-oyL6OPYme/CmiFvNuGzeoxCJ4nOrZE2O1FwM9MWM1AsGri6nLXB2pg+lNA8aLeXMSav0J6eIVS1j6vUPzUtK9g==",
       "source": "https://registry.npmjs.org/ws/-/ws-8.22.1.tgz",
-      "satisfies": "dsh-better-sidebar@0.28.2 dependencies.ws ^8.18.0"
+      "satisfies": "dsh-better-sidebar@0.32.1 dependencies.ws ^8.18.0"
     },
     {
       "name": "yaml",
@@ -60,7 +58,7 @@
       "tarball": "yaml-2.9.1.tgz",
       "integrity": "sha512-3NxN8+78OdzbT7C/WjGsyfPAtJaN3FNDsWxv7Y7mcDsT/oOmgW8BpyQQFFBnvZE3j9Y2Sdz1ULFLezL7Eb2yFw==",
       "source": "https://registry.npmjs.org/yaml/-/yaml-2.9.1.tgz",
-      "satisfies": "dsh-better-sidebar@0.28.2 dependencies.yaml ^2.9.1"
+      "satisfies": "dsh-better-sidebar@0.32.1 dependencies.yaml ^2.9.1"
     }
   ]
 }

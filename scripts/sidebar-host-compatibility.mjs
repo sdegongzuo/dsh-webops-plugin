@@ -9,6 +9,10 @@
  * 0.28.2（2026-11-04 升级）复核：OLD_INJECT / OLD_FENCE / PREVIOUS_* 计数均为 0、
  * `ctx.connection.requestRejection` 消费点 1 处，且 cordis.patch.yml 与 0.28.0 逐字节相同，
  * 故同样不进下方集合、manifest 不启用 hostCompatibility。
+ * 0.32.1（2026-11-18 升级）复核：OLD_INJECT / OLD_FENCE / PREVIOUS_* 计数均为 0、
+ * `const fence = (req) => ctx.connection.requestRejection(req) === void 0;` 消费点 1 处，
+ * cordis.patch.yml 与 0.28.2 逐字节相同（isTrustedApiRequest 辅助函数已在上游删掉，
+ * 与本补丁无关）；peer 只是从 ^0.2.1-rc.1 抬到 ^0.2.2-rc.2，同样不进下方集合。
  */
 import { createHash } from 'node:crypto'
 import { existsSync, readFileSync, writeFileSync } from 'node:fs'
