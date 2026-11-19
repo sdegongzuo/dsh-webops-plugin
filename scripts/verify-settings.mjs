@@ -1,38 +1,34 @@
 /**
- * 验证便携包里预置的出厂模型配置在**真宿主**里真的生效。
+ * 验证便携包里预置的出厂配置在**真宿主**里真的生效。
  *
- * 为什么需要单独验这个：出厂配置是一份「裸 YAML」，它对不对只有 dsh 自己的
- * schemastery 说了算。写错一个字段名（比如把 `baseURL` 写成 `baseUrl`、把 `providers`
- * 写成数组）不会报错到脸上 —— `projectForm()` 只挑 schema 声明过的键，多出来的键
- * **静默丢掉**，整段配置就此作废，用户装完包打开设置页看不到任何 provider。
- * 静态检查拦不住这一类，所以 [2/3] 必须真起宿主。
+ * 出厂配置不再预置任何模型 provider —— 模型接入由用户在「设置 → 模型」里自行添加。
+ * 这里验证两件事：
+ *   1. 出厂 patch 没有偷偷预置模型 provider / 默认模型 / 凭据引用（反向断言）；
+ *   2. 剩下的权限配置在真宿主里过了 schema、确实作用到运行中的条目。
+ *
+ * 为什么权限配置也要单独验：出厂配置是一份「裸 YAML」，它对不对只有 dsh 自己的
+ * schemastery 说了算。写错一个字段名不会报错到脸上 —— `projectForm()` 只挑 schema
+ * 声明过的键，多出来的键**静默丢掉**。尤其 patch 命中一行时 config 是**整块替换**，
+ * 只写 defaultPreset 会把 base 层的 presets 冲成 schema 默认的两项。静态检查拦不住
+ * 这一类，所以 [2/3] 必须真起宿主。
  *
  * ⚠️ 配置的落点（2026-09-24 适配 dsh 0.1.7）：**不是 `home/settings.yaml`**。
- * 0.1.7 起上游把它退役了 —— `packages/settings/settings/src/index.ts` 的
- * `importLegacyDocument()` 只在启动时把 `home/settings.yaml` 一次性导入本 profile，
- * 然后改名成 `settings.yaml.imported`。设置现在的家是 **profile patch**：
- * `configEditor.documentPath` → `profileContext.patchPath` →
- * `home/profiles/desktop/cordis.patch.yml`（用户在「设置」页的每次改动也写这里，
- * 见 `packages/boot/config-editor/src/index.ts:34,49-58`）。出厂配置直接写在终点，
- * 才不必依赖一个上游明确标为「已移除」的迁移垫片。
+ * 0.1.7 起上游把它退役了 —— `importLegacyDocument()` 只在启动时把 `home/settings.yaml`
+ * 一次性导入本 profile，然后改名成 `settings.yaml.imported`。设置现在的家是 **profile
+ * patch**：`configEditor.documentPath` → `profileContext.patchPath` →
+ * `home/profiles/desktop/cordis.patch.yml`。
  *
  * 断言链（全部离线，不发任何 HTTP）：
- *   profile patch 里 `llm-pi-ai` 项的 config
- *     → `@deepseek-ai/dsh-llm-pi-ai` 注册 provider 路由
- *     → `ctx.settings.describe()` 回吐「用户文档那份值」（projectForm 过了 schema，
- *        字段名写错会在这里消失 —— 这是静态检查拿不到的那一层）
- *     → `ctx.llm.listModels(route)` 列出模型（pi-ai 的 listModels 是纯本地的）
- *     → `ctx.llm.resolveModelInfo(route, model)` 解析出上下文窗口
- *   profile patch 里 `agent-default-model` 项 → `ctx.agentDefaultModel.currentSelection()`
+ *   profile patch 静态断言（无 provider、权限段完整）
+ *     → 起真宿主解析这份 patch，`ctx.settings.describe()` 回吐权限描述符
+ *     → `ctx.agentDefaultModel.currentSelection()` 不应被出厂 patch 强行指定
  *
  * 用法：
  *   node scripts/verify-settings.mjs --dir <解压后的便携包根目录>
- *   node scripts/verify-settings.mjs --dir <包根> --route unisound --model u2-flash
  *   node scripts/verify-settings.mjs --dir <包根> --patch scripts/portable-profile-patch.yaml
  *
  * `--patch` 覆盖「读哪份配置」（默认 `<包根>/home/profiles/desktop/cordis.patch.yml`），
- * 用来在**还没打出包**的时候先验出厂模板本身：拿一个现成的 app 目录 + 模板跑这一遍，
- * 配置写错了当场就知道。
+ * 用来在**还没打出包**的时候先验出厂模板本身。
  *
  * 退出码 0 = 通过，1 = 失败。
  */
@@ -51,21 +47,17 @@ const readArg = (name) => {
 }
 
 if (readArg('dir') === undefined) {
-  console.error('用法: node scripts/verify-settings.mjs --dir <解压后的便携包根目录> [--route unisound] [--model u2-flash] [--patch <出厂配置>] [--keep-temp]')
+  console.error('用法: node scripts/verify-settings.mjs --dir <解压后的便携包根目录> [--patch <出厂配置>] [--keep-temp]')
   process.exit(1)
 }
 
 const packageRoot = resolve(readArg('dir'))
-const route = readArg('route') ?? 'unisound'
-const modelId = readArg('model') ?? 'u2-flash'
-
 const appRoot = join(packageRoot, 'app')
 /**
  * profile patch 在**便携包**里的相对位置（相对包根）。
  * 便携版的 `DSH_HOME` = `<包根>/home`，所以文档落点是 `<包根>/home/profiles/desktop/cordis.patch.yml`。
  * ⚠️ 别把这个相对路径直接套到探测用的临时 home 上：那里的 `DSH_HOME` 就是临时根本身，
- * 落点是 `<临时根>/profiles/desktop/cordis.patch.yml` —— 差一层 `home/`，
- * 写错了 patch 根本不被读，症状是「配置全没生效」而不是「路径不存在」。
+ * 落点是 `<临时根>/profiles/desktop/cordis.patch.yml` —— 差一层 `home/`。
  */
 const PACKAGE_PATCH_REL = join('home', 'profiles', 'desktop', 'cordis.patch.yml')
 const patchPath = resolve(readArg('patch') ?? join(packageRoot, PACKAGE_PATCH_REL))
@@ -77,8 +69,7 @@ function check(ok, message) {
 }
 
 // ---------------------------------------------------------------------------
-// [1/3] 出厂配置的静态断言：先把「文件在不在、关键字段写没写对」证掉，
-//       再看宿主那一层。两层分开，失败时能立刻判断是配置写错还是接线断了。
+// [1/3] 出厂配置的静态断言：确认没有预置模型、权限段完整。
 // ---------------------------------------------------------------------------
 
 console.log('\n[1/3] 出厂 profile patch 的静态检查')
@@ -92,30 +83,7 @@ const patchText = readFileSync(patchPath, 'utf8')
 /** 第一个 `<key>: <scalar>` 的值。 */
 const valueOf = (key) => patchText.match(new RegExp(`^\\s*${key}:\\s*(\\S+)\\s*$`, 'mu'))?.[1]
 
-/**
- * 取某个 `<key>:` 映射块**缩进范围内**的行。
- * @param key - 映射键名，如 `models`。
- * @returns 块内每一行原文（不含键行本身）。
- */
-function blockLines(key) {
-  const lines = patchText.split(/\r?\n/)
-  const start = lines.findIndex(line => new RegExp(`^\\s*${key}:\\s*$`).test(line))
-  if (start === -1) return []
-  const indent = lines[start].match(/^\s*/)[0].length
-  const out = []
-  for (let i = start + 1; i < lines.length; i += 1) {
-    if (lines[i].trim() === '') continue
-    if (lines[i].match(/^\s*/)[0].length <= indent) break
-    out.push(lines[i])
-  }
-  return out
-}
-
-// 顶层 patch 项与被列出的模型**都**长成 `- id: xxx`，所以模型必须只在 `models:` 块内数，
-// 否则会把 `- id: llm-pi-ai` 也算成一个模型。顶层项则反过来只认**零缩进**的。
-const declaredModels = blockLines('models')
-  .map(line => line.match(/^\s*-\s+id:\s*(\S+)\s*$/)?.[1])
-  .filter(id => id !== undefined)
+// 顶层 patch 项与模型曾经用的 `models` 项都长成 `- id: xxx`，所以顶层项只认零缩进的。
 const patchEntries = [...patchText.matchAll(/^-\s+id:\s*(\S+)\s*$/gmu)].map(match => match[1])
 const entryNames = new Map(
   // 允许 id 与 name 之间夹空行（dsh 自己重写过这份文件，布局不保证逐字一致）。
@@ -123,30 +91,24 @@ const entryNames = new Map(
     .map(match => [match[1], match[2].trim()]),
 )
 
-check(patchEntries.includes('llm-pi-ai'), `顶层 patch 项里有 llm-pi-ai（实得 ${JSON.stringify(patchEntries)}）`)
-check(patchEntries.includes('agent-default-model'), '顶层 patch 项里有 agent-default-model')
-// `name` 必须带上：config-editor 按「id 相同且 name 相同」认行（`index.ts:105-107`），
-// 少了 name 就会在用户第一次改设置时**另起一行**、留下两条同 id 的 patch。
+check(patchEntries.includes('permission'), `顶层 patch 项里有 permission（实得 ${JSON.stringify(patchEntries)}）`)
+// `name` 必须带上：config-editor 按「id 相同且 name 相同」认行，少了 name 就会在
+// 用户第一次改设置时另起一行、留下两条同 id 的 patch。
 check(
-  (entryNames.get('llm-pi-ai') ?? '').includes('llm-pi-ai')
-  && (entryNames.get('agent-default-model') ?? '').includes('agent-default-model'),
-  `两个 patch 项都带 name（实得 ${JSON.stringify([...entryNames])}）`,
+  (entryNames.get('permission') ?? '').includes('dsh-permission-presets'),
+  `permission 项带 name 且指向 dsh-permission-presets（实得 ${JSON.stringify([...entryNames])}）`,
 )
-check(patchText.includes(`${route}:`), `有 provider 路由 ${route}`)
-check(valueOf('api') === 'openai-completions', `api = openai-completions（实际 ${String(valueOf('api'))}）`)
-check(
-  valueOf('baseURL') === 'https://maas-api.unisound.com/v1',
-  `baseURL 指向云知声（实际 ${String(valueOf('baseURL'))}）`,
-)
-check(valueOf('apiKeyEnv') === 'UNISOUND_API_KEY', `凭据引用名 = UNISOUND_API_KEY（实际 ${String(valueOf('apiKeyEnv'))}）`)
-check(declaredModels.includes(modelId), `声明的模型里有 ${modelId}（共 ${declaredModels.length} 个）`)
-// 默认模型是**两个字段**：provider 与 model，且必须指向本文件里声明过的那个模型，
-// 否则用户开局第一句话就会被路由到一个不存在的模型上。
-check(valueOf('provider') === route, `agent-default-model.provider = ${route}（实际 ${String(valueOf('provider'))}）`)
-check(valueOf('model') === modelId, `agent-default-model.model = ${modelId}（实际 ${String(valueOf('model'))}）`)
+
+// 反向断言：不预置任何模型 provider / 默认模型 / 凭据引用。
+// 模型接入交给用户在「设置 → 模型」里自行添加，出厂 patch 不该替用户决定。
+check(!patchText.includes('llm-pi-ai'), '出厂 patch 不含 llm-pi-ai provider')
+check(!/^\s*providers:/mu.test(patchText), '出厂 patch 不预置 provider 路由')
+check(!patchText.includes('agent-default-model'), '出厂 patch 不预置默认模型')
+check(!patchText.includes('apiKeyEnv'), '出厂 patch 不写 apiKeyEnv')
+check(!/unisound|maas-api/u.test(patchText), '出厂 patch 不含任何云知声残留')
+
 // 出厂默认权限 = 自动审查（实验）。patch 命中一行时 config 是**整块替换**，所以
-// presets 必须跟着重述；只写 defaultPreset 会把 base 层的三项冲成 schema 默认的两项，
-// 设置页的「仅可查看」静默消失。
+// presets 必须跟着重述；只写 defaultPreset 会把 base 层的三项冲成 schema 默认的两项。
 check(patchText.includes('defaultPreset: auto'), `出厂默认权限 = auto（实际 ${String(valueOf('defaultPreset'))}）`)
 check(/presets:\s*\n\s*read-only:/u.test(patchText), 'permission 段重述了 presets（含 read-only）')
 
@@ -167,8 +129,6 @@ mkdirSync(probeDir, { recursive: true })
 
 // 只把**出货的那份** patch 拷进来：验的就是包里那个文件，但让它落在一个临时 home 上，
 // 避免把待验的包「启动过」（verify:portable 有同样要求）。
-// 落点是 `join(profileDir, 'cordis.patch.yml')`，**不是**包内那个相对路径 —— 临时 home 就是
-// DSH_HOME，没有多出来的那层 `home/`。
 copyFileSync(patchPath, join(profileDir, 'cordis.patch.yml'))
 
 writeFileSync(join(probeDir, 'package.json'), `${JSON.stringify({
@@ -182,8 +142,6 @@ writeFileSync(join(probeDir, 'cordis.patch.yml'), [
   "      name: 'settings-probe'",
   '      config:',
   `        report: '${reportPath.replace(/\\/g, '/')}'`,
-  `        route: '${route}'`,
-  `        model: '${modelId}'`,
   '',
 ].join('\n'))
 writeFileSync(join(probeDir, 'index.js'), `
@@ -207,83 +165,42 @@ export function apply(ctx, config) {
       try {
         const value = await fn()
         if (value !== undefined) return [value, undefined]
-        // 空列表不是异常，但也要记下来：否则超时时报的是**早先某一次**抛错的
-        // 陈旧消息（比如适配器还没注册上的「no adapter registered」），
-        // 而真正原因——凭据缺失导致 listModels 返回空——反而看不见。
-        lastError = 'listModels returned an empty list'
+        lastError = 'condition not met yet'
       } catch (error) { lastError = String(error?.message ?? error) }
       if (Date.now() > deadline) return [undefined, lastError]
       await new Promise(resolve => setTimeout(resolve, 300))
     }
   }
 
-  // 三个服务都在 dsh-base 里：llm 是适配器运行时，settings 是用户配置文档，
-  // agentDefaultModel 是默认模型选择。缺任何一个都会让 inject 永不回调。
-  ctx.inject(['llm', 'settings', 'agentDefaultModel'], async (c) => {
+  // settings 服务来自 dsh-base；agentDefaultModel 用于确认出厂 patch 没有强行指定默认模型。
+  ctx.inject(['settings', 'agentDefaultModel'], async (c) => {
     report.injected = true
     flush()
 
+    // 落点先自证：0.1.7 的家就是 profile patch。上游若再挪家，这里会先红。
     try {
-      // 落点先自证：0.1.7 的家就是 profile patch。上游若再挪家，这里会先红，
-      // 而不是让「配置读不到」伪装成「配置写错了」。
       report.documentPath = c.get('settings').documentPath
     } catch (error) {
       report.describeThrew = String(error?.stack ?? error?.message ?? error)
     }
 
-    // ① 模型注册。**必须轮询**：pi-ai 把适配器注册在它自己的 settings 注入回调里，
-    //    与本回调之间没有任何先后保证（实测本回调先跑，此时路由还不存在）。
-    const [models, modelError] = await until(async () => {
-      const list = await c.get('llm').listModels(config.route)
-      return list.length > 0 ? list : undefined
-    }, 20000)
-    if (models === undefined) {
-      report.llmThrew = modelError ?? \`listModels(\${config.route}) 20s 内一直为空\`
-    } else {
-      report.models = models.map(model => model.id)
-      report.modelNames = Object.fromEntries(models.map(model => [model.id, model.name]))
-      try {
-        const info = await c.get('llm').resolveModelInfo(config.route, config.model)
-        report.resolved = { id: info.id, name: info.name, contextWindow: info.context?.contextWindow ?? null }
-      } catch (error) {
-        report.resolveThrew = String(error?.message ?? error)
-      }
-    }
-
-    // ② 设置描述符。**顺序有讲究：必须在 pi-ai 起来之后再读。**
-    //    describe() 只列「已 ACTIVE 且带 volatile 表单」的条目，而 llm-pi-ai 在这个
-    //    树里是**最后**一批激活的（它自己 inject settings）—— 早读会拿到一份**没有它**
-    //    的列表，症状是「配置明明生效了（18 个模型都注册了），描述符里却查无此条」。
-    //    所以按同一个 20s 节奏轮询它出现，而不是读一次就走。
+    // describe() 只列「已 ACTIVE 且带 volatile 表单」的条目，且权限条目在这一批里
+    // 出现得偏晚 —— 早读会拿到不完整的列表。不必等模型，但按 20s 节奏轮询
+    // permission 出现，避免捕获到刚开始那一份不完整描述符。
     const [descriptors, describeError] = await until(() => {
       const list = c.get('settings').describe()
-      return list.some(row => row.ns === 'llm-pi-ai') ? list : undefined
+      return list.some(row => row.ns === 'permission') ? list : undefined
     }, 20000)
     if (descriptors === undefined) {
-      // 诊断：describe() 会**静默丢掉**不可寻址的条目（无 volatile 表单 / 未 ACTIVE /
-      // id 在同一棵树里重复）。丢掉时症状只是「设置页里没有它」，所以把 loader 侧的真身
-      // 一起报回来，免得下一次又要靠猜。
-      const loaderSide = [...c.root.loader.entries()]
-        .filter(entry => entry.options.id === 'llm-pi-ai')
-        .map(entry => ({
-          state: entry.fiber?.state ?? null,
-          hasConfig: entry.fiber?.runtime?.Config !== undefined,
-          parentEntryId: entry.parent?.tree?.ctx?.fiber?.entry?.id ?? null,
-        }))
       report.describeThrew = \`\${describeError ?? 'no error'}\`
-        + \`；loader 侧 llm-pi-ai 条目 \${JSON.stringify(loaderSide)}\`
-        + \`；configEditor.entries() 命中 \${String(c.get('configEditor').entries().filter(entry => entry.options.id === 'llm-pi-ai').length)} 个（总条目 \${String([...c.root.loader.entries()].length)}）\`
     } else {
       report.namespaces = descriptors.map(row => row.ns)
-      const llm = descriptors.find(row => row.ns === 'llm-pi-ai')
-      // user = 用户文档那一层；value = 与内置层合并后的生效值。
-      // 两个都取：user 证明「是我们那份文件给的值」，value 证明「真的进入了运行中的条目」。
-      report.llmDescriptor = { user: llm.user, value: llm.value }
       const permission = descriptors.find(row => row.ns === 'permission')
+      // user = 用户文档那一层；value = 与内置层合并后的生效值。两个都取：user 证明
+      // 是出厂文件给的值，value 证明真的作用到了运行中的条目。
       if (permission !== undefined) report.permissionDescriptor = { user: permission.user, value: permission.value }
-      const fallback = descriptors.find(row => row.ns === 'agent-default-model')
-      if (fallback !== undefined) report.defaultDescriptor = fallback.user
     }
+
     try {
       report.defaultSelection = c.get('agentDefaultModel').currentSelection()
     } catch (error) {
@@ -304,15 +221,6 @@ writeFileSync(join(profileDir, 'package.json'), `${JSON.stringify({
 }, null, 2)}\n`)
 
 process.env.DSH_HOME = home
-// 上游 alpha.3 起 `PiAiAdapter.listModels` 对「命名凭据解析不到」的路由返回**空列表**
-// （"offers no models until the key is stored"——密钥存储前不提供模型）。本自检验的是
-// 出厂**配置管线**（路由/模型/默认选择能不能一路落到运行中的条目），不是凭据层；
-// 没有这个 fixture，18 个模型会被凭据检查全部藏掉，断言红得莫名其妙。取自 patch 里
-// 声明的 apiKeyEnv 名，fixture 值只为过 resolveApiKey 的格式校验，不发任何 HTTP。
-const apiKeyRef = patchText.match(/^\s*apiKeyEnv:\s*(\S+)\s*$/mu)?.[1]
-if (apiKeyRef !== undefined && process.env[apiKeyRef] === undefined) {
-  process.env[apiKeyRef] = 'verify-settings-fixture-key'
-}
 
 const host = startPackagedDesktopHost({
   runtimeDir,
@@ -347,10 +255,8 @@ if (ready !== undefined) {
 
 console.log('\n[3/3] 结论')
 
-check(report?.injected === true, '探针拿到 llm / settings / agentDefaultModel 三个服务')
+check(report?.injected === true, '探针拿到 settings / agentDefaultModel 服务')
 if (report?.describeThrew !== undefined) check(false, `读 settings 描述符失败：${report.describeThrew}`)
-if (report?.llmThrew !== undefined) check(false, `llm 解析抛异常：${report.llmThrew}`)
-if (report?.resolveThrew !== undefined) check(false, `解析模型信息抛异常：${report.resolveThrew}`)
 if (report?.defaultThrew !== undefined) check(false, `读默认模型抛异常：${report.defaultThrew}`)
 
 // 上游若把设置的家再挪走，这里先红 —— 「配置读不到」不该伪装成「配置写错了」。
@@ -360,16 +266,15 @@ check(
   `settings 文档落点是 profile patch（实际 ${String(report?.documentPath)}）`,
 )
 
-// 这一段同样是静态检查拿不到的那一层：describe() 的 user 过了 permission Config
-// 的 schema 投影 —— 字段名写错或 presets 被整块冲掉，都会在这里显形。
+// describe() 的 user 是过了 permission Config 的 schema 投影 —— 字段名写错或 presets
+// 被整块冲掉，都会在这里显形。
 const permissionUser = report?.permissionDescriptor?.user
 check(
   permissionUser?.defaultPreset === 'auto',
   `schema 收下了 permission.defaultPreset = auto（实际 ${String(permissionUser?.defaultPreset)}）`,
 )
 // presets 不是 volatile 字段：describe 的 user 只投影 volatile 表单时它本就不出现，
-// 那时这条断言无从谈起（静态检查已兜底）。它一旦出现，就必须仍是完整三项 ——
-// 这是「整块替换把 read-only 冲掉」最容易漏测的形状。
+// 那时这条断言无从谈起（静态检查已兜底）。它一旦出现，就必须仍是完整三项。
 if (permissionUser?.presets !== undefined) {
   check(
     Object.keys(permissionUser.presets).length === 3,
@@ -377,63 +282,18 @@ if (permissionUser?.presets !== undefined) {
   )
 }
 
-const userRoutes = Object.keys(report?.llmDescriptor?.user?.providers ?? {})
-check(
-  userRoutes.includes(route),
-  `profile patch 原样带到了 llm-pi-ai.providers（实得 ${JSON.stringify(userRoutes.length > 0 ? userRoutes : report?.namespaces)}）`,
-)
-
-// 这一段是**静态检查拿不到的那一层**：describe() 的 user 是过了 pi-ai Config schema 的
-// projectForm 投影 —— 字段名写错就会在这里消失，而不是在启动日志里报错。
-const userProfile = report?.llmDescriptor?.user?.providers?.[route]
-check(userProfile?.api === 'openai-completions', `schema 收下了 api（实际 ${String(userProfile?.api)}）`)
-check(
-  userProfile?.baseURL === 'https://maas-api.unisound.com/v1',
-  `schema 收下了 baseURL（实际 ${String(userProfile?.baseURL)}）`,
-)
-check(userProfile?.apiKeyEnv === 'UNISOUND_API_KEY', `schema 收下了 apiKeyEnv（实际 ${String(userProfile?.apiKeyEnv)}）`)
-check(
-  typeof userProfile?.displayName === 'string' && userProfile.displayName.length > 0,
-  `schema 收下了 displayName（实际 ${String(userProfile?.displayName)}）`,
-)
-const userModels = Array.isArray(userProfile?.models) ? userProfile.models : []
-check(
-  userModels.length === declaredModels.length,
-  `schema 收下了全部 ${declaredModels.length} 个模型（实得 ${userModels.length}）`,
-)
-check(
-  userModels.every(model => typeof model?.contextWindow === 'number' && model.contextWindow > 0),
-  '每个模型都带上了正整数 contextWindow',
-)
-
 // user 层有值只说明文件被读到了；value 层有值才说明 patch 真的作用到了运行中的条目。
-const valueRoutes = Object.keys(report?.llmDescriptor?.value?.providers ?? {})
 check(
-  valueRoutes.includes(route),
-  `运行中的 llm-pi-ai 条目里也有这个路由（实得 ${JSON.stringify(valueRoutes)}）`,
+  report?.permissionDescriptor?.value?.defaultPreset === 'auto',
+  `运行中的 permission 条目 defaultPreset = auto（实际 ${String(report?.permissionDescriptor?.value?.defaultPreset)}）`,
 )
 
-const gotModels = Array.isArray(report?.models) ? report.models : []
-// 双向比较：少一个说明有模型没注册上，多一个说明配置里的模型被替换过。
-const missing = declaredModels.filter(id => !gotModels.includes(id))
-const extra = gotModels.filter(id => !declaredModels.includes(id))
+// 出厂 patch 不该替用户指定默认模型：currentSelection 可能是 null（未指定），
+// 但若非 null，就绝不能指向被移除的 unisound 路由。
+const selection = report?.defaultSelection
 check(
-  missing.length === 0 && extra.length === 0,
-  `注册的模型集合与出厂声明一致（声明 ${declaredModels.length} / 实得 ${gotModels.length}`
-    + `${missing.length > 0 ? `，缺 ${missing.join(', ')}` : ''}${extra.length > 0 ? `，多 ${extra.join(', ')}` : ''}）`,
-)
-
-check(
-  report?.resolved?.id === modelId && typeof report.resolved?.name === 'string' && report.resolved.name.length > 0,
-  `resolveModelInfo(${route}, ${modelId}) 解析出模型名（实际 ${JSON.stringify(report?.resolved?.name)}）`,
-)
-check(
-  typeof report?.resolved?.contextWindow === 'number' && report.resolved.contextWindow > 0,
-  `解析出上下文窗口（实际 ${JSON.stringify(report?.resolved?.contextWindow)}）`,
-)
-check(
-  report?.defaultSelection?.provider === route && report?.defaultSelection?.model === modelId,
-  `默认模型 = ${route}/${modelId}（实际 ${JSON.stringify(report?.defaultSelection)}）`,
+  selection === null || selection === undefined || selection?.provider !== 'unisound',
+  `默认模型未被出厂 patch 指向 unisound（实际 ${JSON.stringify(selection)}）`,
 )
 
 await host.stop()
@@ -448,4 +308,4 @@ if (failures.length > 0) {
   for (const failure of failures) console.log(`  · ${failure}`)
   process.exit(1)
 }
-console.log(`\n✓ verify:settings 通过：出厂配置在真宿主里注册了 ${route}，默认模型 ${route}/${modelId}`)
+console.log('\n✓ verify:settings 通过：出厂配置无预置模型，权限配置在真宿主里生效')

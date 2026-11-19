@@ -672,10 +672,9 @@ console.log(`  · app 内的 dsh 运行时：${runtime.release.version}`
   + `（node ${runtime.release.nodeVersion}, ${runtime.platform}/${runtime.arch}）`
   + ' —— 不写 profile 状态文件（alpha.2 起该文件已退役）')
 
-// 2.7) 出厂模型配置：预置模型接入。便携版的 home\ 是全新的一份，不写这里的话
-//      用户开箱只有 dsh 自带的默认路由、且没有凭据，等于没有可用模型。
-//      模板在 scripts/portable-profile-patch.yaml：**凭据引用名**（apiKeyEnv）进包，
-//      API Key 本身不进包，由用户在「设置 → 模型」里填，落到 home\.credentials.yaml。
+// 2.7) 出厂配置：只写权限默认值，**不预置任何模型 provider**。模型接入改由用户在
+//      「设置 → 模型」里添加自己的提供商（OpenAI 兼容网关 / xAI / DeepSeek 等）并填 Key。
+//      模板在 scripts/portable-profile-patch.yaml，API Key 不进包。
 //
 // ⚠️ **落点是 profile patch，不是 `home/settings.yaml`**（2026-09-24 适配 dsh 0.1.7）。
 //      上游在 0.1.7 把 `settings.yaml` 退役了（`packages/settings/settings/src/index.ts`
@@ -684,7 +683,7 @@ console.log(`  · app 内的 dsh 运行时：${runtime.release.version}`
 //      （`configEditor.documentPath` = `profileContext.patchPath`），用户每次在「设置」页里
 //      改动也写在这里 —— 出厂配置直接写在终点。
 //      历史：v0.2.x 一直写 `home/settings.yaml`，靠上面那个迁移垫片生效；垫片一旦被上游删掉，
-//      用户开箱就没有任何可用模型，所以主动前移。
+//      出厂配置就失效，所以主动前移。
 //      ⚠️ 这个文件是**用户自己的设置文档**（出厂表头就写着 “Your patch layer”），我们只填初值、
 //      之后由设置页维护 —— 别把它当成「我们的」文件去覆盖用户改动（增量包不碰它）。
 const profilePatchTemplate = join(ROOT, 'scripts', 'portable-profile-patch.yaml')
@@ -693,7 +692,7 @@ if (!existsSync(profilePatchTemplate)) {
   process.exit(1)
 }
 cpSync(profilePatchTemplate, join(profileDir, 'cordis.patch.yml'))
-console.log('  + home/profiles/desktop/cordis.patch.yml（预置云知声 MaaS provider）')
+console.log('  + home/profiles/desktop/cordis.patch.yml（出厂权限配置，不预置模型 provider）')
 
 // 3) 插件真身。必须是**真实文件**：validateDesktopPluginGraph 见 symlink 就拒。
 //    发布版 package.json 剔除 devDependencies 里指向本机 harness 的 link:。
@@ -780,18 +779,11 @@ writeFileSync(
     `  另随包预置第三方插件：${vendoredPlugins.map((plugin) => `${plugin.name} v${plugin.version}`).join('、')}。`,
     '  （清单、版本与出处见仓库 vendor/plugins/manifest.json；卸载/升级方法与普通 dsh 插件相同。）',
     '',
-    '【第一次打开：填一个模型 API Key】',
-    '  home\\profiles\\desktop\\cordis.patch.yml 已经预置好云知声 MaaS（https://maas.unisound.com，',
-    '  OpenAI 兼容），默认模型 u2-flash，另有 17 个备选（DeepSeek / Kimi / GLM /',
-    '  MiniMax / Qwen 等）。**包里不含任何 API Key**，需要你自己填一个：',
-    '',
-    '    1) 打开「设置 → 模型」，找到「云知声 MaaS」',
-    '    2) 粘贴你的 API Key（会写进 home\\.credentials.yaml，下次启动自动带上）',
-    '',
-    '  也可以不改界面，直接设环境变量 UNISOUND_API_KEY 再启动',
-    '  （环境变量优先级更高，但只读、不会被设置页改写）。',
-    '  Key 在 https://maas.unisound.com 控制台申请。',
-    '  没填就发消息的话，dsh 会报 MISSING_CREDENTIAL 并提示要设哪个变量。',
+    '【第一次打开：配一个模型】',
+    '  包里**不预置任何模型 provider 或 API Key**。打开「设置 → 模型」，',
+    '  添加你自己的模型提供商（OpenAI 兼容网关 / xAI / DeepSeek 等），',
+    '  填好 API Key 与模型后即可使用。Key 会写进 home\\.credentials.yaml，下次启动自动带上。',
+    '  没配就发消息的话，dsh 会报 MISSING_CREDENTIAL 并提示要设哪个变量。',
     '',
     '【验证插件生效】',
     '  1) 先「选择工作区」，然后新建一个会话。',

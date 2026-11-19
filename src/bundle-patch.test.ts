@@ -374,18 +374,17 @@ describe('便携版使用说明（scripts/package-desktop-portable.mjs）', () =
   })
 })
 
-describe('出厂模型配置：落点与凭据卫生', () => {
+describe('出厂配置：落点与凭据卫生', () => {
   const patch = readRepoFile('scripts/portable-profile-patch.yaml')
 
-  it('云知声推理模型保留 system 角色，不能误发网关不支持的 developer', () => {
-    const provider = patch.slice(patch.indexOf('      unisound:'), patch.indexOf('        models:'))
-    expect(provider).toMatch(/compat:\s*\n\s+supportsDeveloperRole: false/u)
-    expect(patch).toContain('reasoningEfforts:')
-    expect(patch).toContain('off: none')
+  it('不预置任何模型 provider，模型接入交给用户在设置页自行配置', () => {
+    expect(patch, '出厂 patch 还留着 llm-pi-ai provider').not.toContain('llm-pi-ai')
+    expect(patch, '出厂 patch 还留着 unisound 路由').not.toMatch(/^\s*providers:/mu)
+    expect(patch, '出厂 patch 还留着默认模型指向').not.toContain('agent-default-model')
+    expect(patch, '出厂 patch 还留着 apiKeyEnv').not.toContain('apiKeyEnv')
   })
 
-  it('只写凭据引用名 apiKeyEnv，正文里没有 sk- 形态的 secret', () => {
-    expect(patch).toContain('apiKeyEnv: UNISOUND_API_KEY')
+  it('正文里没有 sk- 形态的 secret', () => {
     expect(patch, '出厂 YAML 混进了 sk- 开头的 key').not.toMatch(/sk-[A-Za-z0-9]{8,}/u)
   })
 
