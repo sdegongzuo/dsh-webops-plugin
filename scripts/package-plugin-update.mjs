@@ -107,6 +107,22 @@ if (probeToken !== undefined) {
   console.log(`  · 注入自检探针 ${probeToken}`)
 }
 
+// 随包携带本版的不可变 tarball（便携包根的 vendor\ 下）。出厂/新版 profile 把本插件
+// 登记为 file: 相对路径指向它 —— 宿主 install_bundle 全量解析 dependencies 时，本地包
+// 在 registry 上不存在，精确版本登记必然 404（2026-11-19 实测）；tgz 是本地事实来源。
+const tarballName = `${PLUGIN_NAME}-${version}.tgz`
+const tarballOut = join(stage, 'vendor', tarballName)
+const tarballRun = spawnSync(process.execPath, [
+  join(ROOT, 'scripts', 'package-plugin-tarball.mjs'),
+  '--lib-dir', libDir, '--version', version, '--stage-root', stageRoot, '--out', tarballOut,
+], { encoding: 'utf8' })
+if (tarballRun.status !== 0 || !existsSync(tarballOut)) {
+  console.error('package-plugin-update: 插件 tarball 生成失败，中止打包')
+  console.error((tarballRun.stderr ?? '').trim() || (tarballRun.stdout ?? '').trim())
+  process.exit(1)
+}
+console.log(`  + vendor/${tarballName}（file: 登记的事实来源）`)
+
 /**
  * 2026-11-04 起随包 WorkBuddy 插件换成 dsh-connect-workbuddy（范围 peer，不再需要精确版本豁免）。
  * 本增量包只更新 dsh-webops-plugin 自身，不带也不增删随包插件；老 profile 里若仍登记旧包名，
@@ -157,6 +173,16 @@ writeFileSync(
     '  整份覆盖会把它们抹掉。插件管理页读取插件自身 package.json 的 version，更新后以本包版本为准。',
     '',
     ...vendorMigration,
+    '【登记同步（重要）】',
+    `  本包已把新版不可变 tarball 放在便携包根的 vendor\\${tarballName}。`,
+    '  若你的 profile 用 file: 形式登记本插件（新版出厂包如此），覆盖后请把',
+    '  home\\profiles\\desktop\\package.json 里 dependencies 的 dsh-webops-plugin 一项改为：',
+    `    "file:../../../vendor/${tarballName}"`,
+    '  只改这一个键，其它内容都不要动。不同步的话，下次在桌面端安装其它插件时，',
+    '  本插件会被旧 tarball 回滚。旧 tgz 文件可以保留，不影响使用。',
+    '  若登记仍是精确版本号（如 "0.2.28"），建议借这次升级一并改成上面的 file: 写法 ——',
+    '  否则桌面端每次 install_bundle 都会因本插件不在 npm registry 而 404。',
+    '',
     '【没生效怎么查】',
     '  · 确认 dsh 已经完全退出后重新覆盖一次（最常见的失败就是进程还占着文件）',
     '  · 确认解压目标层面对（见上面第 2 步）',

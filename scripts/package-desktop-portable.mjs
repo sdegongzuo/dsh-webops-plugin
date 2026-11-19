@@ -612,9 +612,30 @@ if (leftover.length > 0) {
 const slimResult = slimApp(join(STAGE, 'app'))
 console.log(`  - 瘦身：locales 删 ${slimResult.locales.removed} 个（${(slimResult.locales.bytes / 1048576).toFixed(1)}MB），旧布局 pnpm ${slimResult.legacyPnpm.removed ? `已删（${(slimResult.legacyPnpm.bytes / 1048576).toFixed(1)}MB）` : '无（上游已修复或基包不同）'}`)
 
+// 1.5) 本插件的不可变 tarball：出厂 profile 用它做 file: 登记（见第 2 节注释）。
+const tarballName = `${pluginName}-${pluginVersion}.tgz`
+mkdirSync(join(STAGE, 'vendor'), { recursive: true })
+const tarballRun = spawnSync(
+  process.execPath,
+  [join(ROOT, 'scripts', 'package-plugin-tarball.mjs'),
+    '--lib-dir', join(ROOT, 'lib'), '--version', pluginVersion,
+    '--stage-root', join(BUILD_ROOT, '.tarball-stage'), '--out', join(STAGE, 'vendor', tarballName)],
+  { stdio: 'inherit' },
+)
+if (tarballRun.status !== 0 || !existsSync(join(STAGE, 'vendor', tarballName))) {
+  console.error('package-desktop-portable: 插件 tarball 生成失败（npm pack 或完整性校验出错），中止打包')
+  process.exit(1)
+}
+console.log(`  + vendor/${tarballName}（出厂 file: 登记的事实来源）`)
+
 // 2) profile：官方模板 + 本插件
-//    dependencies 必须是**精确版本**（project-manager.ts:160-162 会校验），
-//    bundles 必须以前两个内置 bundle 开头（project-manager.ts:169）。
+//    bundles 必须以前两个内置 bundle 开头（project-manager.ts 的 WEB_PROFILE 模板顺序）。
+//    本插件登记为 file: 相对路径指向包内 tarball（**不写精确版本**，2026-11-19 实测）：
+//    本插件是本地包、从未发布到 registry；宿主 install_bundle 就是 profile 里的
+//    `pnpm add <spec>`，会全量解析 dependencies —— 精确版本登记让任何一次 install_bundle
+//    都对 registry.npmjs.org/dsh-webops-plugin 404。file: 相对路径（相对 profile 目录）
+//    让解析永远有本地事实来源，整个便携目录搬走后也不失配。
+//    vendored 第三方插件都在 npm 上，保持精确版本登记。
 const profileDir = join(STAGE, 'home', 'profiles', 'desktop')
 mkdirSync(profileDir, { recursive: true })
 const vendoredPlugins = readVendoredPlugins()
@@ -625,10 +646,11 @@ writeFileSync(
       name: PROJECT_NAME,
       private: true,
       version: '0.0.0',
-      // 依赖必须是**精确版本**（project-manager.ts:160-162 会校验）——vendor manifest
-      // 里的 version 就是精确版本，直接派生，不在这里手写第二份。
+      // 本插件：file: 相对路径指向包内 tarball（理由见上方第 2 节注释）；
+      // vendored 第三方插件：精确版本（vendor manifest 里的 version 就是精确版本，
+      // 直接派生，不在这里手写第二份）。
       dependencies: {
-        [pluginName]: pluginVersion,
+        [pluginName]: `file:../../../vendor/${tarballName}`,
         ...Object.fromEntries(vendoredPlugins.map((plugin) => [plugin.name, plugin.version])),
       },
       // bundles 必须以前两个内置 bundle 开头（project-manager.ts:169），本插件与
@@ -795,6 +817,9 @@ writeFileSync(
     '  并在该 profile 的 dsh.profile.bundles 里登记过，开箱即用。',
     `  另随包预置第三方插件：${vendoredPlugins.map((plugin) => `${plugin.name} v${plugin.version}`).join('、')}。`,
     '  （清单、版本与出处见仓库 vendor/plugins/manifest.json；这些插件随包出厂，升级请换整包。）',
+    `  本插件登记为 file: 相对路径，指向包根 vendor\\${tarballName}（不可变 tarball）；`,
+    '  它是插件管理器解析本插件的事实来源 —— 升级时先换它再装，勿删；',
+    '  只覆盖 node_modules 而不同步它，下次安装其它插件会把本插件回滚到 tgz 里的版本。',
     '',
     '【第一次打开：模型】',
     ...(factoryDefault === undefined

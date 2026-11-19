@@ -223,6 +223,23 @@ jobs:
           Add-Content -Path $env:GITHUB_ENV -Value "PLUGIN_ZIP_KB=$([math]::Round((Get-Item $pluginZip).Length / 1KB, 1))"
           Add-Content -Path $env:GITHUB_ENV -Value "PLUGIN_VERSION=$version"
 
+      # 插件 tarball：出厂便携包用它做 file: 登记（本地包不在 registry，精确版本登记会让
+      # install_bundle 全量解析 404）；同时作为 Release 的第三个附件，给已装用户提供
+      # 「换 tgz → install_bundle 指向它」的官方升级通道。
+      - name: 打插件 tarball（保留安全模式）
+        shell: pwsh
+        run: |
+          $version = $env:PLUGIN_VERSION
+          $libDir = Join-Path $env:GITHUB_WORKSPACE 'lib'
+          $stageRoot = Join-Path $env:RUNNER_TEMP 'webops-tarball-stage'
+          $pluginTgz = Join-Path dist "dsh-webops-plugin-$version.tgz"
+          node scripts/package-plugin-tarball.mjs --lib-dir $libDir --version $version --stage-root $stageRoot --out $pluginTgz
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if (-not (Test-Path $pluginTgz)) { throw "没打出预期的产物：$pluginTgz" }
+          Add-Content -Path $env:GITHUB_ENV -Value "PLUGIN_TGZ_NAME=$(Split-Path -Leaf $pluginTgz)"
+          Add-Content -Path $env:GITHUB_ENV -Value "PLUGIN_TGZ_SHA256=$((Get-FileHash $pluginTgz -Algorithm SHA256).Hash.ToLower())"
+          Add-Content -Path $env:GITHUB_ENV -Value "PLUGIN_TGZ_KB=$([math]::Round((Get-Item $pluginTgz).Length / 1KB, 1))"
+
       - name: 组装并验证本次完整便携包（失败即阻止发布）
         shell: pwsh
         env:
@@ -234,7 +251,7 @@ jobs:
           $version = $env:PLUGIN_VERSION
           $portableZip = Join-Path dist "dsh-webops-desktop-v$version-win-x64-portable.zip"
           $stageRoot = Join-Path $env:RUNNER_TEMP 'webops-full-stage'
-          node scripts/package-release-portable.mjs --app $releaseApp --desktop-build-receipt $env:DESKTOP_BUILD_RECEIPT --plugin-zip (Join-Path dist $env:PLUGIN_ZIP_NAME) --version $version --stage-root $stageRoot --out $portableZip
+          node scripts/package-release-portable.mjs --app $releaseApp --desktop-build-receipt $env:DESKTOP_BUILD_RECEIPT --plugin-zip (Join-Path dist $env:PLUGIN_ZIP_NAME) --plugin-tgz (Join-Path dist $env:PLUGIN_TGZ_NAME) --version $version --stage-root $stageRoot --out $portableZip
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $checkRoot = Join-Path $env:RUNNER_TEMP 'webops-full-check'
           python scripts/unzip-portable.py --zip $portableZip --dir $checkRoot
@@ -262,6 +279,9 @@ jobs:
                            -replace '__PLUGIN_ZIP__', $env:PLUGIN_ZIP_NAME `
                            -replace '__PLUGIN_KB__', $env:PLUGIN_ZIP_KB `
                            -replace '__PLUGIN_SHA__', $env:PLUGIN_ZIP_SHA256 `
+                           -replace '__PLUGIN_TGZ__', $env:PLUGIN_TGZ_NAME `
+                           -replace '__PLUGIN_TGZ_KB__', $env:PLUGIN_TGZ_KB `
+                           -replace '__PLUGIN_TGZ_SHA__', $env:PLUGIN_TGZ_SHA256 `
                            -replace '__PORTABLE_ZIP__', $env:PORTABLE_ZIP_NAME `
                            -replace '__PORTABLE_KB__', $env:PORTABLE_ZIP_KB `
                            -replace '__PORTABLE_SHA__', $env:PORTABLE_ZIP_SHA256 `
@@ -280,9 +300,10 @@ jobs:
           # 显式列出插件附件，不用 `dist/*.zip` 通配 —— 万一以后 dist/ 里多出别的 zip，
           # 通配会把不相干的文件一起传上去。
           $pluginZip = Join-Path "$env:GITHUB_WORKSPACE\dist" "$env:PLUGIN_ZIP_NAME"
+          $pluginTgz = Join-Path "$env:GITHUB_WORKSPACE\dist" "$env:PLUGIN_TGZ_NAME"
           if (-not $env:PORTABLE_ZIP_NAME) { throw '完整便携包未通过验证，禁止发布' }
           $portableZip = Join-Path "$env:GITHUB_WORKSPACE\dist" "$env:PORTABLE_ZIP_NAME"
-          foreach ($f in @($pluginZip, $portableZip)) {
+          foreach ($f in @($pluginZip, $pluginTgz, $portableZip)) {
             if (-not (Test-Path $f)) { Write-Error "找不到待发布的产物：$f"; exit 1 }
           }
 
@@ -291,12 +312,13 @@ jobs:
             Write-Error "Release $env:TAG 已存在 —— 保留式发布不覆盖既有附件、不重指已发布 tag；请换一个新版本号重新发布。"
             exit 1
           }
-          gh release create "$env:TAG" --draft --title "$env:TAG" --notes-file dist/notes.md $pluginZip $portableZip
+          gh release create "$env:TAG" --draft --title "$env:TAG" --notes-file dist/notes.md $pluginZip $pluginTgz $portableZip
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $release = gh release view "$env:TAG" --json assets | ConvertFrom-Json
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           foreach ($expected in @(
             @{ name = $env:PLUGIN_ZIP_NAME; digest = "sha256:$env:PLUGIN_ZIP_SHA256" },
+            @{ name = $env:PLUGIN_TGZ_NAME; digest = "sha256:$env:PLUGIN_TGZ_SHA256" },
             @{ name = $env:PORTABLE_ZIP_NAME; digest = "sha256:$env:PORTABLE_ZIP_SHA256" }
           )) {
             $asset = @($release.assets | Where-Object { $_.name -eq $expected.name })
@@ -314,7 +336,7 @@ jobs:
         run: |
           $lines = @('## 产物与结论', '')
           $any = $false
-          foreach ($name in @($env:PLUGIN_ZIP_NAME, $env:PORTABLE_ZIP_NAME)) {
+          foreach ($name in @($env:PLUGIN_ZIP_NAME, $env:PLUGIN_TGZ_NAME, $env:PORTABLE_ZIP_NAME)) {
             if (-not $name) { continue }
             $f = Join-Path "$env:GITHUB_WORKSPACE\dist" $name
             if (Test-Path $f) {

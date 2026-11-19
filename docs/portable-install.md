@@ -11,6 +11,19 @@ DeepSeek Harness 的源码 checkout。
 
 覆盖后核对插件目录 `package.json` 的 version，再启动检查网页工具是否能实际调用。保留旧 chunk，无需清理；用户会话、设置及 profile 的 `package.json` 不在覆盖范围内。
 
+**profile 登记（0.2.29 起）**：桌面端的「安装插件」动作（`install_bundle`）实际是 profile 目录里的 `pnpm add`，会全量解析 profile 的 `dependencies`。本插件是本地构建产物、不在 npm registry 上，所以出厂 profile 用 `file:` 相对路径指向包内不可变 tarball：
+
+```json
+"dependencies": {
+  "dsh-webops-plugin": "file:../../../vendor/dsh-webops-plugin-<版本>.tgz"
+}
+```
+
+- 路径相对 `home/profiles/desktop/`，指向便携包根 `vendor\` 里的 tgz，整个目录搬走也不失链；
+- 这个 tgz 是插件管理器解析本插件的**事实来源**，不要删；覆盖 `node_modules` 后它仍会被沿用；
+- 若你的登记还是精确版本号（如 `"0.2.28"`），请在安装其它插件前改成上面的写法 —— 否则每次 `install_bundle` 都会因本插件不在 registry 而上抛 404；
+- 发新版时换掉这个 tgz（文件名带版本号，登记也要同步改），后续重装会从新 tgz 复制文件。
+
 本包包含完整插件运行时，不依赖上一版插件文件。DSH 与插件分别发版；DSH 本体不变且接口兼容时，只需更新插件。需要新宿主接口的版本应在 Release 说明列出兼容要求，旧 DSH 不自动获得新接口。
 
 ## 二、首次安装：解压

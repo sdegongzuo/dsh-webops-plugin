@@ -36,7 +36,14 @@ for (const name of ['.credentials.yaml', 'sessions', 'storages', '.anonymous-use
   assert(!existsSync(join(home, name)), `出厂包含用户数据：${name}`)
 }
 const profile = join(home, 'profiles', 'desktop')
-const bundles = json(join(profile, 'package.json')).dsh.profile.bundles
+const profileManifest = json(join(profile, 'package.json'))
+// 出厂登记护栏：本插件必须登记为 file: 相对路径指向包内 tarball。精确版本登记会让
+// install_bundle（= profile 里的 pnpm add 全量解析）对未发布的本地包 404（2026-11-19 实测）。
+const tarballName = `${pkg.name}-${pkg.version}.tgz`
+assert(existsSync(join(dir, 'vendor', tarballName)), `出厂包缺少插件 tarball：vendor/${tarballName}`)
+assert(profileManifest.dependencies?.[pkg.name] === `file:../../../vendor/${tarballName}`,
+  `出厂 profile 的本插件登记必须是 file:../../../vendor/${tarballName}（实际：${String(profileManifest.dependencies?.[pkg.name])}）`)
+const bundles = profileManifest.dsh.profile.bundles
 const vendor = json(join(ROOT, 'vendor/plugins/manifest.json')).plugins
 for (const plugin of [{ name: pkg.name, version: pkg.version }, ...vendor]) {
   const installed = join(profile, 'node_modules', plugin.name)

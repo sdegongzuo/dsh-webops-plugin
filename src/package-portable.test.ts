@@ -7,6 +7,7 @@ import { fileURLToPath } from 'node:url'
 import { describe, expect, it } from 'vitest'
 
 const script = fileURLToPath(new URL('../scripts/package-portable.mjs', import.meta.url))
+const tarballScript = fileURLToPath(new URL('../scripts/package-plugin-tarball.mjs', import.meta.url))
 const updateScript = fileURLToPath(new URL('../scripts/package-plugin-update.mjs', import.meta.url))
 const zipper = fileURLToPath(new URL('../scripts/zip-stage.py', import.meta.url))
 const desktopVersionScript = fileURLToPath(new URL('../scripts/desktop-release-version.mjs', import.meta.url))
@@ -118,8 +119,14 @@ describe('每次发布的完整便携包', () => {
       writeFileSync(join(app, path), '只读输入')
     }
     const out = join(data.root, 'full.zip')
+    // 2026-11-19 起组装脚本要求携带插件不可变 tarball（出厂 profile 用它做 file: 登记，
+    // 避免 install_bundle 全量解析本地包时对 registry 404）。用同一份 fixture lib 真打一份。
+    const sourceTgz = join(data.root, `dsh-webops-plugin-${pkg.version}.tgz`)
+    const tarball = spawnSync(process.execPath, [tarballScript, '--lib-dir', data.lib,
+      '--version', pkg.version, '--stage-root', data.stage, '--out', sourceTgz], { encoding: 'utf8' })
+    expect(tarball.status, tarball.stderr).toBe(0)
     const run = (target: string) => spawnSync(process.execPath, [releasePortableScript,
-      '--app', app, '--plugin-zip', pluginZip, '--version', pkg.version,
+      '--app', app, '--plugin-zip', pluginZip, '--plugin-tgz', sourceTgz, '--version', pkg.version,
       '--stage-root', data.stage, '--out', target], { encoding: 'utf8', env: { ...process.env, PYTHONUTF8: '1' } })
     const result = run(out)
     expect(result.status, result.stderr).toBe(0)
@@ -148,6 +155,11 @@ describe('每次发布的完整便携包', () => {
     const vendorVersion = (name: string) => vendorManifest.plugins
       .find((plugin: { name: string }) => plugin.name === name).version
     expect(zip.profile.dependencies['dsh-better-sidebar']).toBe(vendorVersion('dsh-better-sidebar'))
+    // 本插件必须登记为 file: 相对路径并随包携带不可变 tarball —— 精确版本登记会让
+    // install_bundle（profile 里的 pnpm add 全量解析）对未发布的本地包 404（2026-11-19 实测）。
+    const tarballName = `dsh-webops-plugin-${pkg.version}.tgz`
+    expect(zip.profile.dependencies['dsh-webops-plugin']).toBe(`file:../../../vendor/${tarballName}`)
+    expect(zip.names).toContain(`vendor/${tarballName}`)
     const shipped = spawnSync('python', ['-c',
       'import sys,zipfile; z=zipfile.ZipFile(sys.argv[1]); print(z.read("home/profiles/desktop/node_modules/dsh-better-sidebar/lib/index.js").decode())', out], { encoding: 'utf8' })
     expect(shipped.status, shipped.stderr).toBe(0)
