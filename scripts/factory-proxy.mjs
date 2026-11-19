@@ -26,6 +26,10 @@ export function normalizeFactoryProxy(raw) {
   if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
     throw new Error(`DSH_FACTORY_PROXY 只支持 http/https 代理：${raw}`)
   }
+  // 拒绝带用户名密码的代理 URL：凭据会明文落盘 proxy.txt、进分发 zip 并被打印进使用说明
+  if (parsed.username !== '' || parsed.password !== '') {
+    throw new Error(`DSH_FACTORY_PROXY 不能带账号密码（凭据会明文落盘 proxy.txt 并进分发 zip）：${raw}`)
+  }
   if (parsed.hostname === '' || parsed.port === '') {
     throw new Error(`DSH_FACTORY_PROXY 必须带 host:port：${raw}`)
   }
