@@ -426,7 +426,9 @@ describe('端点发现与归属核验', () => {
     })
     expect(deadPort.ok).toBe(false)
     expect(deadPort.problems.join('\n')).toContain('desktop-host')
-  })
+    // 三段串联，每段自己就有 1200ms 的等待预算（3.6s 起），vitest 默认 5s 在并发调度下会
+    // 稳定误判超时（单跑却是绿的）。这是用例的时间尺度，不是被测代码变慢，显式放宽。
+  }, 20000)
 
   it('主进程始终不出现：超时明确失败', async () => {
     const discovery = await lib.discoverInstanceEndpoints({

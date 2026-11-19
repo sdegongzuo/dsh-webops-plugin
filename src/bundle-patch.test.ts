@@ -626,7 +626,12 @@ describe('发布链的身份契约：签出哪个 ref、版本对不对得上、
     expect(workflow).not.toContain('if ($pkg -ne $version) { throw')
     const pack = readRepoFile('scripts/package-desktop-portable.mjs')
     expect(pack).toContain('desktopReleaseVersion(appDir, readArg(\'version\'))')
-    expect(pack).toContain('[pluginName]: pluginVersion')
+    // 0.2.29 起本插件必须是 file: 相对路径登记（走 plugin-registration 这个唯一真相源），
+    // 写回精确版本号会让 install_bundle 对未发布的本地包 404。
+    expect(pack, '桌面端独发链的插件登记必须走 pluginFileSpec')
+      .toContain('[pluginName]: pluginFileSpec(pluginName, pluginVersion)')
+    expect(pack, '桌面端独发链退回精确版本登记 —— install_bundle 会 404')
+      .not.toContain('[pluginName]: pluginVersion')
     expect(pack).toContain('version: pluginVersion')
   })
 
@@ -710,12 +715,15 @@ describe('发版工作流的保留式打包（不删除、不覆盖）', () => {
     }
   })
 
-  it('每次插件 Release 同时发布完整便携包与独立插件附件', () => {
+  it('每次插件 Release 同时发布插件 tarball、独立插件包与完整便携包', () => {
     expect(workflow).toContain('dsh-webops-plugin-v$version.zip')
     expect(workflow).toContain('node scripts/package-portable.mjs')
     expect(workflow).not.toContain('node scripts/package-plugin-update.mjs')
     expect(workflow).not.toContain('UPDATE_ZIP_NAME')
-    expect(workflow).toContain('--notes-file dist/notes.md $pluginZip $portableZip')
+    // 三附件：tgz 是 profile 里 file: 登记的事实来源，漏发它等于发出去的包装不上插件。
+    expect(workflow).toContain('--notes-file dist/notes.md $pluginZip $pluginTgz $portableZip')
+    expect(workflow, '发布前没校验 tgz 的 digest —— 传错/漏传都不报')
+      .toContain('$env:PLUGIN_TGZ_NAME; digest = "sha256:$env:PLUGIN_TGZ_SHA256"')
     expect(workflow).toContain('dsh-webops-desktop-v$version-win-x64-portable.zip')
     expect(workflow).toContain('node scripts/package-release-portable.mjs')
     expect(workflow).toContain('完整便携包未通过验证，禁止发布')
