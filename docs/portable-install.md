@@ -15,14 +15,22 @@ DeepSeek Harness 的源码 checkout。
 
 ```json
 "dependencies": {
-  "dsh-webops-plugin": "file:../../../vendor/dsh-webops-plugin-<版本>.tgz"
+  "dsh-webops-plugin": "file:../../../vendor/dsh-webops-plugin-0.2.29.tgz"
 }
 ```
 
-- 路径相对 `home/profiles/desktop/`，指向便携包根 `vendor\` 里的 tgz，整个目录搬走也不失链；
-- 这个 tgz 是插件管理器解析本插件的**事实来源**，不要删；覆盖 `node_modules` 后它仍会被沿用；
+三步做完才算升级完成：
+
+1. **放 tgz**：从 Release 页面下载 `dsh-webops-plugin-<版本>.tgz`，放到 `<便携目录>\vendor\`。**tgz 不在插件 ZIP 里**，要单独下载；完整便携包已自带，用 ZIP 升级的必须手动放。
+2. **改登记**：编辑 `home\profiles\desktop\package.json`，只改 `dependencies` 里 `dsh-webops-plugin` **这一个键**（上面的示例是 0.2.29 的完整写法，把版本号换成 `vendor\` 下实际那个文件名）。**不要整块替换 `dependencies`** —— 那会连带抹掉你自己装过的其它插件。
+3. **重启**：改完关掉再开 DSH，核对插件目录 `package.json` 的 version。
+
+要点：
+
+- 路径相对 `home/profiles/desktop/`，指向便携包根 `vendor\` 里的 tgz，整个目录搬到别的盘也不失链；
+- 这个 tgz 是插件管理器解析本插件的**事实来源，不要删**。只覆盖 `node_modules\` 只影响本次启动；下次 `install_bundle` 仍按 tgz 重新解析，tgz 和登记没同步就会被旧版覆盖回去；
 - 若你的登记还是精确版本号（如 `"0.2.28"`），请在安装其它插件前改成上面的写法 —— 否则每次 `install_bundle` 都会因本插件不在 registry 而上抛 404；
-- 发新版时换掉这个 tgz（文件名带版本号，登记也要同步改），后续重装会从新 tgz 复制文件。
+- 发新版时换掉这个 tgz（文件名带版本号，登记也要同步改），后续重装会从新 tgz 复制文件；同一版本号不要重打 tgz。
 
 本包包含完整插件运行时，不依赖上一版插件文件。DSH 与插件分别发版；DSH 本体不变且接口兼容时，只需更新插件。需要新宿主接口的版本应在 Release 说明列出兼容要求，旧 DSH 不自动获得新接口。
 

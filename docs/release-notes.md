@@ -25,16 +25,23 @@
 
 ### 升级须知
 
-- **从 0.2.28 及更早升级（重要）**：只覆盖 `node_modules\dsh-webops-plugin\` 仍能正常启动，但 profile 里那条精确版本登记还在。请顺手把它改成 `file:` 写法（见下方「更新已有安装」第 4 步），否则在桌面端安装其它插件时仍会 404 —— 这不是本版新引入的问题，但只有改了登记才算真正修掉。
+- **从 0.2.28 及更早升级（重要）**：只覆盖 `node_modules\dsh-webops-plugin\` 能让当前版本正常启动（宿主启动时不跑包管理），但 profile 里那条精确版本登记还在 —— 下次在桌面端安装其它插件时仍会 404。必须同时做两件事：把包根的 `vendor\` 放上本版 tgz，并把登记改成 `file:` 写法（见下方第 4 步）。
+- **tgz 不在独立插件 ZIP 里**：它是 Release 的独立附件，要单独下载。只下 ZIP 的用户请先下载 `__PLUGIN_TGZ__` 放到包根 `vendor\`，否则登记指向的文件不存在，比原来的 404 更糟。
 - 完整便携包会替换 `home` 的出厂内容；已有会话、凭据请先备份。
-- 独立插件 ZIP 仍只适用于宿主已是 `0.2.2-rc.5` 的安装；插件功能与 0.2.28 完全一致，从 0.2.28 升级可以只换插件目录。
+- 独立插件 ZIP 仍只适用于宿主已是 `0.2.2-rc.5` 的安装。插件代码与 0.2.28 完全一致，但**不能用它单独完成升级** —— 同步 tgz 与登记这一步同样要做。
 
 ### 更新已有安装
 
 1. 完全退出 DSH，备份现有 `home\`（会话 / 设置 / 凭据都在里面）。
-2. 下载 `__PORTABLE_ZIP__` 解压到新目录，把备份的 `home\`、`data\` 拷进新包根目录（目录契约不变）。
-3. 启动后核对设置页版本为 `__DSH_VERSION__`、插件版本为 `__VERSION__`，并实际调一次网页工具。
-4. 若沿用旧 `home`：确认包根有 `vendor\__PLUGIN_TGZ__`，把 `home\profiles\desktop\package.json` 里 `dependencies.dsh-webops-plugin` 一项改成 `"file:../../../vendor/__PLUGIN_TGZ__"`（只改这一个键），再重启。旧 tarball 可以留着，不影响使用。
+2. 下载 `__PORTABLE_ZIP__` 解压到新目录。
+3. 把备份的 `home\`、`data\` 拷进新包根目录（目录契约不变）。注意这会把旧 `home` 里的插件目录一起带回来（版本仍是旧的），下一步补。
+4. 补齐本版插件与登记：
+   - 用新包自带的 `home\profiles\desktop\node_modules\dsh-webops-plugin\` 覆盖回去（或解压 `__PLUGIN_ZIP__` 覆盖）；
+   - 确认包根有 `vendor\__PLUGIN_TGZ__`（完整包已自带；用 ZIP 升级的从 Release 下载后放进去）；
+   - 把 `home\profiles\desktop\package.json` 里 `dependencies.dsh-webops-plugin` **这一个键**改成 `"file:../../../vendor/__PLUGIN_TGZ__"`。不要整块替换 `dependencies` —— 那会抹掉你自己装过的其它插件。
+5. 启动后核对设置页版本为 `__DSH_VERSION__`、插件版本为 `__VERSION__`，并实际调一次网页工具。
+
+做完这一轮，后续在桌面端安装其它插件不会再因本插件 404；下次 `install_bundle` 也会按新 tgz 重新解析，不会把插件回滚成旧版。
 
 独立插件 ZIP 仍然提供，但**只适用于宿主已经是 `__DSH_VERSION__` 的安装**：完全退出 DSH，把包内文件覆盖到 `home/profiles/desktop/node_modules/dsh-webops-plugin/`（包根目录是插件内容，不能直接解压到便携版根目录），重启后核对 `package.json` 的 version。
 

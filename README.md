@@ -13,10 +13,10 @@
 | 使用方式 | 产物 | 操作 |
 |---|---|---|
 | 首次使用桌面端 | dsh-webops-desktop-v&lt;插件发布版本&gt;-win-x64-portable.zip | 解压后运行启动.cmd |
-| 更新已有插件 | dsh-webops-plugin-v&lt;版本&gt;.zip | 完全退出后覆盖到实际插件目录，再重启 |
+| 更新已有插件 | dsh-webops-plugin-v&lt;版本&gt;.zip + dsh-webops-plugin-&lt;版本&gt;.tgz | 覆盖插件目录、把 tgz 放进 `vendor\`、改 profile 登记、再重启 |
 | 已有自己的 dsh | dsh-webops-plugin-v&lt;版本&gt;.zip | 按 [插件安装说明](docs/portable-install.md) 装入 profile |
 
-每次发布同时提供完整便携包与独立插件包；已有用户可以只替换插件。完整包内置 WebOps、Context 与 Better Sidebar 三个插件，release-manifest.json 分别记录插件和 DSH 本体版本。下载后核对 SHA256；插件版本取插件目录中的 package.json。
+每次发布提供插件 tarball、独立插件包与完整便携包三件产物。**更新插件不能只换插件目录**：tgz 是 profile `file:` 登记的事实来源，还要把它放到便携包根 `vendor\` 并同步 `home\profiles\desktop\package.json`（做法见 [插件安装说明](docs/portable-install.md)），否则下次在桌面端安装其它插件会 404。完整包内置 WebOps、Context、Better Sidebar、WorkBuddy 连接与 Grok 订阅五个插件，release-manifest.json 分别记录插件和 DSH 本体版本。下载后核对 SHA256；插件版本取插件目录中的 package.json。
 
 ## 工具与权限
 
