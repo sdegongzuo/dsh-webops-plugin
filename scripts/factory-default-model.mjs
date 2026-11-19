@@ -20,8 +20,15 @@ export function formatFactoryDefaultModel(config) {
 export function appendFactoryDefaultModel(patchPath, raw = process.env.DSH_FACTORY_DEFAULT_MODEL) {
   if (raw === undefined || raw === '') return undefined
   const [provider, model, reasoningEffort = 'high', ...rest] = raw.split('/')
-  if (provider === '' || model === '' || rest.length > 0) {
-    throw new Error(`DSH_FACTORY_DEFAULT_MODEL 需要 provider/model[/effort]，实际：${raw}`)
+  // 缺 model 段（例如只写 `xai`）必须当场报错：否则 JSON.stringify(undefined) 的结果是
+  // 值 `undefined`，模板串会把它写成字面量 `undefined`，宿主的模型名就成了 "undefined"，
+  // 只能等运行时请求失败才发现；verify-settings 虽然是最后一道门，但构建期报错更省事。
+  if (!provider || !model || rest.length > 0) {
+    throw new Error(`DSH_FACTORY_DEFAULT_MODEL 需要 provider/model[/effort]（例如 xai/grok-4.7/high），实际：${raw}`)
+  }
+  // `xai/grok-4.7/` 这种尾随斜杠：默认值只在 undefined 时生效，空串会写进 `reasoningEffort: ""`。
+  if (reasoningEffort === '') {
+    throw new Error(`DSH_FACTORY_DEFAULT_MODEL 的 effort 段不能为空，省略即默认 high，实际：${raw}`)
   }
   const block = [
     '',
