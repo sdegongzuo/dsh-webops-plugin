@@ -7,6 +7,7 @@ import { readRuntimeDescriptor } from './desktop-runtime.mjs'
 import { planSlimAppCopy } from './slim-portable-app.mjs'
 import { verifyDesktopBuildIdentity } from './desktop-build-identity.mjs'
 import { writeProfileExemptions } from './vendor-compatibility.mjs'
+import { appendFactoryDefaultModel, formatFactoryDefaultModel } from './factory-default-model.mjs'
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 
@@ -75,6 +76,7 @@ try {
   }, null, 2) + '\n')
   writeFileSync(join(profile, 'pnpm-workspace.yaml'), 'nodeLinker: hoisted\nautoInstallPeers: false\nstrictDepBuilds: true\n')
   cpSync(join(ROOT, 'scripts/portable-profile-patch.yaml'), join(profile, 'cordis.patch.yml'))
+  const factoryDefault = appendFactoryDefaultModel(join(profile, 'cordis.patch.yml'))
   run(process.execPath, [join(ROOT, 'scripts/materialize-vendored-plugins.mjs'), '--profile-dir', profile])
   // 物化之后才能读到真实 manifest：厂商插件若把 peer 钉成精确版（workbuddy-connect 钉
   // 0.2.1-rc.2 就是），宿主会把它当不兼容**静默跳过**，功能整块消失。豁免写进出厂 profile。
@@ -84,15 +86,37 @@ try {
     runtimeVersion: runtime.release.version,
     names: [pkg.name, ...vendor.plugins.map(p => p.name)],
   })
-  writeFileSync(join(stage, '启动.cmd'), ['@echo off', 'setlocal', 'set "DSH_HOME=%~dp0home"', `start "" "%~dp0app\\${exe}" %*`, ''].join('\r\n'))
+  writeFileSync(join(stage, '启动.cmd'), [
+    '@echo off',
+    'setlocal',
+    'set "PATH=%SystemRoot%\\System32;%PATH%"',
+    'set "DSH_HOME=%~dp0home"',
+    'rem Node ignores the Windows system proxy; pass the WinINET proxy to dsh.',
+    'rem Only a simple host:port value is used; per-protocol values are left alone.',
+    'set "PROXY_ENABLE="',
+    'set "PROXY_SERVER="',
+    'for /f "tokens=3" %%A in (\'reg query "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings" /v ProxyEnable 2^>nul ^| findstr /i "ProxyEnable"\') do set "PROXY_ENABLE=%%A"',
+    'if "%PROXY_ENABLE%"=="0x1" for /f "tokens=3" %%A in (\'reg query "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings" /v ProxyServer 2^>nul ^| findstr /i "ProxyServer"\') do set "PROXY_SERVER=%%A"',
+    'echo %PROXY_SERVER%| findstr "=" >nul && set "PROXY_SERVER="',
+    'if defined PROXY_SERVER set "HTTPS_PROXY=http://%PROXY_SERVER%"',
+    'if defined PROXY_SERVER set "HTTP_PROXY=http://%PROXY_SERVER%"',
+    'rem Optional override: put one proxy URL on the first line of proxy.txt.',
+    'if exist "%~dp0proxy.txt" for /f "usebackq delims=" %%P in ("%~dp0proxy.txt") do (set "HTTPS_PROXY=%%P" & set "HTTP_PROXY=%%P")',
+    `start "" "%~dp0app\\${exe}" %*`,
+    '',
+  ].join('\r\n'))
   writeFileSync(join(stage, '使用说明.txt'), [
     `插件发布版本：${version}；DSH 本体：${runtime.release.version}；Windows x64 完整便携包。`,
-    '解压到较短路径，双击启动.cmd。出厂不预置任何模型 provider：首次使用请在设置→模型添加自己的提供商并填 API Key；包内不含凭据或用户会话。',
+    factoryDefault === undefined
+      ? '解压到较短路径，双击启动.cmd。出厂不预置默认模型：请在设置→模型选择或添加自己的提供商；包内不含凭据或用户会话。'
+      : `解压到较短路径，双击启动.cmd。本构建默认 ${formatFactoryDefaultModel(factoryDefault)}：首次启动复用本机登录态，没有则按插件引导登录；包内不含凭据或用户会话。`,
+    '启动脚本会自动读取 Windows 系统代理；也可在包根 proxy.txt 第一行写完整代理地址覆盖。直接双击 app 下的 exe 不会带代理。',
     '已有用户请先备份原 home 与 data。不要用出厂 home 覆盖自己的会话、设置和凭据。',
     '只换插件要求插件 peer 仍匹配当前宿主版本（插件的 package.json 会写明）；DSH 本体升级时请用整包。',
     '完整安装与数据迁移说明：https://github.com/sdegongzuo/dsh-webops-plugin/blob/main/docs/portable-install.md',
   ].join('\r\n'))
   writeFileSync(join(stage, 'release-manifest.json'), JSON.stringify({ pluginVersion: version, dshVersion: runtime.release.version,
+    ...factoryDefault === undefined ? {} : { factoryDefault },
     ...desktopBuild !== undefined ? { desktopBuild } : {},
   }, null, 2) + '\n')
   mkdirSync(dirname(out), { recursive: true })

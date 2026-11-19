@@ -61,6 +61,7 @@ import { readRuntimeDescriptor } from './desktop-runtime.mjs'
 import { desktopReleaseVersion } from './desktop-release-version.mjs'
 import { slimApp } from './slim-portable-app.mjs'
 import { writeProfileExemptions } from './vendor-compatibility.mjs'
+import { appendFactoryDefaultModel, formatFactoryDefaultModel } from './factory-default-model.mjs'
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const DIST = join(ROOT, 'dist')
@@ -692,7 +693,11 @@ if (!existsSync(profilePatchTemplate)) {
   process.exit(1)
 }
 cpSync(profilePatchTemplate, join(profileDir, 'cordis.patch.yml'))
-console.log('  + home/profiles/desktop/cordis.patch.yml（出厂权限配置，不预置模型 provider）')
+const factoryDefault = appendFactoryDefaultModel(join(profileDir, 'cordis.patch.yml'))
+console.log('  + home/profiles/desktop/cordis.patch.yml（出厂权限配置'
+  + (factoryDefault === undefined
+    ? '，不预置模型 provider）'
+    : `，默认 ${formatFactoryDefaultModel(factoryDefault)}）`))
 
 // 3) 插件真身。必须是**真实文件**：validateDesktopPluginGraph 见 symlink 就拒。
 //    发布版 package.json 剔除 devDependencies 里指向本机 harness 的 link:。
@@ -743,9 +748,21 @@ writeFileSync(
   [
     '@echo off',
     'setlocal',
+    'set "PATH=%SystemRoot%\\System32;%PATH%"',
     'set "ROOT=%~dp0"',
     'set "DSH_HOME=%ROOT%home"',
     'if not exist "%DSH_HOME%" mkdir "%DSH_HOME%"',
+    'rem Node ignores the Windows system proxy; pass the WinINET proxy to dsh.',
+    'rem Only a simple host:port value is used; per-protocol values are left alone.',
+    'set "PROXY_ENABLE="',
+    'set "PROXY_SERVER="',
+    'for /f "tokens=3" %%A in (\'reg query "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings" /v ProxyEnable 2^>nul ^| findstr /i "ProxyEnable"\') do set "PROXY_ENABLE=%%A"',
+    'if "%PROXY_ENABLE%"=="0x1" for /f "tokens=3" %%A in (\'reg query "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings" /v ProxyServer 2^>nul ^| findstr /i "ProxyServer"\') do set "PROXY_SERVER=%%A"',
+    'echo %PROXY_SERVER%| findstr "=" >nul && set "PROXY_SERVER="',
+    'if defined PROXY_SERVER set "HTTPS_PROXY=http://%PROXY_SERVER%"',
+    'if defined PROXY_SERVER set "HTTP_PROXY=http://%PROXY_SERVER%"',
+    'rem Optional override: put one proxy URL on the first line of proxy.txt.',
+    'if exist "%ROOT%proxy.txt" for /f "usebackq delims=" %%P in ("%ROOT%proxy.txt") do (set "HTTPS_PROXY=%%P" & set "HTTP_PROXY=%%P")',
     `start "" "%ROOT%app\\${exe}" %*`,
     '',
   ].join('\r\n'),
@@ -777,13 +794,25 @@ writeFileSync(
     `  ${pluginName} 已经预装在 home\\profiles\\desktop\\node_modules\\ 下，`,
     '  并在该 profile 的 dsh.profile.bundles 里登记过，开箱即用。',
     `  另随包预置第三方插件：${vendoredPlugins.map((plugin) => `${plugin.name} v${plugin.version}`).join('、')}。`,
-    '  （清单、版本与出处见仓库 vendor/plugins/manifest.json；卸载/升级方法与普通 dsh 插件相同。）',
+    '  （清单、版本与出处见仓库 vendor/plugins/manifest.json；这些插件随包出厂，升级请换整包。）',
     '',
-    '【第一次打开：配一个模型】',
-    '  包里**不预置任何模型 provider 或 API Key**。打开「设置 → 模型」，',
-    '  添加你自己的模型提供商（OpenAI 兼容网关 / xAI / DeepSeek 等），',
-    '  填好 API Key 与模型后即可使用。Key 会写进 home\\.credentials.yaml，下次启动自动带上。',
-    '  没配就发消息的话，dsh 会报 MISSING_CREDENTIAL 并提示要设哪个变量。',
+    '【第一次打开：模型】',
+    ...(factoryDefault === undefined
+      ? [
+        '  出厂不预置默认模型。打开「设置 → 模型」，选择或添加自己的模型提供商。',
+      ]
+      : [
+        `  本构建默认 ${formatFactoryDefaultModel(factoryDefault)}。`,
+        '  首次启动会自动复用本机 ~/.grok-bridge 或 ~/.grok 的登录态；',
+        '  没有可用 token 时，插件会打开浏览器引导完成设备码登录。',
+        '  没有 SuperGrok / X Premium 订阅的用户，可在模型选择里切回 WorkBuddy 等自带模型。',
+      ]),
+    '  API Key 与本机登录态都不进包，只落在当前用户的 home 目录。',
+    '',
+    '【代理】',
+    '  启动脚本会自动读取 Windows 系统代理（仅支持简单的 host:port）；',
+    '  也可在包根新建 proxy.txt，第一行写一个完整代理地址（如 http://127.0.0.1:7890）覆盖它。',
+    '  直接双击 app 下的 exe 不会带上代理，Node 也不读系统代理 —— 请优先用「启动.cmd」。',
     '',
     '【验证插件生效】',
     '  1) 先「选择工作区」，然后新建一个会话。',

@@ -46,3 +46,11 @@
         sandbox: danger-full-access
         approval: never
     defaultPreset: auto
+
+# Grok 订阅插件（dsh-llm-xai-oauth）：固定伪装版本。
+# 上游 cli-chat-proxy 会校验 x-grok-client-version，插件默认的 1.0.0 会被 426 拒绝
+# （响应体要求 1.0.13 or later）；这里写在出厂 patch，用户不必手工改配置。
+# 以后服务端继续抬版本时，只改这一处并重新打包。
+- id: llm-xai-oauth
+  config:
+    clientVersion: "1.0.13"

@@ -136,10 +136,11 @@ describe('每次发布的完整便携包', () => {
     expect(zip.names).not.toContain('app/resources/runtime/pnpm/index.js')
     expect(zip.manifest).toEqual({ pluginVersion: pkg.version, dshVersion: '0.2.2-rc.5' })
     // 2026-10-18 起出厂默认追加 5 个实验性 bundle（FACTORY_EXPERIMENTAL_BUNDLES，
-    // 见 scripts/package-release-portable.mjs）；这里故意硬编码，钉住意外变动。
+    // 见 scripts/package-release-portable.mjs）；2026-11-19 起随包再加 dsh-llm-xai-oauth
+    // （Grok 订阅接入），这里故意硬编码，钉住意外变动。
     expect(zip.profile.dsh.profile.bundles).toEqual(['@deepseek-ai/dsh-base', '@deepseek-ai/dsh-web-app',
-      'dsh-webops-plugin', 'dsh-context', 'dsh-better-sidebar', 'dsh-connect-workbuddy',
-          '@deepseek-ai/dsh-experimental-auto-review',
+      'dsh-webops-plugin', 'dsh-context', 'dsh-better-sidebar', 'dsh-connect-workbuddy', 'dsh-llm-xai-oauth',
+      '@deepseek-ai/dsh-experimental-auto-review',
       '@deepseek-ai/dsh-experimental-tool-worktree',
       '@deepseek-ai/dsh-experimental-terminal-bundle',
       '@deepseek-ai/dsh-experimental-session-search'])
