@@ -22,6 +22,14 @@ on:
         description: deepseek-harness 的 ref（tag / branch / sha）
         required: false
         type: string
+      # 24 小时发布窗口的**一次性**绕过（默认关闭）。仅在上游包发布不足 24h、且已确认
+      # 本机验收全绿时手动勾选；推 tag 触发的常规发版不经过此开关。机制与纪律见
+      # scripts/release-age-override.mjs 与 docs/打包机制参考.md §24小时发布窗口。
+      skip_release_age:
+        description: 24h 窗口内临时放宽 pnpm minimumReleaseAge（仅本次 dispatch）
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -141,6 +149,16 @@ jobs:
             'DSH_DESKTOP_WINDOWS_KEY_CONTAINER='
             'DSH_DESKTOP_WINDOWS_TOKEN_PIN='
           ) | Set-Content -LiteralPath $path -Encoding utf8
+
+      # 24 小时发布窗口的一次性绕过：仅 dispatch 显式传 skip_release_age=true 时执行。
+      # 改的是本作业全新 checkout 的一次性 harness，用完即弃，不还原、不进 patch，
+      # 因此 patchSha256 与产物身份不受影响；推 tag 的常规发版**不经过**这一步。
+      - name: 24h 窗口内临时放宽 pnpm 年龄策略（仅 opt-in）
+        if: ${{ inputs.skip_release_age == true }}
+        shell: pwsh
+        run: |
+          node scripts/release-age-override.mjs $env:HARNESS_ROOT
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: 装 harness 的依赖
         shell: pwsh
