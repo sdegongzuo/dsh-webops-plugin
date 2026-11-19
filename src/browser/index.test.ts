@@ -61,6 +61,9 @@ function makeProvider(id: string, available: boolean): StubProvider {
     // 好让「history 导航」这类请求也能过 `BrowserSession` 的类型。
     navigate: (request: BrowserNavigateRequest) => {
       calls.push(`navigate:${request.sessionId}`)
+      // 与真实 provider 一致：导航**无论成功与否**都作废既有 ref（provider.ts `navigate()`
+      // 里 `session.refs.invalidate()`）。桩若省略这一步，「导航后旧 ref 失效」就没有证据。
+      invalidated.push(request.sessionId)
       const url = request.url ?? SESSION.url
       const existing = sessions.get(request.sessionId)
       if (existing !== undefined) sessions.set(request.sessionId, { ...existing, url })
@@ -68,12 +71,15 @@ function makeProvider(id: string, available: boolean): StubProvider {
     },
     observe: (request: BrowserObserveRequest) => {
       calls.push(`observe:${request.sessionId}`)
+      // 地址 / 标题取自**这个会话当前的状态**，不是常量：`open` 复用路径的回执要求
+      // 「url/title 是本次真的观察到的值」，桩若一律回常量，那条要求就没法被证伪。
+      const known = sessions.get(request.sessionId)
       return Promise.resolve({
         kind: 'snapshot' as const,
         sessionId: request.sessionId,
         epoch: SESSION.epoch,
-        url: SESSION.url,
-        title: SESSION.title,
+        url: known?.url ?? SESSION.url,
+        title: known?.title ?? SESSION.title,
         outline: '',
         refs: [],
         truncated: false,
@@ -1016,5 +1022,324 @@ describe('失败恢复与同标签互斥', () => {
     finish()
     await assertion
     await expect(queued).resolves.toMatchObject({ kind: 'snapshot' })
+  })
+})
+
+/**
+ * 档 2「复用本对话已有标签」的用例组。
+ *
+ * 这一组反复断言的是**同一件事的三个侧面**：落点是不是同一个 session_id、标签数有没有
+ * 增加、ref 纪元有没有真的被作废。只断言第一个会让「复用」与「新建一张恰好同 id 的标签」
+ * 混在一起；只断言第二个会漏掉「页面被导航走了但模型手里的 ref 还能用」。
+ */
+describe('open 复用本对话已有标签（档 2）', () => {
+  it('已持有 A 时 open(B)：同一个 session_id、不新建标签、旧 ref 作废', async () => {
+    const { browser, provider } = await mountWithProvider()
+    const first = await browser.open({ url: 'https://example.com/a' }, ALICE)
+    provider.invalidated.length = 0
+    provider.calls.length = 0
+
+    const second = await browser.open({ url: 'https://example.com/b' }, ALICE)
+
+    // ① 落点就是原来那个标签：不新建、id 不变。
+    expect(second.id).toBe(first.id)
+    expect(provider.sessions.size).toBe(1)
+    expect(provider.calls.filter(call => call.startsWith('open:'))).toEqual([])
+    // ② 走的是既有 navigate 路径 —— 不是复制的一份导航逻辑。
+    expect(provider.calls).toContain(`navigate:${first.id}`)
+    // ③ 导航在快照之前：先换文档、再观察，回执才是新页面的。
+    expect(provider.calls.indexOf(`navigate:${first.id}`))
+      .toBeLessThan(provider.calls.indexOf(`observe:${first.id}`))
+    // ④ 旧 ref 确实作废了：provider 的 navigate 按契约作废纪元（这条断言同时锁住「档 2
+    //    必须走真导航、不能自己拼一条不发 navigate 的假路径」）。
+    expect(provider.invalidated).toContain(first.id)
+    // ⑤ 回执地址是**这次观察到的**新地址，不是复用前那张页面的旧地址 —— 否则模型会拿
+    //    「它以为还在 A」的判断去操作一个已经停在 B 的页面。
+    expect(second.url).toBe('https://example.com/b')
+    // ⑥ 归属没变：A 仍持有，B 仍进不来。
+    expect(() => browser.assertHeld(first.id, ALICE)).not.toThrow()
+    expect(() => browser.assertHeld(first.id, BOB))
+      .toThrow(expect.objectContaining({ code: 'BROWSER_TAB_NOT_HELD' }))
+    await browser.dispose()
+  })
+
+  it('open(同 URL)：不重复导航，但仍激活并重拍快照（回执是这次观察到的值）', async () => {
+    const { browser, provider } = await mountWithProvider()
+    const first = await browser.open({ url: 'https://example.com/same' }, ALICE)
+    provider.calls.length = 0
+
+    const again = await browser.open({ url: 'https://example.com/same' }, ALICE)
+
+    expect(again.id).toBe(first.id)
+    // 关键：一个 navigate 都没有 —— 无谓刷新会让页面丢掉已填表单与页面内状态。
+    expect(provider.calls.filter(call => call.startsWith('navigate:'))).toEqual([])
+    // 但快照照拍：回执里的 url/title/epoch 必须是**本次观察到的**，否则模型会拿旧纪元
+    // 去操作一个它以为刚打开的页面。这里断言的是「快照命令真的发出去了」+「它排在激活之后」。
+    expect(provider.calls).toContain(`observe:${first.id}`)
+    expect(provider.calls.indexOf('tabs:activate'))
+      .toBeLessThan(provider.calls.indexOf(`observe:${first.id}`))
+    expect(again).toMatchObject({ id: first.id, url: 'https://example.com/same', title: SESSION.title })
+    await browser.dispose()
+  })
+
+  it('回执的 url/title 取自本次快照，而不是复用前清单里的旧值', async () => {
+    const { browser, provider } = await mountWithProvider()
+    const first = await browser.open({ url: 'https://example.com/a' }, ALICE)
+    // 清单里仍报旧地址（标签条的清单有缓存是常态），快照才是权威：让它给出差别明显的新值。
+    const listed = provider.tabs
+    provider.tabs = async (request) => {
+      const result = await listed(request)
+      if (request.kind !== 'list') return result
+      return { ...result, tabs: result.tabs.map(tab => ({ ...tab, url: 'https://example.com/a', title: '旧标题' })) }
+    }
+    const observing = provider.observe
+    provider.observe = async (request) => {
+      const snapshot = await observing(request)
+      return snapshot.kind === 'snapshot'
+        ? { ...snapshot, url: 'https://example.com/b', title: '新标题' }
+        : snapshot
+    }
+
+    const second = await browser.open({ url: 'https://example.com/b' }, ALICE)
+
+    expect(second.id).toBe(first.id)
+    // 若实现偷懒用清单值或复用前的会话值，这里会拿到 a / 旧标题。
+    expect(second).toMatchObject({ url: 'https://example.com/b', title: '新标题' })
+    await browser.dispose()
+  })
+
+  it('等价写法（大小写与默认端口不同）同样不重复导航', async () => {
+    const { browser, provider } = await mountWithProvider()
+    const first = await browser.open({ url: 'https://example.com/' }, ALICE)
+    provider.calls.length = 0
+
+    const again = await browser.open({ url: 'https://EXAMPLE.com:443' }, ALICE)
+
+    // 规范化之后是同一个地址：不该为了「写法不同」白白刷新一次页面。
+    expect(again.id).toBe(first.id)
+    expect(provider.calls.filter(call => call.startsWith('navigate:'))).toEqual([])
+    await browser.dispose()
+  })
+
+  it('持有标签被人工接管时回落新建，绝不导航别人正在操作的页面', async () => {
+    const { browser, provider } = await mountWithProvider()
+    const first = await browser.open({ url: 'https://example.com/a' }, ALICE)
+    // 契约：`refRecoveryState` 在人工持有时无值（src/browser/types.ts）。
+    provider.refRecoveryState = (sessionId: string) => (sessionId === first.id ? undefined : 1)
+    provider.calls.length = 0
+
+    const second = await browser.open({ url: 'https://example.com/b' }, ALICE)
+
+    expect(second.id).not.toBe(first.id)
+    expect(provider.sessions.size).toBe(2)
+    // 关键否证：一条 navigate 都没发 —— 「回落新建」不能顺带把人工页面导航走。
+    expect(provider.calls.filter(call => call.startsWith('navigate:'))).toEqual([])
+    expect(() => browser.assertHeld(first.id, ALICE)).not.toThrow()
+    await browser.dispose()
+  })
+
+  it('reuseOwnTabOnOpen:false 回到旧行为（同址不同址都新建）', async () => {
+    const { browser, provider } = await mountWithProvider({ reuseOwnTabOnOpen: false })
+    const first = await browser.open({ url: 'https://example.com/a' }, ALICE)
+    provider.calls.length = 0
+
+    const other = await browser.open({ url: 'https://example.com/b' }, ALICE)
+    const same = await browser.open({ url: 'https://example.com/a' }, ALICE)
+
+    expect(other.id).not.toBe(first.id)
+    expect(same.id).not.toBe(first.id)
+    expect(same.id).not.toBe(other.id)
+    expect(provider.sessions.size).toBe(3)
+    expect(provider.calls.filter(call => call.startsWith('navigate:'))).toEqual([])
+    await browser.dispose()
+  })
+
+  it('别人的标签永不被复用（哪怕它就在 provider 清单里）', async () => {
+    const { browser, provider } = await mountWithProvider()
+    const alice = await browser.open({ url: 'https://example.com/a' }, ALICE)
+    const bob = await browser.open({ url: 'https://example.com/b' }, BOB)
+    provider.calls.length = 0
+
+    const aliceAgain = await browser.open({ url: 'https://example.com/c' }, ALICE)
+
+    // A 只可能复用自己那一张：B 的标签不能因为「清单里看得到」就变成落点。
+    expect(aliceAgain.id).toBe(alice.id)
+    expect(aliceAgain.id).not.toBe(bob.id)
+    expect(provider.calls.filter(call => call.startsWith('navigate:')).sort())
+      .toEqual([`navigate:${alice.id}`].sort())
+    expect(() => browser.assertHeld(bob.id, BOB)).not.toThrow()
+    await browser.dispose()
+  })
+
+  it('弹窗家族成员不进候选：宁可新建也不复用家族子标签', async () => {
+    const { browser, provider, adopt } = await mountWithAdoptingProvider()
+    const parent = await browser.open({ url: 'https://example.com/parent' }, ALICE)
+    provider.sessions.set('popup', { sessionId: 'popup', url: 'https://pop.example/', title: '弹窗' })
+    adopt('popup', parent.id)
+    provider.calls.length = 0
+
+    const next = await browser.open({ url: 'https://example.com/next' }, ALICE)
+
+    // 家族里的两张都不动：没有 navigate 落到 parent 或 popup 上。
+    expect(provider.calls).not.toContain(`navigate:${parent.id}`)
+    expect(provider.calls).not.toContain('navigate:popup')
+    expect(next.id).not.toBe(parent.id)
+    expect(next.id).not.toBe('popup')
+    await browser.dispose()
+  })
+
+  it('多个自有标签时选前台那一张', async () => {
+    const { browser, provider } = await mountWithProvider()
+    // 先用「释放再新建」造出两张同属 A 的标签：直接连开两次会被档 2 合并——这正是它该做的事。
+    const background = await browser.open({ url: 'https://example.com/a' }, ALICE)
+    await browser.tabs({ kind: 'release', sessionId: background.id }, ALICE)
+    const foreground = await browser.open({ url: 'https://example.com/b' }, ALICE)
+    await browser.tabs({ kind: 'claim', sessionId: background.id }, ALICE)
+    // provider 清单里前台信号是权威的：provider.tabs 的 active 标记。
+    const listed = provider.tabs
+    provider.tabs = async (request) => {
+      const result = await listed(request)
+      if (request.kind !== 'list') return result
+      return {
+        ...result,
+        tabs: result.tabs.map(tab => ({ ...tab, active: tab.sessionId === background.id })),
+      }
+    }
+    provider.calls.length = 0
+
+    const next = await browser.open({ url: 'https://example.com/c' }, ALICE)
+
+    expect(next.id).toBe(background.id)
+    expect(next.id).not.toBe(foreground.id)
+    await browser.dispose()
+  })
+
+  it('没有前台信号时取所有者清单里较新的那条，而不是「剩余租期最长」的那条', async () => {
+    // 受控时钟造出可区分的两种答案：按登记顺序 → newer；按剩余租期 → older。
+    let now = 0
+    const clock = vi.spyOn(performance, 'now').mockImplementation(() => now)
+    try {
+      const { browser, provider } = await mountWithProvider({ tabLeaseIdleMs: 10_000 })
+      // 两张同属 A 的标签（直接连开两次会被档 2 合并 —— 这正是它该做的事）。
+      const older = await browser.open({ url: 'https://example.com/a' }, ALICE)
+      await browser.tabs({ kind: 'release', sessionId: older.id }, ALICE)
+      const newer = await browser.open({ url: 'https://example.com/b' }, ALICE)
+      await browser.tabs({ kind: 'claim', sessionId: older.id }, ALICE)
+      // 晚 5 秒再碰 older：它的租期被续到最新，剩余期限比 newer 长。
+      // 若实现拿「最近活跃 = 剩余租期最长」当判据，落点就会倒向 older —— 而 older 恰恰是
+      // 模型正在看的那张，把它导航走正是要避免的事。
+      now = 5_000
+      await browser.observe({ kind: 'snapshot', sessionId: older.id }, ALICE)
+      provider.calls.length = 0
+
+      const next = await browser.open({ url: 'https://example.com/c' }, ALICE)
+
+      expect(next.id).toBe(newer.id)
+      expect(next.id).not.toBe(older.id)
+      await browser.dispose()
+    } finally {
+      clock.mockRestore()
+    }
+  })
+
+  it('复用不产生新标签，也不把这次 open 算成 opened_tabs', async () => {
+    const { browser, provider } = await mountWithProvider()
+    const first = await browser.open({ url: 'https://example.com/a' }, ALICE)
+    const second = await browser.open({ url: 'https://example.com/b' }, ALICE)
+    // open 的回执形态是 BrowserSession，没有 openedTabs 字段；这里断言的是「真的没多开」——
+    // provider 的 sessions 只有一张，且回执 id 自始至终没变过。
+    expect(second.id).toBe(first.id)
+    expect(provider.sessions.size).toBe(1)
+    expect(Object.keys(second).sort()).toEqual(['epoch', 'id', 'title', 'url'])
+    await browser.dispose()
+  })
+
+  it('目标网址非法时不进入档 2，交回 provider 的地址策略拒绝', async () => {
+    const { browser, provider } = await mountWithProvider()
+    const first = await browser.open({ url: 'https://example.com/a' }, ALICE)
+    const failing = provider.navigate
+    provider.navigate = async () => { throw new BrowserError('bad url', 'BROWSER_INVALID_PARAMS') }
+    provider.calls.length = 0
+
+    // 非 http(s) 规范化失败 ⇒ 档 2 整档跳过 ⇒ 落到档 3 新建（而不是拿它去导航既有标签）。
+    const created = await browser.open({ url: 'javascript:alert(1)' }, ALICE)
+    expect(created.id).not.toBe(first.id)
+    expect(provider.calls.filter(call => call.startsWith('navigate:'))).toEqual([])
+    provider.navigate = failing
+    await browser.dispose()
+  })
+
+  it('空 URL 的 open 不触发档 2（空白页请求仍按新建处理）', async () => {
+    const { browser, provider } = await mountWithProvider()
+    const first = await browser.open({ url: 'https://example.com/a' }, ALICE)
+    provider.calls.length = 0
+
+    const blank = await browser.open({}, ALICE)
+
+    expect(blank.id).not.toBe(first.id)
+    expect(provider.calls.filter(call => call.startsWith('navigate:'))).toEqual([])
+    await browser.dispose()
+  })
+
+  it('档 1（空闲同址领取）仍优先于档 2：有自己该领的空闲标签时不导航自有标签', async () => {
+    const { browser, provider } = await mountWithProvider()
+    // 先造一张空闲的同址标签，再让 A 另开一张自己的：档 1 命中时不该去导航后者。
+    const idle = await browser.open({ url: 'https://example.com/idle' }, ALICE)
+    await browser.tabs({ kind: 'release', sessionId: idle.id }, ALICE)
+    const mine = await browser.open({ url: 'https://example.com/mine' }, ALICE)
+    expect(mine.id).not.toBe(idle.id)
+    provider.calls.length = 0
+
+    const reused = await browser.open({ url: 'https://example.com/idle' }, ALICE)
+
+    // 档 1 命中：领取那张空闲的同址标签，页面原样保留，不导航、也不去动 mine。
+    expect(reused.id).toBe(idle.id)
+    expect(reused.id).not.toBe(mine.id)
+    expect(provider.calls.filter(call => call.startsWith('navigate:'))).toEqual([])
+    expect(() => browser.assertHeld(mine.id, ALICE)).not.toThrow()
+    await browser.dispose()
+  })
+
+  it('选好落点后被人工接管的竞争：回落新建，不把失败甩给模型', async () => {
+    const { browser, provider } = await mountWithProvider()
+    const first = await browser.open({ url: 'https://example.com/a' }, ALICE)
+    // 候选筛选时还看不出接管（钩子先回正常值），真正导航时才拒绝 —— 模拟「人刚按下接管」。
+    let seen = 0
+    provider.refRecoveryState = () => { seen += 1; return seen === 1 ? 1 : undefined }
+    provider.navigate = async () => {
+      throw new BrowserError('human took over', 'BROWSER_HUMAN_HOLDING')
+    }
+
+    const second = await browser.open({ url: 'https://example.com/b' }, ALICE)
+
+    expect(second.id).not.toBe(first.id)
+    expect(provider.sessions.size).toBe(2)
+    await browser.dispose()
+  })
+
+  it('导航失败（非竞争类错误）照原样抛出，不变成一张新标签', async () => {
+    const { browser, provider } = await mountWithProvider()
+    await browser.open({ url: 'https://example.com/a' }, ALICE)
+    provider.navigate = async () => { throw new BrowserError('boom', 'BROWSER_NAVIGATION_FAILED') }
+
+    // 网络 / 地址策略失败是请求本身的问题：回落新建会掩盖它，还平白多一张标签。
+    await expect(browser.open({ url: 'https://example.com/b' }, ALICE))
+      .rejects.toThrow(expect.objectContaining({ code: 'BROWSER_NAVIGATION_FAILED' }))
+    expect(provider.sessions.size).toBe(1)
+    await browser.dispose()
+  })
+
+  it('台账里有、provider 清单里已消失的标签不进候选（回到新建）', async () => {
+    const { browser, provider } = await mountWithProvider()
+    const first = await browser.open({ url: 'https://example.com/a' }, ALICE)
+    // 绕过受控入口直接关掉：台账还挂着，provider 这边已经没了。
+    provider.sessions.delete(first.id)
+    provider.calls.length = 0
+
+    const next = await browser.open({ url: 'https://example.com/b' }, ALICE)
+
+    expect(next.id).not.toBe(first.id)
+    expect(provider.calls.filter(call => call.startsWith('navigate:'))).toEqual([])
+    await browser.dispose()
   })
 })

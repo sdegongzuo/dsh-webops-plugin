@@ -86,7 +86,8 @@ export function apply(ctx: Context, config: Config = {}): void {
 
   registerSystemPrompt(ctx)
 
-  if (enabled.open) registerOpen(ctx, disclosure)
+  // open 也要拿到同一份缓存：它领取空闲标签 / 新建标签都会推进 ref 纪元（见 registerOpen 内注释）。
+  if (enabled.open) registerOpen(ctx, snapshotCache, disclosure)
   if (enabled.navigate) registerNavigate(ctx, snapshotCache)
   if (enabled.snapshot) registerSnapshot(ctx, snapshotCache)
   if (enabled.screenshot) registerScreenshot(ctx, snapshotCache)

@@ -100,6 +100,38 @@ function observationFailure(error: unknown): { code: BrowserErrorCode; message: 
     : { code: 'BROWSER_PROTOCOL_ERROR', message: error instanceof Error ? error.message : String(error) }
 }
 
+/**
+ * 目标网址的规范化形式，**只用于比较落点是否已经在目标地址上**。
+ *
+ * 只认 http(s)：其余 scheme（`javascript:` / `mailto:` / `about:`）不是「打开一个网页」，
+ * 让它们走新建路径，由 provider 的地址策略照今天的样子拒绝 —— 用复用路径去试探策略边界，
+ * 等于把「拒绝」变成「把用户手上的页面导航到一个非法地址」。
+ *
+ * 非法 URL 返回 `undefined`：地址策略归 provider，这里绝不替它判合法性。
+ */
+function normalizedUrl(url: string | undefined): string | undefined {
+  if (url === undefined) return undefined
+  try {
+    const parsed = new URL(url.trim())
+    return parsed.protocol === 'http:' || parsed.protocol === 'https:' ? parsed.href : undefined
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * 复用落点在「选好之后、动手之前」失效的三种竞争。
+ *
+ * 都只说明**这个落点此刻不能用**，不说明请求本身有问题：人刚按下接管、标签被关掉、
+ * 同标签上还有一次调用在跑。回落新建比把失败甩给模型更接近 OPEN 的本意。
+ */
+function isReuseRace(error: unknown): boolean {
+  return error instanceof BrowserError
+    && (error.code === 'BROWSER_TAB_NOT_HELD'
+      || error.code === 'BROWSER_TAB_BUSY'
+      || error.code === 'BROWSER_HUMAN_HOLDING')
+}
+
 export { BrowserError, isBrowserError, presentBrowserError } from './types.ts'
 export { DEFAULT_TAB_HANDOFF_TTL_MS, DEFAULT_TAB_LEASE_IDLE_MS, TabLeaseRegistry } from './lease.ts'
 export type { TabLeaseReleaseReason, TabLeaseView } from './lease.ts'
@@ -153,6 +185,14 @@ export interface BrowserRuntimeConfig {
   readonly tabLeaseIdleMs?: number
   /** 一次性移交码的有效期（毫秒）。默认 5 分钟；必须是正整数。 */
   readonly tabHandoffTtlMs?: number
+  /**
+   * `open()` 在本对话**已持有**标签时，是否复用其中一个并导航过去。默认 `true`。
+   *
+   * 为什么要这个开关：它把「一个 URL 一个标签」从模型纪律变成接口默认行为 —— 模型最直觉的
+   * 写法（每个 URL 一次 `webpage_open`）不再必然堆标签。但复用意味着**旧页面被导航走**，
+   * 与「open = 开新页」的既有预期不同，所以要留一条关掉即回到旧行为的路。
+   */
+  readonly reuseOwnTabOnOpen?: boolean
 }
 
 /**
@@ -169,6 +209,9 @@ export class BrowserRuntime extends Service {
     provider: z.string(),
     tabLeaseIdleMs: z.number(),
     tabHandoffTtlMs: z.number(),
+    // `.default(true)` 而不是在代码里 `?? true`：配置回执与文档必须能直接读出默认值，
+    // 「没写就是 true」一旦只活在实现里，关掉它的人会以为默认是 false。
+    reuseOwnTabOnOpen: z.boolean().default(true),
   })
 
   private readonly providers = new Map<string, BrowserProvider>()
@@ -177,11 +220,16 @@ export class BrowserRuntime extends Service {
   private readonly providerId: string | undefined
   /** 标签占用表。内存态，插件卸载即清空（不从历史回执恢复权限）。 */
   private readonly lease: TabLeaseRegistry
+  /** `open()` 是否复用本对话自己已有的标签（见 {@link BrowserRuntimeConfig.reuseOwnTabOnOpen}）。 */
+  private readonly reuseOwnTabOnOpen: boolean
 
   constructor(ctx: Context, config: BrowserRuntimeConfig = {}) {
     super(ctx, 'browser')
     const fromEnv = process.env[BROWSER_PROVIDER_ENV]
     this.providerId = config.provider ?? (fromEnv !== undefined && fromEnv.length > 0 ? fromEnv : undefined)
+    // 直接构造 Config 的地方（单测、编程式装配）绕过了 schema 的默认值，所以这里再兜一次；
+    // 两处都写 true 而只有一处是默认值来源，是最容易让「关掉却不生效」的坑。
+    this.reuseOwnTabOnOpen = config.reuseOwnTabOnOpen ?? true
     this.lease = new TabLeaseRegistry({
       // 展开写而不是直接赋值：`exactOptionalPropertyTypes` 下把 undefined 显式传进去
       // 与「不传」是两回事，而这里要的恰恰是「不传就用默认值」。
@@ -268,7 +316,12 @@ export class BrowserRuntime extends Service {
   }
 
   /**
-   * 相同网址的空闲受控标签优先领取复用，否则新建并登记给调用方。
+   * 打开一个受控标签页：按「空闲同址领取 → 复用本对话已有标签 → 新建」三档决定落点。
+   *
+   * 档 2 是「一个 URL 一个标签」从模型纪律变成接口默认行为的那一步：模型最直觉的写法
+   * （每个 URL 一次 `webpage_open`）此前必然堆标签，而租期到期只释放占用、不关页面，
+   * 于是页面一直活到浏览器进程退出。**注意它是有代价的选择**：复用会把本对话原有的页面
+   * 导航走，所以留了 `reuseOwnTabOnOpen` 关掉它。
    *
    * 登记必须在返回 session id 之前完成：只要模型看到了 id，它就能用，而中间那一瞬
    * 谁都用不了的窗口没有意义。登记失败则关掉刚开的标签（§5.1），不留孤儿。
@@ -284,45 +337,162 @@ export class BrowserRuntime extends Service {
   ): Promise<BrowserSession> {
     const owner = this.requireCaller(caller)
     const provider = this.resolve()
+    const target = normalizedUrl(request.url)
+    // 档 1（既有行为，一字不改）：空闲且同址的受控标签直接领取，页面原样保留。
+    if (request.url !== undefined && target !== undefined && this.lease.listAvailable(provider.id).length > 0) {
+      const idle = await this.claimIdleSameUrl(provider, owner, target, signal)
+      if (idle !== undefined) return idle
+    }
+    // 档 2（新增）：本对话已经持有标签时，挑一个复用并导航过去，返回**同一个** session_id。
+    if (this.reuseOwnTabOnOpen && request.url !== undefined && target !== undefined) {
+      const reused = await this.reuseOwnTab(provider, owner, target, signal)
+      if (reused !== undefined) return reused
+    }
+    // 档 3（既有行为）：新建并登记给调用方。
+    return this.createAndRegister(provider, owner.ownerId, request, signal)
+  }
+
+  /**
+   * 档 1：领取「空闲且同址」的受控标签。
+   *
+   * 返回 `undefined` = 没有可领取的落点，让调用方继续往下走。**领取成功之后的一切失败
+   * 都照原样抛出**（含快照失败）：那条路径已经把占用拿到手，回退成「新建」会让模型在
+   * 一次 open 里拿到两张标签。
+   */
+  private async claimIdleSameUrl(
+    provider: BrowserProvider,
+    owner: BrowserCaller,
+    target: string,
+    signal?: AbortSignal,
+  ): Promise<BrowserSession | undefined> {
     const available = new Set(this.lease.listAvailable(provider.id))
-    if (available.size > 0 && request.url !== undefined) {
-      let target: string | undefined
-      try { target = new URL(request.url.trim()).href } catch { /* 非法 URL 留给 provider 的地址策略拒绝。 */ }
-      if (target !== undefined) {
-        const listed = await provider.tabs({ kind: 'list' }, signal)
-        for (const tab of listed.tabs) {
-          if (!available.has(tab.sessionId) || tab.url !== target
-            || this.lease.view(provider.id, tab.sessionId)?.state !== 'available') continue
-          // 检查和领取之间没有 await，竞争者不能抢入；不领取移交中的或人工新建的标签。
-          this.lease.claim(provider.id, tab.sessionId, owner.ownerId)
-          try {
-            // 领取是家族级的，ref 作废也家族级（复用的标签可能带着上次留下的弹窗）。
-            for (const id of this.lease.familyTargets(provider.id, tab.sessionId)) {
-              provider.invalidateSession?.(id)
-            }
-            return await this.withLease(tab.sessionId, caller, async () => {
-              await provider.tabs({ kind: 'activate', sessionId: tab.sessionId }, signal)
-              const snapshot = await provider.observe({ kind: 'snapshot', sessionId: tab.sessionId }, signal)
-              if (snapshot.kind !== 'snapshot') throw new BrowserError('reused tab did not return a snapshot', 'BROWSER_PROTOCOL_ERROR')
-              return { id: tab.sessionId, url: snapshot.url, title: snapshot.title, epoch: snapshot.epoch }
-            }, signal)
-          } catch (error) {
-            // 失败只退还本次领取的租约，不覆盖期间发生的释放或移交。
-            // 调用计数已在 finally 归零；无 await，核对与退还之间不会换主。
-            try {
-              this.lease.assertHeld(provider.id, tab.sessionId, owner.ownerId)
-              this.lease.release(provider.id, tab.sessionId, owner.ownerId)
-            } catch { /* 已不归本调用者持有，保留新状态。 */ }
-            throw error
-          }
+    if (available.size === 0) return undefined
+    const listed = await provider.tabs({ kind: 'list' }, signal)
+    for (const tab of listed.tabs) {
+      if (!available.has(tab.sessionId) || tab.url !== target
+        || this.lease.view(provider.id, tab.sessionId)?.state !== 'available') continue
+      // 检查和领取之间没有 await，竞争者不能抢入；不领取移交中的或人工新建的标签。
+      this.lease.claim(provider.id, tab.sessionId, owner.ownerId)
+      try {
+        // 领取是家族级的，ref 作废也家族级（复用的标签可能带着上次留下的弹窗）。
+        for (const id of this.lease.familyTargets(provider.id, tab.sessionId)) {
+          provider.invalidateSession?.(id)
         }
+        return await this.withLease(tab.sessionId, owner, async () => {
+          await provider.tabs({ kind: 'activate', sessionId: tab.sessionId }, signal)
+          const snapshot = await provider.observe({ kind: 'snapshot', sessionId: tab.sessionId }, signal)
+          if (snapshot.kind !== 'snapshot') throw new BrowserError('reused tab did not return a snapshot', 'BROWSER_PROTOCOL_ERROR')
+          return { id: tab.sessionId, url: snapshot.url, title: snapshot.title, epoch: snapshot.epoch }
+        }, signal)
+      } catch (error) {
+        // 失败只退还本次领取的租约，不覆盖期间发生的释放或移交。
+        // 调用计数已在 finally 归零；无 await，核对与退还之间不会换主。
+        try {
+          this.lease.assertHeld(provider.id, tab.sessionId, owner.ownerId)
+          this.lease.release(provider.id, tab.sessionId, owner.ownerId)
+        } catch { /* 已不归本调用者持有，保留新状态。 */ }
+        throw error
       }
     }
+    return undefined
+  }
+
+  /**
+   * 档 2：复用**本对话自己**持有的标签，导航到目标地址后返回同一个 session_id。
+   *
+   * 三处刻意的保守取舍：
+   *
+   * 1. **只认同一 ownerId**。别人的、移交中的、空闲的都不在候选里 —— 门禁不是这里新加的
+   *    判断，而是 `listHeld` 本身就只回主人的标签；后续每一步仍走 `withLease` 再核一次。
+   * 2. **人工接管的标签不复用**。判据只有 `provider.refRecoveryState()`：契约写明「人工
+   *    持有时无值」。这是**不完整的判断** —— provider 没实现该钩子时根本无从得知 holder，
+   *    此时按「非人工」处理，真正拦住写操作的是 provider 的写前门
+   *    （`BROWSER_HUMAN_HOLDING`）。所以选完落点后的竞态失败一律回落新建，而不是把
+   *    「人刚按下接管」变成一次 open 失败。
+   * 3. **弹窗家族成员不进候选**。`lease.parentKey` 是租约表的私有字段，本轮不为此改它的
+   *    公开面，所以只认 `familyTargets()` 长度为 1 的孤立标签 —— 拿不到「这个标签是不是
+   *    弹窗子标签」的可靠答案时，宁可回落新建，也不猜。改取父标签那条路同理留待以后
+   *    （不是不能，而是需要先给租约表加一个公开的家族查询口）。
+   *
+   * 返回 `undefined` = 没有可复用的落点（含选好之后失效的竞态），调用方回落新建。
+   */
+  private async reuseOwnTab(
+    provider: BrowserProvider,
+    owner: BrowserCaller,
+    target: string,
+    signal?: AbortSignal,
+  ): Promise<BrowserSession | undefined> {
+    const held = this.lease.listHeld(provider.id, owner.ownerId)
+    if (held.length === 0) return undefined
+    const listed = await provider.tabs({ kind: 'list' }, signal)
+    const byId = new Map(listed.tabs.map(tab => [tab.sessionId, tab]))
+    const candidates = held.filter((view) => {
+      // 台账里有、provider 清单里没有：标签已经被关掉（或连接断了），导航它没意义。
+      if (byId.get(view.targetId) === undefined) return false
+      // 家族成员一律跳过（父标签同样跳过：复用父标签会把整族的页面一起带走，见头注 ③）。
+      if (this.lease.familyTargets(provider.id, view.targetId).length !== 1) return false
+      return !this.underHumanControl(provider, view.targetId)
+    })
+    if (candidates.length === 0) return undefined
+    // 前台优先；没有前台信号（外部 Chrome 没有可靠的活动标签信号）时取所有者清单里靠后的
+    // 那一条（`listHeld` 按台账插入顺序给出，靠后 = 较晚登记的）。
+    // 刻意**不用**剩余租期来猜「最近活跃」：租约在每次调用结束时续期，期限最长只说明「最近
+    // 被调用过」，而模型最常调用的往往正是它正在盯着的那个页面 —— 拿它当落点恰好会把模型
+    // 手上的页面导航走。登记顺序是确定性的，不会因为一次 observe 就改变选择。
+    const chosen = candidates.find(view => byId.get(view.targetId)?.active === true)
+      ?? candidates[candidates.length - 1]
+    if (chosen === undefined) return undefined
+    const sessionId = chosen.targetId
+    try {
+      // 「当前地址已经是目标地址」不重新导航：无谓刷新会让页面丢掉已填表单、滚动位置与
+      // 页面内状态 —— 而这正是模型「再 open 一次同一个网址」时最不想要的结果。
+      const current = byId.get(sessionId)?.url
+      if (current === undefined || normalizedUrl(current) !== target) {
+        // 复用既有导航路径：`navigate()` 自己走 withLease、作废 ref 纪元，并让 provider 记
+        // `expectSelfNavigation` 赊账 —— 不在这里复制一遍导航逻辑。
+        // 它必须**在**下面的 withLease 之前调用：同一个标签重复进 `tabCalls` 的临界区
+        // 会自己等自己。
+        await this.navigate({ sessionId, url: target }, owner, signal)
+      }
+      return await this.withLease(sessionId, owner, async () => {
+        await provider.tabs({ kind: 'activate', sessionId }, signal)
+        // 无论有没有导航都要重拍一次全页：回执里的 url / title / epoch 必须是**这次真的
+        // 观察到的**值。少了这一步，模型会拿着旧纪元（甚至旧 ref）去操作一个新地址。
+        const snapshot = await provider.observe({ kind: 'snapshot', sessionId }, signal)
+        if (snapshot.kind !== 'snapshot') throw new BrowserError('reused tab did not return a snapshot', 'BROWSER_PROTOCOL_ERROR')
+        return { id: sessionId, url: snapshot.url, title: snapshot.title, epoch: snapshot.epoch }
+      }, signal)
+    } catch (error) {
+      // 选好落点之后才失效的几种竞争：人刚按下接管、标签被关掉、同标签上还有调用在跑。
+      // 它们只说明「这个落点此刻不能用」，不说明请求本身有问题 —— 回落新建比把失败甩给
+      // 模型更接近 open 的本意。其余错误（地址策略、网络、超时）照原样抛。
+      if (isReuseRace(error)) return undefined
+      throw error
+    }
+  }
+
+  /**
+   * 这个标签是否正被人接管。**只看得到一部分**：provider 不实现
+   * `refRecoveryState` 时无从判断（外部 Chrome 直连没有 holder 通道），此时按「非人工」
+   * 处理，靠写前门兜底。
+   */
+  private underHumanControl(provider: BrowserProvider, sessionId: string): boolean {
+    if (provider.refRecoveryState === undefined) return false
+    return provider.refRecoveryState(sessionId) === undefined
+  }
+
+  /** 档 3：新建标签并登记给调用方；登记失败就关掉刚开的标签，不留孤儿。 */
+  private async createAndRegister(
+    provider: BrowserProvider,
+    ownerId: string,
+    request: BrowserOpenRequest,
+    signal?: AbortSignal,
+  ): Promise<BrowserSession> {
     let createdId: string | undefined
     const session = await provider.open({
       ...request,
       onCreated: id => {
-        this.lease.register(provider.id, id, owner.ownerId)
+        this.lease.register(provider.id, id, ownerId)
         createdId = id
       },
     }, signal).catch(error => {
@@ -330,7 +500,7 @@ export class BrowserRuntime extends Service {
       throw error
     })
     try {
-      if (createdId !== session.id) this.lease.register(provider.id, session.id, owner.ownerId)
+      if (createdId !== session.id) this.lease.register(provider.id, session.id, ownerId)
     } catch (error: unknown) {
       await provider.close(session.id).catch(() => undefined)
       throw error

@@ -45,6 +45,8 @@ interface Harness {
   failObserve: Error | undefined
   /** 设置后 `locate` 一律失败，用来验证工具层不吞异常。 */
   failLocate: Error | undefined
+  /** 设置后 `open` 一律失败：验证「打开失败不清本地大纲缓存」这条取舍。 */
+  failOpen: Error | undefined
   /** 逐步披露：当前被屏蔽的网页工具；`tools.get` 据此模拟宿主可见性。 */
   readonly hidden: Set<string>
   /** 逐步披露：已存在的对话（插件加载晚于 agent 创建时由 `attachExisting` 接管）。 */
@@ -137,6 +139,7 @@ function mount(): Harness {
     heldError: undefined,
     failObserve: undefined,
     failLocate: undefined,
+    failOpen: undefined,
     snapshotResponse: SNAPSHOT,
     openedTabs: undefined,
     affectedTabs: undefined,
@@ -229,6 +232,7 @@ function mount(): Harness {
       open: (args: unknown, caller?: unknown) => {
         callers.push({ method: 'open', caller })
         browserCalls.push({ method: 'open', args })
+        if (harness.failOpen !== undefined) return Promise.reject(harness.failOpen)
         return Promise.resolve(SESSION)
       },
       navigate: (args: unknown, caller?: unknown) => {
@@ -1959,6 +1963,60 @@ describe('2026-09-17 导航后 find 缓存必须失效', () => {
     await expect(tool(harness, 'webpage_find').execute({ session_id: 's1', query: 'submit' }, exec()))
       .rejects.toThrow(expect.objectContaining({ code: 'BROWSER_SNAPSHOT_REQUIRED' }))
     // s2 没动过 —— 整表清空的实现会在这里露馅。
+    await expect(tool(harness, 'webpage_find').execute({ session_id: 's2', query: 'submit' }, exec()))
+      .resolves.toMatchObject({ session_id: 's2', matches: [{ ref: 'e1' }] })
+  })
+})
+
+describe('2026-11-19 open 成功后同样必须丢 find 缓存', () => {
+  // 缺陷现场：`registerOpen` 从来没拿到 snapshotCache，所以 `webpage_open` 成功后工具层仍留着
+  // 上一纪元（甚至上一个 owner）的大纲。find 在 assertHeld 门禁之后读的是本地缓存，
+  // 门禁放过就照旧命中旧大纲 —— 新 owner 能直接检索前一个对话页面的大纲，
+  // 或者拿旧 ref 去 click 撞 BROWSER_STALE_REF。navigate / tabs 早就有这条清理，open 漏了。
+  let harness: Harness
+
+  beforeEach(() => {
+    harness = mount()
+  })
+
+  /** 先落一份缓存大纲：snapshot 是缓存写入的唯一途径。 */
+  async function cacheSnapshot(sessionId: string): Promise<void> {
+    await tool(harness, 'webpage_snapshot').execute({ session_id: sessionId }, exec())
+  }
+
+  it('open 成功后旧大纲作废，find 要求重拍而不是命中旧 ref', async () => {
+    await cacheSnapshot('s1')
+    // 先确认缓存真的能命中：否则下面那条 rejection 可能只是「本来就没缓存」的假绿。
+    await expect(tool(harness, 'webpage_find').execute({ session_id: 's1', query: 'submit' }, exec()))
+      .resolves.toMatchObject({ session_id: 's1', matches: [{ ref: 'e1' }] })
+
+    await tool(harness, 'webpage_open').execute({ url: 'https://example.com/' }, exec())
+
+    await expect(tool(harness, 'webpage_find').execute({ session_id: 's1', query: 'submit' }, exec()))
+      .rejects.toThrow(expect.objectContaining({ code: 'BROWSER_SNAPSHOT_REQUIRED' }))
+  })
+
+  it('open 失败不清缓存：没产生新会话，旧大纲仍是当前有效的观察', async () => {
+    await cacheSnapshot('s1')
+    harness.failOpen = new BrowserError('open failed: BROWSER_NAVIGATION_FAILED', 'BROWSER_NAVIGATION_FAILED')
+
+    await expect(tool(harness, 'webpage_open').execute({ url: 'https://example.com/broken' }, exec()))
+      .rejects.toThrow(expect.objectContaining({ code: 'BROWSER_NAVIGATION_FAILED' }))
+
+    // 失败路径上什么都没变：纪元没推进、也没拿到新会话，删掉只会让模型白付一次快照成本。
+    await expect(tool(harness, 'webpage_find').execute({ session_id: 's1', query: 'submit' }, exec()))
+      .resolves.toMatchObject({ session_id: 's1', matches: [{ ref: 'e1' }] })
+  })
+
+  it('只丢被打开的那个会话，其他会话的大纲不受影响', async () => {
+    await cacheSnapshot('s1')
+    await cacheSnapshot('s2')
+
+    await tool(harness, 'webpage_open').execute({}, exec())
+
+    // open 的回执是 s1 —— 整表清空的实现会在这里露馅。
+    await expect(tool(harness, 'webpage_find').execute({ session_id: 's1', query: 'submit' }, exec()))
+      .rejects.toThrow(expect.objectContaining({ code: 'BROWSER_SNAPSHOT_REQUIRED' }))
     await expect(tool(harness, 'webpage_find').execute({ session_id: 's2', query: 'submit' }, exec()))
       .resolves.toMatchObject({ session_id: 's2', matches: [{ ref: 'e1' }] })
   })

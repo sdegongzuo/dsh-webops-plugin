@@ -4,6 +4,7 @@ import {
   callFromBlock,
   observeBrowser,
   parseBrowserUrl,
+  visitedPages,
   type BrowserCall,
 } from './observation.ts'
 
@@ -26,6 +27,18 @@ function call(partial: Partial<BrowserCall> & Pick<BrowserCall, 'toolName'>): Br
     callId: 'c', settled: true, isError: false, argsRaw: '', resultText: '', image: undefined,
     ...partial,
   }
+}
+
+/**
+ * 页面没有 `<title>` 时回执的第二行**不是空串**，而是这句面向模型的解释文案。
+ * 逐字取自 `src/tool-browser/common-output.ts` 的 formatSessionOutput 与
+ * `src/tool-browser/snapshot-output.ts` 的 formatSnapshotOutput（两处完全相同）。
+ */
+const NO_TITLE_LINE = 'title: (empty — the document sets no <title>, or it is still loading)'
+
+/** open / snapshot 回执头：首行地址、title 行、session 行；标题传空串表示「页面无标题」。 */
+function receipt(url: string, title: string, sessionId: string, epoch = 0): string {
+  return `${url}\n${title === '' ? NO_TITLE_LINE : `title: ${title}`}\nsession_id=${sessionId} (ref epoch ${epoch})\n\n(UNTRUSTED ...)`
 }
 
 describe('parseBrowserUrl', () => {
@@ -395,4 +408,150 @@ describe('observeBrowser', () => {
     // latest 是最新落盘的那次调用，但页面状态仍保持高 epoch 观察。
     expect(observation.url).toBe('http://b.test/two')
   })
+
+  // ---- 标题占位文案（2026-11-19 实测：真实会话 9 个确认访问地址里 8 个把它当成了标题） ----
+
+  it('无标题占位文案不算标题：整句文案不得变成页面标题', () => {
+    const observation = observeBrowser([
+      call({ toolName: 'webpage_open', argsRaw: '{"url":"http://httpbin.test/"}', resultText: `http://httpbin.test/\n${NO_TITLE_LINE}\nsession_id=t9 (ref epoch 0)\n\n(UNTRUSTED ...)` }),
+    ])
+    expect(observation.title).toBeUndefined()
+    expect(observation.url).toBe('http://httpbin.test/')
+    expect(observation.sessionId).toBe('t9')
+  })
+
+  it('真实标题不受占位文案判据影响（含以括号开头的正常标题）', () => {
+    const real = observeBrowser([
+      call({ toolName: 'webpage_snapshot', argsRaw: '{}', resultText: openReceipt('http://a.test/', '目录 页', 't9', 0) }),
+    ])
+    expect(real.title).toBe('目录 页')
+    const parenthesized = observeBrowser([
+      call({ toolName: 'webpage_snapshot', argsRaw: '{}', resultText: openReceipt('http://a.test/', '(草稿) 未命名文档', 't9', 0) }),
+    ])
+    expect(parenthesized.title).toBe('(草稿) 未命名文档')
+  })
 })
+
+// ---- 本会话访问列表（面板「这次去过哪些页」视图） ----
+
+describe('visitedPages', () => {
+  it('空输入返回空数组', () => {
+    expect(visitedPages([])).toEqual([])
+  })
+
+  it('成功访问按 url 去重合并，保留首次 order，标题取第一个非空值', () => {
+    const visits = visitedPages([
+      call({ toolName: 'webpage_open', argsRaw: '{"url":"http://a.test/"}', resultText: receipt('http://a.test/', '目录', 't9', 0) }),
+      call({ toolName: 'webpage_click', argsRaw: '{"ref":"e2"}', resultText: 'click done on session_id=t9 (now at http://a.test/chapter — 章节, ref epoch 1).' }),
+      // 回到目录页时回执没有标题（占位文案），不得把已确认的「目录」抹掉。
+      call({ toolName: 'webpage_snapshot', argsRaw: '{"session_id":"t9"}', resultText: receipt('http://a.test/', '', 't9', 3) }),
+    ])
+    expect(visits).toEqual([
+      { url: 'http://a.test/', title: '目录', sessionId: 't9', order: 0, ok: true },
+      { url: 'http://a.test/chapter', title: '章节', sessionId: 't9', order: 1, ok: true },
+    ])
+  })
+
+  it('无标题页面的占位文案不会流入访问列表的 title', () => {
+    const visits = visitedPages([
+      call({ toolName: 'webpage_open', argsRaw: '{"url":"http://httpbin.test/"}', resultText: receipt('http://httpbin.test/', '', 't9', 0) }),
+    ])
+    expect(visits).toEqual([{ url: 'http://httpbin.test/', title: undefined, sessionId: 't9', order: 0, ok: true }])
+  })
+
+  it('失败调用只记目标地址、ok 为 false，标题与标签留空，且不与同址成功项合并', () => {
+    const visits = visitedPages([
+      call({ toolName: 'webpage_open', argsRaw: '{"url":"http://a.test/"}', resultText: receipt('http://a.test/', '目录', 't9', 0) }),
+      // 失败的 navigate：参数里有完全正常的 url，但那次导航没落地 —— 只是目标，不是访问。
+      call({ toolName: 'webpage_navigate', argsRaw: '{"url":"http://a.test/"}', isError: true, resultText: '[BROWSER_NAVIGATION_FAILED] boom' }),
+      call({ toolName: 'webpage_navigate', argsRaw: '{"url":"http://a.test/dead"}', isError: true, resultText: '[BROWSER_NAVIGATION_FAILED] boom' }),
+    ])
+    expect(visits).toEqual([
+      { url: 'http://a.test/', title: '目录', sessionId: 't9', order: 0, ok: true },
+      { url: 'http://a.test/', title: undefined, sessionId: undefined, order: 1, ok: false },
+      { url: 'http://a.test/dead', title: undefined, sessionId: undefined, order: 2, ok: false },
+    ])
+  })
+
+  it('同一目标反复失败合并成一条，保留首次 order', () => {
+    const visits = visitedPages([
+      call({ toolName: 'webpage_navigate', argsRaw: '{"url":"https://dead.test/"}', isError: true }),
+      call({ toolName: 'webpage_open', argsRaw: '{"url":"https://ok.test/"}', resultText: receipt('https://ok.test/', 'OK', 't9', 0) }),
+      call({ toolName: 'webpage_navigate', argsRaw: '{"url":"https://dead.test/"}', isError: true }),
+    ])
+    expect(visits).toEqual([
+      { url: 'https://dead.test/', title: undefined, sessionId: undefined, order: 0, ok: false },
+      { url: 'https://ok.test/', title: 'OK', sessionId: 't9', order: 1, ok: true },
+    ])
+  })
+
+  it('失败的 click（参数只有 ref、没有目标地址）不产生记录', () => {
+    const visits = visitedPages([
+      call({ toolName: 'webpage_click', argsRaw: '{"session_id":"t9","ref":"e9"}', isError: true }),
+    ])
+    expect(visits).toEqual([])
+  })
+
+  it('click 导航产生的地址被收录（参数里没有 url）', () => {
+    const visits = visitedPages([
+      call({ toolName: 'webpage_click', argsRaw: '{"session_id":"t9","ref":"e2"}', resultText: 'click done on session_id=t9 (now at http://a.test/chapter — 章节, ref epoch 2).' }),
+    ])
+    expect(visits).toEqual([{ url: 'http://a.test/chapter', title: '章节', sessionId: 't9', order: 0, ok: true }])
+  })
+
+  it('execute 回执的 (at …) 被收录', () => {
+    const visits = visitedPages([
+      call({ toolName: 'webpage_execute', argsRaw: '{"session_id":"t9","code":"return 1;"}', resultText: 'Runtime.evaluate on session_id=t9 (at http://a.test/page?x=a,b(c), ref epoch 6)\n\n{}' }),
+    ])
+    expect(visits).toEqual([{ url: 'http://a.test/page?x=a,b(c)', title: undefined, sessionId: 't9', order: 0, ok: true }])
+  })
+
+  it('tabs 的 foreground 行被收录，后台行不算本会话访问', () => {
+    const visits = visitedPages([
+      call({
+        toolName: 'webpage_tabs',
+        argsRaw: '{"action":"list","scope":"held"}',
+        resultText: '2 controlled tab(s) HELD BY THIS CONVERSATION:\n- session_id=t8 — http://a.test/other (别的标签)\n- session_id=t9 [foreground] — http://a.test/page (当前页)\n',
+      }),
+    ])
+    expect(visits).toEqual([{ url: 'http://a.test/page', title: '当前页', sessionId: 't9', order: 0, ok: true }])
+  })
+
+  it('open 成功但回执无头部时退回参数 url（与 observeBrowser 同一兜底口径）', () => {
+    const visits = visitedPages([
+      call({ toolName: 'webpage_open', argsRaw: '{"url":"https://kept.test/"}' }),
+    ])
+    expect(visits).toEqual([{ url: 'https://kept.test/', title: undefined, sessionId: undefined, order: 0, ok: true }])
+  })
+
+  it('运行中的调用不算访问（还没回话，页面状态未知）', () => {
+    const visits = visitedPages([
+      call({ toolName: 'webpage_navigate', argsRaw: '{"url":"https://in-flight.test/"}', settled: false }),
+    ])
+    expect(visits).toEqual([])
+  })
+
+  it('形状不符的调用逐条跳过，不抛错', () => {
+    const visits = visitedPages([
+      call({ toolName: 'webpage_navigate', argsRaw: '{ url: ' }),
+      call({ toolName: 'webpage_unknown', argsRaw: '{"url":"https://ignored.test/"}' }),
+      call({ toolName: 'webpage_snapshot', argsRaw: '{}', resultText: 'not a receipt header' }),
+      call({ toolName: 'webpage_screenshot', argsRaw: '{"url":"https://not-a-page-identity.test/"}' }),
+    ])
+    expect(visits).toEqual([])
+  })
+
+  it('返回按首次出现顺序升序，失败项与成功项混排', () => {
+    const visits = visitedPages([
+      call({ toolName: 'webpage_navigate', argsRaw: '{"url":"https://dead.test/"}', isError: true }),
+      call({ toolName: 'webpage_open', argsRaw: '{"url":"https://a.test/"}', resultText: receipt('https://a.test/', 'A', 't9', 0) }),
+      call({ toolName: 'webpage_navigate', argsRaw: '{"url":"https://b.test/"}', resultText: receipt('https://b.test/', 'B', 't9', 1) }),
+    ])
+    expect(visits.map(visit => [visit.order, visit.url, visit.ok])).toEqual([
+      [0, 'https://dead.test/', false],
+      [1, 'https://a.test/', true],
+      [2, 'https://b.test/', true],
+    ])
+  })
+})
+

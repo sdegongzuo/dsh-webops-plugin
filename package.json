@@ -73,6 +73,7 @@
     "probe:stale-node": "tsx scripts/probe-stale-node.ts",
     "probe:within-doc": "tsx scripts/probe-within-document.ts",
     "probe:p2-dirty": "tsx scripts/probe-p2-dirty.ts",
+    "audit:webpage": "tsx scripts/webpage-audit.ts",
     "window:desktop": "node scripts/window-in-host.mjs",
     "harness:build": "node scripts/harness-build.mjs",
     "package:portable": "node scripts/package-portable.mjs",

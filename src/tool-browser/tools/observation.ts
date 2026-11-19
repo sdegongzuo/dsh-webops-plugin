@@ -106,9 +106,10 @@ const ATTACHMENT_SCHEMA = {
  * 打开**成功**才把该对话提升到基础组（逐步披露）：失败不提升，模型看到的仍是初始四项。
  *
  * @param ctx - 上下文；其 `browser` 服务执行打开动作。
+ * @param cache - find 的 snapshot 缓存；打开成功即删（理由见 execute 内的注释）。
  * @param disclosure - 逐步披露控制器；缺省时不接线（单测与未启用披露的场景）。
  */
-export function registerOpen(ctx: Context, disclosure?: ToolDisclosure): void {
+export function registerOpen(ctx: Context, cache: SnapshotCache, disclosure?: ToolDisclosure): void {
   ctx.tools.register(defineTool({
     name: 'webpage_open',
     description:
@@ -132,6 +133,15 @@ export function registerOpen(ctx: Context, disclosure?: ToolDisclosure): void {
       )
       // 只有真的拿到会话才展开基础组：打开失败时模型仍应停在初始四项。
       disclosure?.markOpened(exec.agent)
+      // 打开成功同样要让旧大纲作废：open 既可能「领取空闲的同 URL 标签」，也可能新建标签，
+      // 两种落点在 provider 侧都会作废 ref 纪元并重拍快照 —— 缓存里那份大纲属于**上一个纪元**，
+      // 甚至可能属于上一个 owner（领取时），留着它等于让本对话越过「先 snapshot」直接检索别人的页面大纲。
+      // 与 navigate 同一条规则（见 registerNavigate）：成功即删，不判断 key 是否存在（Map.delete 本身幂等）。
+      //
+      // 失败路径**刻意不删**：open 抛错时没有产生新会话、纪元也没推进，缓存里那份仍是当前有效的观察；
+      // 此时删掉只会让模型「打开失败 → 连原有的 find 也不能用了」再多付一次快照成本，
+      // 而它并没有得到任何新的页面事实。
+      cache.delete(session.id)
       return toSessionOutput(session)
     },
     presentCall: args => observeCall(

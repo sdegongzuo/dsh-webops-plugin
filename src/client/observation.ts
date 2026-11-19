@@ -203,7 +203,20 @@ export function observedPage(call: BrowserCall): PageObservation | undefined {
       for (const line of lines.slice(1)) {
         const titleMatch = /^title: (.*)$/.exec(line)
         if (titleMatch !== null) {
-          title = titleMatch[1] === '' ? undefined : titleMatch[1]
+          // 「没有标题」在回执里**不是空串**，而是工具层的一句占位文案
+          // （`common-output.ts` 的 formatSessionOutput 与 `snapshot-output.ts` 的
+          // formatSnapshotOutput 逐字相同：`(empty — the document sets no <title>, …)`）。
+          // 只把空串当「没标题」的话，这句面向模型的解释会被当成页面标题显示在面板上，
+          // 还会顺路流进本会话访问列表的 PageVisit.title —— 一轮真实会话里 9 次确认访问
+          // 有 8 次被记成这句文案，面板等于在报「页面叫这个名字」。
+          //
+          // 判据用**前缀**而不是整串比较：这句是工具层的内部措辞，上游改一次文案整串比较
+          // 就静默失效、bug 悄悄回归，而前缀失效时至少只漏掉新写法的一种。它也不会被
+          // 页面伪造：这里只解析工具自己生成的 `title:` 行（行首锚定、且只在前三行内），
+          // 页面正文拿不到这个位置。真实标题恰好以 `(empty` 开头时代价也只是少显示一个
+          // 标题，不会把地址或标签归属认错。
+          const raw = titleMatch[1]
+          title = raw === undefined || raw === '' || raw.startsWith('(empty') ? undefined : raw
           continue
         }
         const sessionMatch = /^session_id=(\S+)/.exec(line)
@@ -366,4 +379,88 @@ export function observeBrowser(calls: readonly BrowserCall[]): BrowserObservatio
     screenshots,
     failures,
   }
+}
+
+/**
+ * 本会话「访问过的一个页面」—— 面板要多列的第二种视图。
+ *
+ * 与 {@link BrowserObservation} 的区别是**回放 vs 快照**：观察对象只回答「现在在哪一页」，
+ * 而模型这轮会话常常已经翻过好几页（点进章节、真实后退、开新标签），用户想知道的是
+ * 「它到底去了哪些页面」。所以这里按调用顺序累积，而不是取最新一次。
+ */
+export interface PageVisit {
+  /** 确认访问的地址（来自成功回执头部，或 open/navigate 成功时的参数兜底）。 */
+  readonly url: string
+  readonly title: string | undefined
+  /** 该次访问所属的受控标签；拿不到为 undefined。 */
+  readonly sessionId: string | undefined
+  /** 首次出现的调用序号（calls 数组下标），用于排序；客户端拿不到墙钟时间。 */
+  readonly order: number
+  /** 这次访问是否失败（失败只保留目标地址，见下）。 */
+  readonly ok: boolean
+}
+
+/**
+ * 把整个会话的调用列表聚合成「访问列表」。
+ *
+ * 三条口径，都直接决定面板会不会说谎：
+ *
+ * 1. **只算成功且带页面身份的调用**。地址优先取 {@link observedPage} 的回执自报值
+ *    （click 导航、真实后退、execute 的 `(at …)`、tabs 前台行都算），这样翻页留下的
+ *    痕迹不会因为参数里没有 url 而丢失。open/navigate 成功但回执没有头部时，退回
+ *    {@link parseBrowserUrl} 的 url 参数 —— 与 {@link observeBrowser} 的兜底同一口径，
+ *    只是这两族工具的 url 参数才表示「页面身份」。
+ * 2. **失败调用的 url 只是目标，不是访问**。这一点最容易写错：`webpage_navigate` 失败时
+ *    参数里照样有一个完全正常的 url，把它当访问记进去，面板就会声称「本会话访问过
+ *    /dead」，而实际上那次导航根本没落地（TLS 失败、404、被取消、截断的旧节点都这样）。
+ *    失败调用因此单独记 `ok:false`，并把 `title` / `sessionId` 留空 —— 没落地就没有页面
+ *    可观察，编一个标题等于伪造证据。它也不与同址的成功记录合并：同一地址先失败后成功
+ *    是两次不同的事实（失败一次 + 成功一次），合并成一条会抹掉「这里失败过」。
+ * 3. **按地址去重**。成功项同一 url 只留一条，标题/标签取第一个拿到的非空值，`order`
+ *    保持首次出现 —— 列表是「去过哪些页」的索引而不是时序回放，重复访问不该让同一页
+ *    占三行。失败项同理，同一目标反复失败仍是一条（保留首次 order）。重复失败往往是
+ *    模型重试，逐条列出来只会把列表撑成噪声。
+ *
+ * 运行中的调用不算访问：还没回话，页面状态未知 —— 与 {@link observeBrowser} 一致。
+ * 形状不符的调用（工具名不认识、参数不是合法 JSON、回执头部对不上）逐条跳过，不抛错。
+ * @param calls - 按时间顺序排列的调用列表（{@link browserCallsFrom} 的输出）。
+ */
+export function visitedPages(calls: readonly BrowserCall[]): readonly PageVisit[] {
+  /** 成功项：`url → 首次 order + 目前最好的标题/标签`。 */
+  const visited = new Map<string, { title: string | undefined; sessionId: string | undefined; order: number }>()
+  /** 失败项：`目标 url → 首次 order`。只存目标，不存任何页面身份。 */
+  const failed = new Map<string, number>()
+  for (const [order, call] of calls.entries()) {
+    if (!call.settled) continue
+    if (call.isError) {
+      const target = parseBrowserUrl(call.argsRaw)
+      // 连目标地址都解析不出来（例如失败的 click 只带 ref）就不记：面板列不出一条
+      // 没有任何地址的行，那只会变成一行没法点也没法读的噪声。
+      if (target !== undefined && !failed.has(target)) failed.set(target, order)
+      continue
+    }
+    const observed = observedPage(call)
+    const fallback = observed === undefined && (call.toolName === 'webpage_open' || call.toolName === 'webpage_navigate')
+      ? parseBrowserUrl(call.argsRaw)
+      : undefined
+    const url = observed?.url ?? fallback
+    if (url === undefined) continue
+    const existing = visited.get(url)
+    if (existing === undefined) {
+      visited.set(url, { title: observed?.title, sessionId: observed?.sessionId, order })
+      continue
+    }
+    // 后一次观察缺字段（execute/tabs 不带标题、参数兜底拿不到标签）时不抹掉已确认的身份。
+    if (existing.title === undefined && observed?.title !== undefined) existing.title = observed.title
+    if (existing.sessionId === undefined && observed?.sessionId !== undefined) existing.sessionId = observed.sessionId
+  }
+  const visits: PageVisit[] = []
+  for (const [url, entry] of visited) {
+    visits.push({ url, title: entry.title, sessionId: entry.sessionId, order: entry.order, ok: true })
+  }
+  for (const [url, order] of failed) {
+    visits.push({ url, title: undefined, sessionId: undefined, order, ok: false })
+  }
+  // 成功项与失败项各自由 Map 的插入顺序给出，合并后必须显式按首次出现排序。
+  return visits.sort((left, right) => left.order - right.order)
 }

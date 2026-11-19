@@ -13,7 +13,9 @@ import type { BrowserTextRead } from '../browser/types.ts'
  * 方案 4.2 的零状态语义落在 tool 层：find 只查这份缓存，**绝不发任何 CDP 命令**，
  * 因此也没有归属问题。维护规则：
  * - `webpage_snapshot` 成功时整体覆盖（新纪元落表，旧大纲随之失效）；
- * - `webpage_navigate` / `webpage_tabs close` 时删除（ref 已作废，留着只会误导）；
+ * - `webpage_navigate` / `webpage_open` / `webpage_tabs close` 时删除（ref 已作废，留着只会误导）；
+ *   `webpage_tabs` 的 claim / release / handoff 按 `affectedSessionIds` 逐个删除 —— 归属一变，
+ *   那份大纲就属于上一个主人了，留着等于让新主人跳过「先拍快照」；
  * - 容量封顶（{@link SNAPSHOT_CACHE_CAPACITY}），超出按插入序淘汰最旧 —— tool 层没有
  *   会话关闭的现成清理钩子，用容量上限兜底防泄漏。
  */
