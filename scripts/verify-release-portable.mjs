@@ -67,7 +67,12 @@ const scratch = mkdtempSync(join(tmpdir(), 'webops-release-check-'))
 const workProfile = join(scratch, 'home', 'profiles', 'desktop')
 mkdirSync(workProfile, { recursive: true })
 cpSync(profile, workProfile, { recursive: true })
-const host = startPackagedDesktopHost({ runtimeDir, profileDir: workProfile, env: { ...process.env, DSH_HOME: join(scratch, 'home') } })
+// 自检环境必须禁用随包 Grok 插件的首次登录：出厂 profile 没有用户 token，插件会判定
+// 「无 token + Windows 桌面 = 视觉设备码登录」，打开本地 onboarding 页与系统浏览器
+// （CI 日志里的 msedge 孤儿进程就是这个），干扰真宿主的 ready / 端口，导致自检在
+// 「desktop-host 60000ms 内没发 ready」上必现失败（v0.2.28 三次 CI）。插件自身提供
+// DSH_XAI_OAUTH_NO_LOGIN 开关走「跳过登录」分支，语义正确、不影响被测的出货行为。
+const host = startPackagedDesktopHost({ runtimeDir, profileDir: workProfile, env: { ...process.env, DSH_HOME: join(scratch, 'home'), DSH_XAI_OAUTH_NO_LOGIN: '1' } })
 try {
   const ready = await host.ready
   const page = await fetchHostPath(ready.url, '/index.html')

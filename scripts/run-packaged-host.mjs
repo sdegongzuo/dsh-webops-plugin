@@ -210,7 +210,17 @@ export function startPackagedDesktopHost(options) {
 
   const ready = new Promise((resolve, reject) => {
     const timer = setTimeout(() => {
-      reject(new Error(`desktop-host ${String(options.timeoutMs ?? 60_000)}ms 内没发 ready：${stderr.trim().slice(0, 400)}`))
+      // 只加诊断，不改超时时长：记住「不能只延长超时」。CI 上遇到过 stderr 空、进程却还活着
+      // 的 ready 超时（v0.2.28），把存活状态与关键 env 一并打出来，才能区分「没起来」和
+      // 「起来了但被某插件卡住启动钩子」。
+      const diag = [
+        `alive=${child.exitCode === null && child.signalCode === null}`,
+        `exitCode=${String(child.exitCode)}`,
+        `signalCode=${String(child.signalCode)}`,
+        `pid=${String(child.pid)}`,
+        `NO_LOGIN=${String(process.env.DSH_XAI_OAUTH_NO_LOGIN)}`,
+      ].join(' ')
+      reject(new Error(`desktop-host ${String(options.timeoutMs ?? 60_000)}ms 内没发 ready（${diag}）：${stderr.trim().slice(0, 400)}`))
       if (options.gracefulOnly !== true) child.kill('SIGTERM')
     }, options.timeoutMs ?? 60_000)
     const fail = error => {
