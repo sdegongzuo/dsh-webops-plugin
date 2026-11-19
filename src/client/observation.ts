@@ -59,6 +59,17 @@ export interface BrowserObservation {
 /** 本插件认领的工具名前缀。 */
 export const BROWSER_TOOL_PREFIX = 'webpage_'
 
+/**
+ * 「页面没有 <title>」时工具层回执里的占位文案前缀。
+ *
+ * 逐字取自 `src/tool-browser/common-output.ts` 的 formatSessionOutput 与
+ * `snapshot-output.ts` 的 formatSnapshotOutput（两处完全相同）：
+ * `(empty — the document sets no <title>, or it is still loading)`。
+ * 这里只取独特片段，不取全句：既不会把 `(empty) cart` 这类真实标题误判掉，也能容忍
+ * 上游在句尾增删标点。判据是**显示层的**——它只决定面板要不要把这句解释当页面标题。
+ */
+const EMPTY_TITLE_PREFIX = '(empty — the document sets no <title>'
+
 function asRecord(value: unknown): Record<string, unknown> | undefined {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
     ? value as Record<string, unknown>
@@ -210,13 +221,14 @@ export function observedPage(call: BrowserCall): PageObservation | undefined {
           // 还会顺路流进本会话访问列表的 PageVisit.title —— 一轮真实会话里 9 次确认访问
           // 有 8 次被记成这句文案，面板等于在报「页面叫这个名字」。
           //
-          // 判据用**前缀**而不是整串比较：这句是工具层的内部措辞，上游改一次文案整串比较
-          // 就静默失效、bug 悄悄回归，而前缀失效时至少只漏掉新写法的一种。它也不会被
-          // 页面伪造：这里只解析工具自己生成的 `title:` 行（行首锚定、且只在前三行内），
-          // 页面正文拿不到这个位置。真实标题恰好以 `(empty` 开头时代价也只是少显示一个
-          // 标题，不会把地址或标签归属认错。
+          // 判据要足够窄，否则会误伤真实标题：页面把标题写成「(empty) cart」或
+          // 「(empty results)」时，用 `startsWith('(empty')` 会把这类真实标题丢掉。
+          // 占位文案有独特片段 `'(empty — the document sets no <title>'`，真实标题几乎
+          // 不可能撞上它；用 `startsWith` 到这个片段为止，上游在句尾改标点也不会让判据
+          // 静默失效（比整串比较稳），又不会波及 `(empty) xxx`。它也不会被页面伪造：
+          // 只解析工具自己生成的 `title:` 行（行首锚定、限前三行），页面正文拿不到这个位置。
           const raw = titleMatch[1]
-          title = raw === undefined || raw === '' || raw.startsWith('(empty') ? undefined : raw
+          title = raw === undefined || raw === '' || raw.startsWith(EMPTY_TITLE_PREFIX) ? undefined : raw
           continue
         }
         const sessionMatch = /^session_id=(\S+)/.exec(line)

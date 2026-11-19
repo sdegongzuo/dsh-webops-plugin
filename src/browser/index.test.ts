@@ -1343,3 +1343,91 @@ describe('open 复用本对话已有标签（档 2）', () => {
     await browser.dispose()
   })
 })
+
+describe('本对话标签数硬顶 maxOwnedTabs', () => {
+  // 用「不带 url 的 open()」造真新建：档 2 要求 url 有值，空白页每次都落到档 3，
+  // 于是能稳定地堆出 N 张标签，不受复用逻辑干扰。
+  const openBlank = (browser: BrowserRuntime, caller: BrowserCaller) => browser.open({}, caller)
+
+  it('达到上限后拒绝新建，回执列出当前标签让模型自己腾位置', async () => {
+    const { browser, provider } = await mountWithProvider({ maxOwnedTabs: 3 })
+    const ids: string[] = []
+    for (let i = 0; i < 3; i += 1) ids.push((await openBlank(browser, ALICE)).id)
+    expect(provider.sessions.size).toBe(3)
+
+    const before = [...provider.calls]
+    await expect(openBlank(browser, ALICE))
+      .rejects.toThrow(expect.objectContaining({ code: 'BROWSER_TOO_MANY_TABS' }))
+    // 拒绝必须发生在派发之前：一个页面命令都不能发，否则就是「开完再报错」。
+    expect(provider.calls.length).toBe(before.length)
+    expect(provider.sessions.size).toBe(3)
+    // 回执里点名当前持有的 session_id，模型才知道该关哪几个。
+    // 用 rejects.toThrow 的正则直接断言消息文本，避免把 .catch 的返回类型收窄错。
+    await expect(openBlank(browser, ALICE)).rejects.toThrow(/hard limit 3/u)
+    await expect(openBlank(browser, ALICE)).rejects.toThrow(
+      new RegExp(ids.map(id => id.replaceAll('.', '\\.')).join('[\\s\\S]*'), 'u'),
+    )
+    await browser.dispose()
+  })
+
+  it('关掉一个之后又能新建（拒绝是可恢复的，不是死锁）', async () => {
+    const { browser, provider } = await mountWithProvider({ maxOwnedTabs: 2 })
+    const first = await openBlank(browser, ALICE)
+    await openBlank(browser, ALICE)
+    await expect(openBlank(browser, ALICE))
+      .rejects.toThrow(expect.objectContaining({ code: 'BROWSER_TOO_MANY_TABS' }))
+
+    await browser.tabs({ kind: 'close', sessionId: first.id }, ALICE)
+    await expect(openBlank(browser, ALICE)).resolves.toBeDefined()
+    expect(provider.sessions.size).toBe(2)
+    await browser.dispose()
+  })
+
+  it('上限只数本对话的标签，别人的标签不占额度', async () => {
+    const { browser, provider } = await mountWithProvider({ maxOwnedTabs: 2 })
+    await openBlank(browser, BOB)
+    await openBlank(browser, BOB)
+    // BOB 已经 2 张，但那是 BOB 的：ALICE 应仍能开满自己的 2 张。
+    const a1 = await openBlank(browser, ALICE)
+    const a2 = await openBlank(browser, ALICE)
+    expect([a1.id, a2.id]).toHaveLength(2)
+    await expect(openBlank(browser, ALICE))
+      .rejects.toThrow(expect.objectContaining({ code: 'BROWSER_TOO_MANY_TABS' }))
+    expect(provider.sessions.size).toBe(4)
+    await browser.dispose()
+  })
+
+  it('档 1 领取、档 2 复用不受上限影响（它们不增加标签数）', async () => {
+    const { browser, provider } = await mountWithProvider({ maxOwnedTabs: 1 })
+    // 上限设成 1：正常读页「反复 open 不同 url」应始终复用同一张，不该被上限挡死。
+    const first = await browser.open({ url: 'https://example.com/a' }, ALICE)
+    const second = await browser.open({ url: 'https://example.com/b' }, ALICE)
+    expect(second.id).toBe(first.id)
+    expect(provider.sessions.size).toBe(1)
+    await browser.dispose()
+  })
+
+  it('默认值是 8，且非法配置（0/负数/小数）当场报配置错误', async () => {
+    const { browser, provider } = await mountWithProvider()
+    for (let i = 0; i < 8; i += 1) await openBlank(browser, ALICE)
+    expect(provider.sessions.size).toBe(8)
+    await expect(openBlank(browser, ALICE))
+      .rejects.toThrow(expect.objectContaining({ code: 'BROWSER_TOO_MANY_TABS' }))
+    await browser.dispose()
+
+    for (const bad of [0, -1, 2.5]) {
+      await expect(mountBrowser({ maxOwnedTabs: bad }))
+        .rejects.toThrow(/maxOwnedTabs.*positive integer/u)
+    }
+  })
+
+  it('上限检查只在档 3 前：没有 url 的空白页也照样被拦', async () => {
+    const { browser, provider } = await mountWithProvider({ maxOwnedTabs: 1 })
+    await browser.open({ url: 'https://example.com/' }, ALICE)
+    // 空白页 open() 不走档 2（要求 url 有值），必落档 3 → 撞上限。
+    await expect(openBlank(browser, ALICE))
+      .rejects.toThrow(expect.objectContaining({ code: 'BROWSER_TOO_MANY_TABS' }))
+    expect(provider.sessions.size).toBe(1)
+    await browser.dispose()
+  })
+})

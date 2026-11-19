@@ -37,7 +37,8 @@ export function registerSystemPrompt(ctx: Context): void {
             + 'After a successful webpage_open (or claiming an idle tab) the basic operation tools — navigate, snapshot, click, fill, press, wait — appear automatically. '
             + 'Load the rest by name with webpage_tools(tools=["webpage_find"]): find, scroll, locate, screenshot, console, network; once loaded they stay for the rest of this conversation.'],
         ...visible('webpage_open')
-          ? ['webpage_open returns a session_id; pass it to calls that read or operate that tab. webpage_tools only loads tools for this conversation: pass tools only, without session_id.']
+          ? ['webpage_open returns a session_id; pass it to calls that read or operate that tab. webpage_tools only loads tools for this conversation: pass tools only, without session_id.',
+            'webpage_open reuses a held tab by default (SAME session_id, navigated); webpage_navigate makes that explicit. At maxOwnedTabs, close some or reuse first.']
           : [],
         ...visible('webpage_snapshot')
           ? ['webpage_snapshot gives a compact accessibility outline and refs such as [ref=e12]. Navigation and full snapshots invalidate refs; regional snapshots (region_ref / region_viewport / region_box) preserve other refs.',

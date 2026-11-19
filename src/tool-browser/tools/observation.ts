@@ -113,7 +113,7 @@ export function registerOpen(ctx: Context, cache: SnapshotCache, disclosure?: To
   ctx.tools.register(defineTool({
     name: 'webpage_open',
     description:
-      'Open a controlled webpage and return its session id. Reuse an idle tab with the same full URL, otherwise create one. Occupied tabs are never reused. Omit url for a blank page.',
+      'Open a controlled webpage and return its session id. Reuse an idle tab with the same full URL, or a tab this conversation already holds (see system prompt). Omit url for a blank page.',
     parameters: {
       url: {
         type: 'string',

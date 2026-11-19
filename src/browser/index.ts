@@ -101,6 +101,26 @@ function observationFailure(error: unknown): { code: BrowserErrorCode; message: 
 }
 
 /**
+ * 校验「正整数个数」配置（与 `lease.ts` 的 `requirePositiveMs` 同一口径，只是单位不同）。
+ *
+ * 不静默回落默认值：配置写错时人要立刻知道，否则「改成 8 了」和「根本没改」在运行态同形。
+ * @param value - 配置值。
+ * @param field - 配置键名，写进错误消息。
+ * @returns 原值（已确认是正整数）。
+ * @throws `BROWSER_PROTOCOL_ERROR`：非正整数。
+ */
+function requirePositiveCount(value: number, field: string): number {
+  if (!Number.isInteger(value) || value <= 0) {
+    throw new BrowserError(
+      `browser config "${field}" must be a positive integer, got ${String(value)}; `
+      + 'zero or negative would forbid every new tab instead of limiting them — remove the option to keep the default',
+      'BROWSER_PROTOCOL_ERROR',
+    )
+  }
+  return value
+}
+
+/**
  * 目标网址的规范化形式，**只用于比较落点是否已经在目标地址上**。
  *
  * 只认 http(s)：其余 scheme（`javascript:` / `mailto:` / `about:`）不是「打开一个网页」，
@@ -193,6 +213,20 @@ export interface BrowserRuntimeConfig {
    * 与「open = 开新页」的既有预期不同，所以要留一条关掉即回到旧行为的路。
    */
   readonly reuseOwnTabOnOpen?: boolean
+  /**
+   * 本对话最多能同时持有多少个受控标签。默认 `8`；必须是正整数。
+   *
+   * 只在「新建」（档 3）前检查：档 1 领取空闲标签、档 2 复用自有标签都不增加标签数，
+   * 因此不受限 —— 否则「上限 1 且复用开着」的正常读页路径会被自己挡死。
+   *
+   * 为什么要有它：`reuseOwnTabOnOpen` 只挡住「每个 URL 一次 open」这一种堆积方式，
+   * 而 `open()`（不带 url，开空白页）仍然每次新建。没有上限时，一个反复开空白页再
+   * 导航的模型可以把标签堆到几十个，而租期到期只释放占用、不关页面，页面一直活到进程退出。
+   *
+   * 8 是**绝对硬顶**：模型确实需要并排好几个页面时可以开到 8，但超过就不给开，
+   * 回执里列出当前持有的标签让它先关掉几个或改用 navigate，而不是无界增长。
+   */
+  readonly maxOwnedTabs?: number
 }
 
 /**
@@ -204,6 +238,15 @@ export interface BrowserRuntimeConfig {
  */
 export const BROWSER_PROVIDER_ENV = 'DSH_BROWSER_PROVIDER'
 
+/**
+ * 本对话同时持有标签数的默认硬顶。
+ *
+ * 取 8：正常读页路径（档 2 复用）几乎不涨，8 给「主页面 + 若干并排对照 + 弹窗」留足余量；
+ * 它要拦的是「堆到几十个也没人管」，而不是一般人开三四个页。达到 8 后 `open` 返回
+ * `BROWSER_TOO_MANY_TABS`，模型关掉几个或改用 navigate 才能继续 —— 不是静默失败。
+ */
+export const DEFAULT_MAX_OWNED_TABS = 8
+
 export class BrowserRuntime extends Service {
   static Config: z<BrowserRuntimeConfig> = z.object({
     provider: z.string(),
@@ -212,6 +255,9 @@ export class BrowserRuntime extends Service {
     // `.default(true)` 而不是在代码里 `?? true`：配置回执与文档必须能直接读出默认值，
     // 「没写就是 true」一旦只活在实现里，关掉它的人会以为默认是 false。
     reuseOwnTabOnOpen: z.boolean().default(true),
+    // 同样用 `.default`：这条上限必须能从配置回执里读出来。`0` 不做「等于关闭」的约定 ——
+    // 关闭用不着它（档 2 才是关闭开关），而 0 会让任何 open 都失败，是配置错误不是用法。
+    maxOwnedTabs: z.number().default(DEFAULT_MAX_OWNED_TABS),
   })
 
   private readonly providers = new Map<string, BrowserProvider>()
@@ -222,6 +268,8 @@ export class BrowserRuntime extends Service {
   private readonly lease: TabLeaseRegistry
   /** `open()` 是否复用本对话自己已有的标签（见 {@link BrowserRuntimeConfig.reuseOwnTabOnOpen}）。 */
   private readonly reuseOwnTabOnOpen: boolean
+  /** 本对话同时持有的标签数上限（见 {@link BrowserRuntimeConfig.maxOwnedTabs}）。 */
+  private readonly maxOwnedTabs: number
 
   constructor(ctx: Context, config: BrowserRuntimeConfig = {}) {
     super(ctx, 'browser')
@@ -230,6 +278,9 @@ export class BrowserRuntime extends Service {
     // 直接构造 Config 的地方（单测、编程式装配）绕过了 schema 的默认值，所以这里再兜一次；
     // 两处都写 true 而只有一处是默认值来源，是最容易让「关掉却不生效」的坑。
     this.reuseOwnTabOnOpen = config.reuseOwnTabOnOpen ?? true
+    // 与 tabLeaseIdleMs 同一套校验口径：非正整数是**配置错误**，当场抛出而不是悄悄回落默认值。
+    // 静默回落会让「我把上限改成 8 了」和「我根本没改」在运行态完全同形。
+    this.maxOwnedTabs = requirePositiveCount(config.maxOwnedTabs ?? DEFAULT_MAX_OWNED_TABS, 'maxOwnedTabs')
     this.lease = new TabLeaseRegistry({
       // 展开写而不是直接赋值：`exactOptionalPropertyTypes` 下把 undefined 显式传进去
       // 与「不传」是两回事，而这里要的恰恰是「不传就用默认值」。
@@ -347,6 +398,19 @@ export class BrowserRuntime extends Service {
     if (this.reuseOwnTabOnOpen && request.url !== undefined && target !== undefined) {
       const reused = await this.reuseOwnTab(provider, owner, target, signal)
       if (reused !== undefined) return reused
+    }
+    // 档 3 前的硬顶检查：档 1/档 2 都不增加标签数，只有走到「真要新建」这一步才数。
+    // 用 listHeld 而不是 provider.tabs()：占用表是归属的权威，provider 清单里还混着别人的标签，
+    // 拿它计数会把别的对话占的页面算到本对话头上，误拒一次合法的新建。
+    const held = this.lease.listHeld(provider.id, owner.ownerId)
+    if (held.length >= this.maxOwnedTabs) {
+      throw new BrowserError(
+        `cannot open a new tab: this conversation already holds ${String(held.length)} controlled tabs `
+        + `(hard limit ${String(this.maxOwnedTabs)}). Close the ones you no longer need — `
+        + `session_id=${held.map(tab => tab.targetId).join(', ')} — with webpage_tabs(action=close, session_id=…), `
+        + 'or use webpage_navigate on an existing tab instead. Retrying this open will fail the same way.',
+        'BROWSER_TOO_MANY_TABS',
+      )
     }
     // 档 3（既有行为）：新建并登记给调用方。
     return this.createAndRegister(provider, owner.ownerId, request, signal)

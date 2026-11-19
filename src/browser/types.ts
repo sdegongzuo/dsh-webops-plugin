@@ -116,6 +116,17 @@ export type BrowserErrorCode =
    */
   | 'BROWSER_TAB_BUSY'
   /**
+   * 本对话持有的受控标签已达上限，`open` 不再新建。
+   *
+   * **可恢复，且恢复动作只有两种**：关掉不用的标签，或在现有标签上 `webpage_navigate`。
+   * 之所以单列一个错误码而不是复用 `BROWSER_TAB_OCCUPIED`：那个说的是「这个标签被别人
+   * 抢了」，模型该做的是换目标；这里说的是「你的标签池满了」，该做的是**先腾位置**。
+   * 混用会让模型去翻别人的标签，而不是回头看看自己开了什么。
+   *
+   * 不重试同一个 `open`：没有任何等待能让它变成功，除非期间自己关了标签。
+   */
+  | 'BROWSER_TOO_MANY_TABS'
+  /**
    * 多会话占用：移交码错误、已过期或已被消费。**不可重放旧码** —— 向原持有者要一个新码。
    */
   | 'BROWSER_HANDOFF_INVALID'
@@ -236,6 +247,7 @@ const BROWSER_ERROR_RECOVERY: Readonly<Partial<Record<BrowserErrorCode, string>>
   BROWSER_TAB_NOT_HELD: 'if the tab is idle, claim it with webpage_tabs(action=claim); if another conversation holds it, wait for release or an explicit handover instead of trying to take it over. After acquiring it, take a fresh webpage_snapshot.',
   BROWSER_TAB_OCCUPIED: 'another conversation holds this tab — do not fight for it; use another tab or wait for release.',
   BROWSER_TAB_BUSY: 'a call is still running on this tab; wait for it to finish, then retry.',
+  BROWSER_TOO_MANY_TABS: 'you hold the maximum number of controlled tabs (see the receipt for which one to close) — close the tabs you no longer need with webpage_tabs(action=close, session_id=…), or navigate an existing one with webpage_navigate instead of opening another. Retrying the same open changes nothing.',
   BROWSER_HANDOFF_INVALID: 'this handoff code is used or expired — ask the previous holder for a fresh code.',
   BROWSER_TARGET_OCCLUDED: 'do not retry the same click — close the overlay or act on the element on top of the target first, then take a fresh webpage_snapshot and click the target again.',
   BROWSER_WINDOW_NOT_VISIBLE: 'restore the browser window (un-minimize or show it), then retry; do not retry while the window stays hidden or minimized.',

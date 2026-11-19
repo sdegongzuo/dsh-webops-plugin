@@ -430,6 +430,18 @@ describe('observeBrowser', () => {
     ])
     expect(parenthesized.title).toBe('(草稿) 未命名文档')
   })
+
+  // 审查发现：旧判据 `startsWith('(empty')` 会误伤「(empty) cart」这类真实标题，
+  // 而原测试夹具用的 '(草稿)' 根本没打到判据。这里用真正以 `(empty` 开头、
+  // 但不含占位片段的标题，锁住「不得误伤」。
+  it('以 (empty 开头但不含占位片段的真实标题必须保留', () => {
+    for (const title of ['(empty) cart', '(empty results) 搜索页']) {
+      const observation = observeBrowser([
+        call({ toolName: 'webpage_snapshot', argsRaw: '{}', resultText: openReceipt('http://a.test/', title, 't9', 0) }),
+      ])
+      expect(observation.title, title).toBe(title)
+    }
+  })
 })
 
 // ---- 本会话访问列表（面板「这次去过哪些页」视图） ----
