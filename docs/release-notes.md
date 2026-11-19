@@ -1,49 +1,26 @@
 ## dsh-webops-plugin __TAG__ · 完整便携包与独立插件包
 
-本版只换随包第三方插件：插件自身代码与内置 DSH 本体（**`0.2.2-rc.3`**）都没有变化，桌面补丁逐字节未动。所以本次不需要重选宿主，已有 0.2.25 的用户覆盖插件目录即可拿到网页工具侧的更新。
+本版把随包的 DSH 本体从 **`0.2.2-rc.3`** 升到 **`0.2.2-rc.5`**（上游 2026-11-18 发布，13 个提交）。插件自身代码与桌面补丁都没有变化：`apps/desktop` 在 rc.3→rc.5 之间只改了 `package.json` 的版本号，补丁 43 个目标文件全部原样复用（`git apply --check` 与反向检查均 0 失败）。随包第三方插件版本也与上一版相同。
 
-| 随包插件 | 上一版 | 本版 |
+| | 上一版 | 本版 |
 | --- | --- | --- |
-| `dsh-better-sidebar` | 0.28.2 | **0.32.1** |
-| `dsh-context` | 0.81.0 | **0.85.1** |
-| `dsh-connect-workbuddy` | 5.18.0（源码构建） | **5.24.14**（npm 官方包） |
+| 内置 DSH | 0.2.2-rc.3 | **0.2.2-rc.5** |
+| 桌面补丁 | `2dcbc7c1…`（43 文件） | `2dcbc7c1…`（逐字节复用） |
+| `dsh-webops-plugin` | 0.2.26 | **__VERSION__** |
+| 三个随包插件 | 0.85.1 / 0.32.1 / 5.24.14 | 同左，未变 |
 
-### 侧边栏：0.28.2 → 0.32.1
+### 宿主变化：0.2.2-rc.3 → 0.2.2-rc.5
 
-- **右侧栏开始页改由插件接管**：宽屏两列、行数可配（默认 6），常驻「更多」卡片、可调顺序、可选居中或靠上；开关关掉即恢复宿主原页面。终端卡片保留原生 Shell 菜单。
-- **插件页新增图文详情**：右侧栏总览图 +「每个会话独立」示意图，带编号说明。
-- **右键菜单与「打开方式」子菜单跟随宿主新定位**：DSH 0.2.2-rc.2 起菜单改为 CSS 锚点定位、子菜单是独立浮层，插件不再自己算几何，交给宿主按可用空间放置。
-- **团队任务板写入改走 `@deepseek-ai/dsh-agent-team`**（上游把实验包升进 base composition，Team 模式按会话开启）。
-- **Markdown 里的 `file://` 图片现在能显示**（Windows 盘符、`localhost`、UNC、百分号编码都认）。
-- 中途版本还带来：内置音视频预览、桌面壳 HTML 预览内联、侧边对话大修、线性时间 diff 高亮，以及多个数据安全修复。
-- 对外扩展点由 3 个增到 5 个（新增 `registerFileIcon` / `registerFileAction` / `registerTabAction`），生态插件按新 API 接入。
+- **网页搜索的默认提供方改为按模型路由**（上游 `web-search-deepseek-model-default` 升级指南）。共享基座不再写死 `web.searchProvider: deepseek-search-api`：在 DeepSeek 模型路由（`deepseek-official` / `deepseek-account`）上的搜索改用旧版 Messages 搜索——它向 `web-search-deepseek` 端点发一次辅助 Messages 请求，**不按次收费、按模型 token 计费**，并在会话日志里追加一条 `web/deepseek-search-llm-request` 事件；其余路由仍用 DeepSeek Search API。设置页「网页搜索提供方」新增**自动选择**（新装默认选中）。想恢复旧行为：在该菜单里改选 DeepSeek Search API，或在 `@deepseek-ai/dsh-web` 的 config 里把 `searchProvider: deepseek-search-api` 与 `fetchProvider: http` 一起写回。注意 Messages 搜索的端点不跟随模型 base URL——用网关部署的用户需要把 `web-search-deepseek.baseURL` 指到网关（到 `/messages` 之前为止）。
+- **内容拒答的错误码变了**（`deepseek-refusal-code` 指南）：DeepSeek 以 `stop_reason: "refusal"` 结束流时，错误终止块与失败轮次的 `turn/end` 现在报 `CONTENT_REFUSED`，此前是 `MALFORMED_RESPONSE`。如果外部脚本按旧码分类，需要跟着改。
+- **LiveShare 隧道 worker 改为在宿主的 Electron Node 模式下启动**（#8634），并修正了 owner 凭据的时间基准（#8638）。
+- 其余为版本号同步与文档 / catalog 更新。上游本区间**没有删除任何包**，随包清单无需调整。
 
-### 上下文：0.81.0 → 0.85.1
+### 升级须知
 
-- **上下文洞察页**（一级侧边栏面板）：7 天 Token/成本 KPI、活动热力图、组成环形图，以及可筛选并跳到任一会话的会话卡片。
-- **Context 标签页**：上下文统计、组成、趋势、事件与消息级仪表板；新增**总览**模式把整个会话压成一条连续堆叠带，一眼看每次压缩的下跌与组成变化。
-- **Fleet 标签页**：当前 Agent、父级、每个子 Agent 各一张实时卡片。
-- **上下文浏览器**：查看任意一次请求的完整组装内容，工具定义标来源（`tool-*` / `dsh-*` / `mcp:<server>` / 具体插件），助手回复可按 Thinking / Tools / Answer 过滤，附件按顺序显示为卡片并可一键预览。
-- `/context` 命令保留，输出当前组成与近期演变。
-
-### 模型连接：5.18.0 → 5.24.14
-
-这一版从源码构建改回 **npm 官方包**（上游已正式发布 5.24.14），用户侧依赖写法不变。中途累计的、用户能感知的修复：
-
-- **`deepseek-v4.1-flash` 等 8 个模型在 agent 模式下必定 400** 已修。
-- **工具 schema 导致的 11129** 连修几轮：关键字值类型错误（36 种实测）、显式 `additionalItems: false` 被丢成「接受任意元素」、以及启用 REA MCP 后 `pattern` 里 `\uD800`–`\uDFFF` 代理区转义被上游拒绝——现在这类 `pattern` 会在发送前删掉，工具照常可用。
-- **请求体按字节上限做历史折叠**（原先只按条数，超字节时从不触发）。
-- **积分与账号**：积分快过期可直接看出、签到/充值到账后不再被判积分耗尽、选号顺序可切「自动 / 手动」、OAuth 添加的账号不再显示「未命名账号」也不再互相覆盖、身份全空的登录改为明确拒绝而不是写出一个会覆盖别人的账号。
-- **反代部署**新增 `trustedHosts`，卡片路由不再全量 403；**路线 B**（从宿主会话 ID 派生上游会话亲和键）作为 opt-in 开关提供，默认关闭。
-- 依赖栈跟随到 `0.2.2-rc.3`，心跳回执不再被失败的启动或旧实例误删。
-
-### 随包依赖
-
-`dsh-context` 本版把 `zod` 从精确 `4.4.3` 放开成 `^4.6.6`，随包 `zod` 相应由 4.4.3 升到 **4.6.7**；侧边栏的 `ws` / `yaml` 范围未变，仍是 8.22.1 / 2.9.1。三个插件的 peer 都落在宿主 `0.2.2-rc.3` 内，用随包 `dsh-app-boot` 的真判据实算为零 issue —— 不需要 `compatibility.json` 豁免。
-
-下载 `__PLUGIN_ZIP__`，包内包含完整编译插件及 INSTALL.md，无需重新下载 DSH 桌面整包。
-
-首次安装下载 `__PORTABLE_ZIP__`，解压后双击启动.cmd；内置本次插件、dsh-context、dsh-better-sidebar 与 dsh-connect-workbuddy 四个插件。DSH 本体版本为 __DSH_VERSION__，插件版本为 __VERSION__。首次使用请在设置中填写自己的 API Key；不含凭据或会话数据。
+- **本版必须用完整包更新**：宿主版本变了，插件的三个 DSH peer 已改为精确等于 `^0.2.2-rc.5`（打包门禁就是按这个判的），把 __VERSION__ 的插件目录覆盖到 rc.3 宿主上会被判 peer 不满足。所以本版没有提供可用的增量插件包。
+- 完整便携包会替换 `home` 的出厂内容；已有会话、凭据请先备份。本机验收走的是「备份 home → 重铺 → 回填 `.credentials.yaml` 与 WorkBuddy 目录」路径，实测登录态与工具调用可用。
+- 随包依赖未变：`dsh-context` 0.85.1 + `zod` 4.6.7、`dsh-better-sidebar` 0.32.1 + `ws` 8.22.1 / `yaml` 2.9.1、`dsh-connect-workbuddy` 5.24.14（peer 全为范围 `>=0.1.7-rc.1 <0.3.0-0`，覆盖 rc.5，仍然不需要 `compatibility.json` 豁免）。
 
 ### 更新已有插件
 
@@ -53,11 +30,7 @@
    本包根目录是插件内容，不能直接解压到便携版根目录。
 3. 重新启动，核对插件 package.json 的 version 为 `__VERSION__`，并实际调用网页工具。
 
-### 升级说明
-
-- 只覆盖插件目录**不会**换掉随包第三方插件，仍是上一版的侧边栏 0.28.2 / 上下文 0.81.0 / 模型连接 5.18.0；要拿到本版三个插件，需要下载完整的 `__PORTABLE_ZIP__`（会换掉 `home` 的出厂内容，先备份自己的数据），或按下方「手工换随包插件」替换 profile 里的三个目录。
-- 已有 0.2.25 的用户**不需要**重做 WorkBuddy 换包动作；本版插件名仍是 `dsh-connect-workbuddy`。
-- 手工换随包插件（增量升级用）：完全退出 DSH 后，删除 `home/profiles/desktop/node_modules/` 下的 `dsh-context`、`dsh-better-sidebar`、`dsh-connect-workbuddy` 三个目录，再用完整便携包里的同名目录替换，并把 `home/profiles/desktop/package.json` 的 `dependencies` 三项改成 `0.85.1` / `0.32.1` / `5.24.14`。物化脚本只从零铺，目录已存在会直接报错。
+首次安装下载 `__PORTABLE_ZIP__`，解压后双击启动.cmd；内置本次插件、dsh-context、dsh-better-sidebar 与 dsh-connect-workbuddy 四个插件。DSH 本体版本为 __DSH_VERSION__，插件版本为 __VERSION__。首次使用请在设置中填写自己的 API Key；不含凭据或会话数据。
 
 保留旧 chunk 和用户 profile 登记。首次安装按包内 INSTALL.md 执行 `dsh plugin add`。
 每次发布都提供完整便携包；已有用户也可只更新插件。其他宿主版本的兼容性以实测为准。
