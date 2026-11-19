@@ -60,6 +60,34 @@ describe('stripPresetDefaultModel', () => {
 `
     expect(() => stripPresetDefaultModel(noInsert)).toThrowError(/挂载行消失/)
   })
+
+  // 2026-11-19 审查发现的 fail-open：精确块失配时原实现直接放行，预设默认模型
+  // 会悄悄回到出厂组合，且回执显示「无需改动」。这两条把这个口子焊死。
+  it('上游把 model 版本号抬上去（精确块失配）时拒绝，不静默放行', () => {
+    const bumped = `- id: agent-default-model
+  config:
+    provider: grok-build
+    model: grok-4.7
+
+- insert:
+    - id: llm-grok-build-oauth
+      name: dsh-coding-subscription-oauth
+`
+    expect(() => stripPresetDefaultModel(bumped)).toThrowError(/形状已变化/)
+  })
+
+  it('上游只改 provider 名（仍写默认模型条目）时同样拒绝', () => {
+    const renamed = `- id: agent-default-model
+  config:
+    provider: another-route
+    model: whatever
+
+- insert:
+    - id: llm-grok-build-oauth
+      name: dsh-coding-subscription-oauth
+`
+    expect(() => stripPresetDefaultModel(renamed)).toThrowError(/形状已变化/)
+  })
 })
 
 describe('applyCodingOAuthPatchCompatibility', () => {

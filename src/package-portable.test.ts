@@ -203,7 +203,13 @@ describe('每次发布的完整便携包', () => {
     expect(wrong.status).toBe(1)
     expect(wrong.stderr).toContain('peerDependencies')
     expect(readdirSync(data.root)).not.toContain('incompatible.zip')
-  }, 60_000)
+    // 2026-11-19：随包 Grok 插件换成 dsh-coding-subscription-oauth（0.8.8）后本用例从
+    // 约 40s 涨到约 74s，越过原 60_000ms。这是真实体量差而非逻辑变慢：旧插件
+    // dsh-llm-xai-oauth 是 60KB 级纯后端包，新插件解包后 187 文件 / 10.12 MB（含 136 个
+    // lib 与 source map），组装每轮都要解出它、写进 profile 再压缩。故显式放宽，
+    // 不靠机器变快碰运气；若将来继续显著变慢，先查是不是又多了一个大插件，
+    // 而不是继续加这个数字。
+  }, 180_000)
 })
 
 describe('纯插件包保留模式的真实 ZIP', () => {

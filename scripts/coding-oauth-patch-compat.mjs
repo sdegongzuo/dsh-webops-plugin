@@ -49,18 +49,48 @@ export const CODING_OAUTH_PATCH_COMPAT = 'strip-preset-default-model-v1'
 
 /**
  * 从 patch 文本里删掉预设默认模型段。
+ *
+ * ## 为什么 count===0 不能直接放行
+ *
+ * 精确块匹配只在「上游一字未改」时命中。若上游把 `model: grok-4.6` 抬成
+ * `grok-4.7`（或改动缩进、加字段），精确块失配 → 原实现走 fail-open 返回
+ * `stripped: false`，物化照常成功、打包照常通过，而 `provider: grok-build`
+ * 已经悄悄回到出厂组合里。这比一开始就没做剥除更糟：回执会显示「无需改动」，
+ * 没人会去查。
+ *
+ * 所以 count===0 时追加一条**排除式断言**：剥除目标的招牌标记不得再出现。
+ * 命中即「上游换了写法」→ 抛错拒绝，让升级必须有人看一眼。这样「上游真的
+ * 不再写默认模型」（良性）与「上游换了版本号但仍写默认模型」（需处理）就被
+ * 区分开了。
+ *
  * @param {string} source - 插件 `cordis.patch.yml` 原文。
  * @returns {{ text: string, stripped: boolean }}
  */
 export function stripPresetDefaultModel(source) {
   const count = source.split(PRESET_DEFAULT_MODEL_BLOCK).length - 1
-  if (count === 0) return { text: source, stripped: false }
+  if (count === 0) {
+    // fail-closed：没有精确块，但仍有 agent-default-model 条目 → 上游改了写法。
+    const hasRow = /^\s*-\s+id:\s*agent-default-model\s*$/mu.test(source)
+    const hasGrokProvider = /provider:\s*["']?grok-build["']?\s*$/mu.test(source)
+    if (hasRow || hasGrokProvider) {
+      throw new Error(
+        '编码订阅插件的默认模型段形状已变化（精确块未命中，但仍检测到 agent-default-model / grok-build）：'
+          + '拒绝静默跳过，否则预设默认模型会重新污染出厂组合。请核对上游 cordis.patch.yml 并更新 '
+          + 'PRESET_DEFAULT_MODEL_BLOCK。',
+      )
+    }
+    return { text: source, stripped: false }
+  }
   if (count > 1) {
     throw new Error(`编码订阅插件的默认模型段出现 ${count} 次（期望 1 次），拒绝自动改写；请核对上游 patch 形状。`)
   }
   const text = source.replace(PRESET_DEFAULT_MODEL_BLOCK, '')
   if (!text.includes(REQUIRED_INSERT_MARKER)) {
     throw new Error(`剥离默认模型段后 ${REQUIRED_INSERT_MARKER} 挂载行消失，拒绝写入；请核对上游 patch 形状。`)
+  }
+  // 剥完再确认目标确实消失，防止 replace 匹配到别处却漏掉真正那行。
+  if (/provider:\s*["']?grok-build["']?\s*$/mu.test(text)) {
+    throw new Error('剥离后仍残留 grok-build 默认模型行，拒绝写入；请核对上游 patch 形状。')
   }
   return { text, stripped: true }
 }
