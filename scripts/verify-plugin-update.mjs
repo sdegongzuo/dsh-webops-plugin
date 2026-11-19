@@ -141,11 +141,18 @@ check((zippedLib.get('client.js') ?? '').length > 0 && readFileSync(join(pluginI
 
 // 越界检查：这个包会被用户直接解压到便携包根目录，多带任何一个 home 下的文件都是
 // 覆盖用户数据的行为（settings.yaml / 凭据 / profile manifest 尤其不能碰）。
+// 包根 `vendor\<tgz>` 是**有意携带**的：profile 用 file: 相对路径登记它当事实来源
+// （0.2.29 起），解压后正好落在登记指向的位置，不给白名单整段前缀——只放行这一份文件名，
+// 免得以后有人往 vendor 里塞别的东西也被判通过。
 const allEntries = inventory(unzipped)
 const allowedPrefix = `home/profiles/desktop/node_modules/${PLUGIN_NAME}/`
-const stray = [...allEntries.keys()].filter(rel => !rel.startsWith(allowedPrefix) && rel !== '更新说明.txt')
+const allowedFiles = new Set([
+  '更新说明.txt',
+  `vendor/${PLUGIN_NAME}-${version}.tgz`,
+])
+const stray = [...allEntries.keys()].filter(rel => !rel.startsWith(allowedPrefix) && !allowedFiles.has(rel))
 check(stray.length === 0,
-  `增量包里只有插件目录与更新说明，没有越界文件${stray.length === 0 ? '' : `（越界：${stray.slice(0, 8).join(', ')}）`}`)
+  `增量包里只有插件目录、包根 vendor 里的插件 tarball 与更新说明，没有越界文件${stray.length === 0 ? '' : `（越界：${stray.slice(0, 8).join(', ')}）`}`)
 
 /* ---------- 3. 三轮启动 ---------- */
 

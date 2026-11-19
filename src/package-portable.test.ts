@@ -210,7 +210,7 @@ describe('纯插件包保留模式的真实 ZIP', () => {
     expect(run('0.2.1-alpha.1').status).toBe(1)
     expect(run('0.2.1-alpha.1').stderr).toContain('拒绝回退到插件版本')
   })
-  it.each([script, updateScript])('遗漏 --lib-dir 时写入前拒绝：%s', (target) => {
+  it.each([script, updateScript, tarballScript])('遗漏 --lib-dir 时写入前拒绝：%s', (target) => {
     const data = fixture()
     const before = readdirSync(data.root)
     const result = spawnSync(process.execPath, [target, '--stage-root', data.stage,
@@ -218,6 +218,17 @@ describe('纯插件包保留模式的真实 ZIP', () => {
     expect(result.status).toBe(1)
     expect(result.stderr).toContain('--lib-dir 必须显式指定')
     expect(readdirSync(data.root)).toEqual(before)
+  })
+  it('插件 tarball 拒绝覆盖既有产物，且失败后原文件字节不变', () => {
+    const data = fixture()
+    const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'))
+    const out = join(data.root, `dsh-webops-plugin-${pkg.version}.tgz`)
+    writeFileSync(out, '既有产物不能被动')
+    const result = spawnSync(process.execPath, [tarballScript, '--lib-dir', data.lib,
+      '--version', pkg.version, '--stage-root', data.stage, '--out', out], { encoding: 'utf8' })
+    expect(result.status).toBe(1)
+    expect(result.stderr).toContain('目标已存在')
+    expect(readFileSync(out, 'utf8')).toBe('既有产物不能被动')
   })
 
   it.each(['host.cjs', 'action-overlay.cjs', 'action-overlay.html', 'tabbar.html', 'tabbar-preload.cjs'])

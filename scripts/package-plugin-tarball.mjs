@@ -12,15 +12,17 @@
  * scripts，进 tgz 会让任何 install 炸掉。这里与 package-portable.mjs 同一口径净化
  * （剔 devDependencies / scripts / exports['./fake-llm']），在干净暂存目录里 pack。
  *
- * 保留安全模式：唯一新暂存目录（mkdtemp，保留不删除）、输出必须尚不存在、全程零删除。
+ * 保留安全模式：唯一新暂存目录（mkdtemp）、输出必须尚不存在、不碰任何输入与既有产物。
+ * 暂存目录默认在收尾时清理（只删本次 mkdtemp 出来的那个，与 package-plugin-update 同口径）；
+ * 需要留证据时传 `--keep-stage`。
  *
  * 用法：
  *   node scripts/package-plugin-tarball.mjs --lib-dir <本轮构建目录> [--version 0.2.28]
- *        [--out dist/dsh-webops-plugin-<version>.tgz] [--stage-root <D 盘暂存父目录>]
+ *        [--out dist/dsh-webops-plugin-<version>.tgz] [--stage-root <D 盘暂存父目录>] [--keep-stage]
  */
 import { spawnSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
-import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, statSync, writeFileSync } from 'node:fs'
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { dirname, join, resolve, basename } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -37,7 +39,10 @@ const readArg = (name) => {
   const at = args.indexOf(`--${name}`)
   return at === -1 ? undefined : args[at + 1]
 }
+const FLAGS = ['--keep-stage']
+const keepStage = args.includes('--keep-stage')
 for (let i = 0; i < args.length; i += 1) {
+  if (FLAGS.includes(args[i])) continue
   if (!['--lib-dir', '--version', '--out', '--stage-root'].includes(args[i])) fail(`未知参数：${args[i]}`)
   if (args[i + 1] === undefined || args[i + 1].startsWith('--')) fail(`${args[i]} 缺少路径值`)
   i += 1
@@ -86,7 +91,7 @@ delete releasePkg.exports['./fake-llm']
 delete releasePkg.devDependencies
 delete releasePkg.scripts
 writeFileSync(join(pkgDir, 'package.json'), `${JSON.stringify(releasePkg, null, 2)}\n`)
-console.log(`  + 暂存 ${pkgDir}（保留，不删除；lib 已滤 fake-llm，package.json 已净化）`)
+console.log(`  + 暂存 ${pkgDir}（lib 已滤 fake-llm，package.json 已净化；收尾${keepStage ? '保留' : '清理'}）`)
 
 mkdirSync(dirname(out), { recursive: true })
 // Windows 上 npm 是 npm.cmd；Node ≥18.20.2 禁止无 shell 直接 spawn .cmd（EINVAL，
@@ -104,4 +109,5 @@ console.log(`\n产物: ${out}`)
 console.log(`体积: ${(bytes.length / 1024).toFixed(1)} KB`)
 console.log(`sha256: ${createHash('sha256').update(bytes).digest('hex')}`)
 console.log(`sha512: sha512-${createHash('sha512').update(bytes).digest('base64')}`)
-console.log(`暂存目录已保留（不删除）：${stage}`)
+if (keepStage) console.log(`暂存目录已保留（不删除）：${stage}`)
+else rmSync(stage, { recursive: true, force: true })
