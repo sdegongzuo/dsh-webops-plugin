@@ -27,6 +27,7 @@ import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { fetchHostPath, startPackagedDesktopHost } from './run-packaged-host.mjs'
+import { pluginTarballName } from './plugin-registration.mjs'
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const PLUGIN_NAME = 'dsh-webops-plugin'
@@ -148,7 +149,7 @@ const allEntries = inventory(unzipped)
 const allowedPrefix = `home/profiles/desktop/node_modules/${PLUGIN_NAME}/`
 const allowedFiles = new Set([
   '更新说明.txt',
-  `vendor/${PLUGIN_NAME}-${version}.tgz`,
+  `vendor/${pluginTarballName(PLUGIN_NAME, version)}`,
 ])
 const stray = [...allEntries.keys()].filter(rel => !rel.startsWith(allowedPrefix) && !allowedFiles.has(rel))
 check(stray.length === 0,

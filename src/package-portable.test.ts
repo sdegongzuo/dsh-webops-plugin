@@ -2,7 +2,7 @@
 import { spawnSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { mkdirSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from 'node:fs'
-import { join } from 'node:path'
+import { join, posix } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { describe, expect, it } from 'vitest'
 
@@ -30,6 +30,10 @@ describe('便携实例的构建接线', () => {
 })
 const localPaths = await import(new URL('../scripts/local-env.mjs', import.meta.url).href) as {
   buildRoot(): string
+}
+const registration = await import(new URL('../scripts/plugin-registration.mjs', import.meta.url).href) as {
+  pluginFileSpec(pluginName: string, version: string): string
+  pluginTarballName(pluginName: string, version: string): string
 }
 const testRoot = join(localPaths.buildRoot(), 'package-test-evidence')
 if (process.platform === 'win32' && !/^D:[\\/]/i.test(testRoot)) {
@@ -157,9 +161,16 @@ describe('每次发布的完整便携包', () => {
     expect(zip.profile.dependencies['dsh-better-sidebar']).toBe(vendorVersion('dsh-better-sidebar'))
     // 本插件必须登记为 file: 相对路径并随包携带不可变 tarball —— 精确版本登记会让
     // install_bundle（profile 里的 pnpm add 全量解析）对未发布的本地包 404（2026-11-19 实测）。
-    const tarballName = `dsh-webops-plugin-${pkg.version}.tgz`
-    expect(zip.profile.dependencies['dsh-webops-plugin']).toBe(`file:../../../vendor/${tarballName}`)
+    const tarballName = registration.pluginTarballName('dsh-webops-plugin', pkg.version)
+    const spec = registration.pluginFileSpec('dsh-webops-plugin', pkg.version)
+    expect(zip.profile.dependencies['dsh-webops-plugin']).toBe(spec)
     expect(zip.names).toContain(`vendor/${tarballName}`)
+    // 光比字符串不够（期望值与写入方是同一份字面量，一起写错会一起通过）：按 POSIX 语义
+    // 从 profile 目录解析这条相对登记，解析结果必须正好命中 zip 里的那份 tgz —— 层级写错
+    //（多一层或少写一个 ..）在这里就会红。
+    const resolvedInZip = posix.normalize(posix.join('home/profiles/desktop', spec.slice('file:'.length)))
+    expect(resolvedInZip).toBe(`vendor/${tarballName}`)
+    expect(zip.names).toContain(resolvedInZip)
     const shipped = spawnSync('python', ['-c',
       'import sys,zipfile; z=zipfile.ZipFile(sys.argv[1]); print(z.read("home/profiles/desktop/node_modules/dsh-better-sidebar/lib/index.js").decode())', out], { encoding: 'utf8' })
     expect(shipped.status, shipped.stderr).toBe(0)

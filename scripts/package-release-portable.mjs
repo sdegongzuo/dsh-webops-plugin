@@ -4,6 +4,7 @@ import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, 
 import { basename, dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { readRuntimeDescriptor } from './desktop-runtime.mjs'
+import { pluginFileSpec, pluginTarballName } from './plugin-registration.mjs'
 import { planSlimAppCopy } from './slim-portable-app.mjs'
 import { verifyDesktopBuildIdentity } from './desktop-build-identity.mjs'
 import { writeProfileExemptions } from './vendor-compatibility.mjs'
@@ -46,7 +47,7 @@ try {
   if (existsSync(out)) throw Error(`输出已存在，拒绝覆盖：${out}`)
   if (!existsSync(pluginZip)) throw Error(`插件 ZIP 不存在：${pluginZip}`)
   if (!existsSync(pluginTgz)) throw Error(`插件 tarball 不存在：${pluginTgz}（先跑 scripts/package-plugin-tarball.mjs）`)
-  const tarballName = `${pkg.name}-${version}.tgz`
+  const tarballName = pluginTarballName(pkg.name, version)
   if (basename(pluginTgz) !== tarballName) throw Error(`插件 tarball 文件名必须是 ${tarballName}：${pluginTgz}`)
   const runtime = readRuntimeDescriptor(app).descriptor
   const receiptIndex = args.indexOf('--desktop-build-receipt')
@@ -78,7 +79,7 @@ try {
   // profile 里的 `pnpm add <spec>`，会全量解析 dependencies —— 精确版本登记会让任何一次
   // install_bundle 对 registry 404。file: 相对路径（相对 profile 目录）让解析永远有本地
   // 事实来源，且整个便携目录搬走后仍有效。 vendored 第三方插件都在 npm 上，保持精确版本。
-  const pluginSpec = `file:../../../vendor/${tarballName}`
+  const pluginSpec = pluginFileSpec(pkg.name, version)
   mkdirSync(join(stage, 'vendor'), { recursive: true })
   cpSync(pluginTgz, join(stage, 'vendor', tarballName))
   writeFileSync(join(profile, 'package.json'), JSON.stringify({

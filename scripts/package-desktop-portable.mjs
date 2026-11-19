@@ -57,6 +57,7 @@ import { cpSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, r
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { buildRoot } from './local-env.mjs'
+import { pluginFileSpec, pluginTarballName } from './plugin-registration.mjs'
 import { readRuntimeDescriptor } from './desktop-runtime.mjs'
 import { desktopReleaseVersion } from './desktop-release-version.mjs'
 import { slimApp } from './slim-portable-app.mjs'
@@ -613,7 +614,7 @@ const slimResult = slimApp(join(STAGE, 'app'))
 console.log(`  - 瘦身：locales 删 ${slimResult.locales.removed} 个（${(slimResult.locales.bytes / 1048576).toFixed(1)}MB），旧布局 pnpm ${slimResult.legacyPnpm.removed ? `已删（${(slimResult.legacyPnpm.bytes / 1048576).toFixed(1)}MB）` : '无（上游已修复或基包不同）'}`)
 
 // 1.5) 本插件的不可变 tarball：出厂 profile 用它做 file: 登记（见第 2 节注释）。
-const tarballName = `${pluginName}-${pluginVersion}.tgz`
+const tarballName = pluginTarballName(pluginName, pluginVersion)
 mkdirSync(join(STAGE, 'vendor'), { recursive: true })
 const tarballRun = spawnSync(
   process.execPath,
@@ -650,7 +651,7 @@ writeFileSync(
       // vendored 第三方插件：精确版本（vendor manifest 里的 version 就是精确版本，
       // 直接派生，不在这里手写第二份）。
       dependencies: {
-        [pluginName]: `file:../../../vendor/${tarballName}`,
+        [pluginName]: pluginFileSpec(pluginName, pluginVersion),
         ...Object.fromEntries(vendoredPlugins.map((plugin) => [plugin.name, plugin.version])),
       },
       // bundles 必须以前两个内置 bundle 开头（project-manager.ts:169），本插件与

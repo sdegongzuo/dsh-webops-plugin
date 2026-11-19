@@ -32,6 +32,7 @@ import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statS
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { pluginFileSpec, pluginTarballName } from './plugin-registration.mjs'
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const DIST = join(ROOT, 'dist')
@@ -110,7 +111,7 @@ if (probeToken !== undefined) {
 // 随包携带本版的不可变 tarball（便携包根的 vendor\ 下）。出厂/新版 profile 把本插件
 // 登记为 file: 相对路径指向它 —— 宿主 install_bundle 全量解析 dependencies 时，本地包
 // 在 registry 上不存在，精确版本登记必然 404（2026-11-19 实测）；tgz 是本地事实来源。
-const tarballName = `${PLUGIN_NAME}-${version}.tgz`
+const tarballName = pluginTarballName(PLUGIN_NAME, version)
 const tarballOut = join(stage, 'vendor', tarballName)
 const tarballRun = spawnSync(process.execPath, [
   join(ROOT, 'scripts', 'package-plugin-tarball.mjs'),
@@ -178,7 +179,7 @@ writeFileSync(
     `  本包已把新版不可变 tarball 放在便携包根的 vendor\\${tarballName}。`,
     '  若你的 profile 用 file: 形式登记本插件（新版出厂包如此），覆盖后请把',
     '  home\\profiles\\desktop\\package.json 里 dependencies 的 dsh-webops-plugin 一项改为：',
-    `    "file:../../../vendor/${tarballName}"`,
+    `    "${pluginFileSpec(PLUGIN_NAME, version)}"`,
     '  只改这一个键，其它内容都不要动。不同步的话，下次在桌面端安装其它插件时，',
     '  本插件会被旧 tarball 回滚。旧 tgz 文件可以保留，不影响使用。',
     '  若登记仍是精确版本号（如 "0.2.28"），建议借这次升级一并改成上面的 file: 写法 ——',

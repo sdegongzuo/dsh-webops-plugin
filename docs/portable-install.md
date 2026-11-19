@@ -22,7 +22,7 @@ DeepSeek Harness 的源码 checkout。
 三步做完才算升级完成：
 
 1. **放 tgz**：从 Release 页面下载 `dsh-webops-plugin-<版本>.tgz`，放到 `<便携目录>\vendor\`。**tgz 不在插件 ZIP 里**，要单独下载；完整便携包已自带，用 ZIP 升级的必须手动放。
-2. **改登记**：编辑 `home\profiles\desktop\package.json`，只改 `dependencies` 里 `dsh-webops-plugin` **这一个键**（上面的示例是 0.2.29 的完整写法，把版本号换成 `vendor\` 下实际那个文件名）。**不要整块替换 `dependencies`** —— 那会连带抹掉你自己装过的其它插件。
+2. **改登记**：编辑 `home\profiles\desktop\package.json`，只改 `dependencies` 里 `dsh-webops-plugin` **这一个键**（上面的示例是 0.2.29 的完整写法，把版本号换成 `vendor\` 下实际那个文件名）。**不要整块替换 `dependencies`** —— 那会连带抹掉你自己装过的其它插件。改之前先把这份 `package.json` 复制一份备份，改错了直接覆盖回来即可。
 3. **重启**：改完关掉再开 DSH，核对插件目录 `package.json` 的 version。
 
 要点：

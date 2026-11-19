@@ -22,15 +22,19 @@
  */
 import { spawnSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
-import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { dirname, join, resolve, basename } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const DIST = join(ROOT, 'dist')
 
+// 暂存目录在成功与失败路径上都要清（失败时留一份完整 lib 副本最容易被忽略：
+// 只在成功分支 rmSync 等于把失败当成「多了份证据」）。--keep-stage 才保留。
+let stage
 const fail = (msg) => {
   console.error(`package-plugin-tarball: ${msg}`)
+  if (stage !== undefined && !keepStage) rmSync(stage, { recursive: true, force: true })
   process.exit(1)
 }
 
@@ -61,6 +65,17 @@ if (basename(out) !== tarballName) fail(`输出文件名必须是 ${tarballName}
 if (existsSync(out)) fail(`目标已存在：${out} —— 保留安全模式不覆盖既有产物，换一个未存在的 --out 路径`)
 const stageRoot = resolve(readArg('stage-root') ?? join(ROOT, '.portable-stage'))
 
+// Windows 下 npm pack 走 `cmd.exe /c`（绕 Node 的 .cmd EINVAL 限制），路径里的 cmd 元字符
+// 会被解释：`%VAR%` 展开、`&` 断句、`^` 转义、`|` 管道、`!` 延迟展开。与其打包时莫名失败，
+// 不如在这里点名报错。
+if (process.platform === 'win32') {
+  for (const [flag, value] of [['--lib-dir', libDir], ['--out', out], ['--stage-root', stageRoot]]) {
+    if (/[&|^%!<>"]/.test(value)) {
+      fail(`${flag} 含 Windows shell 元字符（& | ^ % ! < > "），npm pack 会经 cmd.exe 解释而失败：${value}`)
+    }
+  }
+}
+
 // 完整性前置：与 package-portable.mjs 同一清单，缺哪个报哪个，不静默打出残包。
 for (const from of ['cordis.patch.yml', 'README.md', 'LICENSE']) {
   if (!existsSync(join(ROOT, from))) fail(`缺少 ${join(ROOT, from)}（仓库文件缺失）`)
@@ -72,7 +87,7 @@ for (const file of ['index.js', 'client.js',
 }
 
 mkdirSync(stageRoot, { recursive: true })
-const stage = mkdtempSync(join(stageRoot, 'dsh-plugin-tarball-'))
+stage = mkdtempSync(join(stageRoot, 'dsh-plugin-tarball-'))
 // npm pack 的产物以 `package/` 为前缀，所以暂存目录本身就叫 package。
 const pkgDir = join(stage, 'package')
 mkdirSync(pkgDir, { recursive: true })

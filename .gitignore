@@ -6,6 +6,8 @@ dist/
 .desktop-base/
 # 打包中间产物（app/ + profile/ 的临时拼装目录；`--stage` 可带后缀，故用通配）
 .desktop-stage*/
+# 插件 tarball 的 npm pack 暂存父目录（成功/失败都会清，中断时可能残留）
+.tarball-stage*/
 # verify:portable 用的解压副本（几百 MB，一次性；本机 safe-delete 会拦大目录删除）
 .rel-verify*/
 # 手工解压的便携版副本（同上，几百 MB）

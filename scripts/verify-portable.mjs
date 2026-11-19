@@ -97,6 +97,7 @@ import { materializeRuntimeDir } from './desktop-runtime.mjs'
 import { harnessRoot } from './local-env.mjs'
 import { fetchHostPath, startPackagedDesktopHost } from './run-packaged-host.mjs'
 import { verifyMaterializedRuntime } from './vendored-runtime-lock.mjs'
+import { checkPluginRegistration } from './plugin-registration.mjs'
 
 /* ---------- 参数 ---------- */
 
@@ -377,6 +378,23 @@ console.log(`\n[3/5] 便携版内容（profile=${options.profile}）`)
 
 const shippedPluginDir = join(profileDir, 'node_modules', 'dsh-webops-plugin')
 check(existsSync(shippedPluginDir), '插件已物化到 profile 的 node_modules')
+
+// 出厂登记检查：桌面端独发链（release-desktop.yml）只跑本脚本，如果这里不查，登记被改坏
+// 或包内漏带 tarball 时这条链不会红 —— 而 release.yml 会，两条链的判据必须一致。
+try {
+  const shippedManifest = JSON.parse(readFileSync(join(profileDir, 'package.json'), 'utf8'))
+  const shippedVersion = JSON.parse(readFileSync(join(shippedPluginDir, 'package.json'), 'utf8')).version
+  const registration = checkPluginRegistration({
+    root: packageRoot, pluginName: 'dsh-webops-plugin', version: shippedVersion,
+    profileManifest: shippedManifest, profileDir,
+  })
+  for (const problem of registration.problems) check(false, `出厂登记：${problem}`)
+  if (registration.problems.length === 0) {
+    check(true, `出厂登记是 file: 相对路径且包内 tarball 自洽：vendor/${registration.tarballName}`)
+  }
+} catch (error) {
+  check(false, `出厂登记检查失败：${error instanceof Error ? error.message : String(error)}`)
+}
 
 // vendor 第三方插件的静态检查：真实目录（非 symlink，用户机器上没有 checkout 可指）、
 // 有 package.json、有插件清单或 bundle patch 之一、manifest 声明的运行时依赖已嵌套物化。
