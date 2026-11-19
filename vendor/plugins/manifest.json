@@ -37,7 +37,7 @@
     {
       "name": "dsh-llm-xai-oauth",
       "version": "0.3.1",
-      "client": true,
+      "client": false,
       "tarball": "dsh-llm-xai-oauth-0.3.1.tgz",
       "integrity": "sha512-PjsQwWoWXp2QVRQ552J+iiVGaBoy2ksRncJUJRGaxJZeFdkNXVBwviTeyTIxuyrk3LXB5n5BWynCGVb8LANHpA==",
       "source": "https://registry.npmjs.org/dsh-llm-xai-oauth/-/dsh-llm-xai-oauth-0.3.1.tgz",

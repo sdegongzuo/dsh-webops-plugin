@@ -74,14 +74,26 @@ try {
   assert(page.status === 200, `首页返回 ${page.status}`)
   const html = page.body.toString('utf8')
   assert(html.includes('__DSH_BOOT__'), '首页缺少客户端加载图')
-  for (const name of [pkg.name, ...vendor.map(p => p.name)]) assert(html.includes(name), `客户端加载图缺少 ${name}`)
+  // 客户端加载图只列**有 client half 的插件**：`dsh.client` 声明 + `exports["./client"]`。
+  // 纯后端插件（如 dsh-llm-xai-oauth 的 OAuth / 模型接入）没有客户端产物，本就不会出现在
+  // 这张图里 —— 不能拿「首页少个名字」当它加载失败的证据。判据读插件实际 exports，而不是
+  // manifest 里的 client 标记（那是文档性字段，填错也不影响物化）。后端是否加载由上面的
+  // bundles 登记、版本一致性和兼容性判定覆盖，加载图这里只管客户端那半边。
+  const clientNames = [pkg.name]
+  for (const plugin of vendor) {
+    const installedPkg = json(join(profile, 'node_modules', plugin.name, 'package.json'))
+    if (installedPkg.dsh?.client !== undefined && installedPkg.exports?.['./client'] !== undefined) {
+      clientNames.push(plugin.name)
+    }
+  }
+  for (const name of clientNames) assert(html.includes(name), `客户端加载图缺少 ${name}`)
   // 只见客户端不能证明后端挂载；GET 必须进入侧边栏处理器的 JSON 方法校验。
   const sidebar = await fetchHostPath(ready.url, '/sidebar/api/fs.read')
   let envelope
   try { envelope = JSON.parse(sidebar.body.toString('utf8')) } catch { /* 空 405 是本次回归症状。 */ }
   assert(sidebar.status === 405 && envelope?.ok === false && envelope?.error?.code === 'method-error',
     `侧边栏后端未正常挂载：HTTP ${sidebar.status}，缺少方法校验信封`)
-  console.log(`verify-release-portable: 实际生产宿主首页、${vendor.length + 1} 个插件加载图与侧边栏后端路由通过；验收副本保留在 ${scratch}`)
+  console.log(`verify-release-portable: 实际生产宿主首页、客户端加载图（${clientNames.length} 个含 client half 的插件；纯后端插件按 bundles/兼容性判定覆盖）与侧边栏后端路由通过；验收副本保留在 ${scratch}`)
 } finally {
   await host.stop()
 }

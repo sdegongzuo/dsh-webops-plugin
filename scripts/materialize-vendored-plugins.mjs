@@ -157,6 +157,15 @@ for (const plugin of manifest.plugins) {
   if (meta?.name !== plugin.name || meta?.version !== plugin.version) {
     throw new Error(`tarball 身份对不上：期望 ${plugin.name}@${plugin.version}，实际 ${meta?.name}@${meta?.version}`)
   }
+  // client 标记必须与包内实际 client half 一致：`dsh.client` 声明 + `exports["./client"]`。
+  // 纯后端插件（如 dsh-llm-xai-oauth）两者皆无，必须标 client:false —— 否则发布门禁
+  // verify-release-portable 会误以为它该出现在客户端加载图里（2026-11-19 v0.2.28 两次
+  // CI 失败即为此）。这条把「填错标记」在物化阶段就挡住，不等到 CI 真宿主验证才暴露。
+  const hasClient = meta?.dsh?.client !== undefined && meta?.exports?.['./client'] !== undefined
+  if (plugin.client !== undefined && plugin.client !== hasClient) {
+    throw new Error(`client 标记与包内容不符：${plugin.name} 的 manifest.client=${plugin.client}，但包内 `
+      + `dsh.client=${meta?.dsh?.client !== undefined} / exports["./client"]=${meta?.exports?.['./client'] !== undefined}`)
+  }
   console.log(`+ node_modules/${plugin.name}@${plugin.version}`)
   const locked = lockedRuntimes.get(plugin.name)
   if (locked) {
