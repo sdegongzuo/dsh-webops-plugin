@@ -15,7 +15,7 @@
 import { existsSync, readFileSync } from 'node:fs'
 import { join, resolve } from 'node:path'
 
-/** 出厂 settings 的引用名，以及便携 home 里实际会出现的引用名。 */
+/** 开发态联调会碰到的凭据引用名（出厂不再预置 provider，这里只是按名字找 key）。 */
 export const LOCAL_LLM_KEY_NAMES = ['UNISOUND_API_KEY', 'DEEPSEEK_API_KEY', 'OPENROUTER_API_KEY', 'ARK_API_KEY'] as const
 
 function unquote(raw: string): string {

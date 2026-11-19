@@ -481,7 +481,7 @@ function inspectProfilePatch(path) {
     check(profilePatch.leaked.length === 0,
       `profile patch 里没有 insert / disabled 这类越权写法（实得 ${JSON.stringify(profilePatch.leaked)}）`)
     console.log(`  · profile patch 条目：${JSON.stringify(profilePatch.ids)}`
-      + '（含出厂模型配置；宿主与设置页会自己追加行，正常）')
+      + '（出厂只含权限配置；宿主与设置页会自己追加行，正常）')
   }
 }
 

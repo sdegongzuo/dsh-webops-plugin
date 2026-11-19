@@ -486,11 +486,12 @@ jobs:
         #                      打包态 process.execPath 是 Electron exe，而 ptc 子进程会
         #                      删掉 ELECTRON_RUN_AS_NODE，于是永远不回应。只验「服务存在」
         #                      拦不住，必须真跑一段程序看返回值。
-        #   verify-settings —— 出厂 profile patch 真的注册成了 llm provider
-        #                      （落点是 home/profiles/desktop/cordis.patch.yml：
+        #   verify-settings —— 出厂 profile patch 在真宿主里过 schema：不预置任何模型
+        #                      provider / 默认模型 / 凭据引用（反向断言），且权限配置真的
+        #                      作用到运行中的条目（落点 home/profiles/desktop/cordis.patch.yml：
         #                       0.1.7 起设置的家就是 profile patch，settings.yaml 已退役）。
-        #                      字段名写错（baseURL/baseUrl）或取值越界时，pi-ai 会把
-        #                      **整条路由静默拒掉**，用户只看到「一个模型都没有」。
+        #                      字段名写错时 `projectForm()` 只挑 schema 声明过的键、静默丢掉，
+        #                      所以必须真起宿主。
         #   verify-browser-host —— agent 调 browser_open 真能开出窗口（spawn 主 exe 的
         #                      窗口宿主 → 真导航 → 快照 + 截图），并在 cdp/electron
         #                      同时可用时断言 provider 选对了。
@@ -562,18 +563,16 @@ jobs:
              认出旁边的 `home\`（`resolvePortableDshHome`），配置照样随包走
           3. 首次运行会被 SmartScreen 拦，点「更多信息」→「仍要运行」
 
-          ### 第一次打开：填一个模型 API Key
+          ### 第一次打开：添加你自己的模型提供商
 
-          包里的 `home\profiles\desktop\cordis.patch.yml`（dsh 的设置文档）已经预置好**云知声 MaaS**（[maas.unisound.com](https://maas.unisound.com)，
-          OpenAI 兼容），默认模型 `u2-flash`，备选 17 个（DeepSeek / Kimi / GLM / MiniMax / Qwen 等）。
-          **包里不含任何 API Key**，需要你自己填一个：
+          包里的 `home\profiles\desktop\cordis.patch.yml`（dsh 的设置文档）**不预置任何模型 provider** ——
+          便携版的 `home\` 是全新的，预置了也没有凭据可用。**包里不含任何 API Key**：
 
-          1. 打开「设置 → 模型」，找到 **云知声 MaaS**
-          2. 粘贴你的 API Key —— 它会写进 `home\.credentials.yaml`，下次启动自动带上
+          1. 打开「设置 → 模型」，添加你自己的模型提供商（OpenAI 兼容网关 / xAI / DeepSeek 等）并填 API Key
+          2. Key 会写进 `home\.credentials.yaml`，下次启动自动带上
 
-          也可以不改界面，直接设环境变量 `UNISOUND_API_KEY`（环境变量优先级更高，但只读、不会被设置页改写）。
-
-          API Key 在 [maas.unisound.com](https://maas.unisound.com) 控制台申请。
+          随包插件 `dsh-connect-workbuddy` 会复用 WorkBuddy 桌面端的登录态提供模型（设置页「模型」里可选）；
+          没有 WorkBuddy 账号时按上面第 1 步自行添加。
 
           ### 这一版装在里面的是什么
 
@@ -590,7 +589,8 @@ jobs:
           **保留 `home\` 即可**：把新包解压到别处，再把旧包的 `home\` 整个拷进新包根目录 ——
           会话 / 设置 / 凭据 / 已装插件全在 `home\` 里，一个都不会丢。
 
-          DSH 本体升级时下载桌面整包；本体不变且接口兼容时，下载独立插件包覆盖实际插件目录后重启。
+          DSH 本体升级时下载桌面整包；只有本体版本不变且插件的 peer 仍满足该宿主时，才能用独立插件包覆盖插件目录后重启。
+          本版升了本体（0.2.2-rc.5），插件 peer 精确指向该版本，旧宿主请直接换整包。
 
           ⚠️ 出厂模型配置从 dsh 0.1.7 起写在 `home\profiles\desktop\cordis.patch.yml` ——
           dsh 0.1.7 把 `home\settings.yaml` 退役了，设置的家就是这份 profile patch。

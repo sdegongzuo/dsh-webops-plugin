@@ -87,9 +87,9 @@ try {
   writeFileSync(join(stage, '启动.cmd'), ['@echo off', 'setlocal', 'set "DSH_HOME=%~dp0home"', `start "" "%~dp0app\\${exe}" %*`, ''].join('\r\n'))
   writeFileSync(join(stage, '使用说明.txt'), [
     `插件发布版本：${version}；DSH 本体：${runtime.release.version}；Windows x64 完整便携包。`,
-    '解压到较短路径，双击启动.cmd。首次使用在设置→模型填写 API Key；包内不含凭据或用户会话。',
+    '解压到较短路径，双击启动.cmd。出厂不预置任何模型 provider：首次使用请在设置→模型添加自己的提供商并填 API Key；包内不含凭据或用户会话。',
     '已有用户请先备份原 home 与 data。不要用出厂 home 覆盖自己的会话、设置和凭据。',
-    '只更新插件时，完全退出后使用同一 Release 的独立插件 ZIP 覆盖实际插件目录，再重启。',
+    '只换插件要求插件 peer 仍匹配当前宿主版本（插件的 package.json 会写明）；DSH 本体升级时请用整包。',
     '完整安装与数据迁移说明：https://github.com/sdegongzuo/dsh-webops-plugin/blob/main/docs/portable-install.md',
   ].join('\r\n'))
   writeFileSync(join(stage, 'release-manifest.json'), JSON.stringify({ pluginVersion: version, dshVersion: runtime.release.version,
