@@ -63,6 +63,7 @@ import { desktopReleaseVersion } from './desktop-release-version.mjs'
 import { slimApp } from './slim-portable-app.mjs'
 import { writeProfileExemptions } from './vendor-compatibility.mjs'
 import { appendFactoryDefaultModel, formatFactoryDefaultModel } from './factory-default-model.mjs'
+import { writeFactoryProxy } from './factory-proxy.mjs'
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const DIST = join(ROOT, 'dist')
@@ -791,6 +792,10 @@ writeFileSync(
   ].join('\r\n'),
 )
 console.log('  + 启动.cmd')
+const factoryProxy = writeFactoryProxy(STAGE)
+console.log(factoryProxy === undefined
+  ? '  + 不预置 proxy.txt（启动时读系统代理或包根 proxy.txt）'
+  : `  + proxy.txt（出厂代理 ${factoryProxy}）`)
 
 // 5) 说明
 writeFileSync(
@@ -836,8 +841,11 @@ writeFileSync(
     '  API Key 与本机登录态都不进包，只落在当前用户的 home 目录。',
     '',
     '【代理】',
+    ...(factoryProxy === undefined
+      ? ['  本包未预置 proxy.txt；启动脚本会读取 Windows 系统代理。']
+      : [`  本包已预置 proxy.txt：${factoryProxy}；端口不同请改第一行。`]),
     '  启动脚本会自动读取 Windows 系统代理（仅支持简单的 host:port）；',
-    '  也可在包根新建 proxy.txt，第一行写一个完整代理地址（如 http://127.0.0.1:7890）覆盖它。',
+    '  也可在包根新建/修改 proxy.txt，第一行写一个完整代理地址（如 http://127.0.0.1:7890）覆盖它。',
     '  直接双击 app 下的 exe 不会带上代理，Node 也不读系统代理 —— 请优先用「启动.cmd」。',
     '',
     '【验证插件生效】',

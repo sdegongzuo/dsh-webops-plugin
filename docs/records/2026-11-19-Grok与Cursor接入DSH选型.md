@@ -352,7 +352,29 @@ dsh plugin --profile <profile> remove dsh-llm-xai-oauth
 - 真机验收（用包内 `启动.cmd`，**不手工设 `HTTPS_PROXY`**）：默认模型 `Grok 4.7 / High`；回复 `desktop-xai-ok` 用时 2–5 秒、约 1,500–2,000 tok/s；工具调用 25 秒返回结果。说明代理自动读取与 426 修复都生效。
 - 插件页显示 `dsh-llm-xai-oauth v0.3.1`「运行中」，无需手工改 profile。
 
-### 11.3 仍未闭合
+### 11.3 发版代理补齐（同日第三轮）
+
+第二轮的发版包只有「默认模型 = Grok」，但 zip 根没有 `proxy.txt`：第一次启动如果系统代理没开，插件拉不到 xAI 模型目录，Grok 分组就不出现。第三轮把这块补成可复现的出厂动作，而不是让用户自己找目录新建文件。
+
+| 位置 | 改动 |
+|---|---|
+| `scripts/factory-proxy.mjs`（新） | 可选构建参数 `DSH_FACTORY_PROXY=http://127.0.0.1:7890`；显式设置时才写包根 `proxy.txt`，未设置不产生文件。只接受 `http/https`、必须带 `host:port`，拒绝 query/hash/路径 |
+| `scripts/package-desktop-portable.mjs` | 生成 `启动.cmd` 后调用 `writeFactoryProxy(STAGE)`；`使用说明.txt` 按是否预置代理输出不同文案 |
+| `scripts/package-release-portable.mjs` | 同一套出厂代理写入；`release-manifest.json` 增加 `factoryProxy` 字段（有值时） |
+| 构建命令 | `DSH_FACTORY_DEFAULT_MODEL=xai/grok-4.7/high` + `DSH_FACTORY_PROXY=http://127.0.0.1:7890` |
+
+重打产物：
+
+- `dist/dsh-webops-desktop-v0.2.2-rc.5-win-x64-portable.zip`
+- 432,148,904 bytes（412.1 MB），40,878 个条目
+- sha256 `a14c2e3080438441609f1a4d7239b6637db744964b54560ecef04603e38e7ce2`
+- zip 根含 `proxy.txt`，内容 `http://127.0.0.1:7890`
+- `home/profiles/desktop/cordis.patch.yml` 仍为 `xai / grok-4.7 / high`
+- `verify-portable --dir D:\dsh-build\verify-proxy-release` **全部通过**：20,583 个受校验文件 sha256 全匹配、4 个 vendor 插件都在 activePlugins、宿主真启动并注入 `__DSH_BOOT__`、客户端 bundle 可拉取
+
+取舍：出厂代理是**构建参数**，不是仓库默认策略；默认包不设 `DSH_FACTORY_PROXY` 时仍然没有 `proxy.txt`。当前包的端口写死为 7890，换机器/换端口需要改 `proxy.txt` 第一行；自动探测本地代理端口尚未实现。
+
+### 11.4 仍未闭合
 
 - **桌面插件市场仍不能在线安装第三方插件**：profile 现有 4 个插件不在 npmjs / npmmirror，`pnpm add` 会连带解析并 404。本包通过出厂物化绕开；在线安装要改安装器或补本地解析，未在本次实现。
 - `/usage` 未验，订阅池扣减仍无账单侧证据。

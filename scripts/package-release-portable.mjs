@@ -9,6 +9,7 @@ import { planSlimAppCopy } from './slim-portable-app.mjs'
 import { verifyDesktopBuildIdentity } from './desktop-build-identity.mjs'
 import { writeProfileExemptions } from './vendor-compatibility.mjs'
 import { appendFactoryDefaultModel, formatFactoryDefaultModel } from './factory-default-model.mjs'
+import { writeFactoryProxy } from './factory-proxy.mjs'
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 
@@ -118,11 +119,15 @@ try {
     `start "" "%~dp0app\\${exe}" %*`,
     '',
   ].join('\r\n'))
+  const factoryProxy = writeFactoryProxy(stage)
   writeFileSync(join(stage, '使用说明.txt'), [
     `插件发布版本：${version}；DSH 本体：${runtime.release.version}；Windows x64 完整便携包。`,
     factoryDefault === undefined
       ? '解压到较短路径，双击启动.cmd。出厂不预置默认模型：请在设置→模型选择或添加自己的提供商；包内不含凭据或用户会话。'
       : `解压到较短路径，双击启动.cmd。本构建默认 ${formatFactoryDefaultModel(factoryDefault)}：首次启动复用本机登录态，没有则按插件引导登录；包内不含凭据或用户会话。`,
+    factoryProxy === undefined
+      ? '启动脚本会自动读取 Windows 系统代理；也可在包根 proxy.txt 第一行写完整代理地址覆盖。'
+      : `本包已预置代理 ${factoryProxy}；端口不同请改包根 proxy.txt 第一行。`,
     '启动脚本会自动读取 Windows 系统代理；也可在包根 proxy.txt 第一行写完整代理地址覆盖。直接双击 app 下的 exe 不会带代理。',
     '已有用户请先备份原 home 与 data。不要用出厂 home 覆盖自己的会话、设置和凭据。',
     `插件以 file: 相对路径登记到包内 vendor\\${tarballName}（不可变 tarball，供插件管理器解析）；升级请用同版新 tgz，见安装说明。`,
@@ -131,6 +136,7 @@ try {
   ].join('\r\n'))
   writeFileSync(join(stage, 'release-manifest.json'), JSON.stringify({ pluginVersion: version, dshVersion: runtime.release.version,
     ...factoryDefault === undefined ? {} : { factoryDefault },
+    ...factoryProxy === undefined ? {} : { factoryProxy },
     ...desktopBuild !== undefined ? { desktopBuild } : {},
   }, null, 2) + '\n')
   mkdirSync(dirname(out), { recursive: true })
