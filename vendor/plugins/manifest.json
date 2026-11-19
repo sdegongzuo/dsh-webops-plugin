@@ -35,15 +35,16 @@
       "runtimeLock": "workbuddy-runtime.lock.json"
     },
     {
-      "name": "dsh-llm-xai-oauth",
-      "version": "0.3.1",
-      "client": false,
-      "tarball": "dsh-llm-xai-oauth-0.3.1.tgz",
-      "integrity": "sha512-PjsQwWoWXp2QVRQ552J+iiVGaBoy2ksRncJUJRGaxJZeFdkNXVBwviTeyTIxuyrk3LXB5n5BWynCGVb8LANHpA==",
-      "source": "https://registry.npmjs.org/dsh-llm-xai-oauth/-/dsh-llm-xai-oauth-0.3.1.tgz",
-      "repo": "https://github.com/cyjyyd/dsh-llm-xai-oauth",
-      "portableNote": "Grok 订阅接入：设备码 OAuth 复用 grok-bridge 登录态，走 cli-chat-proxy 订阅池，不填 API Key；出厂 patch 固定 clientVersion 1.0.13（服务端 426 要求 1.0.13+）。首次使用需在插件页完成设备码登录，凭据落在用户目录、不进包。",
-      "runtimeDependencies": ["undici", "eventsource-parser"]
+      "name": "dsh-coding-subscription-oauth",
+      "version": "0.8.8",
+      "client": true,
+      "tarball": "dsh-coding-subscription-oauth-0.8.8.tgz",
+      "integrity": "sha512-u+0jgG5P2+w3gBibTDtVgwCOVrKH3KOxn2M4o6uH0b7Aj7Kvgj7hQAIm9NIOgqfR5vclYmzuIbBY9lrcoO4oZQ==",
+      "source": "https://registry.npmjs.org/dsh-coding-subscription-oauth/-/dsh-coding-subscription-oauth-0.8.8.tgz",
+      "repo": "https://github.com/lninghaha/dsh-coding-subscription-oauth",
+      "portableNote": "Grok 订阅接入（替代 dsh-llm-xai-oauth）：注册 grok-build 路由走 cli-chat-proxy 订阅池，兼容并装 xai 插件而不抢路由；客户端含「账户与模型」设置卡片。ⓘ 上游已把 CLI 最低版本抬到 1.0.13，而插件常量默认 0.1.220 → 启动器必须注入 GROK_BUILD_CLIENT_VERSION=1.0.13，否则 Grok 请求 426。另：DSH 0.2.2 线的 settings 服务无 register()，能力开关会退化为只读（Grok 登录/选模型不受影响）。",
+      "patchCompatibility": "strip-preset-default-model-v1",
+      "runtimeDependencies": []
     }
   ],
   "dependencies": [

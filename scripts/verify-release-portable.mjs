@@ -75,12 +75,11 @@ const scratch = mkdtempSync(join(tmpdir(), 'webops-release-check-'))
 const workProfile = join(scratch, 'home', 'profiles', 'desktop')
 mkdirSync(workProfile, { recursive: true })
 cpSync(profile, workProfile, { recursive: true })
-// 自检环境必须禁用随包 Grok 插件的首次登录：出厂 profile 没有用户 token，插件会判定
-// 「无 token + Windows 桌面 = 视觉设备码登录」，打开本地 onboarding 页与系统浏览器
-// （CI 日志里的 msedge 孤儿进程就是这个），干扰真宿主的 ready / 端口，导致自检在
-// 「desktop-host 60000ms 内没发 ready」上必现失败（v0.2.28 三次 CI）。插件自身提供
-// DSH_XAI_OAUTH_NO_LOGIN 开关走「跳过登录」分支，语义正确、不影响被测的出货行为。
-const host = startPackagedDesktopHost({ runtimeDir, profileDir: workProfile, env: { ...process.env, DSH_HOME: join(scratch, 'home'), DSH_XAI_OAUTH_NO_LOGIN: '1' } })
+// 自检不需要任何登录绕过：随包 Grok 插件是 dsh-coding-subscription-oauth，它**惰性**登录
+// （只在用户点「登录」时才起设备码流程），宿主启动阶段不碰浏览器、不阻塞 ready。
+// 上一代 dsh-llm-xai-oauth 会在无 token 时主动开视觉设备码登录，才需要 DSH_XAI_OAUTH_NO_LOGIN；
+// 换插件后该开关不再适用，若残留会让人误以为还需要它。
+const host = startPackagedDesktopHost({ runtimeDir, profileDir: workProfile, env: { ...process.env, DSH_HOME: join(scratch, 'home') } })
 try {
   const ready = await host.ready
   const page = await fetchHostPath(ready.url, '/index.html')
@@ -88,10 +87,11 @@ try {
   const html = page.body.toString('utf8')
   assert(html.includes('__DSH_BOOT__'), '首页缺少客户端加载图')
   // 客户端加载图只列**有 client half 的插件**：`dsh.client` 声明 + `exports["./client"]`。
-  // 纯后端插件（如 dsh-llm-xai-oauth 的 OAuth / 模型接入）没有客户端产物，本就不会出现在
-  // 这张图里 —— 不能拿「首页少个名字」当它加载失败的证据。判据读插件实际 exports，而不是
-  // manifest 里的 client 标记（那是文档性字段，填错也不影响物化）。后端是否加载由上面的
-  // bundles 登记、版本一致性和兼容性判定覆盖，加载图这里只管客户端那半边。
+  // 纯后端插件没有客户端产物，本就不会出现在这张图里 —— 不能拿「首页少个名字」当它加载
+  // 失败的证据。判据读插件实际 exports，而不是 manifest 里的 client 标记（那是文档性字段，
+  // 填错也不影响物化）。后端是否加载由上面的 bundles 登记、版本一致性和兼容性判定覆盖。
+  // 2026-11-19 起随包 Grok 插件是 dsh-coding-subscription-oauth，它**带** client half
+  // （设置页「账户与模型」卡片），所以会出现在这张图里；上一代 dsh-llm-xai-oauth 没有。
   const clientNames = [pkg.name]
   for (const plugin of vendor) {
     const installedPkg = json(join(profile, 'node_modules', plugin.name, 'package.json'))

@@ -24,6 +24,7 @@ import { fileURLToPath } from 'node:url'
 import { gunzipSync } from 'node:zlib'
 import { spawnSync } from 'node:child_process'
 import { applySidebarHostCompatibility, SIDEBAR_COMPATIBILITY_PATCH } from './sidebar-host-compatibility.mjs'
+import { applyCodingOAuthPatchCompatibility, CODING_OAUTH_PATCH_COMPAT } from './coding-oauth-patch-compat.mjs'
 import { materializeVendoredRuntime, readVendoredRuntimeLock } from './vendored-runtime-lock.mjs'
 
 const ROOT = resolve(fileURLToPath(import.meta.url), '..', '..')
@@ -177,6 +178,16 @@ for (const plugin of manifest.plugins) {
     if (plugin.hostCompatibility !== SIDEBAR_COMPATIBILITY_PATCH) throw new Error(`未知宿主兼容补丁：${plugin.hostCompatibility}`)
     const receipt = applySidebarHostCompatibility(pluginDir)
     console.log(`+ ${plugin.name} 宿主兼容：${receipt.patch ?? '已适配'}`)
+  }
+
+  if (plugin.patchCompatibility !== undefined) {
+    if (plugin.patchCompatibility !== CODING_OAUTH_PATCH_COMPAT) {
+      throw new Error(`未知 patch 兼容补丁：${plugin.patchCompatibility}`)
+    }
+    const receipt = applyCodingOAuthPatchCompatibility(pluginDir)
+    console.log(receipt.unchanged === true
+      ? `+ ${plugin.name} 出厂补丁：上游已不写默认模型，无需改动`
+      : `+ ${plugin.name} 出厂补丁：剥除预设默认模型（${receipt.patch}）`)
   }
 
   // 该插件声明的运行时依赖，按 npm 嵌套规则落到插件自己的 node_modules 下

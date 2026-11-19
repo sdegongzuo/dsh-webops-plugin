@@ -117,6 +117,9 @@ try {
     'rem Optional override: put one proxy URL on the first line of proxy.txt.',
     'if exist "%~dp0proxy.txt" for /f "usebackq delims=" %%P in ("%~dp0proxy.txt") do (set "HTTPS_PROXY=%%P" & set "HTTP_PROXY=%%P")',
     'if defined HTTPS_PROXY echo [dsh] proxy: %HTTPS_PROXY%  (edit proxy.txt at package root to change/remove)',
+    'rem Grok subscription plugin: upstream cli-chat-proxy rejects CLI builds below 1.0.13',
+    'rem (the plugin hardcodes 0.1.220). Its own escape hatch overrides that constant.',
+    'set "GROK_BUILD_CLIENT_VERSION=1.0.13"',
     `start "" "%~dp0app\\${exe}" %*`,
     '',
   ].join('\r\n'))
