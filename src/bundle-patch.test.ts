@@ -363,9 +363,13 @@ describe('便携版使用说明（scripts/package-desktop-portable.mjs）', () =
     expect(script, '说明没告诉用户可以不外接 Chrome').toContain('不需要外接 Chrome')
   })
 
-  it('说明里两种启动方式都写了（脚本 + 直接双击 exe）', () => {
-    expect(script).toContain('· 双击根目录的「启动.cmd」')
-    expect(script).toContain('· 直接双击 app 目录里的')
+  it('说明推荐启动.cmd，并写明直接双击 exe 不带代理的后果', () => {
+    // 2026-11-19 评审（P1-5）：旧文案「二选一，效果相同」与「直接双击不带代理」自相矛盾，
+    // 改为明确口径 —— 推荐启动.cmd；直接双击不带代理，默认模型依赖代理出网会请求失败。
+    expect(script).toContain('推荐双击根目录的「启动.cmd」')
+    expect(script).toContain('直接双击 app 目录里的')
+    expect(script).toContain('不会带上代理')
+    expect(script, '「效果相同」的旧口径必须删掉').not.toContain('效果相同')
   })
 
   it('不把本机 .credentials.yaml 拷进便携包', () => {
@@ -378,10 +382,13 @@ describe('出厂配置：落点与凭据卫生', () => {
   const patch = readRepoFile('scripts/portable-profile-patch.yaml')
 
   it('不预置任何模型 provider，模型接入交给用户在设置页自行配置', () => {
-    expect(patch, '出厂 patch 还留着 llm-pi-ai provider').not.toContain('llm-pi-ai')
-    expect(patch, '出厂 patch 还留着 unisound 路由').not.toMatch(/^\s*providers:/mu)
-    expect(patch, '出厂 patch 还留着默认模型指向').not.toContain('agent-default-model')
-    expect(patch, '出厂 patch 还留着 apiKeyEnv').not.toContain('apiKeyEnv')
+    // 2026-11-19 起（评审 P2-10）表头注释会提到 DSH_FACTORY_DEFAULT_MODEL 追加
+    // agent-default-model 的行为，所以这几条只断言去掉注释行的正文。
+    const body = patch.split('\n').filter(line => !line.trimStart().startsWith('#')).join('\n')
+    expect(body, '出厂 patch 还留着 llm-pi-ai provider').not.toContain('llm-pi-ai')
+    expect(body, '出厂 patch 还留着 unisound 路由').not.toMatch(/^\s*providers:/mu)
+    expect(body, '出厂 patch 还留着默认模型指向').not.toContain('agent-default-model')
+    expect(body, '出厂 patch 还留着 apiKeyEnv').not.toContain('apiKeyEnv')
   })
 
   it('正文里没有 sk- 形态的 secret', () => {

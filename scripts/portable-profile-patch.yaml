@@ -8,9 +8,10 @@
 # 便携包出厂配置 —— 由 scripts/package-desktop-portable.mjs 复制成
 #   <便携包根>/home/profiles/desktop/cordis.patch.yml
 #
-# 不预置任何模型 provider：便携版的 home\ 是全新的，没有凭据，预置了也用不起来。
+# 默认不预置任何模型 provider 与 API Key：便携版的 home\ 是全新的，没有凭据，预置了也用不起来。
+# 设置 DSH_FACTORY_DEFAULT_MODEL 时会追加一条 agent-default-model 默认模型（不含任何凭据）。
 # 用户在「设置 → 模型」里添加自己的模型提供商（OpenAI 兼容网关 / xAI / DeepSeek 等）
-# 并填入 API Key，落到 home\.credentials.yaml。API Key 不进包。
+# 并填入 API Key，落到 home\.credentials.yaml。
 #
 # ⚠️ 为什么写在这里、而不是 `home/settings.yaml`（2026-09-24 适配 dsh 0.1.7）：
 #   0.1.7 起 `settings.yaml` 已被上游**退役**——`packages/settings/settings/src/index.ts` 的

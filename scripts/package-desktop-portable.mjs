@@ -60,6 +60,7 @@ import { buildRoot } from './local-env.mjs'
 import { pluginFileSpec, pluginTarballName } from './plugin-registration.mjs'
 import { readRuntimeDescriptor } from './desktop-runtime.mjs'
 import { desktopReleaseVersion } from './desktop-release-version.mjs'
+import { verifyDesktopBuildIdentity } from './desktop-build-identity.mjs'
 import { slimApp } from './slim-portable-app.mjs'
 import { writeProfileExemptions } from './vendor-compatibility.mjs'
 import { appendFactoryDefaultModel, formatFactoryDefaultModel } from './factory-default-model.mjs'
@@ -787,6 +788,7 @@ writeFileSync(
     'if defined PROXY_SERVER set "HTTP_PROXY=http://%PROXY_SERVER%"',
     'rem Optional override: put one proxy URL on the first line of proxy.txt.',
     'if exist "%ROOT%proxy.txt" for /f "usebackq delims=" %%P in ("%ROOT%proxy.txt") do (set "HTTPS_PROXY=%%P" & set "HTTP_PROXY=%%P")',
+    'if defined HTTPS_PROXY echo [dsh] proxy: %HTTPS_PROXY%  (edit proxy.txt at package root to change/remove)',
     `start "" "%ROOT%app\\${exe}" %*`,
     '',
   ].join('\r\n'),
@@ -804,11 +806,12 @@ writeFileSync(
     `dsh 桌面端便携版 v${version}（Windows x64，已内置 ${pluginName} 插件）`,
     '',
     '【运行】',
-    '  二选一，效果相同：',
-    '    · 双击根目录的「启动.cmd」',
-    `    · 直接双击 app 目录里的 ${exe}`,
-    '',
-    '  后者能行是因为 dsh 认「exe 上一级的 home\\ 目录」为数据目录（便携模式）。',
+    '  推荐双击根目录的「启动.cmd」。',
+    `  直接双击 app 目录里的 ${exe} 也能启动，但不会带上代理`,
+    ...(factoryDefault === undefined
+      ? ['  （Node 不读系统代理，需要出网的功能会失败）。']
+      : ['  （本包默认模型依赖代理出网，直接双击会导致模型请求失败）。']),
+    '  数据目录仍按便携模式认「exe 上一级的 home\\ 目录」；',
     '  只要 home\\ 与 app\\ 还保持同层，配置与插件就随包走。',
     '  ⚠️ 唯一的例外：把 exe 单独挪出 app\\ 目录，就会落回用户目录 ~/.dsh，',
     '     那里没有本插件，表现是「状态条不见了」。',
@@ -836,6 +839,8 @@ writeFileSync(
         `  本构建默认 ${formatFactoryDefaultModel(factoryDefault)}。`,
         '  首次启动会自动复用本机 ~/.grok-bridge 或 ~/.grok 的登录态；',
         '  没有可用 token 时，插件会打开浏览器引导完成设备码登录。',
+        '  设备码有效期约 10 分钟：请在过期前完成登录，不要关掉引导页置之不理 ——',
+        '  插件在等登录完成，期间宿主可能长时间未就绪。',
         '  没有 SuperGrok / X Premium 订阅的用户，可在模型选择里切回 WorkBuddy 等自带模型。',
       ]),
     '  API Key 与本机登录态都不进包，只落在当前用户的 home 目录。',
@@ -874,6 +879,31 @@ writeFileSync(
   ].join('\r\n'),
   { encoding: 'utf8' },
 )
+
+// 5.5) release-manifest.json —— 与 package-release-portable.mjs 的收尾清单同款、字段同源：
+//      插件版本 / DSH 版本 / 出厂默认模型 / 出厂代理 / 桌面构建回执。desktopBuild 的来源
+//      与 release 路径一致：release.yml 给 --desktop-build-receipt 传的就是
+//      DESKTOP_BUILD_RECEIPT 这个环境变量，这里读同名变量、复用同一 helper
+//      verifyDesktopBuildIdentity，并且对**进包的那份** app（STAGE 里已瘦身的副本）核验。
+//      未设置该变量时字段自然缺省（release-desktop.yml 目前不设它，接上即自动出现）。
+const receiptPath = process.env.DESKTOP_BUILD_RECEIPT
+let desktopBuild
+if (receiptPath !== undefined && receiptPath !== '') {
+  try {
+    desktopBuild = verifyDesktopBuildIdentity(join(STAGE, 'app'), receiptPath)
+  } catch (error) {
+    console.error(`package-desktop-portable: 桌面构建回执核验失败（${error.message}）`)
+    process.exit(1)
+  }
+}
+writeFileSync(join(STAGE, 'release-manifest.json'), JSON.stringify({
+  pluginVersion,
+  dshVersion: version,
+  ...factoryDefault === undefined ? {} : { factoryDefault },
+  ...factoryProxy === undefined ? {} : { factoryProxy },
+  ...desktopBuild !== undefined ? { desktopBuild } : {},
+}, null, 2) + '\n')
+console.log('  + release-manifest.json（与 release 打包路径同款收尾清单）')
 
 // 6) 打包
 //

@@ -116,6 +116,7 @@ try {
     'if defined PROXY_SERVER set "HTTP_PROXY=http://%PROXY_SERVER%"',
     'rem Optional override: put one proxy URL on the first line of proxy.txt.',
     'if exist "%~dp0proxy.txt" for /f "usebackq delims=" %%P in ("%~dp0proxy.txt") do (set "HTTPS_PROXY=%%P" & set "HTTP_PROXY=%%P")',
+    'if defined HTTPS_PROXY echo [dsh] proxy: %HTTPS_PROXY%  (edit proxy.txt at package root to change/remove)',
     `start "" "%~dp0app\\${exe}" %*`,
     '',
   ].join('\r\n'))
@@ -124,11 +125,13 @@ try {
     `插件发布版本：${version}；DSH 本体：${runtime.release.version}；Windows x64 完整便携包。`,
     factoryDefault === undefined
       ? '解压到较短路径，双击启动.cmd。出厂不预置默认模型：请在设置→模型选择或添加自己的提供商；包内不含凭据或用户会话。'
-      : `解压到较短路径，双击启动.cmd。本构建默认 ${formatFactoryDefaultModel(factoryDefault)}：首次启动复用本机登录态，没有则按插件引导登录；包内不含凭据或用户会话。`,
+      : `解压到较短路径，双击启动.cmd。本构建默认 ${formatFactoryDefaultModel(factoryDefault)}：首次启动复用本机登录态，没有则按插件引导完成设备码登录（约 10 分钟内完成，不要关掉引导页 —— 期间宿主可能长时间未就绪）；包内不含凭据或用户会话。`,
     factoryProxy === undefined
       ? '启动脚本会自动读取 Windows 系统代理；也可在包根 proxy.txt 第一行写完整代理地址覆盖。'
       : `本包已预置代理 ${factoryProxy}；端口不同请改包根 proxy.txt 第一行。`,
-    '启动脚本会自动读取 Windows 系统代理；也可在包根 proxy.txt 第一行写完整代理地址覆盖。直接双击 app 下的 exe 不会带代理。',
+    ...(factoryDefault === undefined
+      ? ['直接双击 app 下的 exe 不会带代理；需要出网的功能会失败，请优先用启动.cmd。']
+      : ['直接双击 app 下的 exe 不会带代理；本包默认模型依赖代理出网，会导致模型请求失败，请用启动.cmd。']),
     '已有用户请先备份原 home 与 data。不要用出厂 home 覆盖自己的会话、设置和凭据。',
     `插件以 file: 相对路径登记到包内 vendor\\${tarballName}（不可变 tarball，供插件管理器解析）；升级请用同版新 tgz，见安装说明。`,
     '只换插件要求插件 peer 仍匹配当前宿主版本（插件的 package.json 会写明）；DSH 本体升级时请用整包。',
