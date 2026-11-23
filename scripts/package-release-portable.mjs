@@ -9,7 +9,7 @@ import { planSlimAppCopy } from './slim-portable-app.mjs'
 import { verifyDesktopBuildIdentity } from './desktop-build-identity.mjs'
 import { writeProfileExemptions } from './vendor-compatibility.mjs'
 import { appendFactoryDefaultModel, formatFactoryDefaultModel } from './factory-default-model.mjs'
-import { writeFactoryProxy } from './factory-proxy.mjs'
+import { DOMESTIC_DIRECT_HOSTS, launcherNoProxyLines, writeFactoryProxy } from './factory-proxy.mjs'
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 
@@ -117,6 +117,7 @@ try {
     'rem Optional override: put one proxy URL on the first line of proxy.txt.',
     'if exist "%~dp0proxy.txt" for /f "usebackq delims=" %%P in ("%~dp0proxy.txt") do (set "HTTPS_PROXY=%%P" & set "HTTP_PROXY=%%P")',
     'if defined HTTPS_PROXY echo [dsh] proxy: %HTTPS_PROXY%  (edit proxy.txt at package root to change/remove)',
+    ...launcherNoProxyLines(),
     'rem Grok subscription plugin: upstream cli-chat-proxy rejects CLI builds below 1.0.13',
     'rem (the plugin hardcodes 0.1.220). Its own escape hatch overrides that constant.',
     'set "GROK_BUILD_CLIENT_VERSION=1.0.13"',
@@ -132,6 +133,7 @@ try {
     factoryProxy === undefined
       ? '启动脚本会自动读取 Windows 系统代理；也可在包根 proxy.txt 第一行写完整代理地址覆盖。'
       : `本包已预置代理 ${factoryProxy}；端口不同请改包根 proxy.txt 第一行。`,
+    `国内 ${DOMESTIC_DIRECT_HOSTS.join(' / ')} 走直连（启动脚本已设 NO_PROXY），代理只用于其余域名（如 Grok）。`,
     ...(factoryDefault === undefined
       ? ['直接双击 app 下的 exe 不会带代理；需要出网的功能会失败，请优先用启动.cmd。']
       : ['直接双击 app 下的 exe 不会带代理；本包默认模型依赖代理出网，会导致模型请求失败，请用启动.cmd。']),
