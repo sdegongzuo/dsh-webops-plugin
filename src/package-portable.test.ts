@@ -113,7 +113,7 @@ describe('每次发布的完整便携包', () => {
       'export function evaluatePluginCompatibility() { return undefined }\nexport function validatePluginVersionExemption() {}\n')
     // 打包脚本会拿这个版本去比对插件声明的 peerDependencies（package-release-portable.mjs），
     // 所以夹具必须跟 package.json 的 DSH peer 同源；升上游时这两处一起改。
-    writeFileSync(descriptor, JSON.stringify({ release: { version: '0.2.2-rc.5' } }))
+    writeFileSync(descriptor, JSON.stringify({ release: { version: '0.2.3-alpha.2' } }))
     writeFileSync(join(app, 'DeepSeek Harness.exe'), '测试本体')
     writeFileSync(join(app, 'debug.log'), '运行时日志不出货')
     const preservedInputs = ['locales/en-US.pak', 'locales/zh-CN.pak', 'locales/ja.pak',
@@ -145,7 +145,7 @@ describe('每次发布的完整便携包', () => {
     expect(zip.names).toContain('app/resources/runtime/primary-runtime/dependencies/pnpm/index.js')
     expect(zip.names).not.toContain('app/locales/ja.pak')
     expect(zip.names).not.toContain('app/resources/runtime/pnpm/index.js')
-    expect(zip.manifest).toEqual({ pluginVersion: pkg.version, dshVersion: '0.2.2-rc.5' })
+    expect(zip.manifest).toEqual({ pluginVersion: pkg.version, dshVersion: '0.2.3-alpha.2' })
     // 2026-10-18 起出厂默认追加 5 个实验性 bundle（FACTORY_EXPERIMENTAL_BUNDLES，
     // 见 scripts/package-release-portable.mjs）；2026-11-19 起 Grok 订阅接入从
     // dsh-llm-xai-oauth 换成 dsh-coding-subscription-oauth（前者与原生 xai 抢路由，
@@ -176,12 +176,14 @@ describe('每次发布的完整便携包', () => {
     const shipped = spawnSync('python', ['-c',
       'import sys,zipfile; z=zipfile.ZipFile(sys.argv[1]); print(z.read("home/profiles/desktop/node_modules/dsh-better-sidebar/lib/index.js").decode())', out], { encoding: 'utf8' })
     expect(shipped.status, shipped.stderr).toBe(0)
-    // 0.28.0 起上游原生 inject「connection」并直接用 ctx.connection.requestRejection，
-    // 无需宿主兼容补丁，官方模块原样出货、不落兼容回执。
+    // 0.28.0 起上游原生 inject「connection」并直接用 ctx.connection.requestRejection；
+    // 但 DSH 0.2.3-alpha.2 把这个方法删了（准入搬到 webServer 的 admit/authenticate），
+    // 于是物化阶段按 manifest 的 hostCompatibility 就地适配栅栏，并落兼容回执。
     expect(shipped.stdout).toContain('"connection",')
-    expect(shipped.stdout).toContain('const fence = (req) => ctx.connection.requestRejection(req) === void 0;')
+    expect(shipped.stdout).toContain('requestRejection.call(connection, req)')
+    expect(shipped.stdout).not.toContain('const fence = (req) => ctx.connection.requestRejection(req) === void 0;')
     expect(shipped.stdout).not.toContain('ctx.get("webRuntime")?.trustedHosts ?? []')
-    expect(zip.names).not.toContain('home/profiles/desktop/node_modules/dsh-better-sidebar/dsh-host-compatibility.json')
+    expect(zip.names).toContain('home/profiles/desktop/node_modules/dsh-better-sidebar/dsh-host-compatibility.json')
     // 夹具里所有插件都判满足，所以出厂 profile 不该出现豁免文件 —— 别让「有 exemptions」变成常态。
     expect(zip.names).not.toContain('home/profiles/desktop/compatibility.json')
     for (const name of ['dsh-webops-plugin', 'dsh-context', 'dsh-better-sidebar', 'dsh-connect-workbuddy']) {

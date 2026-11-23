@@ -22,6 +22,7 @@
  * 不传（`undefined`）至少会退回 `pnpmCommand`。
  */
 import { spawn, spawnSync } from 'node:child_process'
+import { randomBytes } from 'node:crypto'
 import { existsSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
 
@@ -208,6 +209,14 @@ export function startPackagedDesktopHost(options) {
   child.stderr?.on('data', chunk => { stderr = (stderr + chunk).slice(-64 * 1024) })
   child.stdout?.pipe(process.stdout)
 
+  // 0.2.3-alpha.2 起宿主协议升到 v5：宿主先发 `{type:'starting'}`，父进程必须回
+  // `{type:'desktop-auth', secret}`（32 字节 base64url），宿主才继续初始化并发 ready。
+  // 不回这一手时进程活着却**永不出 ready**、stderr 还是空的 —— 2026-11-23 自检 60s
+  // 超时的现场就是它。同一份 secret 也是后续 HTTP 请求的凭据
+  // （`cookie: dsh-desktop-session=<secret>`）：上游已删掉旧的 303 + set-cookie 交换，
+  // 那条路现在走不通。
+  const authenticationSecret = randomBytes(32).toString('base64url')
+
   const ready = new Promise((resolve, reject) => {
     const timer = setTimeout(() => {
       // 只加诊断，不改超时时长：记住「不能只延长超时」。CI 上遇到过 stderr 空、进程却还活着
@@ -227,10 +236,28 @@ export function startPackagedDesktopHost(options) {
       clearTimeout(timer)
       reject(error)
     }
+    /** 凭据只交付一次：宿主重复宣告启动时不重复发（`deliver()` 上游也是一次性 Promise）。 */
+    let credentialDelivered = false
     child.on('message', message => {
+      if (message?.type === 'starting') {
+        if (credentialDelivered) return
+        credentialDelivered = true
+        try {
+          child.send({ type: 'desktop-auth', secret: authenticationSecret }, error => {
+            if (error !== null && error !== undefined) fail(error)
+          })
+        } catch (error) {
+          fail(error)
+        }
+        return
+      }
       if (message?.type === 'ready' && typeof message.url === 'string') {
         clearTimeout(timer)
-        resolve({ url: message.url, injections: message.injections })
+        resolve({
+          url: message.url,
+          injections: message.injections,
+          authenticationCookie: `dsh-desktop-session=${authenticationSecret}`,
+        })
       } else if (message?.type === 'fatal') {
         fail(new Error(String(message.message)))
       }
@@ -266,15 +293,27 @@ export function startPackagedDesktopHost(options) {
 /**
  * 从宿主 ready URL 拉一个路径。
  *
- * alpha.2 的 `authenticatedUrl` 把 process token 放在 `/?token=`：第一次 GET 会 303
- * 并 Set-Cookie，之后的请求必须带 cookie、且不能再带 token（`/index.html?token=`
- * 会 401）。这里先换 cookie，再按 pathname 取。
+ * 两条协议并存，按是否给了 `authenticationCookie` 分流：
  *
- * @param {string} readyUrl
- * @param {string} pathname
+ * - **0.2.3-alpha.2（宿主协议 v5）**：没有 `/?token=` 交换了。ready URL 就是
+ *   `http://127.0.0.1:<port>/`，认证凭据由父进程在启动握手时下发，请求直接带
+ *   `cookie: dsh-desktop-session=<secret>`。不带 cookie 一律 401。
+ * - **0.2.2 及更早（旧协议兜底）**：`authenticatedUrl` 把 process token 放在 `/?token=`，
+ *   第一次 GET 返 303 并 Set-Cookie，之后必须带 cookie、且不能再带 token
+ *   （`/index.html?token=` 会 401）。旧包里没有 cookie 可传，仍走这条交换。
+ *
+ * @param {string} readyUrl - `ready` 事件里的 url。
+ * @param {string} pathname - 要取的路由。
+ * @param {string} [authenticationCookie] - v5 的会话 cookie；缺省则走旧协议交换。
  */
-export async function fetchHostPath(readyUrl, pathname) {
+export async function fetchHostPath(readyUrl, pathname, authenticationCookie) {
   const base = new URL(readyUrl)
+  const path = pathname === '/index.html' ? '/' : pathname
+  const url = new URL(path, base.origin)
+  if (authenticationCookie !== undefined && authenticationCookie !== '') {
+    const response = await fetch(url, { headers: { cookie: authenticationCookie } })
+    return { status: response.status, body: Buffer.from(await response.arrayBuffer()), url: url.href }
+  }
   const login = await fetch(base.href, { redirect: 'manual' })
   const setCookies = typeof login.headers.getSetCookie === 'function'
     ? login.headers.getSetCookie()
@@ -283,8 +322,6 @@ export async function fetchHostPath(readyUrl, pathname) {
   if (login.status !== 303) {
     return { status: login.status, body: Buffer.from(await login.arrayBuffer()), url: base.href }
   }
-  const path = pathname === '/index.html' ? '/' : pathname
-  const url = new URL(path, base.origin)
   const response = await fetch(url, { headers: cookie === '' ? {} : { cookie } })
   return { status: response.status, body: Buffer.from(await response.arrayBuffer()), url: url.href }
 }

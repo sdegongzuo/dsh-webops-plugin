@@ -610,7 +610,7 @@ const ORIGIN = ready === undefined ? `http://127.0.0.1:${String(options.port)}` 
 /** 走宿主 HTTP 通道取一个路径（带 ready URL 上的认证 query）。 */
 async function hostFetch(pathname) {
   if (ready === undefined) throw new Error('宿主没起来，没法 fetch')
-  return fetchHostPath(ready.url, pathname)
+  return fetchHostPath(ready.url, pathname, ready.authenticationCookie)
 }
 
 const index = await hostFetch('/index.html')

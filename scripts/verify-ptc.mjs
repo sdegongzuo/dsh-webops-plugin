@@ -140,7 +140,7 @@ function check(ok, message) {
 // 在 Electron 运行时里跑的小探针：只想问一句「沙箱打算用哪个程序起 windows-acl runner」。
 // 路径都走 argv 传，源码里不出现模板插值（这个字符串本身是模板字面量）。
 const RUNNER_PROBE_SOURCE = `
-import { writeFileSync } from 'node:fs'
+import { readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { pathToFileURL } from 'node:url'
 
@@ -223,14 +223,27 @@ function findShippedPluginPatch(profile) {
  */
 async function composePtcRuntimeRow(runtimeDir, pluginPatchFile) {
   const include = await import(pathToFileURL(require.resolve('@deepseek-ai/cordis-plugin-include')).href)
-  const yaml = await import(pathToFileURL(require.resolve('js-yaml')).href)
   const basePatch = join(runtimeDir, 'node_modules', '@deepseek-ai', 'dsh-base', 'cordis.patch.yml')
-  const load = file => yaml.load(readFileSync(file, 'utf8'), { schema: include.entryListSchema })
+  // 0.2.3-alpha.2 起 include 包不再导出 `entryListSchema`，改成自带方言的 `parseEntryYaml()`
+  // （内部用 js-yaml 的 custom schema，认识 `!!js` 表达式节点）。继续用裸 `js-yaml` + 默认
+  // schema 会在第一处 `!!js` 上报 `unknown tag !<tag:yaml.org,2002:js>` —— 那不是补丁坏了，
+  // 是解析器换了一本账。旧包仍走原路径，两个包都能跑。
+  let load
+  if (typeof include.parseEntryYaml === 'function') {
+    load = file => include.parseEntryYaml(readFileSync(file, 'utf8'))
+  } else {
+    const yaml = await import(pathToFileURL(require.resolve('js-yaml')).href)
+    load = file => yaml.load(readFileSync(file, 'utf8'), { schema: include.entryListSchema })
+  }
   const skipped = []
-  const rows = include.applyEntryPatches([], [...load(basePatch), ...load(pluginPatchFile)], (message, ...args) => {
+  const applied = include.applyEntryPatches([], [...load(basePatch), ...load(pluginPatchFile)], (message, ...args) => {
     let index = 0
     skipped.push(String(message).replace(/%C/g, () => JSON.stringify(args[index++])))
   })
+  // 0.2.3-alpha.2 起 `applyEntryPatches`（= include 的 `applyPatches`）返回 `{ data, index }`
+  // 而不是行数组 —— 索引要跟补丁归属一起交回，光给行已经不够用了。旧包仍返回数组。
+  const rows = Array.isArray(applied) ? applied : applied?.data
+  if (!Array.isArray(rows)) throw new Error(`applyEntryPatches 的返回里没有行数组：${Object.keys(applied ?? {}).join(',')}`)
   const row = rows.find(item => item?.id === 'ptc-runtime')
   const raw = row?.config?.launch?.executable
   return { skipped, raw, expr: raw !== null && typeof raw === 'object' ? raw.__jsExpr : undefined }
@@ -304,6 +317,16 @@ try { runtimeJson = JSON.parse(readFileSync(join(runtimeDir, 'desktop-runtime.js
 const shared = new Set((runtimeJson.sharedPackages ?? []).map(entry => entry.name))
 check(shared.has('@deepseek-ai/dsh-ptc-runtime-node'), 'runtime 携带 @deepseek-ai/dsh-ptc-runtime-node')
 
+// PTC 的执行约定在 0.2.3-alpha.2 变了：**不支持顶层 return**，最终表达式即结果
+// （runtime 自带 executionInstructions 原话「top-level return is not supported ... The final
+// expression is awaited if it is a Promise」）。旧版反过来只认 return，写表达式会得到 undefined。
+// 这里在**生成侧**按包内 desktop-runtime.json 的版本判定，把结果当常量插进探针源码 ——
+// 探针里没有 runtimeDir / readFileSync / join（它们是本脚本的变量），之前写在探针里会在
+// async inject 回调里抛 ReferenceError，被吞掉后报告一直停在初始的 `false`。
+const releaseVersion = String(runtimeJson?.release?.version ?? '0.0.0')
+const [relMajor, relMinor, relPatch] = releaseVersion.split('.').map(part => parseInt(part, 10))
+const expressionResultAllowed = relMajor > 0 || relMinor > 2 || (relMinor === 2 && relPatch >= 3)
+
 if (!nodeOk) {
   console.log('\n前置文件缺失，后续真跑无意义。')
   if (!keepTemp) materialized.cleanup()
@@ -349,42 +372,50 @@ export function apply(ctx, config) {
   const flush = () => writeFileSync(config.report, JSON.stringify(report, null, 2))
   flush()
   ctx.inject(['ptcRuntime'], async (c) => {
-    report.ptcRuntime = true
-    const runtime = c.get('ptcRuntime')
-    report.language = runtime?.language
-    flush()
-    // 1) 显式给 sandboxPolicy：必须真走一遍 confine()。
-    //    2026-09-17 之前这里不带 sandboxPolicy，于是 ctx.sandboxPolicy.resolve()
-    //    给了 full-access，confine() 整段被跳过 —— 沙箱那条链断了也照样全绿。
-    //    真机上桌面端默认是 workspace-write，于是 run_code 全线 worker-exit。
+    // 整个回调包一层：inject 回调是 async，抛出的异常没人接（宿主只当没发生），
+    // 报告就永远停在初始值 —— 表现成「服务没挂载」，排查方向全错。
     try {
-      const result = await runtime.run(runtime.resolve({
-        program: 'return 6 * 7',
-        bindings: [],
-        signal: new AbortController().signal,
-      }))
-      report.value = result.value
-      report.sandboxMode = result.sandbox?.mode
-      report.error = result.error === undefined ? undefined : result.error.message
+      report.ptcRuntime = true
+      const runtime = c.get('ptcRuntime')
+      report.language = runtime?.language
+      const programOf = expr => ${expressionResultAllowed ? 'expr' : "'return ' + expr"}
+      flush()
+      // 1) 显式给 sandboxPolicy：必须真走一遍 confine()。
+      //    2026-09-17 之前这里不带 sandboxPolicy，于是 ctx.sandboxPolicy.resolve()
+      //    给了 full-access，confine() 整段被跳过 —— 沙箱那条链断了也照样全绿。
+      //    真机上桌面端默认是 workspace-write，于是 run_code 全线 worker-exit。
+      try {
+        const result = await runtime.run(runtime.resolve({
+          program: programOf('6 * 7'),
+          bindings: [],
+          signal: new AbortController().signal,
+        }))
+        report.value = result.value
+        report.sandboxMode = result.sandbox?.mode
+        report.error = result.error === undefined ? undefined : result.error.message
+      } catch (error) {
+        report.threw = String(error?.message ?? error)
+      }
+      flush()
+      try {
+        const confined = await runtime.run(runtime.resolve({
+          program: programOf('6 * 7 + 1'),
+          bindings: [],
+          signal: new AbortController().signal,
+          sandboxPolicy: { mode: 'workspace-write', workspaceRoot: config.workspace },
+        }))
+        report.confinedValue = confined.value
+        report.confinedMode = confined.sandbox?.mode
+        report.confinedEnforcement = confined.sandbox?.enforcement
+        report.confinedError = confined.error === undefined ? undefined : confined.error.message
+      } catch (error) {
+        report.confinedThrew = String(error?.message ?? error)
+      }
+      flush()
     } catch (error) {
-      report.threw = String(error?.message ?? error)
+      report.injectThrew = String(error?.message ?? error)
+      flush()
     }
-    flush()
-    try {
-      const confined = await runtime.run(runtime.resolve({
-        program: 'return 6 * 7 + 1',
-        bindings: [],
-        signal: new AbortController().signal,
-        sandboxPolicy: { mode: 'workspace-write', workspaceRoot: config.workspace },
-      }))
-      report.confinedValue = confined.value
-      report.confinedMode = confined.sandbox?.mode
-      report.confinedEnforcement = confined.sandbox?.enforcement
-      report.confinedError = confined.error === undefined ? undefined : confined.error.message
-    } catch (error) {
-      report.confinedThrew = String(error?.message ?? error)
-    }
-    flush()
   })
 }
 `.trim() + '\n')
@@ -488,6 +519,7 @@ check(
   `受限（workspace-write）下 PTC 返回值 = ${confinedExpected}（实际 ${JSON.stringify(report?.confinedValue)}）`,
 )
 check(report?.confinedMode === 'workspace-write', `受限那次真跑在 workspace-write 下（实际 ${String(report?.confinedMode)}）`)
+if (report?.injectThrew !== undefined) check(false, `探针回调抛异常：${report.injectThrew}`)
 if (report?.error !== undefined) check(false, `PTC 程序报错：${report.error}`)
 if (report?.threw !== undefined) check(false, `PTC 程序抛异常：${report.threw}`)
 if (report?.confinedError !== undefined) check(false, `受限 PTC 程序报错：${report.confinedError}`)

@@ -66,10 +66,10 @@ concurrency:
 
 env:
   # 默认 pin 到与本机 checkout 一致的提交，避免上游 main 漂移把构建搞挂。
-  # 9c2670d3 = tag `dsh-v0.2.2-rc.5`（2026-11-18）。之所以必须跟着上游走：
+  # 9c2670d3 → 4b399c39a6 = tag `dsh-v0.2.3-alpha.2`（2026-11-23 核对）。之所以必须跟着上游走：
   # `docs/harness-desktop-build.patch` 的上下文行取自这个提交，pin 旧 ref 会直接 apply 失败。
   # 换 ref 会让本体缓存 key 失效，CI 得全量重建一次（~18min），属预期。
-  HARNESS_REF: ${{ inputs.harness_ref || '9c2670d3bce5275e0d1610272958121af87787bb' }}
+  HARNESS_REF: ${{ inputs.harness_ref || '4b399c39a6d1479cd84ca591b4d7c88e24d38a96' }}
   TAG: ${{ github.event_name == 'workflow_dispatch' && format('desktop-v{0}', inputs.version) || github.ref_name }}
   # ⚠️ 这一条**不生效**：dsh 0.1.6-alpha.2 起 `loadDesktopPackageEnvironment()` 会把环境变量里的
   # release 设置全部过滤掉（`AMBIENT_RELEASE_SETTING`），`DSH_DESKTOP_APP_ID` 只能由
@@ -590,7 +590,7 @@ jobs:
           会话 / 设置 / 凭据 / 已装插件全在 `home\` 里，一个都不会丢。
 
           DSH 本体升级时下载桌面整包；只有本体版本不变且插件的 peer 仍满足该宿主时，才能用独立插件包覆盖插件目录后重启。
-          本版升了本体（0.2.2-rc.5），插件 peer 精确指向该版本，旧宿主请直接换整包。
+          本版升了本体（0.2.3-alpha.2），插件 peer 精确指向该版本，旧宿主请直接换整包。
 
           ⚠️ 出厂模型配置从 dsh 0.1.7 起写在 `home\profiles\desktop\cordis.patch.yml` ——
           dsh 0.1.7 把 `home\settings.yaml` 退役了，设置的家就是这份 profile patch。

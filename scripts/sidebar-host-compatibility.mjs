@@ -76,3 +76,71 @@ export function applySidebarHostCompatibility(pluginDir) {
   writeFileSync(join(pluginDir, 'dsh-host-compatibility.json'), JSON.stringify(receipt, null, 2) + '\n')
   return { changed: true, ...receipt }
 }
+
+/**
+ * ## 第二处宿主兼容：cordis 4.2 / DSH 0.2.3 删掉了 `connection.requestRejection`
+ *
+ * 0.32.1 的栅栏是单行 `const fence = (req) => ctx.connection.requestRejection(req) === void 0;`。
+ * 0.2.3 把准入搬进了 webServer：`connection` 服务改为 `admit()` / `authenticate()`
+ * （`packages/client/connection/src/rpc.ts`），`requestRejection` **零命中**。
+ * 于是每个 `/sidebar/api/*` 请求都抛 TypeError，被宿主兜底成 **400 空 body** ——
+ * 侧边栏看着加载了（客户端半在 boot graph 里），文件树/编辑器/任务面板却全废。
+ *
+ * 判据与安全性：插件 `inject` 里本来就有 `"connection"`，所以 `ctx.connection` 合法；
+ * 缺的只是那个方法。新宿主对未声明 `auth` 的路由默认 `required`（`authPolicy()` 的
+ * `auth ?? 'required'`），请求进 handler 前已经过 `authorize()` —— 认证准入由宿主负责，
+ * 插件这道栅栏在新宿主上是冗余的第二道。故：方法在就照旧校验，不在就交还宿主。
+ */
+export const SIDEBAR_CORDIS42_PATCH = 'connection-fence-cordis42-v1'
+/** 官方 tgz 里栅栏为上述单行、可直接适配的版本。 */
+export const SIDEBAR_CORDIS42_VERSIONS = ['0.32.1']
+const CURRENT_FENCE = 'const fence = (req) => ctx.connection.requestRejection(req) === void 0;'
+const CORDIS42_FENCE = [
+  'const fence = (req) => {',
+  '\t\tconst connection = ctx.connection;',
+  '\t\tconst requestRejection = connection == null ? void 0 : connection.requestRejection;',
+  '\t\t// dsh-webops: DSH 0.2.3 的 connection 不再提供 requestRejection；',
+  '\t\t// 宿主已在 webserver 层按 auth 策略（未声明时默认 required）完成准入。',
+  '\t\tif (typeof requestRejection !== "function") return true;',
+  '\t\treturn requestRejection.call(connection, req) === void 0;',
+  '\t};',
+].join('\n')
+/** 已打补丁的判据：出现这行调用即视为改过。 */
+const CORDIS42_SENTINEL = 'requestRejection.call(connection, req)'
+
+/** @param {string} source @returns {string} */
+export function adaptSidebarCordis42Source(source) {
+  if (source.includes(CORDIS42_SENTINEL)) return source
+  const count = source.split(CURRENT_FENCE).length - 1
+  if (count !== 1) {
+    throw new Error(`侧边栏 requestRejection 栅栏出现 ${count} 次（期望 1 次），拒绝自动修改；请核对上游 lib/index.js 形状。`)
+  }
+  return source.replace(CURRENT_FENCE, CORDIS42_FENCE)
+}
+
+/** @param {string} pluginDir @returns {{ changed: boolean, unchanged?: boolean }} */
+export function applySidebarCordis42Compatibility(pluginDir) {
+  const pkg = JSON.parse(readFileSync(join(pluginDir, 'package.json'), 'utf8'))
+  if (pkg.name !== 'dsh-better-sidebar' || !SIDEBAR_CORDIS42_VERSIONS.includes(pkg.version)) {
+    throw new Error(`该补丁仅适用于 dsh-better-sidebar@${SIDEBAR_CORDIS42_VERSIONS.join(' / ')}。`)
+  }
+  const entry = join(pluginDir, 'lib', 'index.js')
+  const before = readFileSync(entry, 'utf8')
+  const after = adaptSidebarCordis42Source(before)
+  if (before === after) return { changed: false, unchanged: true }
+
+  const backup = join(pluginDir, 'lib', 'index.pre-cordis42.js')
+  if (existsSync(backup)) {
+    if (readFileSync(backup, 'utf8') !== before) throw new Error('已有侧边栏 cordis42 备份与当前模块不一致。')
+  } else writeFileSync(backup, before, { flag: 'wx' })
+  writeFileSync(entry, after)
+
+  const sha256 = value => createHash('sha256').update(value).digest('hex')
+  const receipt = {
+    patch: SIDEBAR_CORDIS42_PATCH, plugin: `${pkg.name}@${pkg.version}`,
+    originalSha256: sha256(before), adaptedSha256: sha256(after),
+    note: 'DSH 0.2.3 的 connection 服务不再提供 requestRejection；栅栏改为「有则照旧校验、无则交给宿主 webserver 的 auth 准入」。',
+  }
+  writeFileSync(join(pluginDir, 'dsh-host-compatibility.json'), JSON.stringify(receipt, null, 2) + '\n')
+  return { changed: true, ...receipt }
+}

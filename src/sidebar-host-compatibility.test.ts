@@ -6,7 +6,7 @@ import { runInNewContext } from 'node:vm'
 import { gunzipSync } from 'node:zlib'
 import { describe, expect, it } from 'vitest'
 
-const { adaptSidebarHostSource, applySidebarHostCompatibility } = await import(
+const { adaptSidebarHostSource, applySidebarHostCompatibility, adaptSidebarCordis42Source, applySidebarCordis42Compatibility, SIDEBAR_CORDIS42_PATCH } = await import(
   new URL('../scripts/sidebar-host-compatibility.mjs', import.meta.url).href
 )
 const { buildRoot } = await import(new URL('../scripts/local-env.mjs', import.meta.url).href)
@@ -138,5 +138,73 @@ describe.each(['0.25.0', '0.26.0', '0.26.1'] as const)('PR905 的实际栅栏行
   ])('无旧服务时保留侧边栏特例：$headers', req => {
     const fn = fence(version, key => key === 'connection' ? { requestRejection: () => 403 } : undefined)
     expect(fn(req)).toBe(true)
+  })
+})
+
+/**
+ * 0.2.3（cordis 4.2）删掉了 `connection.requestRejection`：0.32.1 的栅栏会抛 TypeError，
+ * 宿主兜底成 400 空 body，侧边栏接口全废。这里对着**正式 0.32.1 产物**验证补丁：
+ * 老宿主仍按原规则拦，新宿主把准入交还 webserver。
+ */
+const SB_0321 = officialSource('dsh-better-sidebar-0.32.1.tgz')
+const FENCE_0321_ORIGINAL = 'const fence = (req) => ctx.connection.requestRejection(req) === void 0;'
+
+describe('侧边栏 cordis 4.2 栅栏兼容（正式产物 0.32.1）', () => {
+  it('正式产物形状符合判据：栅栏消费点恰好一处', () => {
+    expect(SB_0321.split(FENCE_0321_ORIGINAL).length - 1).toBe(1)
+    expect(SB_0321).toContain('"connection"')
+  })
+
+  it('适配后改为判存在性，且重复调用幂等', () => {
+    const adapted = adaptSidebarCordis42Source(SB_0321)
+    expect(adapted).toContain('typeof requestRejection !== "function"')
+    expect(adapted).toContain('requestRejection.call(connection, req)')
+    expect(adapted.split(FENCE_0321_ORIGINAL).length - 1).toBe(0)
+    expect(adaptSidebarCordis42Source(adapted)).toBe(adapted)
+  })
+
+  it('消费点缺失或重复时拒绝猜测', () => {
+    expect(() => adaptSidebarCordis42Source(SB_0321.replace(FENCE_0321_ORIGINAL, 'const fence = () => true;'))).toThrow(/出现 0 次/)
+    expect(() => adaptSidebarCordis42Source(`${SB_0321}\n${FENCE_0321_ORIGINAL}`)).toThrow(/出现 2 次/)
+  })
+
+  it('写盘留原文备份并返回回执；非 0.32.1 拒绝', () => {
+    const parent = join(buildRoot(), 'sidebar-compat42-test')
+    mkdirSync(parent, { recursive: true })
+    const root = mkdtempSync(join(parent, 'keep-'))
+    const plugin = join(root, 'plugin')
+    mkdirSync(join(plugin, 'lib'), { recursive: true })
+    writeFileSync(join(plugin, 'package.json'), JSON.stringify({ name: 'dsh-better-sidebar', version: '0.32.1' }))
+    writeFileSync(join(plugin, 'lib', 'index.js'), SB_0321)
+
+    const receipt = applySidebarCordis42Compatibility(plugin)
+    expect(receipt.changed).toBe(true)
+    expect(receipt.patch).toBe(SIDEBAR_CORDIS42_PATCH)
+    expect(readFileSync(join(plugin, 'lib', 'index.pre-cordis42.js'), 'utf8')).toBe(SB_0321)
+    expect(receipt.adaptedSha256).toBe(sha(readFileSync(join(plugin, 'lib', 'index.js'), 'utf8')))
+    expect(applySidebarCordis42Compatibility(plugin).changed).toBe(false)
+
+    writeFileSync(join(plugin, 'package.json'), JSON.stringify({ name: 'dsh-better-sidebar', version: '0.33.0' }))
+    expect(() => applySidebarCordis42Compatibility(plugin)).toThrow(/仅适用于/)
+  })
+
+  /** 执行真实适配后的栅栏体，而不是只比对字符串。 */
+  const fence0321 = (connection: unknown) => {
+    const adapted = adaptSidebarCordis42Source(SB_0321)
+    const declaration = adapted.match(/const fence = \(req\) => \{[\s\S]*?\n\t\};/)?.[0]
+    if (!declaration) throw new Error('适配后的 0.32.1 栅栏结构变化')
+    return runInNewContext(`${declaration}\nfence`, { ctx: { connection } }) as (req: unknown) => boolean
+  }
+
+  it('老宿主仍按 requestRejection 判定', () => {
+    expect(fence0321({ requestRejection: () => undefined })(remote)).toBe(true)
+    expect(fence0321({ requestRejection: () => 403 })(remote)).toBe(false)
+    // 0.32.1 原生语义是「仅 undefined 放行」，401 同样拒绝 —— 补丁不改这条
+    expect(fence0321({ requestRejection: () => 401 })(remote)).toBe(false)
+  })
+
+  it('新宿主无该方法时交还 webserver 准入（不再抛错成 400）', () => {
+    expect(fence0321({ admit: () => ({ kind: 'allow' }) })(remote)).toBe(true)
+    expect(fence0321(undefined)(remote)).toBe(true)
   })
 })

@@ -23,8 +23,8 @@ import { join, resolve, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { gunzipSync } from 'node:zlib'
 import { spawnSync } from 'node:child_process'
-import { applySidebarHostCompatibility, SIDEBAR_COMPATIBILITY_PATCH } from './sidebar-host-compatibility.mjs'
-import { applyCodingOAuthPatchCompatibility, CODING_OAUTH_PATCH_COMPAT } from './coding-oauth-patch-compat.mjs'
+import { applySidebarCordis42Compatibility, applySidebarHostCompatibility, SIDEBAR_CORDIS42_PATCH, SIDEBAR_COMPATIBILITY_PATCH } from './sidebar-host-compatibility.mjs'
+import { applyCodingOAuthLibraryCompatibility, applyCodingOAuthPatchCompatibility, CODING_OAUTH_LIBRARY_COMPAT, CODING_OAUTH_PATCH_COMPAT } from './coding-oauth-patch-compat.mjs'
 import { materializeVendoredRuntime, readVendoredRuntimeLock } from './vendored-runtime-lock.mjs'
 
 const ROOT = resolve(fileURLToPath(import.meta.url), '..', '..')
@@ -175,9 +175,17 @@ for (const plugin of manifest.plugins) {
   }
 
   if (plugin.hostCompatibility !== undefined) {
-    if (plugin.hostCompatibility !== SIDEBAR_COMPATIBILITY_PATCH) throw new Error(`未知宿主兼容补丁：${plugin.hostCompatibility}`)
-    const receipt = applySidebarHostCompatibility(pluginDir)
-    console.log(`+ ${plugin.name} 宿主兼容：${receipt.patch ?? '已适配'}`)
+    if (plugin.hostCompatibility === SIDEBAR_COMPATIBILITY_PATCH) {
+      const receipt = applySidebarHostCompatibility(pluginDir)
+      console.log(`+ ${plugin.name} 宿主兼容：${receipt.patch ?? '已适配'}`)
+    } else if (plugin.hostCompatibility === SIDEBAR_CORDIS42_PATCH) {
+      const receipt = applySidebarCordis42Compatibility(pluginDir)
+      console.log(receipt.unchanged === true
+        ? `+ ${plugin.name} 宿主兼容：上游已兼容 connection 栅栏，无需改动`
+        : `+ ${plugin.name} 宿主兼容：栅栏改判 requestRejection 存在性（${receipt.patch}）`)
+    } else {
+      throw new Error(`未知宿主兼容补丁：${plugin.hostCompatibility}`)
+    }
   }
 
   if (plugin.patchCompatibility !== undefined) {
@@ -188,6 +196,16 @@ for (const plugin of manifest.plugins) {
     console.log(receipt.unchanged === true
       ? `+ ${plugin.name} 出厂补丁：上游已不写默认模型，无需改动`
       : `+ ${plugin.name} 出厂补丁：剥除预设默认模型（${receipt.patch}）`)
+  }
+
+  if (plugin.libraryCompatibility !== undefined) {
+    if (plugin.libraryCompatibility !== CODING_OAUTH_LIBRARY_COMPAT) {
+      throw new Error(`未知 bundle 兼容补丁：${plugin.libraryCompatibility}`)
+    }
+    const receipt = applyCodingOAuthLibraryCompatibility(pluginDir)
+    console.log(receipt.unchanged === true
+      ? `+ ${plugin.name} 出厂补丁：上游已兼容 dsh-llm 导出，无需改动`
+      : `+ ${plugin.name} 出厂补丁：内联 assertUsableApiKey（${receipt.libraryPatch}）`)
   }
 
   // 该插件声明的运行时依赖，按 npm 嵌套规则落到插件自己的 node_modules 下

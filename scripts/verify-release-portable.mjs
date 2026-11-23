@@ -82,7 +82,7 @@ cpSync(profile, workProfile, { recursive: true })
 const host = startPackagedDesktopHost({ runtimeDir, profileDir: workProfile, env: { ...process.env, DSH_HOME: join(scratch, 'home') } })
 try {
   const ready = await host.ready
-  const page = await fetchHostPath(ready.url, '/index.html')
+  const page = await fetchHostPath(ready.url, '/index.html', ready.authenticationCookie)
   assert(page.status === 200, `首页返回 ${page.status}`)
   const html = page.body.toString('utf8')
   assert(html.includes('__DSH_BOOT__'), '首页缺少客户端加载图')
@@ -101,7 +101,7 @@ try {
   }
   for (const name of clientNames) assert(html.includes(name), `客户端加载图缺少 ${name}`)
   // 只见客户端不能证明后端挂载；GET 必须进入侧边栏处理器的 JSON 方法校验。
-  const sidebar = await fetchHostPath(ready.url, '/sidebar/api/fs.read')
+  const sidebar = await fetchHostPath(ready.url, '/sidebar/api/fs.read', ready.authenticationCookie)
   let envelope
   try { envelope = JSON.parse(sidebar.body.toString('utf8')) } catch { /* 空 405 是本次回归症状。 */ }
   assert(sidebar.status === 405 && envelope?.ok === false && envelope?.error?.code === 'method-error',

@@ -193,7 +193,7 @@ async function boot(label, profileDir = profile) {
     return ''
   }
   let bundle = ''
-  const index = await fetchHostPath(ready.url, '/index.html')
+  const index = await fetchHostPath(ready.url, '/index.html', ready.authenticationCookie)
   if (index.status !== 200) {
     check(false, `${label}：/index.html 返回 ${String(index.status)}`)
   } else {
@@ -214,7 +214,7 @@ async function boot(label, profileDir = profile) {
       if (entry === undefined) {
         check(false, `${label}：boot graph 里没有 ${PLUGIN_NAME}`)
       } else {
-        const fetched = await fetchHostPath(ready.url, entry.url)
+        const fetched = await fetchHostPath(ready.url, entry.url, ready.authenticationCookie)
         bundle = fetched.body.toString('utf8')
       }
     }
