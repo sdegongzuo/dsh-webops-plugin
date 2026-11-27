@@ -237,7 +237,7 @@ const BROWSER_ERROR_RECOVERY: Readonly<Partial<Record<BrowserErrorCode, string>>
   BROWSER_CONNECTION_LOST: 'the connection dropped; re-open the page with webpage_open.',
   BROWSER_DEBUGGER_DETACHED: 'the debugger briefly detached (e.g. DevTools opened); this recovers automatically — retry once after a moment.',
   BROWSER_STATE_CONTENDED: 'the state is held by someone else; do not retry the same write — coordinate or use force only if you mean to override.',
-  BROWSER_EXECUTE_RESULT_UNSERIALIZABLE: 'return ordinary JSON data with enumerable data fields; avoid live DOM nodes, functions, cycles, accessors, and deeply nested objects.',
+  BROWSER_EXECUTE_RESULT_UNSERIALIZABLE: 'fix the exact field the message names, return only the data fields you need, and never hand back live DOM nodes, functions, cycles or accessors.',
   BROWSER_EXECUTE_SCRIPT_ERROR: 'fix the reported JavaScript syntax or runtime error; the function body is not automatically retried.',
   BROWSER_EXECUTE_TIMEOUT: 'inspect the page state before retrying; the result is unconfirmed and page code may still finish.',
   BROWSER_EXECUTE_NOT_ALLOWED: 'this internal CDP command is not exposed by webpage_execute; use its documented session_id, code, and optional timeout_ms interface.',

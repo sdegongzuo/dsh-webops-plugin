@@ -492,16 +492,21 @@ export function registerExecute(ctx: Context, cache: SnapshotCache): void {
       if (result.navigated) cache.delete(result.sessionId)
       const envelope = unwrapExecuteEnvelope(result.value)
       if (envelope.script_error !== undefined) {
+        // 页面自己抛的异常必须说清「这是页面错误，不是工具故障」：模型常把
+        // `x.toFixed is not a function` 当成插件 bug 去查插件，而不是回去改自己的取值。
         throw new BrowserError(
           envelope.script_error.phase === 'compile'
-            ? `webpage_execute ${envelope.script_error.name}: ${envelope.script_error.message}${envelope.script_error.stack === undefined ? '' : `\n${envelope.script_error.stack}`} The function body did not run; correct the code and call again.`
-            : `webpage_execute ${envelope.script_error.name}: ${envelope.script_error.message}${envelope.script_error.stack === undefined ? '' : `\n${envelope.script_error.stack}`} The function body ran once; any side effects are not rolled back. Inspect page state before deciding whether to call again.`,
+            ? `webpage_execute could not compile the function body, so nothing ran: ${envelope.script_error.name}: ${envelope.script_error.message}${envelope.script_error.stack === undefined ? '' : `\n${envelope.script_error.stack}`} Correct the code and call again.`
+            : `webpage_execute ran the function body once and it threw a JavaScript runtime error: ${envelope.script_error.name}: ${envelope.script_error.message}${envelope.script_error.stack === undefined ? '' : `\n${envelope.script_error.stack}`}\nThis is the page's own error, not a tool failure. Common causes: calling a method on a value that is not what you assumed (a page often returns "" or "-" for a missing number, so check typeof, convert with Number() and check Number.isFinite first), reading a property of null or undefined, or a rejected await. Any side effects are not rolled back; inspect page state before deciding whether to call again.`,
           'BROWSER_EXECUTE_SCRIPT_ERROR',
         )
       }
       if (envelope.serialization_error !== undefined) {
+        // 具体修法由页面侧包装器写进 detail（哪个字段、缺什么、怎么改），这里只补仍然成立的
+        // 副作用边界。不再追加「避免 DOM / 函数 / 循环 / 访问器」这类清单：成因是缺字段时
+        // 那句话会把模型引向无关方向（2026-11-27 实测）。
         throw new BrowserError(
-          `webpage_execute ran once but could not serialize the returned value: ${envelope.serialization_error}. Return only ordinary JSON data and avoid DOM nodes, functions, cycles, accessors, and deep objects. Any side effects are not rolled back.`,
+          `webpage_execute ran once but could not serialize the returned value: ${envelope.serialization_error}. Any side effects are not rolled back.`,
           'BROWSER_EXECUTE_RESULT_UNSERIALIZABLE',
         )
       }

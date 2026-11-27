@@ -81,6 +81,8 @@ interface Harness {
   mutateSessionId: string
   /** 置 true 让 `execute` 报 `navigated:true`（模拟表达式改了 location）。 */
   executeNavigated: boolean
+  /** 设置后 `execute` 的返回值信封换用它（模拟页面侧序列化/脚本错误），验证工具层的报错编排。 */
+  executeEnvelope: unknown
   /**
    * console / network list 的桩要模拟哪种截断：
    * `limit` 是「条数到了」，`budget` 是「总量到了」。用来验证工具层的建议
@@ -150,6 +152,7 @@ function mount(): Harness {
     reboundRefs: undefined,
     mutateSessionId: 's1',
     executeNavigated: false,
+    executeEnvelope: undefined,
     truncation: 'none',
     reobserveRequired: [],
     hidden,
@@ -377,7 +380,7 @@ function mount(): Harness {
           url: SESSION.url,
           navigated: harness.executeNavigated,
           ...harness.pageChanged !== undefined ? { pageChanged: harness.pageChanged } : {},
-          value: { __dsh_webpage_execute_result_v1__: 1, has_value: true, value: 2 },
+          value: harness.executeEnvelope ?? { __dsh_webpage_execute_result_v1__: 1, has_value: true, value: 2 },
           truncated: false,
         })
       },
@@ -1221,6 +1224,47 @@ describe('webpage_console / webpage_network / webpage_execute', () => {
     }])
     expect(value).toMatchObject({ session_id: 's1', method: 'Runtime.evaluate', has_value: true, value: 2, truncated: false })
     expect(validateJsonSchemaValue(definition.output.schema, value)).toEqual([])
+  })
+
+  it('passes the actionable serialization detail through to the model without a contradicting tail', async () => {
+    harness.executeEnvelope = {
+      __dsh_webpage_execute_result_v1__: 1,
+      has_value: false,
+      serialization_error: '$.eps is undefined: the page object has no such property, or the property is not set. For optional fields use ?? null so the value survives JSON serialization',
+    }
+    const failure = await tool(harness, 'webpage_execute')
+      .execute({ session_id: 's1', code: 'const d = {}; return { eps: d.BASIC_EPS };' }, exec())
+      .then(() => undefined, (error: unknown) => error as { code: string; message: string })
+
+    expect(failure?.code).toBe('BROWSER_EXECUTE_RESULT_UNSERIALIZABLE')
+    expect(failure?.message).toContain('$.eps is undefined')
+    // 只保留仍然成立的那条恢复建议（副作用不回滚）；「避免 DOM/函数/循环/访问器」那句不能
+    // 再跟着出现 —— 本次的成因是缺字段，跟着一句 unrelated 的清单会把模型指向错方向。
+    expect(failure?.message).toContain('side effects are not rolled back')
+    expect(failure?.message).not.toContain('avoid DOM nodes, functions, cycles, accessors')
+    expect(failure?.message).toContain('Recovery:')
+  })
+
+  it('names a third-party runtime TypeError with the field it came from', async () => {
+    harness.executeEnvelope = {
+      __dsh_webpage_execute_result_v1__: 1,
+      has_value: false,
+      script_error: {
+        name: 'TypeError',
+        message: 'd.TOTALOPERATEREVETZ.toFixed is not a function',
+        phase: 'runtime',
+        stack: 'TypeError: d.TOTALOPERATEREVETZ.toFixed is not a function\n    at __dshRun (eval:1:1)',
+      },
+    }
+    const failure = await tool(harness, 'webpage_execute')
+      .execute({ session_id: 's1', code: 'return 1;' }, exec())
+      .then(() => undefined, (error: unknown) => error as { code: string; message: string })
+
+    expect(failure?.code).toBe('BROWSER_EXECUTE_SCRIPT_ERROR')
+    // 报错必须说明是**页面给的原始错误**、不等同于工具缺陷，并指向常见成因。
+    expect(failure?.message).toContain('JavaScript runtime error')
+    expect(failure?.message).toContain('"-"')
+    expect(failure?.message).toContain('typeof')
   })
 
   it('rejects unknown and malformed execute fields before dispatch', async () => {

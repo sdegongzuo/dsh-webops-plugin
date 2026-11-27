@@ -38,6 +38,53 @@ describe('webpage_execute async function body wrapper', () => {
     expect(unwrapExecuteEnvelope(await run('const local = 1; void local;'))).toEqual({ has_value: false })
   })
 
+  it('names the undefined field and the fix so the next attempt can succeed', async () => {
+    const topLevelField = unwrapExecuteEnvelope(await run('return { a: 1, b: undefined };'))
+    expect(topLevelField.has_value).toBe(false)
+    expect(topLevelField.serialization_error).toContain('$.b')
+    expect(topLevelField.serialization_error).toContain('?? null')
+
+    // 真实失败形状（东财行情）：第一行没有 BASIC_EPS 字段，模型照抄 d.BASIC_EPS。
+    const fromPageRows = unwrapExecuteEnvelope(await run(
+      "const rows = [{ rd: 'x' }]; return rows.map(d => ({ rd: d.rd, eps: d.BASIC_EPS }));",
+    ))
+    expect(fromPageRows.serialization_error).toContain('$[0].eps')
+    expect(fromPageRows.serialization_error).toContain('?? null')
+  })
+
+  it('reports an undefined array slot by index instead of a bare type name', async () => {
+    const result = unwrapExecuteEnvelope(await run('return [null, undefined];'))
+    expect(result.has_value).toBe(false)
+    expect(result.serialization_error).toContain('$[1]')
+    expect(result.serialization_error).toContain('?? null')
+  })
+
+  it('points a non-finite number at Number() before Number.isFinite', async () => {
+    const result = unwrapExecuteEnvelope(await run('return { n: NaN };'))
+    expect(result.has_value).toBe(false)
+    expect(result.serialization_error).toContain('$.n is not a finite number')
+    expect(result.serialization_error).toContain('Number.isFinite')
+  })
+
+  it('keeps functions, symbols and bigints on the generic unsupported-type message', async () => {
+    const fn = unwrapExecuteEnvelope(await run('return { fmt: () => 1 };'))
+    expect(fn.serialization_error).toContain('$.fmt has unsupported type function')
+    expect(unwrapExecuteEnvelope(await run('return { tag: Symbol("s") };')).serialization_error)
+      .toContain('has unsupported type symbol')
+    expect(unwrapExecuteEnvelope(await run('return { n: 1n };')).serialization_error)
+      .toContain('has unsupported type bigint')
+  })
+
+  it('tells the model how to fix a cycle and a non-plain object', async () => {
+    const cyclic = unwrapExecuteEnvelope(await run('const value = { rd: "x" }; value.self = value; return value;'))
+    expect(cyclic.serialization_error).toContain('$.self contains a circular reference')
+    expect(cyclic.serialization_error).toContain('return a copy')
+
+    const notPlain = unwrapExecuteEnvelope(await run('return { when: new Date(0) };'))
+    expect(notPlain.serialization_error).toContain('$.when is not a plain object or array')
+    expect(notPlain.serialization_error).toContain('built from the fields you need')
+  })
+
   it('reports unsupported objects without returning a misleading empty value', async () => {
     const result = unwrapExecuteEnvelope(await run('const value = {}; value.self = value; Object.defineProperty(value, "secret", { enumerable: false, value: 7 }); return value;'))
     expect(result.has_value).toBe(false)

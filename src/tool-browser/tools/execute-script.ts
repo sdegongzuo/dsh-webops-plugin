@@ -16,13 +16,14 @@ export function wrapExecuteFunctionBody(code: string): string {
     + `  const visit = (item, path, depth) => {\n`
     + `    if (item === null || typeof item === 'boolean') return item;\n`
     + `    if (typeof item === 'string') return item;\n`
-    + `    if (typeof item === 'number') { if (!__dshFinite(item)) throw new TypeError(path + ' is not a finite number'); return item; }\n`
+    + `    if (typeof item === 'number') { if (!__dshFinite(item)) throw new TypeError(path + ' is not a finite number: a page often uses "-" or "" for a missing number, so convert it with Number() and check Number.isFinite before returning'); return item; }\n`
+    + `    if (item === undefined) throw new TypeError(path + ' is undefined: the page object has no such property, or the property is not set. For optional fields use ?? null so the value survives JSON serialization');\n`
     + `    if (typeof item !== 'object') throw new TypeError(path + ' has unsupported type ' + typeof item);\n`
     + `    if (typeof __dshNodeCtor === 'function' && item instanceof __dshNodeCtor) throw new TypeError(path + ' is a DOM node; return the fields you need');\n`
     + `    if (depth > 40 || ++nodes > 10000) throw new TypeError(path + ' exceeds the JSON result limit');\n`
-    + `    if (seen.has(item)) throw new TypeError(path + ' contains a circular reference');\n`
+    + `    if (seen.has(item)) throw new TypeError(path + ' contains a circular reference: the returned value must be a tree, so return a copy that holds only the fields you need');\n`
     + `    const proto = __dshGetProto(item);\n`
-    + `    if (!__dshIsArray(item) && proto !== Object.prototype && proto !== null) throw new TypeError(path + ' is not a plain object or array');\n`
+    + `    if (!__dshIsArray(item) && proto !== Object.prototype && proto !== null) throw new TypeError(path + ' is not a plain object or array: class instances, DOM collections, Map, Set and other host objects cannot cross the bridge, so return a plain object or array built from the fields you need');\n`
     + `    seen.add(item);\n`
     + `    let out;\n`
     + `    if (__dshIsArray(item)) { out = []; for (let i = 0; i < item.length; i++) { const d = __dshGetOwn(item, String(i)); if (!d || !('value' in d)) throw new TypeError(path + '[' + i + '] is an accessor or a sparse slot'); out.push(visit(d.value, path + '[' + i + ']', depth + 1)); } }\n`
