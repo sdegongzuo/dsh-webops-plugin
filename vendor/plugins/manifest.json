@@ -3,34 +3,33 @@
   "plugins": [
     {
       "name": "dsh-context",
-      "version": "0.86.0",
+      "version": "0.87.2",
       "client": true,
-      "tarball": "dsh-context-0.86.0.tgz",
-      "integrity": "sha512-91eeDDjzuEfOw6WquAhSj+gGfTP/Q8ZOI9TX8sesWM0fugEBIwjI+f0A7vGDNfmGSlzVMm7rHbEosaxWfCOH7w==",
-      "source": "https://registry.npmjs.org/dsh-context/-/dsh-context-0.86.0.tgz",
+      "tarball": "dsh-context-0.87.2.tgz",
+      "integrity": "sha512-GsSNrdiDpbF20DTZItXhnihz6DBXRSNAMbHs6SohshqdgTcGsAW0l2WZHdXwGvaIGLdfGIL/qZ7qsDFFtHLGIw==",
+      "source": "https://registry.npmjs.org/dsh-context/-/dsh-context-0.87.2.tgz",
       "repo": "https://github.com/bowenliang123/dsh-context",
       "portableNote": "Context 上下文面板与 /context 命令（透视上下文组成、演进、压缩与剪枝），侧栏一级入口可见",
       "runtimeDependencies": ["zod"]
     },
     {
       "name": "dsh-better-sidebar",
-      "version": "0.32.1",
+      "version": "0.33.0",
       "client": true,
-      "tarball": "dsh-better-sidebar-0.32.1.tgz",
-      "integrity": "sha512-UcIEAkLuZXz0SkNDwMtycCoO59yCasowG6DqhxkG+jAjQfofF0BbXIOctfjqsU8WyaP6XoSvi4LgMFhEfinBsw==",
-      "source": "https://registry.npmjs.org/dsh-better-sidebar/-/dsh-better-sidebar-0.32.1.tgz",
+      "tarball": "dsh-better-sidebar-0.33.0.tgz",
+      "integrity": "sha512-ZWiFCkFe9dgl9YvzQSACs+N0stvdyx5SmDFeVrVSs7xQnbtEX78Z/55tmBDvcluBzNPiM5SS4hfa7Q8DgQDxsQ==",
+      "source": "https://registry.npmjs.org/dsh-better-sidebar/-/dsh-better-sidebar-0.33.0.tgz",
       "repo": "https://github.com/omdsh-dev/DSH-better-sidebar",
-      "portableNote": "开放侧边栏底座：文件树/编辑器、文件变动(Git diff)、任务管理、侧边对话；自带 dsh.bundle.patch（单条 insert + 防双挂载守卫），进 bundles 后由 profile boot 自动合并，无需手写 cordis.patch.yml 挂载行",
-      "runtimeDependencies": ["ws", "yaml"],
-      "hostCompatibility": "connection-fence-cordis42-v1"
+      "portableNote": "开放侧边栏底座：文件树/编辑器、文件变动(Git diff)、任务管理、侧边对话；自带 dsh.bundle.patch（单条 insert + 防双挂载守卫），进 bundles 后由 profile boot 自动合并，无需手写 cordis.patch.yml 挂载行。0.33.0 起上游自己处理 0.2.3 删掉 requestRejection 的情况（fence 依次尝试 requestRejection → connection.authentication 的 admit → connection.admit），不再需要宿主补丁。",
+      "runtimeDependencies": ["ws", "yaml"]
     },
     {
       "name": "dsh-connect-workbuddy",
-      "version": "5.24.17",
+      "version": "5.32.2",
       "client": true,
-      "tarball": "dsh-connect-workbuddy-5.24.17.tgz",
-      "integrity": "sha512-7qQPcVWQWw2PCXV97mgNxqJDjvmlTfsS6LeaUqRBcmReUtrcQ7rFc1xNo9bFcxcrwaX+EGoqvWfhiINH3U2xNQ==",
-      "source": "https://registry.npmjs.org/dsh-connect-workbuddy/-/dsh-connect-workbuddy-5.24.17.tgz",
+      "tarball": "dsh-connect-workbuddy-5.32.2.tgz",
+      "integrity": "sha512-77IqYrgKrNisc4dMDabsUi/oLSjuaqrka2LRAa25wLY7gcdN2hF7bi3+m8YlbFGJmwm80yAMNyVPWeI5MxfFcQ==",
+      "source": "https://registry.npmjs.org/dsh-connect-workbuddy/-/dsh-connect-workbuddy-5.32.2.tgz",
       "repo": "https://github.com/dingminhua/dsh-connect-workbuddy",
       "portableNote": "WorkBuddy 模型连接：复用桌面端登录态，含积分/模型管理、生图与视频工具；不改变默认模型。v5.x 的 @deepseek-ai/dsh-* peer 全为范围（>=0.1.7-rc.1 <0.3.0-0），宿主不再需要 compatibility.json 精确版本豁免。隔离运行时（pi-ai 及传递依赖）沿用 workbuddy-runtime.lock.json。",
       "runtimeLock": "workbuddy-runtime.lock.json"
@@ -56,15 +55,15 @@
       "tarball": "zod-4.6.7.tgz",
       "integrity": "sha512-g8W2D2kU6a8untc053fX1uVBKzM7yqAxW/3zwk83+6RyF2+SKOuV+c0wBDhUwzV1PaGapmZH+rmcUzPf+3CGwg==",
       "source": "https://registry.npmjs.org/zod/-/zod-4.6.7.tgz",
-      "satisfies": "dsh-context@0.86.0 dependencies.zod ^4.6.6（0.85.1 起由精确 4.4.3 放开成 caret，取满足范围的最新 4.6.7）"
+      "satisfies": "dsh-context@0.87.2 dependencies.zod ^4.6.6（0.85.1 起由精确 4.4.3 放开成 caret，取满足范围的最新 4.6.7）"
     },
     {
       "name": "ws",
-      "version": "8.22.1",
-      "tarball": "ws-8.22.1.tgz",
-      "integrity": "sha512-oyL6OPYme/CmiFvNuGzeoxCJ4nOrZE2O1FwM9MWM1AsGri6nLXB2pg+lNA8aLeXMSav0J6eIVS1j6vUPzUtK9g==",
-      "source": "https://registry.npmjs.org/ws/-/ws-8.22.1.tgz",
-      "satisfies": "dsh-better-sidebar@0.32.1 dependencies.ws ^8.18.0"
+      "version": "8.23.0",
+      "tarball": "ws-8.23.0.tgz",
+      "integrity": "sha512-wCkmX8QMOrKjgO8HW2WyDbTSGeqkocxgDzS9iR79rEAexty6/2qzilx3Ag8Tqf9ykop3irLKle0MtVn5qjVnoQ==",
+      "source": "https://registry.npmjs.org/ws/-/ws-8.23.0.tgz",
+      "satisfies": "dsh-better-sidebar@0.33.0 dependencies.ws ^8.18.0（0.33.0 升级时取满足范围的最新 8.23.0）"
     },
     {
       "name": "yaml",
@@ -72,7 +71,7 @@
       "tarball": "yaml-2.9.1.tgz",
       "integrity": "sha512-3NxN8+78OdzbT7C/WjGsyfPAtJaN3FNDsWxv7Y7mcDsT/oOmgW8BpyQQFFBnvZE3j9Y2Sdz1ULFLezL7Eb2yFw==",
       "source": "https://registry.npmjs.org/yaml/-/yaml-2.9.1.tgz",
-      "satisfies": "dsh-better-sidebar@0.32.1 dependencies.yaml ^2.9.1"
+      "satisfies": "dsh-better-sidebar@0.33.0 dependencies.yaml ^2.9.1"
     },
     {
       "name": "undici",

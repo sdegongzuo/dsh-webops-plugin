@@ -1,47 +1,48 @@
-## dsh-webops-plugin __TAG__ · DSH 本体升到 0.2.3-alpha.2（宿主协议 v5）
+## dsh-webops-plugin __TAG__ · 随包第三方插件升到当前最新
 
-本版只升本体与桌面补丁，**插件自身代码未改**。DSH 从 `0.2.2-rc.5` 跨 minor 升到 `0.2.3-alpha.2`（相隔 2348 个提交），桌面补丁在新基线上重做，从 43 文件缩到 39。
+本版只换随包的第三方插件，**插件自身代码未改**。DSH 本体仍是 `0.2.3-alpha.2`：2026-11-27 核对，上游 `master` 与最新 tag 都是它，没有更新的版本，因此桌面补丁与 `runtime-lock/pnpm-lock.yaml` 逐字节未动。
 
-### 本体升级带来的变化
+### 随包插件
 
-- **宿主协议 v4 → v5**：桌面端与宿主之间新增 `parent-authentication` 通道，认证凭据改由父进程经 IPC 下发（`dsh-desktop-session`，32 字节 secret），**取消了原来的 `303 + set-cookie` 交换流程**。
-- **回环地址硬固定 `127.0.0.1`**：上游 `isOwnedHostUrl` 不再接受 `localhost` / `[::1]`。这一改动的代价是：若系统代理或终端策略只放通 `localhost` 而不放通 `127.0.0.1`，界面会停在「重新连接中…」。本版按上游实现，不再自行兜底 —— 遇到请反馈。
-- **跨栈回环兜底整套退役**（补丁少掉的 4 个文件）：`web-document.ts` 里的 `WebHostProbe` / `exchangeProbe` / `jarProbe`、`main.ts` 里的候选名轮换与探测 cookie 清理，以及三处对应测试。它们探测的正是上游已删除的交换流程，留着只会对着新协议假失败。
-- **便携临时目录保留逻辑重接**：`packages/spill`、`packages/subprocess` 跟着上游重构改写法 —— `DSH_TEMP_DIR` 存在时保留目录，退出不 `rmdir` 包内验证与恢复文件。
-- 依赖线：`cordis` 4.1.0 → **4.2.0-alpha.1**，`schemastery` 3.19.0 → **3.20.0-alpha.1**。
-- 构建宿主 Node 下限抬到 `^24.22.3 || >=26.13.1`（上游全部 CI 工作流钉 `^24.22.3`）。
+| 插件 | 上一版 | 本版 |
+| --- | --- | --- |
+| `dsh-context` | 0.86.0 | **0.87.2** |
+| `dsh-better-sidebar` | 0.32.1 | **0.33.0** |
+| `dsh-connect-workbuddy` | 5.24.17 | **5.32.2** |
+| `dsh-coding-subscription-oauth` | 0.8.8 | 0.8.8（未变） |
 
-### 插件侧
+三个 tgz 的 sha512 与 registry `dist.integrity` 逐字节一致；旧 tgz 继续留在 `vendor/plugins/` 里作为回归夹具。
 
-- 三个 DSH peer 精确对齐新运行时：`@deepseek-ai/dsh-attachment`、`dsh-system-prompt`、`dsh-tools` 均为 `^0.2.3-alpha.2`；`cordis ^4.2.0-alpha.1`、`schemastery ^3.20.0-alpha.1`。
-- 0.2.29 → **0.2.30** 仅为对齐新宿主，功能与上一版一致（网页审计、使用中回看、`open` 复用本对话标签等照旧）。
+### 侧边栏不再需要宿主补丁
 
-### 随包插件的两处宿主适配（物化阶段，官方 tgz 不改）
+0.2.30 里 `dsh-better-sidebar` 0.32.1 靠物化期就地补丁活着：DSH 0.2.3 删掉了 `connection.requestRejection`，插件的栅栏每次调用都抛 TypeError，被宿主兜底成 400 空 body。
 
-0.2.3 删掉了两个第三方插件正在用的宿主 API。两者都是**静默失效**：宿主照常启动、界面照常打开，只是功能不见了。官方包不改，物化阶段就地补，判据是精确文本必须恰好命中一次，插件换了写法直接拒绝打包。
+**0.33.0 上游自己解决了这件事**：栅栏改为依次尝试 `requestRejection` → `connection.authentication` 提供的 `admit` → `connection.admit`，三者都没有才抛错。宿主 0.2.3 两个方法都在，所以本版把 `hostCompatibility`（`connection-fence-cordis42-v1`）从 manifest 里**撤掉**，官方 tgz 原样进包，也不再生成 `dsh-host-compatibility.json`。补丁代码保留在仓库里，因为 0.32.1 那份 tgz 仍作为回归夹具、单测继续跑。
 
-- **`dsh-coding-subscription-oauth` 0.8.8（Grok 订阅）**：`dsh-llm` 删除了 `assertUsableApiKey` / `normalizeApiKey` 导出，插件的静态 import 让整层导入失败（设置页少「账户与模型」卡片）。补丁把 import 改指仍在导出的 `LlmError` 与 `INVALID_CREDENTIAL_CODE`，并在文件内联等价实现（trim 后非空、只含可打印 ASCII，否则抛同码 `LlmError`）；调用点一个不动。另：cordis 4.2 拦截未声明 inject 的 `ctx.root`，插件取应用根上下文处改按 `Symbol.for("cordis.root")`（cordis 的自有属性）读取。
-- **`dsh-better-sidebar` 0.32.1**：`connection.requestRejection` 被删除，准入搬进了 webserver 的 admission，于是插件的栅栏每次调用都抛 TypeError，被宿主兜底成 **400 空 body** —— 侧边栏接口全废而界面看着正常。补丁把栅栏改成「该方法存在就照旧校验，不存在就交给宿主」；宿主对未声明 `auth` 的路由默认 `required`，认证准入没有放松。
+对旧宿主仍按原规则拦：`requestRejection` 存在时照旧校验，语义没有放松。
 
-这两处都是**跟着上游临时补**：插件发布新版后补丁会因判据失配而拒绝打包（不是静默跳过），届时核对新写法再决定是否保留。
+### 其它两处细节
+
+- **`dsh-context` 0.87.2**：客户端注入新增 `@deepseek-ai/dsh-api-remotes` 与 `@deepseek-ai/dsh-client-connection`，宿主 0.2.3 两个模块都在；`engines.dsh` 仍是 `>=0.2.0-rc.2 || >=0.2.1-rc.2 || >=0.2.2-rc.1`。
+- **`dsh-connect-workbuddy` 5.32.2**：`@earendil-works/pi-ai` 的 peer 范围与 5.24.17 相同（`>=0.85.0 <0.88.0 || >=1.0.0-0 <2.0.0`），隔离运行时锁里的 `pi-ai 1.3.0` 继续满足，锁不重建；`@deepseek-ai/schemastery 3.19.0` 这条依赖从 5.24.17 起就有，物化路径不变。
+- **依赖**：`ws` 8.22.1 → **8.23.0**（侧边栏 `^8.18.0` 范围内取当前最新）；`zod` 4.6.7、`yaml` 2.9.1 未变。
+
+`dsh-better-sidebar` 0.33.0 的 `engines.dsh` 是 `>=0.2.2-rc.3 <0.3.0`，宿主按 `includePrerelease` 口径判定通过，不需要版本豁免。
 
 ### 版本对照
 
-| | 上一版 0.2.29 | 本版 __VERSION__ |
+| | 上一版 0.2.30 | 本版 __VERSION__ |
 | --- | --- | --- |
-| 内置 DSH | 0.2.2-rc.5 | **0.2.3-alpha.2** |
-| 宿主协议 | v4 | **v5** |
-| 桌面补丁 | 43 文件 | **39 文件**（4 个回环文件退役） |
-| `cordis` | 4.1.0 | **4.2.0-alpha.1** |
-| `schemastery` | 3.19.0 | **3.20.0-alpha.1** |
-| 构建宿主 Node | 24.9+ | **^24.22.3 \|\| >=26.13.1** |
-| `dsh-webops-plugin` | 0.2.29 | **__VERSION__** |
-| `dsh-context` | 0.86.0 | 0.86.0（未变） |
-| `dsh-better-sidebar` | 0.32.1 | 0.32.1（未变） |
-| `dsh-connect-workbuddy` | 5.24.17 | 5.24.17（未变） |
+| 内置 DSH | 0.2.3-alpha.2 | 0.2.3-alpha.2（未变） |
+| 桌面补丁 | 39 文件 | 39 文件（未变） |
+| `dsh-webops-plugin` | 0.2.30 | **__VERSION__** |
+| `dsh-context` | 0.86.0 | **0.87.2** |
+| `dsh-better-sidebar` | 0.32.1（+宿主补丁） | **0.33.0**（无补丁） |
+| `dsh-connect-workbuddy` | 5.24.17 | **5.32.2** |
 | `dsh-coding-subscription-oauth` | 0.8.8 | 0.8.8（未变） |
+| `ws`（随包依赖） | 8.22.1 | **8.23.0** |
 
-随包四个第三方插件的 peer 在宿主的 `includePrerelease` 口径下均覆盖新版本，因此不跟升；实际是否激活以界面为准。
+随包插件的 peer 在宿主的 `includePrerelease` 口径下均覆盖当前运行时，因此不跟升；实际是否激活以界面为准。`dsh-coding-subscription-oauth` 仍靠 `dsh-0.2.3-compat-v1`（内联 `assertUsableApiKey`、`root` 走 `Symbol.for("cordis.root")`）活着 —— 上游尚未发适配版。
 
 ### 登记机制（自 0.2.29 起）
 
@@ -51,21 +52,17 @@
 
 ### 升级须知
 
-- **跨 minor 升级，必须换整包**：只覆盖插件目录会让新插件对着旧宿主（协议 v4）跑，peer 也不匹配。请下载完整便携包。
+- **只换插件也建议换整包**：本版宿主未变，理论上覆盖插件目录即可；但完整包含全部新插件，省去逐个核对。已有会话、凭据请先备份。
 - **tgz 不在独立插件 ZIP 里**：它是 Release 的独立附件，要单独下载。只下 ZIP 的用户请先下载 `__PLUGIN_TGZ__` 放到包根 `vendor\`。
 - 完整便携包会替换 `home` 的出厂内容；已有会话、凭据请先备份。
 
 ### 更新已有安装
 
-1. 完全退出 DSH，备份现有 `home\`（会话 / 设置 / 凭据都在里面）。
-2. 下载 `__PORTABLE_ZIP__` 解压到新目录。
-3. 把备份的 `home\`、`data\` 拷进新包根目录（目录契约不变）。注意这会把旧 `home` 里的插件目录一起带回来（版本仍是旧的），下一步补。
-4. 补齐本版插件与登记：
-   - 把 `__PLUGIN_TGZ__` 放进包根 `vendor\`（完整包已自带），并**删掉旧的插件目录** `vendor\dsh-webops-plugin\`（若曾以目录形式登记，与 tgz 并存会冲突）；
-   - 用新包自带的 `home\profiles\desktop\node_modules\dsh-webops-plugin\` 覆盖回去（或解压 `__PLUGIN_ZIP__` 覆盖）；
-   - 把 `home\profiles\desktop\package.json` 里 `dependencies.dsh-webops-plugin` **这一个键**改成 `"file:../../../vendor/__PLUGIN_TGZ__"`。不要整块替换 `dependencies` —— 那会抹掉你自己装过的其它插件；
-   - 删掉 `home\profiles\desktop\pnpm-lock.yaml`（可能还记着旧的本地路径），下次安装时按新登记重生成。
-5. 启动后核对设置页版本为 `__DSH_VERSION__`、插件版本为 `__VERSION__`，并实际调一次网页工具。
+完全退出 DSH，按需选择：
+
+1. **换整包（推荐）**：备份现有 `home\`（会话 / 设置 / 凭据都在里面）→ 下载 `__PORTABLE_ZIP__` 解压到新目录 → 把备份的 `home\`、`data\` 拷进新包根目录（目录契约不变）。
+2. **只换插件**：把包里 `home\profiles\desktop\node_modules\` 下的 `dsh-context`、`dsh-better-sidebar`、`dsh-connect-workbuddy` 三个目录覆盖到现有安装的同名位置，同时更新 `home\profiles\desktop\package.json` 里对应的三个版本号；`dsh-better-sidebar` 目录里的 `dsh-host-compatibility.json` 可以删掉（0.33.0 不再需要）。
+3. 启动后核对设置页插件版本与本版一致，并实际用一次侧边栏与网页工具。
 
 独立插件 ZIP 仍然提供，但**只适用于宿主已经是 `__DSH_VERSION__` 的安装**：完全退出 DSH，把包内文件覆盖到 `home/profiles/desktop/node_modules/dsh-webops-plugin/`（包根目录是插件内容，不能直接解压到便携版根目录），重启后核对 `package.json` 的 version。它**不能单独完成升级**。
 

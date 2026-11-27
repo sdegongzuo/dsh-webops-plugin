@@ -6,7 +6,7 @@ import { runInNewContext } from 'node:vm'
 import { gunzipSync } from 'node:zlib'
 import { describe, expect, it } from 'vitest'
 
-const { adaptSidebarHostSource, applySidebarHostCompatibility, adaptSidebarCordis42Source, applySidebarCordis42Compatibility, SIDEBAR_CORDIS42_PATCH } = await import(
+const { adaptSidebarHostSource, applySidebarHostCompatibility, adaptSidebarCordis42Source, applySidebarCordis42Compatibility, SIDEBAR_CORDIS42_PATCH, SIDEBAR_CORDIS42_VERSIONS } = await import(
   new URL('../scripts/sidebar-host-compatibility.mjs', import.meta.url).href
 )
 const { buildRoot } = await import(new URL('../scripts/local-env.mjs', import.meta.url).href)
@@ -206,5 +206,54 @@ describe('侧边栏 cordis 4.2 栅栏兼容（正式产物 0.32.1）', () => {
   it('新宿主无该方法时交还 webserver 准入（不再抛错成 400）', () => {
     expect(fence0321({ admit: () => ({ kind: 'allow' }) })(remote)).toBe(true)
     expect(fence0321(undefined)(remote)).toBe(true)
+  })
+})
+
+/**
+ * 0.33.0（2026-11-27 升级）起上游自主兼容 DSH 0.2.3：栅栏依次尝试 `requestRejection` →
+ * `connection.authentication` 提供的 `admit` → `connection.admit`，三者皆无才抛 TypeError。
+ * 所以 manifest **不再启用** connection-fence-cordis42-v1。这里对着**正式 0.33.0 产物**
+ * 钉住这条「无需补丁」的判断，以及栅栏在新旧宿主上的实际行为。
+ */
+const SB_0330 = officialSource('dsh-better-sidebar-0.33.0.tgz')
+
+describe('侧边栏 0.33.0 原生兼容（正式产物）', () => {
+  it('补丁判据在 0.33.0 上零命中，版本白名单也不含它', () => {
+    expect(SB_0330.split(FENCE_0321_ORIGINAL).length - 1).toBe(0)
+    expect(SB_0330).toContain('"connection",')
+    expect(SIDEBAR_CORDIS42_VERSIONS).not.toContain('0.33.0')
+    // 补丁函数见到 0.33.0 自带的 requestRejection 调用即视为已适配 —— 保持原样、不二次改写。
+    expect(adaptSidebarCordis42Source(SB_0330)).toBe(SB_0330)
+  })
+
+  /** 执行正式产物的原生栅栏；`inject` 可选地模拟 connection.authentication 是否存在。 */
+  const fence0330 = (connection: unknown, withProvider = false) => {
+    const start = SB_0330.indexOf('const admitted =')
+    const end = SB_0330.indexOf('const agentOpenRegistry')
+    if (start < 0 || end <= start) throw new Error('0.33.0 栅栏结构变化')
+    const body = SB_0330.slice(start, end)
+    const ctx = {
+      connection,
+      inject: (_deps: string[], callback: (providerCtx: unknown) => void) => {
+        if (withProvider) callback({ connection })
+      },
+    }
+    return runInNewContext(`${body}\nfence`, { ctx }) as (req: unknown) => boolean
+  }
+
+  it('老宿主仍按 requestRejection 判定', () => {
+    expect(fence0330({ requestRejection: () => undefined })(remote)).toBe(true)
+    expect(fence0330({ requestRejection: () => 403 })(remote)).toBe(false)
+  })
+
+  it.each([false, true])('新宿主走 admit（provider=%s）：只有带 rejection 才拒绝', withProvider => {
+    const allow = { admit: () => ({ peer: 'p1' }) }
+    const deny = { admit: () => ({ rejection: 403 }) }
+    expect(fence0330(allow, withProvider)(remote)).toBe(true)
+    expect(fence0330(deny, withProvider)(remote)).toBe(false)
+  })
+
+  it('两个方法都没有时明确抛错，不静默放行', () => {
+    expect(() => fence0330({})(remote)).toThrow('neither requestRejection nor admit')
   })
 })

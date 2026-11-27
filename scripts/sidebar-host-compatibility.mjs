@@ -13,6 +13,12 @@
  * `const fence = (req) => ctx.connection.requestRejection(req) === void 0;` 消费点 1 处，
  * cordis.patch.yml 与 0.28.2 逐字节相同（isTrustedApiRequest 辅助函数已在上游删掉，
  * 与本补丁无关）；peer 只是从 ^0.2.1-rc.1 抬到 ^0.2.2-rc.2，同样不进下方集合。
+ * 0.33.0（2026-11-27 升级）复核：上游自己把 0.2.3 的 `requestRejection` 缺失处理掉了 ——
+ * 栅栏改成依次尝试 `requestRejection` → `connection.authentication` 的 `admit` →
+ * `connection.admit`，三者都没有才抛 TypeError。于是 **manifest 不再启用
+ * connection-fence-cordis42-v1**（下方集合仍只登记 0.32.1：该补丁的唯一判据是那条单行
+ * 栅栏，0.33.0 命中 0 次，误开会在版本白名单处直接抛错）。cordis.patch.yml 与 0.32.1
+ * 逐字节相同。
  */
 import { createHash } from 'node:crypto'
 import { existsSync, readFileSync, writeFileSync } from 'node:fs'

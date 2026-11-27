@@ -176,14 +176,14 @@ describe('每次发布的完整便携包', () => {
     const shipped = spawnSync('python', ['-c',
       'import sys,zipfile; z=zipfile.ZipFile(sys.argv[1]); print(z.read("home/profiles/desktop/node_modules/dsh-better-sidebar/lib/index.js").decode())', out], { encoding: 'utf8' })
     expect(shipped.status, shipped.stderr).toBe(0)
-    // 0.28.0 起上游原生 inject「connection」并直接用 ctx.connection.requestRejection；
-    // 但 DSH 0.2.3-alpha.2 把这个方法删了（准入搬到 webServer 的 admit/authenticate），
-    // 于是物化阶段按 manifest 的 hostCompatibility 就地适配栅栏，并落兼容回执。
+    // 0.33.0 起上游自己兼容 DSH 0.2.3：栅栏依次尝试 requestRejection →
+    // connection.authentication 的 admit → connection.admit，物化阶段不再改源码、不落回执。
     expect(shipped.stdout).toContain('"connection",')
     expect(shipped.stdout).toContain('requestRejection.call(connection, req)')
+    expect(shipped.stdout).toContain('if (typeof admit === "function") return admitted(admit.call(connection, req));')
     expect(shipped.stdout).not.toContain('const fence = (req) => ctx.connection.requestRejection(req) === void 0;')
     expect(shipped.stdout).not.toContain('ctx.get("webRuntime")?.trustedHosts ?? []')
-    expect(zip.names).toContain('home/profiles/desktop/node_modules/dsh-better-sidebar/dsh-host-compatibility.json')
+    expect(zip.names).not.toContain('home/profiles/desktop/node_modules/dsh-better-sidebar/dsh-host-compatibility.json')
     // 夹具里所有插件都判满足，所以出厂 profile 不该出现豁免文件 —— 别让「有 exemptions」变成常态。
     expect(zip.names).not.toContain('home/profiles/desktop/compatibility.json')
     for (const name of ['dsh-webops-plugin', 'dsh-context', 'dsh-better-sidebar', 'dsh-connect-workbuddy']) {
