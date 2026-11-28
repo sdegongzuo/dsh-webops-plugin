@@ -3,7 +3,13 @@
 const ENVELOPE_KEY = '__dsh_webpage_execute_result_v1__'
 const RESULT_TEXT_LIMIT = 18_000
 
-/** 页面内封装只接受无副作用可读取的普通 JSON 数据，不调用 getter 或 toJSON。 */
+/**
+ * 页面内封装只接受无副作用可读取的普通 JSON 数据，不调用 getter 或 toJSON。
+ *
+ * 序列化失败的文案分两段：`visit` 抛 `{__dshFail, path, hint}`，`catch` 里按
+ * 「hint 全长保留 + path 截到剩余预算」拼回 2000 字符上限 —— 长路径（1900 字符的键实测）
+ * 只允许吃掉路径，不能把 `?? null` / `Number.isFinite` 这些修法截掉。
+ */
 export function wrapExecuteFunctionBody(code: string): string {
   return `(()=>{\n`
     + `const __dshSet=Set, __dshGetOwn=Object.getOwnPropertyDescriptor, __dshGetProto=Object.getPrototypeOf, __dshOwnKeys=Reflect.ownKeys, __dshIsArray=Array.isArray, __dshFinite=Number.isFinite, __dshStringify=JSON.stringify, __dshDefine=Object.defineProperty, __dshNodeCtor=globalThis.Node, __dshAsyncFunction=Object.getPrototypeOf(async function(){}).constructor;\n`
@@ -13,25 +19,26 @@ export function wrapExecuteFunctionBody(code: string): string {
     + `const __dshPack = value => {\n`
     + `  const seen = new Set();\n`
     + `  let nodes = 0;\n`
+    + `  const fail = (path, hint) => ({ __dshFail: 1, path, hint });\n`
     + `  const visit = (item, path, depth) => {\n`
     + `    if (item === null || typeof item === 'boolean') return item;\n`
     + `    if (typeof item === 'string') return item;\n`
-    + `    if (typeof item === 'number') { if (!__dshFinite(item)) throw new TypeError(path + ' is not a finite number: a page often uses "-" or "" for a missing number, so convert it with Number() and check Number.isFinite before returning'); return item; }\n`
-    + `    if (item === undefined) throw new TypeError(path + ' is undefined: the page object has no such property, or the property is not set. For optional fields use ?? null so the value survives JSON serialization');\n`
-    + `    if (typeof item !== 'object') throw new TypeError(path + ' has unsupported type ' + typeof item);\n`
-    + `    if (typeof __dshNodeCtor === 'function' && item instanceof __dshNodeCtor) throw new TypeError(path + ' is a DOM node; return the fields you need');\n`
-    + `    if (depth > 40 || ++nodes > 10000) throw new TypeError(path + ' exceeds the JSON result limit');\n`
-    + `    if (seen.has(item)) throw new TypeError(path + ' contains a circular reference: the returned value must be a tree, so return a copy that holds only the fields you need');\n`
+    + `    if (typeof item === 'number') { if (!__dshFinite(item)) throw fail(path, ' is not a finite number: a page often uses "-" or "" for a missing number, so convert it with Number() and return null unless Number.isFinite(number) - note Number("") is 0, not missing'); return item; }\n`
+    + `    if (item === undefined) throw fail(path, ' is undefined: the page object has no such property, or the property is not set. For optional fields use ?? null so the value survives JSON serialization');\n`
+    + `    if (typeof item !== 'object') throw fail(path, ' has unsupported type ' + typeof item);\n`
+    + `    if (typeof __dshNodeCtor === 'function' && item instanceof __dshNodeCtor) throw fail(path, ' is a DOM node; return the fields you need');\n`
+    + `    if (depth > 40 || ++nodes > 10000) throw fail(path, ' exceeds the JSON result limit');\n`
+    + `    if (seen.has(item)) throw fail(path, ' contains a circular reference: the returned value must be a tree, so return a copy that holds only the fields you need');\n`
     + `    const proto = __dshGetProto(item);\n`
-    + `    if (!__dshIsArray(item) && proto !== Object.prototype && proto !== null) throw new TypeError(path + ' is not a plain object or array: class instances, DOM collections, Map, Set and other host objects cannot cross the bridge, so return a plain object or array built from the fields you need');\n`
+    + `    if (!__dshIsArray(item) && proto !== Object.prototype && proto !== null) throw fail(path, ' is not a plain object or array: class instances, DOM collections, Map, Set and other host objects cannot cross the bridge, so return a plain object or array built from the fields you need');\n`
     + `    seen.add(item);\n`
     + `    let out;\n`
-    + `    if (__dshIsArray(item)) { out = []; for (let i = 0; i < item.length; i++) { const d = __dshGetOwn(item, String(i)); if (!d || !('value' in d)) throw new TypeError(path + '[' + i + '] is an accessor or a sparse slot'); out.push(visit(d.value, path + '[' + i + ']', depth + 1)); } }\n`
-    + `    else { out = {}; for (const key of __dshOwnKeys(item)) { const d = __dshGetOwn(item, key); if (!d || !d.enumerable) continue; if (typeof key !== 'string') throw new TypeError(path + ' has an enumerable symbol key'); if (!('value' in d)) throw new TypeError(path + '.' + key + ' is an accessor'); __dshDefine(out, key, {value: visit(d.value, path + '.' + key, depth + 1), enumerable: true, configurable: true, writable: true}); } }\n`
+    + `    if (__dshIsArray(item)) { out = []; for (let i = 0; i < item.length; i++) { const d = __dshGetOwn(item, String(i)); if (!d || !('value' in d)) throw fail(path + '[' + i + ']', d ? ' is an accessor: this array index is a getter, so read it with Object.getOwnPropertyDescriptor(array, index).get.call(array) and return that plain value' : ' is a sparse slot (the array has no element at this index): fill it with null, or build the array with Array.from(array, item => item ?? null), before returning'); out.push(visit(d.value, path + '[' + i + ']', depth + 1)); } }\n`
+    + `    else { out = {}; for (const key of __dshOwnKeys(item)) { const d = __dshGetOwn(item, key); if (!d || !d.enumerable) continue; if (typeof key !== 'string') throw new TypeError(path + ' has an enumerable symbol key'); if (!('value' in d)) throw fail(path + '.' + key, ' is an accessor: this property is a getter, so return a plain data field instead, or read it explicitly with Object.getOwnPropertyDescriptor(object, key).get.call(object) and return that value'); __dshDefine(out, key, {value: visit(d.value, path + '.' + key, depth + 1), enumerable: true, configurable: true, writable: true}); } }\n`
     + `    seen.delete(item); return out;\n`
     + `  };\n`
     + `  try { const packed = visit(value, '$', 0); let envelope = {${JSON.stringify(ENVELOPE_KEY)}:1, has_value:true, value:packed}; if (__dshStringify(envelope).length > ${RESULT_TEXT_LIMIT}) { if (typeof packed !== 'string') throw new TypeError('the structured result exceeds ${RESULT_TEXT_LIMIT} serialized characters; return only the fields or slice you need'); let low = 0, high = packed.length; while (low < high) { const mid = Math.ceil((low + high) / 2); const candidate = {${JSON.stringify(ENVELOPE_KEY)}:1, has_value:true, value:packed.slice(0, mid), truncated:true}; if (__dshStringify(candidate).length <= ${RESULT_TEXT_LIMIT}) low = mid; else high = mid - 1; } envelope = {${JSON.stringify(ENVELOPE_KEY)}:1, has_value:true, value:packed.slice(0, low), truncated:true}; } return envelope; }\n`
-    + `  catch (error) { const descriptor = error && (typeof error === 'object' || typeof error === 'function') ? __dshGetOwn(error, 'message') : undefined; const detail = descriptor && 'value' in descriptor && typeof descriptor.value === 'string' ? descriptor.value : 'the result is not supported JSON data'; return {${JSON.stringify(ENVELOPE_KEY)}:1, has_value:false, serialization_error:detail.slice(0, 2000)}; }\n`
+    + `  catch (error) { const descriptor = error && (typeof error === 'object' || typeof error === 'function') ? __dshGetOwn(error, 'message') : undefined; const path = error && typeof error === 'object' && typeof error.path === 'string' ? error.path : ''; const hint = error && typeof error === 'object' && typeof error.hint === 'string' ? error.hint : ''; let detail = path + hint; if (!detail) detail = descriptor && 'value' in descriptor && typeof descriptor.value === 'string' ? descriptor.value : 'the result is not supported JSON data'; if (detail.length > 2000) detail = hint ? path.slice(0, Math.max(0, 2000 - hint.length)) + hint : detail.slice(0, 2000); return {${JSON.stringify(ENVELOPE_KEY)}:1, has_value:false, serialization_error:detail}; }\n`
     + `};\n`
     + `return Promise.resolve().then(() => __dshRun()).then(value => value === undefined ? {${JSON.stringify(ENVELOPE_KEY)}:1, has_value:false} : __dshPack(value), error => __dshCapture(error, 'runtime'));\n`
     + `})()`

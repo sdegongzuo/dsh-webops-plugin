@@ -10,10 +10,20 @@
  *    的模块表里 require（`react` 等），其余一律内联。这三行 banner/footer/intro 与
  *    `dsh` 自己的 `packages/client/tsdown.client.ts` 对齐，不一致加载器会解析不了。
  */
+import { readFileSync } from 'node:fs'
 import { defineConfig } from 'tsdown'
 
 /** 插件 id：既写进 `__ModuleLoader__.load` 的握手，也是 client 入口的构建名。 */
 const PLUGIN_ID = 'dsh-webops-plugin'
+
+/**
+ * 插件版本。浏览器 bundle 读不到 `package.json`，宿主也不下发插件版本，而面板的
+ * 「复制诊断信息」需要它当版本证据 —— 所以在构建期读一次、以字面量注入
+ * （`src/client/diagnostics.ts` 的 `PLUGIN_VERSION`）。
+ */
+const PLUGIN_VERSION = (JSON.parse(
+  readFileSync(new URL('./package.json', import.meta.url), 'utf8'),
+) as { version: string }).version
 
 /**
  * 浏览器模块表里**本来就有的**共享模块（源自 `packages/client/web/src/platform.ts`
@@ -41,6 +51,8 @@ const clientDefines = {
   'process.env.NODE_ENV': JSON.stringify(process.env.NODE_ENV ?? 'production'),
   'import.meta.env.MODE': JSON.stringify(process.env.NODE_ENV ?? 'production'),
   'import.meta.env': JSON.stringify({ MODE: process.env.NODE_ENV ?? 'production' }),
+  // 诊断报告要显示的插件版本；未注入时面板整行省略（`typeof` 判定，不抛错）。
+  __DSH_WEBOPS_PLUGIN_VERSION__: JSON.stringify(PLUGIN_VERSION),
 }
 
 export default defineConfig([

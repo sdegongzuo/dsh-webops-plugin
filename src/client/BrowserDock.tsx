@@ -28,6 +28,15 @@ import type {} from '@deepseek-ai/dsh-client-ui-chat/client'
 import type {} from '@deepseek-ai/dsh-client-ui-conversation/client'
 import { BROWSER_NS } from './locales.ts'
 import { browserCallsFrom, observeBrowser, visitedPages, type BrowserCall } from './observation.ts'
+import {
+  buildCallDiagnostic,
+  buildFailuresDiagnostic,
+  clientEnvironment,
+  PLUGIN_VERSION,
+  type DiagnosticInput,
+  type DiagnosticLabels,
+} from './diagnostics.ts'
+import { CopyButton } from './CopyButton.tsx'
 
 /** 面板的完整 props：input.dock 的 owner + Session 标准件（含 `useChat`）+ 文案。 */
 export type BrowserDockProps = PropsRuntime<'conversation.input.dock'> & PropsLocale<typeof BROWSER_NS>
@@ -139,6 +148,47 @@ export function BrowserDock(props: BrowserDockProps) {
       : idle ? t('idle') : `${String(calls.length)} ${t('completedCalls')}`
   const visibleCalls = [...calls].reverse().filter(call => !failuresOnly || (call.settled && call.isError))
 
+  // 诊断报告的材料：面板当前页 + 渲染进程 UA + 一套本地化标签。报告在点击时才拼，
+  // 这里只准备输入 —— 面板每帧都在渲染，没必要每次渲染都把全部失败调用的回执拼一遍。
+  const diagnosticPage = { url: observation.url, title: observation.title, sessionId: observation.sessionId }
+  const environment = clientEnvironment()
+  // 标题也走同一套插值：汇总按钮填失败条数，单条按钮填 1；报告层不再二次替换 {count}。
+  const diagnosticLabels: Omit<DiagnosticLabels, 'heading'> = {
+    page: t('diagnosticPage'),
+    // 参数里的目标地址（未确认到达）与「连地址都没有」是两条不同的标签，不能混用 page。
+    target: t('diagnosticTarget'),
+    pageUnknown: t('diagnosticPageUnknown'),
+    currentPage: t('diagnosticCurrentPage'),
+    pageTitle: t('diagnosticTitle'),
+    tab: t('diagnosticTab'),
+    environment: t('diagnosticEnvironment'),
+    plugin: t('diagnosticPlugin'),
+    stats: t('diagnosticStats'),
+    failedTools: t('diagnosticFailedTools'),
+    sequence: t('diagnosticSequence'),
+    errorCode: t('diagnosticErrorCode'),
+    argsCheck: t('diagnosticArgsCheck'),
+    argsJson: t('diagnosticArgsJson'),
+    argsNotJson: t('diagnosticArgsNotJson'),
+    // 空参数不等于「参数不合法」，报告里要分开说。
+    argsMissing: t('diagnosticArgsMissing'),
+    retry: t('diagnosticRetry'),
+    arguments: t('arguments'),
+    receipt: t('receipt'),
+    noReceipt: t('emptyReceipt'),
+    failure: t('diagnosticFailed'),
+    succeeded: t('diagnosticSucceeded'),
+    active: t('diagnosticActive'),
+  }
+  /** 会话全量调用始终传给报告：序号与「上一次失败」都要靠它算。 */
+  const diagnosticFor = (heading: string): DiagnosticInput => ({
+    labels: { ...diagnosticLabels, heading },
+    current: diagnosticPage,
+    environment,
+    pluginVersion: PLUGIN_VERSION,
+    sessionCalls: calls,
+  })
+
   return (
     <div
       data-dsh-browser-dock=""
@@ -247,10 +297,24 @@ export function BrowserDock(props: BrowserDockProps) {
               应该只有一句说明，而不是「只看失败」复选框加一条「暂无符合条件的操作记录」——
               那两句在没有记录可言的时候纯属自说自话。 */}
           {idle ? null : (
-            <label style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '6px 0', borderTop: '0.5px solid var(--dsw-alias-border-l2, rgba(127,127,127,0.25))' }}>
-              <input type="checkbox" checked={failuresOnly} onChange={event => setFailuresOnly(event.target.checked)} />
-              {t('failuresOnly')}
-            </label>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '6px 0', borderTop: '0.5px solid var(--dsw-alias-border-l2, rgba(127,127,127,0.25))' }}>
+              <label style={{ display: 'flex', alignItems: 'center', gap: 6, cursor: 'pointer' }}>
+                <input type="checkbox" checked={failuresOnly} onChange={event => setFailuresOnly(event.target.checked)} />
+                {t('failuresOnly')}
+              </label>
+              {/* 汇总入口只在真有失败时出现：没有失败可复制时摆一个按钮，等于承诺一份空报告。
+                  它复制的是**全部**失败调用，不受「只看失败」过滤影响 —— 用户要的是完整现场。 */}
+              {observation.failures > 0 ? (
+                <CopyButton
+                  label={t('copyFailureReport')}
+                  copiedLabel={t('copied')}
+                  failedLabel={t('copyError')}
+                  title={t('copyFailureHint')}
+                  text={() => buildFailuresDiagnostic(calls, diagnosticFor(t('diagnosticHeading', { count: observation.failures })))}
+                  style={{ marginLeft: 'auto' }}
+                />
+              ) : null}
+            </div>
           )}
           {!idle && visibleCalls.length === 0 ? <p style={{ opacity: 0.75 }}>{t('noRecords')}</p> : null}
           {visibleCalls.map((call, index) => (
@@ -264,7 +328,18 @@ export function BrowserDock(props: BrowserDockProps) {
                 {call.isError && call.resultText ? <span>{' · '}{failureSummary(call.resultText)}</span> : null}
               </summary>
               <div style={{ padding: '4px 0 8px' }}>
-                <strong>{t('arguments')}</strong>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8, margin: '0 0 4px' }}>
+                  <strong>{t('arguments')}</strong>
+                  {/* 每条都带复制入口：成功调用的参数/回执同样可能是「结果不对」的证据。 */}
+                  <CopyButton
+                    label={t('copyDiagnostic')}
+                    copiedLabel={t('copied')}
+                    failedLabel={t('copyError')}
+                    title={t('copyDiagnosticHint')}
+                    text={() => buildCallDiagnostic(call, diagnosticFor(t('diagnosticCallHeading', { count: 1 })))}
+                    style={{ marginLeft: 'auto' }}
+                  />
+                </div>
                 <pre style={{ whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', margin: '4px 0 8px', fontSize: 12 }}>{call.argsRaw || '—'}</pre>
                 <strong>{t('receipt')}</strong>
                 <pre style={{ whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', margin: '4px 0', fontSize: 12 }}>

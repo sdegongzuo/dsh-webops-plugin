@@ -207,7 +207,14 @@ function formatExecuteOutput(value: ExecuteOutput): string {
   return [
     `${value.method} on session_id=${value.session_id} (at ${value.url}${value.title !== undefined ? ` — ${value.title}` : ''}, ref epoch ${value.epoch})`,
     changed,
-    value.has_value ? (rendered ?? 'null') : 'The function completed without returning a value (undefined). Use return when you need data.',
+    // 顶层返回 undefined 有两种来源：没写 return，或 `return <不存在的字段>`。后者已经用过
+    // return，「Use return」只会把模型推回同一个错处（2026-11-27 实测两种输入回执逐字相同）。
+    value.has_value
+      ? (rendered ?? 'null')
+      : 'The function body returned undefined as its top-level value: either no return was executed, or the '
+        + 'expression after return evaluated to undefined - typically reading a property that does not exist '
+        + '(return page.missing). For optional fields write page.missing ?? null; to get data back, return an '
+        + 'object such as { ok: true, items }.',
     '',
     ...notes,
   ].join('\n')
@@ -492,12 +499,13 @@ export function registerExecute(ctx: Context, cache: SnapshotCache): void {
       if (result.navigated) cache.delete(result.sessionId)
       const envelope = unwrapExecuteEnvelope(result.value)
       if (envelope.script_error !== undefined) {
-        // 页面自己抛的异常必须说清「这是页面错误，不是工具故障」：模型常把
-        // `x.toFixed is not a function` 当成插件 bug 去查插件，而不是回去改自己的取值。
+        // 这个 runtime 分支同时接住两种异常：页面取值失败，和模型自己写错代码（`return d.missing`
+        // 实测就是 ReferenceError）。所以不能说成「页面的错误」，只能说「跑的是你交给页面的那段
+        // 函数体，bug 通常在它自己身上」—— 既不误导归因，也不让模型去查插件。
         throw new BrowserError(
           envelope.script_error.phase === 'compile'
             ? `webpage_execute could not compile the function body, so nothing ran: ${envelope.script_error.name}: ${envelope.script_error.message}${envelope.script_error.stack === undefined ? '' : `\n${envelope.script_error.stack}`} Correct the code and call again.`
-            : `webpage_execute ran the function body once and it threw a JavaScript runtime error: ${envelope.script_error.name}: ${envelope.script_error.message}${envelope.script_error.stack === undefined ? '' : `\n${envelope.script_error.stack}`}\nThis is the page's own error, not a tool failure. Common causes: calling a method on a value that is not what you assumed (a page often returns "" or "-" for a missing number, so check typeof, convert with Number() and check Number.isFinite first), reading a property of null or undefined, or a rejected await. Any side effects are not rolled back; inspect page state before deciding whether to call again.`,
+            : `webpage_execute ran the function body once and it threw a JavaScript runtime error: ${envelope.script_error.name}: ${envelope.script_error.message}${envelope.script_error.stack === undefined ? '' : `\n${envelope.script_error.stack}`}\nThe error came from the code that just ran inside the page (the function body you passed in), so it is usually a bug in that code itself - an undefined name, a wrong type, or a property read on null or undefined - not a plugin failure. A common case is calling a method on a value that is not what you assumed (a page often returns "" or "-" for a missing number, so check typeof, convert with Number() and check Number.isFinite first); a rejected await lands here too. Any side effects are not rolled back; inspect page state before deciding whether to call again.`,
           'BROWSER_EXECUTE_SCRIPT_ERROR',
         )
       }

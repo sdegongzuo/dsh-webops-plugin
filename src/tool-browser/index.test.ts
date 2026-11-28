@@ -81,7 +81,12 @@ interface Harness {
   mutateSessionId: string
   /** 置 true 让 `execute` 报 `navigated:true`（模拟表达式改了 location）。 */
   executeNavigated: boolean
-  /** 设置后 `execute` 的返回值信封换用它（模拟页面侧序列化/脚本错误），验证工具层的报错编排。 */
+  /**
+   * 设置后 `execute` 的返回值信封换用它（模拟页面侧序列化/脚本错误），验证工具层的报错编排。
+   * **显式 `null` 有含义**：表示页面回传了非法信封，桩必须把这个 null 原样交出去；
+   * 只有 `undefined` 才落回默认的成功信封。用 `??` 会把 null 也吞成成功，非法信封
+   * 在工具层就不可达、不可测。
+   */
   executeEnvelope: unknown
   /**
    * console / network list 的桩要模拟哪种截断：
@@ -380,7 +385,11 @@ function mount(): Harness {
           url: SESSION.url,
           navigated: harness.executeNavigated,
           ...harness.pageChanged !== undefined ? { pageChanged: harness.pageChanged } : {},
-          value: harness.executeEnvelope ?? { __dsh_webpage_execute_result_v1__: 1, has_value: true, value: 2 },
+          // 用 === undefined 判断而不是 ??：显式 null 是「页面回了非法信封」这条路径的输入，
+          // 不能被当成「没设置」而落回默认成功信封。
+          value: harness.executeEnvelope === undefined
+            ? { __dsh_webpage_execute_result_v1__: 1, has_value: true, value: 2 }
+            : harness.executeEnvelope,
           truncated: false,
         })
       },
@@ -1226,6 +1235,24 @@ describe('webpage_console / webpage_network / webpage_execute', () => {
     expect(validateJsonSchemaValue(definition.output.schema, value)).toEqual([])
   })
 
+  it('explains a top-level undefined without telling the model to use return', async () => {
+    // 回执必须同时交代两种来源：没写 return，以及 return 的表达式算成了 undefined。
+    // 旧文案只说「Use return when you need data」，而 `return page.missing` 这类取值失败
+    // **已经用了 return**，那句话把模型推回同一个错处（2026-11-27 实测两种输入回执逐字相同）。
+    const definition = tool(harness, 'webpage_execute')
+    const rendered = String((definition.output.render({ session_id: 's1' }, {
+      session_id: 's1', method: 'Runtime.evaluate', epoch: 1, url: 'http://fixture.test/',
+      has_value: false, navigated: false, truncated: false,
+    } as never)[0] as { text: string }).text)
+
+    expect(rendered).toContain('returned undefined as its top-level value')
+    expect(rendered).toContain('either no return was executed')
+    expect(rendered).toContain('return page.missing')
+    expect(rendered).toContain('?? null')
+    // 否证：旧文案的那句建议必须消失。
+    expect(rendered).not.toContain('Use return when you need data')
+  })
+
   it('passes the actionable serialization detail through to the model without a contradicting tail', async () => {
     harness.executeEnvelope = {
       __dsh_webpage_execute_result_v1__: 1,
@@ -1238,24 +1265,34 @@ describe('webpage_console / webpage_network / webpage_execute', () => {
 
     expect(failure?.code).toBe('BROWSER_EXECUTE_RESULT_UNSERIALIZABLE')
     expect(failure?.message).toContain('$.eps is undefined')
-    // 只保留仍然成立的那条恢复建议（副作用不回滚）；「避免 DOM/函数/循环/访问器」那句不能
-    // 再跟着出现 —— 本次的成因是缺字段，跟着一句 unrelated 的清单会把模型指向错方向。
+    // 只保留仍然成立的那条恢复建议（副作用不回滚）。
     expect(failure?.message).toContain('side effects are not rolled back')
-    expect(failure?.message).not.toContain('avoid DOM nodes, functions, cycles, accessors')
+    // 这条 code 的 Recovery 现在**按 message 说的是哪种成因分派**，正向钉住新文案的关键词：
+    // 分派前提 + 字段路径场景的修法 + 另一路（DOM/函数/空对象/未 await）的说法。
     expect(failure?.message).toContain('Recovery:')
+    expect(failure?.message).toContain('the message shows which case this is')
+    expect(failure?.message).toContain('give it a fallback with ?? null')
+    expect(failure?.message).toContain('unawaited Promise crossing the bridge')
+    // 旧 Recovery（「fix the exact field the message names … never hand back live DOM nodes」）
+    // 必须不再出现：否证串要取旧句里真实存在的片段，否则少一个词就匹配不上、改回旧句仍全绿。
+    expect(failure?.message).not.toContain('never hand back')
+    expect(failure?.message).not.toContain('the exact field the message names')
   })
 
   it('names a third-party runtime TypeError with the field it came from', async () => {
-    harness.executeEnvelope = {
+    const envelope = {
       __dsh_webpage_execute_result_v1__: 1,
       has_value: false,
       script_error: {
         name: 'TypeError',
         message: 'd.TOTALOPERATEREVETZ.toFixed is not a function',
-        phase: 'runtime',
-        stack: 'TypeError: d.TOTALOPERATEREVETZ.toFixed is not a function\n    at __dshRun (eval:1:1)',
+        phase: 'runtime' as const,
+        // stack 只放调用帧，不放 'TypeError: …' 前缀：否则删掉 name/message 的插值后，
+        // 这两个值还能从 stack 里蒙过断言，等于没钉住插值。
+        stack: '    at __dshRun (eval:1:1)',
       },
     }
+    harness.executeEnvelope = envelope
     const failure = await tool(harness, 'webpage_execute')
       .execute({ session_id: 's1', code: 'return 1;' }, exec())
       .then(() => undefined, (error: unknown) => error as { code: string; message: string })
@@ -1265,6 +1302,56 @@ describe('webpage_console / webpage_network / webpage_execute', () => {
     expect(failure?.message).toContain('JavaScript runtime error')
     expect(failure?.message).toContain('"-"')
     expect(failure?.message).toContain('typeof')
+    // 回执必须把页面侧的 name 与 message 原样带出：删掉 name/message 的插值后，模型只剩
+    // 一句「有个运行时错误」，不知道自己写错了什么（原断言只查通用措辞，删了仍绿）。
+    expect(failure?.message).toContain(envelope.script_error.name)
+    expect(failure?.message).toContain(envelope.script_error.message)
+    // 成因说明仍要指向 typeof + Number.isFinite（非有限数的具体修法在页面侧包装器的
+    // serialization hint 里，由 execute-script.test.ts 覆盖；这里只管工具层带回执的措辞）。
+    expect(failure?.message).toContain('Number.isFinite')
+  })
+
+  it('reports a compile-phase failure without claiming the body ran', async () => {
+    // 语法错误在 `new AsyncFunction` 就炸了，函数体一次都没跑：文案必须说清这一点，
+    // 否则模型会去查页面状态或以为副作用已发生。
+    harness.executeEnvelope = {
+      __dsh_webpage_execute_result_v1__: 1,
+      has_value: false,
+      script_error: { name: 'SyntaxError', message: "Unexpected token '='", phase: 'compile' },
+    }
+    const failure = await tool(harness, 'webpage_execute')
+      .execute({ session_id: 's1', code: 'return 1 =;' }, exec())
+      .then(() => undefined, (error: unknown) => error as { code: string; message: string })
+
+    // 两条 script_error 分支共用同一个错误码，只有 phase 决定文案。
+    expect(failure?.code).toBe('BROWSER_EXECUTE_SCRIPT_ERROR')
+    expect(failure?.message).toContain('could not compile')
+    // 'so nothing ran' 是 compile 分支独有的承诺（runtime 分支反而说副作用不回滚）。
+    expect(failure?.message).toContain('so nothing ran')
+    expect(failure?.message).not.toContain('threw a JavaScript runtime error')
+    // name/message 同样要带出，否则模型不知道是哪个语法错。
+    expect(failure?.message).toContain("Unexpected token '='")
+  })
+
+  it('rejects a page result that is not a valid execute envelope', async () => {
+    // 显式 null 表示页面回传了非法信封；桩必须原样交出（看 executeEnvelope 注释）。
+    harness.executeEnvelope = null
+    const nullFailure = await tool(harness, 'webpage_execute')
+      .execute({ session_id: 's1', code: 'return 2;' }, exec())
+      .then(() => undefined, (error: unknown) => error)
+
+    expect(nullFailure).toBeInstanceOf(Error)
+    expect((nullFailure as Error).message).toBe('The page returned an invalid execute result envelope.')
+    // 这条 throw 是**裸 Error**，没有 `[CODE]` 前缀也没有 code 字段：它属于「插件自己发现
+    // 协议被破坏」，不是页面侧可恢复的浏览器错误。把这个事实写进断言，免得以后有人
+    // 误以为它带 BROWSER_* 码去按码分支。
+    expect(nullFailure).not.toBeInstanceOf(BrowserError)
+    expect((nullFailure as { code?: unknown }).code).toBeUndefined()
+
+    // 缺版本 key 的「形状像信封」的结果同样必须被拒 —— 只判 has_value 的实现会放行。
+    harness.executeEnvelope = { has_value: true }
+    await expect(tool(harness, 'webpage_execute').execute({ session_id: 's1', code: 'return 2;' }, exec()))
+      .rejects.toThrow('The page returned an invalid execute result envelope.')
   })
 
   it('rejects unknown and malformed execute fields before dispatch', async () => {

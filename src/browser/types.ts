@@ -237,7 +237,11 @@ const BROWSER_ERROR_RECOVERY: Readonly<Partial<Record<BrowserErrorCode, string>>
   BROWSER_CONNECTION_LOST: 'the connection dropped; re-open the page with webpage_open.',
   BROWSER_DEBUGGER_DETACHED: 'the debugger briefly detached (e.g. DevTools opened); this recovers automatically — retry once after a moment.',
   BROWSER_STATE_CONTENDED: 'the state is held by someone else; do not retry the same write — coordinate or use force only if you mean to override.',
-  BROWSER_EXECUTE_RESULT_UNSERIALIZABLE: 'fix the exact field the message names, return only the data fields you need, and never hand back live DOM nodes, functions, cycles or accessors.',
+  // 这条 recovery 会拼在 message 尾部，而同一个错误码来自两条互不相同的路径：页面侧包装器
+  // 报的是带 `$` 路径的缺字段（修法已写进 message），provider 路径（browser-cdp/execute.ts）
+  // 报的是 DOM 节点 / 函数 / 空对象 / 未 await 的 Promise，message 里根本没有字段名。
+  // 所以这里按「message 说的是哪种」分派，不假定有字段名，也不把成因清单当成缺字段场景的追加建议。
+  BROWSER_EXECUTE_RESULT_UNSERIALIZABLE: 'the message shows which case this is: when it names a $ field path, fix that field or give it a fallback with ?? null; when it reports a DOM node, a function, an empty object or an unawaited Promise crossing the bridge, return a primitive or a JSON string of the fields you need instead.',
   BROWSER_EXECUTE_SCRIPT_ERROR: 'fix the reported JavaScript syntax or runtime error; the function body is not automatically retried.',
   BROWSER_EXECUTE_TIMEOUT: 'inspect the page state before retrying; the result is unconfirmed and page code may still finish.',
   BROWSER_EXECUTE_NOT_ALLOWED: 'this internal CDP command is not exposed by webpage_execute; use its documented session_id, code, and optional timeout_ms interface.',
